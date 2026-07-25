@@ -114,9 +114,10 @@ pub struct Model {
     /// 绑定姿势的包围盒(米)。**只用来换算屏幕尺寸**(`height_cm` 对应的就是这个高度),
     /// 站姿高度必须稳定,不能跟着动作变。
     pub bounds: (Vec3, Vec3),
-    /// 把所有动作都采样一遍取到的包围盒,`bounds` 的超集。**画布与相机取景用这个**:
-    /// 伸手、张翅、跳跃的姿势会明显超出绑定姿势,只按 `bounds` 取景会把肢体裁掉
-    /// (实测 120 个抽样形态里 11 个被裁,阿米亚特/波波拉肉眼可见)。
+    /// 把各动作采样一遍取到的包围盒,`bounds` 的超集。**画布与相机取景用这个**:
+    /// 伸手、张翅、小跳的姿势会明显超出绑定姿势,只按 `bounds` 取景会把肢体裁掉。
+    /// 实测(120 个抽样形态 × Idle/Happy/Show/Walk 各查一次):按绑定盒取景 11 个被裁
+    /// (阿米亚特/波波拉肉眼可见)→ 按这个盒子取景剩 1 个;代价是画布面积平均 1.64 倍。
     pub motion_bounds: (Vec3, Vec3),
 }
 
@@ -194,7 +195,7 @@ impl Model {
         let mut materials: Vec<Material> = Vec::new();
         let mut material_index = HashMap::new();
         let tex_dir = glb_path.parent().unwrap_or(Path::new(".")).join("tex");
-        let drop_effects = should_drop_effect_layers(&mesh);
+        let decorative_effects = should_drop_effect_layers(&mesh);
 
         for primitive in mesh.primitives() {
             let material_name = primitive
@@ -202,8 +203,8 @@ impl Model {
                 .name()
                 .unwrap_or("material")
                 .to_string();
-            if drop_effects && is_effect_slot(&material_name) {
-                log::debug!("跳过特效层材质 {material_name}");
+            if let Some(reason) = effect_drop_reason(&material_name, decorative_effects) {
+                log::debug!("跳过特效层材质 {material_name}({reason})");
                 continue;
             }
             let reader = primitive.reader(get);
@@ -336,16 +337,39 @@ impl Model {
 /// 比留一块纯白好看;真要正确还得先把材质参数解出来。
 fn find_base_color(tex_dir: &Path, material_name: &str) -> Option<Image> {
     let slot = material_name.rsplit('_').next()?.to_ascii_lowercase();
-    load_slot_texture(tex_dir, &slot).or_else(|| {
-        if slot == "by" {
+    let mut used_body_texture = is_body_slot(&slot);
+    let mut image = load_slot_texture(tex_dir, &slot).or_else(|| {
+        if is_body_slot(&slot) {
             return None;
         }
         let fallback = load_slot_texture(tex_dir, "by");
         if fallback.is_some() {
             log::debug!("材质 {material_name} 没有 {slot}_D 贴图,退用本体贴图");
+            used_body_texture = true;
         }
         fallback
-    })
+    })?;
+    // **用了本体贴图就要把 alpha 刷成不透明。** `_By_D` 的 alpha 不是不透明度,是美术塞的
+    // 遮罩通道:813 张里 160 张通过率 <95%、60 张 <5%,拿去做 alpha 测试会把身体啃掉
+    // (火花 4.8% → 只剩眼睛,迪莫 0.39% → 整只消失)。而叠加片(眼/嘴)自己的贴图是**带透明
+    // 背景的表情图集**,那儿的 alpha 是真遮罩,必须留着剔——菊花梨的眼睛不剔就是一块方糊。
+    // 于是差别放在载入这一步,shader 里只留一个统一的 alpha 测试。
+    //
+    // 判据是「**最终用的是哪张贴图**」而不是「材质槽叫什么」:非本体槽缺贴图时会退用本体贴图,
+    // 那张一样是遮罩 alpha。火神踩过这个坑——它一身肌肉是 Fx 层做的、Fx 槽没自己的贴图,
+    // 按槽名判就漏掉了,整个身体被 alpha 测试剔光,只剩翅膀角和尾巴。
+    if used_body_texture {
+        for pixel in image.rgba.chunks_exact_mut(4) {
+            pixel[3] = 255;
+        }
+    }
+    Some(image)
+}
+
+/// 是不是本体槽:`By`、`By1`、`By2`…(数字后缀是同一只宠物拆开的多张本体贴图)。
+fn is_body_slot(slot: &str) -> bool {
+    slot.strip_prefix("by")
+        .is_some_and(|rest| rest.chars().all(|c| c.is_ascii_digit()))
 }
 
 /// `_Fx*` 槽占三角面的比例低于这个值就当装饰层丢掉,高于则当本体保留。
@@ -353,18 +377,31 @@ fn find_base_color(tex_dir: &Path, material_name: &str) -> Option<Image> {
 /// 阈值落在 40% 两边都不敏感。
 const EFFECT_BODY_SHARE: f32 = 0.4;
 
-/// 要不要丢掉这个形态的特效层。
+/// 这个特效层材质要不要丢掉;返回 `Some(原因)` 表示丢。
 ///
-/// `_Fx*` 槽有**两种完全不同的用途**,只能按几何占比区分:
+/// `_Fx*` 槽有两种用途,按几何占比分:
 ///
-/// - **装饰**(占比极低,几个三角的小面片):加色光晕、拖尾。靠游戏自研 shader 的加色/
-///   半透混合才成立,我们只有不透明 toon 着色,照画就是几块凭空浮着的实心片 → 丢掉。
-/// - **本体**(占比过半):火花 79%、幽星光 92%、小鼓象 91% —— 火焰/星光那一身就是 Fx 层做的,
-///   丢了整只宠物只剩眼睛和配饰 → 必须留。
+/// - **装饰**(占比极低,几个三角的小面片):加色光晕、拖尾。照着不透明画就是几块
+///   凭空浮着的实心片 → 丢。
+/// - **本体**:火花 78%、小鼓象 89%、幽星光三阶 78% 那一身火焰/星光**就是** Fx 层做的,
+///   丢了只剩眼睛和配饰 → 留。
 ///
-/// **已知渲不好的一类**:水蓝蓝这种半透水体,Fx 是内外两层壳(三角数一模一样)+ 一张噪声贴图,
-/// 靠半透混合出水感。占比 79% 走「保留」分支,于是画成一团噪声;要正确得先支持半透材质,
-/// 依赖材质实例参数解析(见 design.md 横向待办)。丢掉又会让它只剩蝴蝶结和脸,两头都不对。
+/// **两类已知渲不好的**(都要等半透/加色材质支持,见 design.md 横向待办;不是这个函数能救的):
+///
+/// - 水蓝蓝那种半透水体:Fx 是内外两层壳(三角数一模一样)+ 一张噪声贴图,靠半透混合出水感。
+///   保留就画成一团噪声,丢掉只剩蝴蝶结和脸。
+/// - 幽星光一阶那种加色发光体:Fx 壳的贴图是**黑底 + 粉色星点**(黑是加色的单位元),
+///   不透明地画就是一坨黑盖住粉本体。
+///   **试过按「贴图接近纯黑」把它丢掉,结果更糟**:那层壳同时也是身体的轮廓,
+///   丢完只剩一个青色光环飘着,连形都没了。黑团至少形是对的,所以宁可留着。
+fn effect_drop_reason(material_name: &str, decorative: bool) -> Option<&'static str> {
+    if !is_effect_slot(material_name) {
+        return None;
+    }
+    decorative.then_some("占比低,当装饰")
+}
+
+/// 特效层是不是「装饰」级别(几何占比低)。
 fn should_drop_effect_layers(mesh: &gltf::Mesh) -> bool {
     let mut effect = 0usize;
     let mut body = 0usize;
@@ -471,12 +508,35 @@ fn topological_order(parents: &[i32]) -> Vec<usize> {
 
 /// 每段动作采样几个时刻算包围盒。取 5 个:首尾加中间三点,够抓住伸展最大的那一帧,
 /// 又不至于让载入变慢(最大的模型 1.2 万顶点 × 16 段 × 5 次 ≈ 100 万次蒙皮,实测几毫秒)。
-const BOUNDS_SAMPLES: usize = 5;
+const BOUNDS_SAMPLES: usize = 9;
+
+/// 单个姿势允许比绑定姿势大多少倍(按最长边)。超过就当这段动作坏了,整个姿势不计入。
+///
+/// 正常伸展有个上限:张翅、伸手、跳起大概到 1.5–2 倍。而**借来的动画对不上骨架**时
+/// (导出器的同族动画回退,见 design.md §9 Phase 4)会把某根骨头甩到几十倍远,
+/// 那一个姿势就能把包围盒撑爆,取景于是把整只宠物缩成一条几像素宽的丝。
+/// 宁可漏掉一段怪动作的伸展,也不能让正常动作全看不清。
+const MAX_POSE_GROWTH: f32 = 2.5;
+
+/// 姿势中心允许偏离绑定姿势中心多远(按绑定盒高度的比例)。超过就是「整只挪到别处去了」。
+///
+/// 这一条专治**召唤/落地类动作**:喵喵的 `CallOut` 是从 1.5m 高处掉下来,起始几帧整只猫
+/// 悬在 y=1.44..2.47(其余动作都在 0..1.0),单帧形体明明只有 1.19 倍,可并集一下
+/// 就把取景盒的高度从 0.8m 撑到 2.48m(3.09 倍),**每只宠物的画布都跟着白涨三倍**。
+///
+/// 整体平移是「宠物在屏幕上的位置」,该由程序挪画布(走路就是这么做的),不该让画布为它留空。
+/// 代价说清楚:真把落地动作接进状态机时,得让程序驱动竖直偏移,而不是指望画布装得下。
+///
+/// 阈值取一整个身高:实测两类的间距很宽——**悬浮类宠物**是正常的,空空颅(幽灵)的 `Alert`
+/// 常态浮在 45–56%,而**召唤落地**是 160–197%。一开始取 0.4 把空空颅的 Alert 也毙了,
+/// 而 Alert 就在表情池里,于是运行时照样顶出画布;放到 1.0 两头都装得下。
+const MAX_POSE_CENTER_DRIFT: f32 = 1.0;
 
 /// 把每段动作采样几帧、CPU 蒙皮一遍,取所有姿势的包围盒并集(含绑定姿势兜底)。
 ///
-/// 水平位移按 `Player` 的规则剥掉(见 `anim.rs` 的 `strip_root_motion`):走跑动作的
+/// 位移按 `Player` 的规则剥掉(见 `anim.rs` 的 `strip_root_motion`):走跑动作的
 /// root 位移由程序推进屏幕坐标,若算进包围盒会把画布撑到几米宽。
+/// root 之上的节点也可能带整体位移(喵喵 `CallOut` 就是),那种由中心偏移这条兜住。
 fn animated_bounds(
     vertices: &[Vertex],
     skeleton: &Skeleton,
@@ -487,17 +547,28 @@ fn animated_bounds(
     if vertices.is_empty() {
         return (min, max);
     }
+    let bind_longest = (bind.1 - bind.0).max_element().max(1e-4);
+    let bind_center = (bind.0 + bind.1) * 0.5;
+    let limit = bind_longest * MAX_POSE_GROWTH;
+    let drift_limit = (bind.1.y - bind.0.y).max(1e-4) * MAX_POSE_CENTER_DRIFT;
     let mut pose = Pose::bind(skeleton);
     let mut matrices = Vec::new();
     let root_bind = skeleton.bind[skeleton.root_joint].translation;
+    let mut rejected = 0usize;
     for clip in clips {
         for step in 0..BOUNDS_SAMPLES {
             let time = clip.duration * step as f32 / (BOUNDS_SAMPLES - 1).max(1) as f32;
             pose.sample(skeleton, clip, time);
+            // **必须和运行时剥得一模一样**:`Player::update` 只把 root 的 X/Z 归零、保留 Y
+            // (跳跃要看得见腾空)。这里若连 Y 一起剥,量出来的盒子就比实际渲的低,
+            // 带纵向起伏的动作(Happy/Show 的小跳)会顶出画布——踩过这个坑。
             let local = &mut pose.locals[skeleton.root_joint];
             local.translation.x = root_bind.x;
             local.translation.z = root_bind.z;
             pose.joint_matrices(skeleton, &mut matrices);
+            // 先单独量这个姿势,坏姿势整帧丢掉,不让它污染并集
+            let mut pose_min = Vec3::splat(f32::INFINITY);
+            let mut pose_max = Vec3::splat(f32::NEG_INFINITY);
             for v in vertices {
                 let mut skin = Mat4::ZERO;
                 for i in 0..4 {
@@ -507,11 +578,38 @@ fn animated_bounds(
                     }
                 }
                 let p = skin.transform_point3(Vec3::from(v.pos));
-                min = min.min(p);
-                max = max.max(p);
+                pose_min = pose_min.min(p);
+                pose_max = pose_max.max(p);
             }
+            let drift = ((pose_min + pose_max) * 0.5 - bind_center)
+                .abs()
+                .max_element();
+            if (pose_max - pose_min).max_element() > limit || drift > drift_limit {
+                log::trace!(
+                    "  丢掉 {} @{:.2}s:形体 {:.2}x、中心偏移 {:.2}(身高的 {:.0}%)",
+                    clip.name,
+                    time,
+                    (pose_max - pose_min).max_element() / bind_longest,
+                    drift,
+                    drift / (bind.1.y - bind.0.y).max(1e-4) * 100.0
+                );
+                rejected += 1;
+                continue;
+            }
+            min = min.min(pose_min);
+            max = max.max(pose_max);
         }
     }
+    if rejected > 0 {
+        log::debug!(
+            "取景包围盒:丢掉 {rejected}/{} 个姿势(形体超 {MAX_POSE_GROWTH} 倍或整只挪走)",
+            clips.len() * BOUNDS_SAMPLES
+        );
+    }
+    log::debug!(
+        "取景包围盒 = 绑定盒的 {:.2} 倍",
+        (max - min).max_element() / bind_longest
+    );
     (min, max)
 }
 

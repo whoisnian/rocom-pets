@@ -75,12 +75,15 @@ fn vs_outline(input: VsIn) -> VsOut {
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let tex = textureSample(base_color, base_sampler, in.uv);
-    // **不能拿 tex.a 当不透明度做 alpha 测试。** `_D` 贴图的 alpha 不是 opacity,
-    // 是美术塞进去的遮罩通道(游戏那边自研 shader 另有用途)。实测 813 张 `_By_D`
-    // 里 160 张 alpha 通过率 < 95%、60 张 < 5%:原来那句 `if tex.a < 0.35 { discard; }`
-    // 把火花啃成只剩眼睛(通过率 4.8%)、迪莫整只消失(0.39%)。
-    // 而喵喵的 By alpha 恰好全 255,开关都一样——它是当初唯一肉眼验过的宠物,
-    // 所以这个 bug 一直没露头。**轮廓由几何决定,不由贴图 alpha 决定。**
+    // alpha 测试**只对叠加片有意义**(眼/嘴那种贴在脸上的小面片,贴图是带透明背景的
+    // 表情图集,不剔就是一块方糊)。**本体贴图的 alpha 不是不透明度**,是美术塞的遮罩通道,
+    // 拿来剔像素会把身体啃掉(火花通过率 4.8% → 只剩眼睛,迪莫 0.39% → 整只消失)。
+    // 两者靠同一个测试共存的办法:载入时**把本体槽的 alpha 强制刷成 255**
+    // (见 model.rs 的 `find_base_color`),于是这里一个分支就够。
+    if tex.a < 0.35 {
+        discard;
+    }
+
     let n = normalize(in.normal);
     let ndl = dot(n, normalize(camera.light_dir));
     // 两段明暗:亮部原色,暗部压到 0.72,过渡带 0.08 宽度避免锯齿
@@ -97,7 +100,9 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
 @fragment
 fn fs_outline(in: VsOut) -> @location(0) vec4<f32> {
     let tex = textureSample(base_color, base_sampler, in.uv);
-    // 同 fs_main:不按贴图 alpha 剔像素,否则描边跟着身体一起被啃掉
+    if tex.a < 0.35 {
+        discard;
+    }
     // 描边取基色的暗版而不是纯黑,卡通渲染里这样更自然
     return vec4<f32>(tex.rgb * 0.25, 1.0);
 }
