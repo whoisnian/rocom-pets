@@ -3,6 +3,7 @@
 //! 平台后端只负责「造表面 / 收事件 / 出帧 / 设输入区」,所有状态都在这里,
 //! 这样 Wayland 与 Windows 两边的行为天然一致,也能脱离窗口系统做单元测试。
 
+use crate::pet::target::camera_yaw;
 use crate::pet::{Model, Player};
 use crate::sprite::{Rect, Sprite};
 
@@ -341,11 +342,7 @@ impl Stage {
                         match (pet.clips.walk, far_enough) {
                             (Some(walk), true) => {
                                 pet.activity = Activity::Walk { target_x };
-                                pet.target_yaw = if target_x > self.pos.0 {
-                                    std::f32::consts::FRAC_PI_2
-                                } else {
-                                    -std::f32::consts::FRAC_PI_2
-                                };
+                                pet.target_yaw = camera_yaw(target_x > self.pos.0);
                                 pet.player.play(walk);
                             }
                             _ => {

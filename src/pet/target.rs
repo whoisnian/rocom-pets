@@ -119,9 +119,51 @@ fn create(
     (color, color_view, depth_view)
 }
 
-/// 宠物在离屏画布里的取景:正交、按包围盒最长边取框,`yaw` 决定朝向(+90° 朝屏幕右)。
+/// 宠物在离屏画布里的取景:正交、按包围盒最长边取框。
 ///
+/// `yaw` 用 [`camera_yaw`] 算,别自己按直觉填角度(符号是反的,理由见那里)。
 /// `padding` 要留余量:跳跃/伸展类动作会超出绑定姿势的包围盒。
 pub fn view_proj(bounds: (Vec3, Vec3), yaw: f32, padding: f32) -> Mat4 {
     super::gpu::orthographic_view(bounds, yaw, padding)
+}
+
+/// 「宠物朝屏幕哪边」→ 相机 yaw。
+///
+/// **符号是反直觉的**:yaw 转的是**相机**而不是模型。相机绕到 -X(yaw = -90°)时,
+/// 屏幕右方向对应世界 +Z,而宠物的前方正是 +Z(见 docs/spike-s3.md:root motion 恒沿 +Z),
+/// 于是这时看到的是「朝右站」。所以**朝右取负角**。
+/// 写成 +90° 的话宠物会背朝行进方向倒着走——Phase 1 实测踩过这个坑。
+pub fn camera_yaw(facing_right: bool) -> f32 {
+    if facing_right {
+        -std::f32::consts::FRAC_PI_2
+    } else {
+        std::f32::consts::FRAC_PI_2
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use glam::Vec4;
+
+    use super::*;
+
+    /// 把「朝向」这件事钉死:宠物前方是世界 +Z(见 docs/spike-s3.md),
+    /// 朝右时它必须落在屏幕右半边。符号写反就是倒着走,这个测试专门防那次回归。
+    fn forward_screen_x(facing_right: bool) -> f32 {
+        let bounds = (Vec3::splat(-1.0), Vec3::splat(1.0));
+        let vp = view_proj(bounds, camera_yaw(facing_right), 1.0);
+        let forward = vp * Vec4::new(0.0, 0.0, 1.0, 1.0);
+        let center = vp * Vec4::new(0.0, 0.0, 0.0, 1.0);
+        forward.x / forward.w - center.x / center.w
+    }
+
+    #[test]
+    fn facing_right_puts_forward_on_screen_right() {
+        assert!(forward_screen_x(true) > 0.1, "朝右时前方该在屏幕右侧");
+    }
+
+    #[test]
+    fn facing_left_puts_forward_on_screen_left() {
+        assert!(forward_screen_x(false) < -0.1, "朝左时前方该在屏幕左侧");
+    }
 }
