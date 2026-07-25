@@ -77,6 +77,25 @@ struct RawMaterial {
     noise_tex: Option<String>,
     #[serde(default)]
     mask_matcap: bool,
+    /// 以下对所有材质都可能有(有基色的也一样)。
+    #[serde(default)]
+    translucent: bool,
+    #[serde(default)]
+    star_tex: Option<String>,
+    #[serde(default)]
+    star_tiling: Option<[f32; 2]>,
+    #[serde(default)]
+    star_color: Option<[f32; 3]>,
+    #[serde(default)]
+    matcap_tex: Option<String>,
+    #[serde(default)]
+    matcap_color: Option<[f32; 3]>,
+    #[serde(default)]
+    rim_color: Option<[f32; 3]>,
+    #[serde(default)]
+    rim_intensity: f32,
+    #[serde(default)]
+    main_color: Option<[f32; 3]>,
 }
 
 #[derive(Deserialize)]
@@ -109,6 +128,21 @@ pub struct Material {
     pub mask_alpha: bool,
     /// 只在 `base_color` 为 None 时有效。
     pub effect: Effect,
+    /// 半透。**有基色的材质也可能是半透**:暮星辰的裙子与那两个球都是,
+    /// 当不透明画就是死板的实心块。
+    pub translucent: bool,
+    pub opacity: f32,
+    /// 身上那些细碎星光。
+    pub star: Option<PathBuf>,
+    pub star_tiling: [f32; 2],
+    pub star_color: [f32; 3],
+    /// 球面反射查找表:玻璃/金属高光。
+    pub matcap: Option<PathBuf>,
+    pub matcap_color: [f32; 3],
+    pub rim_color: [f32; 3],
+    pub rim_intensity: f32,
+    /// 半透材质的整体着色;None = 不改色。
+    pub main_color: [f32; 3],
 }
 
 /// 特效层(火焰/水壳/光晕)的画法参数,全部来自游戏材质。
@@ -285,6 +319,16 @@ impl Pack {
                                     noise: mat.noise_tex.map(|rel| dir.join(rel)),
                                     mask_matcap: mat.mask_matcap,
                                 },
+                                translucent: mat.translucent,
+                                opacity: mat.opacity,
+                                star: mat.star_tex.map(|rel| dir.join(rel)),
+                                star_tiling: mat.star_tiling.unwrap_or([1.0, 1.0]),
+                                star_color: mat.star_color.unwrap_or([1.0; 3]),
+                                matcap: mat.matcap_tex.map(|rel| dir.join(rel)),
+                                matcap_color: mat.matcap_color.unwrap_or([1.0; 3]),
+                                rim_color: mat.rim_color.unwrap_or([1.0; 3]),
+                                rim_intensity: mat.rim_intensity,
+                                main_color: mat.main_color.unwrap_or([1.0; 3]),
                             },
                         )
                     })

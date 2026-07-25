@@ -63,6 +63,12 @@ public record MaterialInfo(
     /// 半透强度;没写就当全不透明。
     public float Opacity => Scalars.TryGetValue("Opacity", out var v) ? v : 1f;
 
+    /// 半透材质的整体着色。暮星辰的裙子 `MainColor` = (0.39, 0.4, 0.63) —— 蓝紫调,
+    /// 不乘上去裙子会偏白。只在显式给了、且不是纯白时才用。
+    public float[]? MainColor =>
+        Vectors.TryGetValue("MainColor", out var c) && (c[0] < 0.99f || c[1] < 0.99f || c[2] < 0.99f)
+            ? c : null;
+
     /// 遮罩/噪声贴图:特效的形状与流动来源。没有就当常量 1。
     public string? MaskTexture =>
         FirstTexture("Mask", "MaskTex", "BaseMap", "Base Color", "MatCap", "MatCapTex");
@@ -85,6 +91,39 @@ public record MaterialInfo(
 
     /// 发光强度(火焰族有);没有就 1。
     public float Glow => Scalar("Glow Intensity", 1f);
+
+    /// 是不是半透材质。**有基色的材质也可能是半透**——暮星辰的裙子(`Fx1`)与那两个球(`Fx2`)
+    /// 都是 `MI_P_Object_Trans_*` 家族、`BLEND_Translucent`,当成不透明画就是死板的实心块。
+    public bool IsTranslucent =>
+        BlendMode is EBlendMode.BLEND_Translucent or EBlendMode.BLEND_AlphaComposite;
+
+    /// 星点贴图:游戏里身上那些细碎星光。共享图 `Tex_PetGlassyStar_004` 一类。
+    ///
+    /// **几乎每个宠物材质都挂着这张图,但绝大多数并没有真的启用它**——游戏靠静态开关
+    /// 与遮罩通道决定要不要叠,那套我们复刻不了。判据取「美术是否显式设了 `StarStickTiling`」:
+    /// 设了(暮星辰的裙子 = 4×4)才当启用。一开始无条件叠,结果整只宠物被星点冲白。
+    public string? StarTexture =>
+        Vectors.ContainsKey("StarStickTiling") ? FirstTexture("StarStickTex", "ShinyStarTex", "StarTex") : null;
+
+    /// 星点平铺;`StarStickTiling` 是 vec4,前两位是 uv 平铺(暮星辰 = (4,4))。
+    public float[] StarTiling =>
+        Vectors.TryGetValue("StarStickTiling", out var v) && v[0] > 0 ? [v[0], v[1]] : [1f, 1f];
+
+    public float[]? StarColor => FirstVector("StarColor", "StarStickColor");
+
+    /// MatCap:球面反射查找表。暮星辰那两个球的玻璃感就是它 + `MatCapColor=(3,3,3)` 的 HDR 白。
+    ///
+    /// 同样**只在美术显式设了 `MatCapColor` 时才算启用**。很多材质的 MatCap 槽绑的压根不是
+    /// 反射图(幽星光的 `By` 绑的是 `Fx_ID` 描边图),无条件当高光叠会把宠物冲成一片白。
+    public string? MatcapTexture =>
+        Vectors.ContainsKey("MatCapColor") ? FirstTexture("MatCap", "MatCapTex") : null;
+
+    public float[]? MatcapColor => FirstVector("MatCapColor");
+
+    /// 边缘光颜色/强度。暮星辰的球有一圈紫边(`Rim LightColor` = (0.67, 0.11, 1))。
+    public float[]? RimColor => FirstVector("Rim LightColor", "RimLightColor", "FresnelColor");
+
+    public float RimIntensity => Scalar("Rim Intensity", Scalar("RimIntensity", 0f));
 
     private float Scalar(string name, float fallback = 0f) =>
         Scalars.TryGetValue(name, out var v) ? v : fallback;

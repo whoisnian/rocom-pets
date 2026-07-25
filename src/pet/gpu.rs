@@ -31,8 +31,18 @@ struct MaterialUniform {
     flow: [f32; 4],
     /// [opacity, glow, additive(0/1), 是否有噪声贴图(0/1)]
     params: [f32; 4],
-    /// [遮罩是否 matcap(0/1), 备用, 备用, 备用]
+    /// [遮罩是否 matcap(0/1), 有基色(0/1), 有星点(0/1), 有 matcap(0/1)]
     flags: [f32; 4],
+    /// [星点 u 平铺, v 平铺, 边缘光强度, 不透明度]
+    star: [f32; 4],
+    /// 星点着色(rgb)+ 线条提亮(a)
+    star_color: [f32; 4],
+    /// MatCap 着色(rgb,可能是 HDR)+ 备用
+    matcap_color: [f32; 4],
+    /// 半透材质的整体着色
+    main_color: [f32; 4],
+    /// 边缘光颜色
+    rim_color: [f32; 4],
 }
 
 /// 本体贴图 alpha 里那层线条遮罩的提亮倍数。游戏里那些纹路(水灵身上的竖条、
@@ -152,6 +162,27 @@ impl PetGpu {
                     },
                     count: None,
                 },
+                // 星点与 MatCap:游戏里几乎每个宠物材质都挂着这两张
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 5,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
             ],
         });
 
@@ -204,6 +235,19 @@ impl PetGpu {
                 .and_then(|e| e.noise.as_ref())
                 .unwrap_or(&white);
             let noise_view = upload_texture(device, queue, &material.name, noise);
+            let star_view = upload_texture(
+                device,
+                queue,
+                &material.name,
+                material.star.as_ref().unwrap_or(&white),
+            );
+            let matcap_view = upload_texture(
+                device,
+                queue,
+                &material.name,
+                material.matcap.as_ref().unwrap_or(&white),
+            );
+            let has = |v: bool| if v { 1.0 } else { 0.0 };
             let uniform = match &material.effect {
                 Some(effect) => MaterialUniform {
                     tint: effect.tint,
@@ -211,23 +255,102 @@ impl PetGpu {
                     params: [
                         effect.opacity,
                         effect.glow,
-                        if effect.additive { 1.0 } else { 0.0 },
-                        if effect.noise.is_some() { 1.0 } else { 0.0 },
+                        has(effect.additive),
+                        has(effect.noise.is_some()),
                     ],
-                    flags: [if effect.mask_matcap { 1.0 } else { 0.0 }, 0.0, 0.0, 0.0],
+                    flags: [
+                        has(effect.mask_matcap),
+                        0.0,
+                        has(material.star.is_some()),
+                        has(material.matcap.is_some()),
+                    ],
+                    star: [
+                        material.star_tiling[0],
+                        material.star_tiling[1],
+                        material.rim_intensity,
+                        effect.opacity,
+                    ],
+                    star_color: [
+                        material.star_color[0],
+                        material.star_color[1],
+                        material.star_color[2],
+                        LINE_BOOST,
+                    ],
+                    matcap_color: [
+                        material.matcap_color[0],
+                        material.matcap_color[1],
+                        material.matcap_color[2],
+                        0.0,
+                    ],
+                    rim_color: [
+                        material.rim_color[0],
+                        material.rim_color[1],
+                        material.rim_color[2],
+                        0.0,
+                    ],
+                    main_color: [
+                        material.main_color[0],
+                        material.main_color[1],
+                        material.main_color[2],
+                        0.0,
+                    ],
                 },
-                // 主通道材质:params.x 说明 alpha 怎么解释(1=镂空遮罩,0=线条遮罩),
-                // params.y 是线条的提亮倍数
+                // 有基色的材质:params.x 说明 alpha 怎么解释(1=镂空遮罩,0=线条遮罩)
                 None => MaterialUniform {
                     tint: [1.0; 4],
                     flow: [0.0, 0.0, 1.0, 1.0],
                     params: [
-                        if material.cutout { 1.0 } else { 0.0 },
-                        LINE_BOOST,
+                        has(material.cutout),
+                        // alpha 恒定的贴图没有线条可提,提亮必须是空操作(1.0),
+                        // 否则整只宠物被均匀调亮
+                        if material.line_detail {
+                            LINE_BOOST
+                        } else {
+                            1.0
+                        },
                         0.0,
                         0.0,
                     ],
-                    flags: [0.0; 4],
+                    flags: [
+                        0.0,
+                        1.0,
+                        has(material.star.is_some()),
+                        has(material.matcap.is_some()),
+                    ],
+                    star: [
+                        material.star_tiling[0],
+                        material.star_tiling[1],
+                        material.rim_intensity,
+                        material.opacity,
+                    ],
+                    star_color: [
+                        material.star_color[0],
+                        material.star_color[1],
+                        material.star_color[2],
+                        if material.line_detail {
+                            LINE_BOOST
+                        } else {
+                            1.0
+                        },
+                    ],
+                    matcap_color: [
+                        material.matcap_color[0],
+                        material.matcap_color[1],
+                        material.matcap_color[2],
+                        0.0,
+                    ],
+                    rim_color: [
+                        material.rim_color[0],
+                        material.rim_color[1],
+                        material.rim_color[2],
+                        0.0,
+                    ],
+                    main_color: [
+                        material.main_color[0],
+                        material.main_color[1],
+                        material.main_color[2],
+                        0.0,
+                    ],
                 },
             };
             let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -254,6 +377,14 @@ impl PetGpu {
                     wgpu::BindGroupEntry {
                         binding: 3,
                         resource: uniform_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
+                        resource: wgpu::BindingResource::TextureView(&star_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 5,
+                        resource: wgpu::BindingResource::TextureView(&matcap_view),
                     },
                 ],
             }));
@@ -354,11 +485,15 @@ impl PetGpu {
         let effect_pipeline = make_pipeline("pet-effect", "vs_main", "fs_effect", None, false);
 
         // 特效层最后画:它们要叠在本体之上
+        // 半透的一律进特效通道:纯特效层(没有基色)和「有基色但 BLEND_Translucent」的
+        // (暮星辰的裙子与那两个球)都在里面
         let (effect_draws, draws): (Vec<_>, Vec<_>) = model
             .primitives
             .iter()
             .map(|p| (p.first_index, p.index_count, p.material))
-            .partition(|&(_, _, material)| model.materials[material].effect.is_some());
+            .partition(|&(_, _, m)| {
+                model.materials[m].effect.is_some() || model.materials[m].translucent
+            });
 
         Ok(Self {
             vertices,

@@ -31,7 +31,21 @@ public record MaterialEntry(
     string? MaskTexture,
     string? NoiseTexture,
     /// 遮罩贴图是不是 MatCap(要按视空间法线采样,不能用网格 UV)。
-    bool MaskIsMatcap);
+    bool MaskIsMatcap,
+    /// 以下对**所有**材质都有意义(有基色的也一样)。
+    bool Translucent,
+    /// 星点贴图 + 平铺 + 着色:身上那些细碎星光。
+    string? StarTexture,
+    float[] StarTiling,
+    float[]? StarColor,
+    /// MatCap 贴图 + 着色:玻璃/金属高光。
+    string? MatcapTexture,
+    float[]? MatcapColor,
+    /// 边缘光。
+    float[]? RimColor,
+    float RimIntensity,
+    /// 半透材质的整体着色(`MainColor`)。
+    float[]? MainColor);
 
 public record FormReport(
     Form Form,
@@ -120,6 +134,31 @@ public static class Manifest
                     parts.Add($"mask_alpha = {(mat.MaskAlpha ? "true" : "false")}");
                     parts.Add($"mask_clip = {Num(mat.MaskClip)}");
                     parts.Add($"blend = {Quote(mat.Blend)}");
+                    if (mat.Translucent) parts.Add("translucent = true");
+                    // 星点/MatCap/边缘光对所有材质都可能有
+                    if (mat.StarTexture is not null)
+                    {
+                        parts.Add($"star_tex = {Quote(mat.StarTexture)}");
+                        parts.Add($"star_tiling = [{Num(mat.StarTiling[0])}, {Num(mat.StarTiling[1])}]");
+                        if (mat.StarColor is { } sc)
+                            parts.Add($"star_color = [{Num(sc[0])}, {Num(sc[1])}, {Num(sc[2])}]");
+                    }
+                    if (mat.MatcapTexture is not null && !mat.MaskIsMatcap)
+                    {
+                        parts.Add($"matcap_tex = {Quote(mat.MatcapTexture)}");
+                        if (mat.MatcapColor is { } mc)
+                            parts.Add($"matcap_color = [{Num(mc[0])}, {Num(mc[1])}, {Num(mc[2])}]");
+                    }
+                    if (mat.RimIntensity > 0 && mat.RimColor is { } rc)
+                    {
+                        parts.Add($"rim_color = [{Num(rc[0])}, {Num(rc[1])}, {Num(rc[2])}]");
+                        parts.Add($"rim_intensity = {Num(mat.RimIntensity)}");
+                    }
+                    // opacity 只写一次:纯特效层那一段也会写,重复键 TOML 直接解析失败
+                    if (mat.Translucent && mat.BaseColor is not null)
+                        parts.Add($"opacity = {Num(mat.Opacity)}");
+                    if (mat.MainColor is { } mn && mat.Translucent)
+                        parts.Add($"main_color = [{Num(mn[0])}, {Num(mn[1])}, {Num(mn[2])}]");
                     if (mat.BaseColor is null)
                     {
                         // 特效层:主色 + 卷动 + 遮罩/噪声,运行时靠这些近似画出火焰/水壳/光晕

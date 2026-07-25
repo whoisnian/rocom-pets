@@ -22,8 +22,17 @@ struct MaterialParams {
     flow: vec4<f32>,
     // [不透明度, 发光强度, 是否加色, 有没有噪声贴图]
     params: vec4<f32>,
-    // [遮罩是否 matcap, 备用×3]
+    // [遮罩是否 matcap, 有基色, 有星点, 有 matcap]
     flags: vec4<f32>,
+    // [星点 u 平铺, v 平铺, 边缘光强度, 不透明度]
+    star: vec4<f32>,
+    // 星点着色(rgb)+ 线条提亮(a)
+    star_color: vec4<f32>,
+    // MatCap 着色(rgb,可能是 HDR)
+    matcap_color: vec4<f32>,
+    rim_color: vec4<f32>,
+    // 半透材质的整体着色
+    main_color: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> camera: Camera;
@@ -34,6 +43,9 @@ struct MaterialParams {
 // 特效层的噪声贴图;普通材质这里是 1×1 白图
 @group(1) @binding(2) var noise_tex: texture_2d<f32>;
 @group(1) @binding(3) var<uniform> material: MaterialParams;
+// 星点(身上的细碎星光)与 MatCap(球面反射查找表);没有就是 1×1 白图
+@group(1) @binding(4) var star_tex: texture_2d<f32>;
+@group(1) @binding(5) var matcap_tex: texture_2d<f32>;
 
 struct VsIn {
     @location(0) pos: vec3<f32>,
@@ -91,6 +103,41 @@ fn vs_outline(input: VsIn) -> VsOut {
     return out;
 }
 
+
+/// 相机的右/上向量。正交投影没有透视错切,`view_proj` 的行向量归一化后就是它们,
+/// 所以不必额外往 uniform 里塞。
+fn camera_basis() -> mat2x3<f32> {
+    let right = normalize(vec3<f32>(camera.view_proj[0][0], camera.view_proj[1][0], camera.view_proj[2][0]));
+    let up = normalize(vec3<f32>(camera.view_proj[0][1], camera.view_proj[1][1], camera.view_proj[2][1]));
+    return mat2x3<f32>(right, up);
+}
+
+/// MatCap 的采样坐标:视空间法线映射到 [0,1](球面查找表的标准做法)。
+fn matcap_uv(n: vec3<f32>) -> vec2<f32> {
+    let basis = camera_basis();
+    return vec2<f32>(dot(n, basis[0]), -dot(n, basis[1])) * 0.5 + vec2<f32>(0.5, 0.5);
+}
+
+/// 身上的细碎星光。共享图 `Tex_PetGlassyStar_004` 一类,形状在 alpha 里,
+/// `StarStickTiling` 控制密度(暮星辰 = 4×4)。按视空间贴,于是转身时星点像浮在表面。
+fn star_light(n: vec3<f32>) -> vec3<f32> {
+    if material.flags.z < 0.5 {
+        return vec3<f32>(0.0);
+    }
+    let uv = matcap_uv(n) * material.star.xy;
+    let star = textureSample(star_tex, base_sampler, uv);
+    return material.star_color.rgb * star.rgb * star.a;
+}
+
+/// MatCap 高光。`MatCapColor` 可能是 HDR(暮星辰那两个球是 (3,3,3)),所以直接相乘。
+fn matcap_light(n: vec3<f32>) -> vec3<f32> {
+    if material.flags.w < 0.5 {
+        return vec3<f32>(0.0);
+    }
+    let m = textureSample(matcap_tex, base_sampler, matcap_uv(n));
+    return material.matcap_color.rgb * m.rgb * m.a;
+}
+
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let tex = textureSample(base_color, base_sampler, in.uv);
@@ -113,8 +160,11 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     // 边缘光:让轮廓从桌面背景里浮出来,桌宠场景下比环境光更有用
     let rim = pow(1.0 - max(dot(n, normalize(in.view_dir)), 0.0), 3.0) * 0.25;
 
-    // 纹路提亮:alpha 高的地方(线条)比底色亮一档
-    let color = tex.rgb * shade * mix(1.0, material.params.y, line) + vec3<f32>(rim);
+    // 纹路提亮:alpha 高的地方(线条)比底色亮一档。
+    // 星点只轻轻加一层;**不透明层不叠 MatCap**——游戏那边靠遮罩通道选择性反射,
+    // 无条件叠会把宠物冲白(试过,整只发白),而 toon 着色本身对着截图已经够像。
+    let color = tex.rgb * shade * mix(1.0, material.params.y, line)
+        + vec3<f32>(rim) + star_light(n) * 0.3;
     // 输出预乘 alpha:透明表面合成要求(见 render.rs)
     return vec4<f32>(color, 1.0);
 }
@@ -148,9 +198,9 @@ fn fs_effect(in: VsOut) -> @location(0) vec4<f32> {
     // 遮罩决定形状。**matcap 要按视空间法线采样**(它是球面反射查找表),
     // 拿网格 UV 采会糊成一块块的斑——水灵的水膜踩过这个坑。
     // 相机基向量从 view_proj 里取:正交投影没有透视错切,行向量归一化后就是右/上。
+    let n = normalize(in.normal);
     var mask_uv = in.uv;
     if material.flags.x > 0.5 {
-        let n = normalize(in.normal);
         let right = normalize(vec3<f32>(camera.view_proj[0][0], camera.view_proj[1][0], camera.view_proj[2][0]));
         let up = normalize(vec3<f32>(camera.view_proj[0][1], camera.view_proj[1][1], camera.view_proj[2][1]));
         mask_uv = vec2<f32>(dot(n, right), -dot(n, up)) * 0.5 + vec2<f32>(0.5, 0.5);
@@ -163,9 +213,22 @@ fn fs_effect(in: VsOut) -> @location(0) vec4<f32> {
     }
 
     // 边缘处更亮/更实:水壳的菲涅尔感与火焰的边缘都靠这个
-    let n = normalize(in.normal);
     let facing = 1.0 - abs(dot(n, normalize(in.view_dir)));
     let rim = mix(0.35, 1.0, facing);
+
+    // **有基色的半透材质**走另一条:暮星辰的裙子与那两个球都是 `BLEND_Translucent`,
+    // 固有色来自贴图而不是 tint。当不透明画就是死板的实心块(球会变成纯色圆片)。
+    if material.flags.y > 0.5 {
+        let ndl = dot(n, normalize(camera.light_dir));
+        let shade = mix(0.72, 1.0, smoothstep(-0.04, 0.04, ndl));
+        let base = mask;   // 这里 base_color 绑的就是基色贴图
+        // 边缘更实、中间更透:玻璃与薄纱都是这个观感
+        let a = clamp(mix(material.star.w, 1.0, facing * facing), 0.0, 1.0);
+        let rim_glow = material.rim_color.rgb * pow(facing, 3.0) * material.star.z;
+        let lit = base.rgb * material.main_color.rgb * shade * mix(1.0, material.star_color.a, base.a)
+            + star_light(n) * 0.45 + matcap_light(n) * 0.35 + rim_glow;
+        return vec4<f32>(lit * a, a);
+    }
 
     let strength = mask.a * flow_amount * rim;
     let color = material.tint.rgb * glow * strength;

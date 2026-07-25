@@ -38,6 +38,20 @@ pub struct Material {
     pub base_color: Option<Image>,
     /// 贴图 alpha 是**镂空遮罩**(眼/嘴的表情图集)还是**线条遮罩**(本体的纹路)。
     pub cutout: bool,
+    /// alpha 里是否真的有线条信息(见 `alpha_has_detail`);否则提亮要关掉。
+    pub line_detail: bool,
+    /// 半透:走特效通道(在不透明层之后画、不写深度),而不是主通道。
+    pub translucent: bool,
+    pub opacity: f32,
+    /// 星点 / MatCap 两张附加贴图与它们的着色,以及边缘光。
+    pub star: Option<Image>,
+    pub star_tiling: [f32; 2],
+    pub star_color: [f32; 3],
+    pub matcap: Option<Image>,
+    pub matcap_color: [f32; 3],
+    pub rim_color: [f32; 3],
+    pub rim_intensity: f32,
+    pub main_color: [f32; 3],
     /// 特效层的画法(火焰/水壳/光晕)。`None` = 普通不透明材质,走主通道。
     pub effect: Option<EffectMaterial>,
 }
@@ -278,6 +292,8 @@ impl Model {
                     .base_color
                     .as_deref()
                     .and_then(|path| load_texture(path, spec.mask_alpha));
+                // 只有 alpha 真的有高低之分才启用纹路提亮(要在 base_color 被移动前算)
+                let line_detail = base_color.as_ref().is_some_and(alpha_has_detail);
                 // 特效层的遮罩/噪声贴图 alpha 原样保留:形状全靠它
                 let effect = spec.base_color.is_none().then(|| EffectMaterial {
                     tint: spec.effect.tint,
@@ -301,6 +317,18 @@ impl Model {
                     name: name.clone(),
                     base_color,
                     cutout: spec.mask_alpha,
+                    line_detail,
+                    translucent: spec.translucent,
+                    opacity: spec.opacity,
+                    // 星点/matcap 的 alpha 原样保留:形状全在 alpha 里
+                    star: spec.star.as_deref().and_then(|p| load_texture(p, true)),
+                    star_tiling: spec.star_tiling,
+                    star_color: spec.star_color,
+                    matcap: spec.matcap.as_deref().and_then(|p| load_texture(p, true)),
+                    matcap_color: spec.matcap_color,
+                    rim_color: spec.rim_color,
+                    rim_intensity: spec.rim_intensity,
+                    main_color: spec.main_color,
                     effect,
                 });
                 materials.len() - 1
@@ -409,6 +437,22 @@ fn load_texture(path: &Path, _mask_alpha: bool) -> Option<Image> {
         height,
         rgba,
     })
+}
+
+/// alpha 里到底有没有「线条」信息。
+///
+/// **不是每张本体贴图都有纹路层**:实测喵喵/鸭吉吉/治愈兔/大耳帽兜的 `By_D` alpha
+/// 恒等于 1(100% 覆盖),那就没有任何线条可言;而水灵是 23% 覆盖,白线压在竖条纹上。
+/// alpha 恒定时若还照着它提亮,等于把**整只宠物均匀调亮**——雪影娃娃就是这么被冲淡的。
+/// 判据:alpha 要真的有高低之分,过高或过低的覆盖率都当「没信息」。
+fn alpha_has_detail(image: &Image) -> bool {
+    let total = image.rgba.len() / 4;
+    if total == 0 {
+        return false;
+    }
+    let high = image.rgba.chunks_exact(4).filter(|p| p[3] > 128).count();
+    let share = high as f32 / total as f32;
+    (0.02..0.90).contains(&share)
 }
 
 /// 父节点一定排在子节点之前的遍历序。
