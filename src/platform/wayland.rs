@@ -387,7 +387,7 @@ impl App {
         }
     }
 
-    /// 所有 stage 里最急的那个推进间隔(待机时会自动放慢)。
+    /// 所有 stage 里最急的那个推进间隔(姿势几乎不动时会自动放慢)。
     fn tick_interval(&self) -> Duration {
         self.stages
             .iter()

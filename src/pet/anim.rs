@@ -128,6 +128,11 @@ pub struct Player {
     pose: Pose,
     scratch: Pose,
     pub matrices: Vec<Mat4>,
+    /// 上一次 advance 的 dt,用来把姿势变化换算成速度。
+    last_dt: f32,
+    /// 上一次 update 时各关节的位置,用来量「这段动画此刻动得多厉害」。
+    previous_positions: Vec<Vec3>,
+    motion: f32,
 }
 
 impl Player {
@@ -142,6 +147,9 @@ impl Player {
             pose: pose.clone(),
             scratch: pose,
             matrices: Vec::new(),
+            last_dt: 1.0 / 30.0,
+            previous_positions: Vec::new(),
+            motion: f32::INFINITY, // 还没量过:先当成「在动」,免得一上来就降频
         }
     }
 
@@ -172,7 +180,14 @@ impl Player {
         self.previous = None;
     }
 
+    /// 关节的最大移动速度(米/秒):睡觉这类几乎静止的动作会接近 0,
+    /// 待机的呼吸/起伏则明显不为 0。调用方拿它决定要不要降帧。
+    pub fn motion(&self) -> f32 {
+        self.motion
+    }
+
     pub fn advance(&mut self, model: &Model, dt: f32) {
+        self.last_dt = dt;
         let duration = model.clips[self.current].duration.max(1e-4);
         self.time = (self.time + dt) % duration;
         if let Some((_, _, remaining)) = &mut self.previous {
@@ -204,5 +219,100 @@ impl Player {
             local.translation.z = bind.z;
         }
         self.pose.joint_matrices(skeleton, &mut self.matrices);
+        self.measure_motion();
+    }
+
+    /// 与上一次 update 比,关节移动得多快。dt 为 0(seek 后的单帧渲染)时不更新。
+    fn measure_motion(&mut self) {
+        let positions: Vec<Vec3> = self.matrices.iter().map(|m| m.w_axis.truncate()).collect();
+        if self.previous_positions.len() == positions.len() && self.last_dt > 1e-4 {
+            let max = self
+                .previous_positions
+                .iter()
+                .zip(&positions)
+                .map(|(a, b)| a.distance(*b))
+                .fold(0.0f32, f32::max);
+            self.motion = max / self.last_dt;
+        }
+        self.previous_positions = positions;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pet::model::{Channel, Interpolation, Property};
+
+    /// 造一个「单关节匀速平移」的模型:1 秒走 0.5 米,方向由 `axis` 指定(0=X, 1=Y)。
+    fn moving_model(axis: usize) -> Model {
+        let mut model = Model::for_test(&["Move"]);
+        let mut end = [0.0, 0.0, 0.0, 0.0];
+        end[axis] = 0.5;
+        model.clips[0].channels.push(Channel {
+            node: 0,
+            property: Property::Translation,
+            interpolation: Interpolation::Linear,
+            times: vec![0.0, 1.0],
+            values: vec![[0.0, 0.0, 0.0, 0.0], end],
+        });
+        model
+    }
+
+    /// motion() 的单位是米/秒——降频阈值(stage.rs 的 STILL_MOTION)按它标定,
+    /// 所以这个换算必须钉住。
+    #[test]
+    fn motion_measures_joint_speed_in_meters_per_second() {
+        // 用垂直方向:待机动画的起伏也是垂直的,而水平位移会被 strip_root_motion 剥掉
+        let model = moving_model(1);
+        let mut player = Player::new(&model, 0);
+        // 第一次 update 只是建立基线
+        player.update(&model);
+        for _ in 0..5 {
+            player.advance(&model, 0.1);
+            player.update(&model);
+        }
+        let motion = player.motion();
+        assert!(
+            (motion - 0.5).abs() < 0.05,
+            "该量出约 0.5 m/s,实际 {motion}"
+        );
+    }
+
+    /// 钉住 Phase 1 的修正:根骨骼的**水平**位移必须被剥掉(否则宠物会「走两份」),
+    /// 因此它也不该被 motion() 量到。
+    #[test]
+    fn root_horizontal_motion_is_stripped() {
+        let model = moving_model(0);
+        let mut player = Player::new(&model, 0);
+        player.update(&model);
+        for _ in 0..5 {
+            player.advance(&model, 0.1);
+            player.update(&model);
+        }
+        assert_eq!(player.motion(), 0.0, "水平位移该被剥掉");
+
+        // 关掉剥离就应该量得到
+        let mut player = Player::new(&model, 0);
+        player.strip_root_motion = false;
+        player.update(&model);
+        for _ in 0..5 {
+            player.advance(&model, 0.1);
+            player.update(&model);
+        }
+        assert!(
+            (player.motion() - 0.5).abs() < 0.05,
+            "关掉剥离后该量出 0.5 m/s"
+        );
+    }
+
+    #[test]
+    fn static_clip_reports_no_motion() {
+        let model = Model::for_test(&["Idle"]);
+        let mut player = Player::new(&model, 0);
+        for _ in 0..3 {
+            player.advance(&model, 0.1);
+            player.update(&model);
+        }
+        assert_eq!(player.motion(), 0.0);
     }
 }

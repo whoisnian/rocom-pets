@@ -61,9 +61,21 @@ const HEAD_ZONE: f32 = 0.45;
 const PET_WINDOW: f32 = 1.2;
 const PET_REVERSALS: u8 = 3;
 
-/// 有事发生时的推进频率,与待机时的降频。
+/// 推进频率的上下限。
+///
+/// 降频**只看姿势实际变化速度**,不按状态硬分档:待机动画本身带明显起伏
+/// (实测关节最大速度 ~6m/s,行走 ~4.7m/s),一律按「待机」降到 12Hz 会看着发顿——
+/// 这是实机反馈改过来的。频率由 [`hz_for_motion`] 连续映射,睡觉那类近乎静止的动作
+/// 自动落到下限,不需要给每段动作手工标注。
 const ACTIVE_HZ: f32 = 30.0;
-const IDLE_HZ: f32 = 12.0;
+const STILL_HZ: f32 = 10.0;
+/// 关节速度到多少就跑满帧(米/秒)。取 1.0:实测有动作的段都在 4m/s 以上,余量充足。
+const FULL_RATE_MOTION: f32 = 1.0;
+
+/// 姿势变化速度 → 推进频率。
+fn hz_for_motion(motion: f32) -> f32 {
+    (motion / FULL_RATE_MOTION * ACTIVE_HZ).clamp(STILL_HZ, ACTIVE_HZ)
+}
 
 /// 宠物当前在干什么。
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -514,13 +526,19 @@ impl Stage {
         Reaction::REDRAW
     }
 
-    /// 下一次推进该隔多久:有事发生时 30fps,待机时降到 12fps 省合成开销。
+    /// 下一次推进该隔多久。只有「正在播的动作几乎不动」时才降频(见 STILL_MOTION)。
     pub fn tick_interval(&self) -> Duration {
         let hz = match &self.actor {
-            Actor::Pet(pet) => match pet.activity {
-                Activity::Idle { .. } if self.drag_offset.is_none() => IDLE_HZ,
-                _ => ACTIVE_HZ,
-            },
+            Actor::Pet(pet) => {
+                // 行走/拖动/反应中位置本身在变,不看姿势也得跑满
+                let busy =
+                    self.drag_offset.is_some() || !matches!(pet.activity, Activity::Idle { .. });
+                if busy {
+                    ACTIVE_HZ
+                } else {
+                    hz_for_motion(pet.player.motion())
+                }
+            }
             Actor::Sprite(_) => ACTIVE_HZ,
         };
         Duration::from_secs_f32(1.0 / hz)
@@ -840,9 +858,16 @@ mod pet_tests {
     }
 
     #[test]
-    fn idle_ticks_slower_than_walking() {
+    fn still_pose_ticks_slower_than_moving() {
         let mut s = pet_stage();
-        let idle = s.tick_interval();
+        // 合成模型没有动画通道 → 姿势纹丝不动,量过两帧后应当降频
+        s.tick(0.05);
+        s.tick(0.05);
+        let still = s.tick_interval();
+        assert!(
+            still > Duration::from_secs_f32(1.0 / 20.0),
+            "静止姿势该降频"
+        );
         // 逼它走起来:待机计时耗尽后会挑目标点
         for _ in 0..100 {
             s.tick(0.1);
@@ -854,7 +879,7 @@ mod pet_tests {
             matches!(activity(&s), Activity::Walk { .. }),
             "待机够久该开始走"
         );
-        assert!(s.tick_interval() < idle, "行走时该比待机更勤地推进");
+        assert!(s.tick_interval() < still, "行走时该比静止更勤地推进");
     }
 
     #[test]
@@ -882,5 +907,24 @@ mod pet_tests {
             }
         }
         assert!((s.actor_pos().0 - target_x).abs() < 1.0, "该走到目标点");
+    }
+}
+
+#[cfg(test)]
+mod rate_tests {
+    use super::*;
+
+    /// 把「姿势速度 → 帧率」的映射钉住:待机实测 ~6m/s 必须跑满,
+    /// 睡觉那类近乎静止的必须落到下限,中间连续过渡。
+    #[test]
+    fn frame_rate_follows_motion() {
+        assert_eq!(hz_for_motion(0.0), STILL_HZ);
+        assert_eq!(hz_for_motion(6.0), ACTIVE_HZ, "待机实测量级该跑满帧");
+        assert_eq!(hz_for_motion(4.7), ACTIVE_HZ, "行走实测量级该跑满帧");
+        let mid = hz_for_motion(0.5);
+        assert!(
+            mid > STILL_HZ && mid < ACTIVE_HZ,
+            "中间值该连续过渡,实际 {mid}"
+        );
     }
 }
