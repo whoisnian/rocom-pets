@@ -3,6 +3,9 @@
 //! 平台后端只负责「造表面 / 收事件 / 出帧 / 设输入区」,所有状态都在这里,
 //! 这样 Wayland 与 Windows 两边的行为天然一致,也能脱离窗口系统做单元测试。
 
+use std::time::Duration;
+
+use crate::pet::mask::Mask;
 use crate::pet::target::camera_yaw;
 use crate::pet::{Model, Player};
 use crate::sprite::{Rect, Sprite};
@@ -49,6 +52,19 @@ const REGION_ALPHA_THRESHOLD: u8 = 8;
 /// 宠物脚底离屏幕底边留的空隙(逻辑像素)。
 const GROUND_MARGIN: f32 = 4.0;
 
+/// 按下后指针移动超过这么多逻辑像素才算拖动,否则算点击。
+const DRAG_THRESHOLD: f32 = 4.0;
+
+/// 摸头判定:头部区域取包围盒上面这个比例。
+const HEAD_ZONE: f32 = 0.45;
+/// 在这段时间窗口内来回蹭够 REVERSALS 次就算「摸头」。
+const PET_WINDOW: f32 = 1.2;
+const PET_REVERSALS: u8 = 3;
+
+/// 有事发生时的推进频率,与待机时的降频。
+const ACTIVE_HZ: f32 = 30.0;
+const IDLE_HZ: f32 = 12.0;
+
 /// 宠物当前在干什么。
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Activity {
@@ -58,6 +74,19 @@ pub enum Activity {
     Walk { target_x: f32 },
     /// 被鼠标拎着。
     Dragged,
+    /// 一次性反应(受惊/开心…),播完 `remaining` 秒回到待机。
+    React { remaining: f32 },
+}
+
+/// 宠物对鼠标的反应(播哪段一次性动作)。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum PetReaction {
+    /// 被点了一下 → 受惊。
+    Startled,
+    /// 头被反复蹭 → 开心。
+    Petted,
+    /// 被拎起来 → 害怕。
+    PickedUp,
 }
 
 /// 一只宠物:模型 + 播放器 + 屏幕上的表现状态。
@@ -75,17 +104,96 @@ pub struct PetActor {
     /// 画布顶端到宠物脚底的距离(逻辑像素)。取景留了余量,脚底不在画布最下沿,
     /// 站地面时要按这个值对齐,否则宠物会悬空。
     pub foot_offset: f32,
+    /// 轮廓掩码(异步回读而来,见 pet/mask.rs);还没到就退化成包围盒判定。
+    pub mask: Option<Mask>,
     clips: Clips,
+    petting: Petting,
     rng: Rng,
+}
+
+/// 摸头追踪:指针在头部区域来回蹭的次数。
+#[derive(Default)]
+struct Petting {
+    last_x: Option<f64>,
+    direction: i8,
+    reversals: u8,
+    window: f32,
+}
+
+impl Petting {
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    /// 喂一个头部区域内的指针 x;够次数就返回 true(算一次摸头)。
+    fn feed(&mut self, x: f64) -> bool {
+        let Some(last) = self.last_x.replace(x) else {
+            self.window = PET_WINDOW;
+            return false;
+        };
+        let delta = x - last;
+        if delta.abs() < 2.0 {
+            return false; // 抖动不算
+        }
+        let direction = if delta > 0.0 { 1 } else { -1 };
+        if self.direction != 0 && direction != self.direction {
+            self.reversals += 1;
+        }
+        self.direction = direction;
+        self.window = PET_WINDOW;
+        if self.reversals >= PET_REVERSALS {
+            self.reset();
+            return true;
+        }
+        false
+    }
+
+    fn tick(&mut self, dt: f32) {
+        if self.last_x.is_none() {
+            return;
+        }
+        self.window -= dt;
+        if self.window <= 0.0 {
+            self.reset();
+        }
+    }
 }
 
 /// 逻辑动作在 glb 里的下标;缺的就是 None,行为要能降级。
 struct Clips {
     idle: usize,
     walk: Option<usize>,
+    startled: Option<usize>,
+    happy: Option<usize>,
+    afraid: Option<usize>,
 }
 
 impl PetActor {
+    /// 播一次性反应动作,播完回待机。缺对应动作就只改状态(至少行为语义还在)。
+    fn react(&mut self, reaction: PetReaction, model_len: f32) {
+        let clip = match reaction {
+            PetReaction::Startled => self.clips.startled,
+            PetReaction::Petted => self.clips.happy,
+            PetReaction::PickedUp => self.clips.afraid,
+        };
+        if let Some(clip) = clip {
+            self.player.play(clip);
+            self.activity = Activity::React {
+                remaining: model_len.max(0.3),
+            };
+        }
+    }
+
+    /// 某段动作的时长(秒)。
+    fn clip_seconds(&self, reaction: PetReaction) -> f32 {
+        let clip = match reaction {
+            PetReaction::Startled => self.clips.startled,
+            PetReaction::Petted => self.clips.happy,
+            PetReaction::PickedUp => self.clips.afraid,
+        };
+        clip.map(|c| self.model.clips[c].duration).unwrap_or(0.0)
+    }
+
     pub fn new(
         model: Model,
         size: (u32, u32),
@@ -96,6 +204,12 @@ impl PetActor {
         // Idle 一定要有:没有 Idle 的包等于没法待机,退化成用第 0 段动作
         let idle = model.clip("Idle").unwrap_or(0);
         let walk = model.clip("Walk");
+        // 反应动作:游戏里「摸头」在 INTERACTIONTREE_CONF 有对应动作键,但键→动作表的映射
+        // 还没核实(见 design.md §5),所以先按语义挑:受惊 Shock、开心 Happy、害怕 Fear,
+        // 缺哪个就退到 Alert / Show / Shock
+        let startled = model.clip("Shock").or_else(|| model.clip("Alert"));
+        let happy = model.clip("Happy").or_else(|| model.clip("Show"));
+        let afraid = model.clip("Fear").or(startled);
         let player = Player::new(&model, idle);
         Self {
             model,
@@ -106,7 +220,15 @@ impl PetActor {
             activity: Activity::Idle { remaining: 2.0 },
             walk_speed,
             foot_offset,
-            clips: Clips { idle, walk },
+            mask: None,
+            clips: Clips {
+                idle,
+                walk,
+                startled,
+                happy,
+                afraid,
+            },
+            petting: Petting::default(),
             rng: Rng::new(seed),
         }
     }
@@ -132,9 +254,18 @@ impl Actor {
     fn hit(&self, lx: i32, ly: i32) -> bool {
         match self {
             Actor::Sprite(sprite) => sprite.alpha_at(lx, ly) >= REGION_ALPHA_THRESHOLD,
-            // 宠物暂时按包围盒判定:逐像素要回读离屏画布的 alpha,排在 Phase 2
             Actor::Pet(pet) => {
-                lx >= 0 && ly >= 0 && (lx as u32) < pet.size.0 && (ly as u32) < pet.size.1
+                if lx < 0 || ly < 0 || lx as u32 >= pet.size.0 || ly as u32 >= pet.size.1 {
+                    return false;
+                }
+                match &pet.mask {
+                    // 有轮廓掩码就按轮廓判:腿与尾之间的空隙可以点穿
+                    Some(mask) => {
+                        mask.hit(lx as f32 / pet.size.0 as f32, ly as f32 / pet.size.1 as f32)
+                    }
+                    // 掩码还没回读回来(头一两帧):先按包围盒,总比点不到好
+                    None => true,
+                }
             }
         }
     }
@@ -143,14 +274,15 @@ impl Actor {
     fn coverage(&self) -> Vec<Rect> {
         match self {
             Actor::Sprite(sprite) => sprite.coverage_rects(REGION_CELL, REGION_ALPHA_THRESHOLD),
-            Actor::Pet(pet) => {
-                vec![Rect {
+            Actor::Pet(pet) => match &pet.mask {
+                Some(mask) if !mask.is_empty() => mask.rects(pet.size),
+                _ => vec![Rect {
                     x: 0,
                     y: 0,
                     w: pet.size.0,
                     h: pet.size.1,
-                }]
-            }
+                }],
+            },
         }
     }
 }
@@ -166,6 +298,8 @@ pub struct Stage {
     pointer: Option<(f64, f64)>,
     /// 按下时记下的「指针 - 角色左上角」偏移。
     drag_offset: Option<(f64, f64)>,
+    /// 本次按下之后指针是否移动过(用来区分「点一下」与「拎起来拖」)。
+    drag_moved: bool,
     passthrough: bool,
 }
 
@@ -179,6 +313,7 @@ impl Stage {
             coverage,
             pointer: None,
             drag_offset: None,
+            drag_moved: false,
             passthrough: false,
         };
         stage.reset_position();
@@ -273,14 +408,26 @@ impl Stage {
             }
             StageEvent::PointerMoved { x, y } => {
                 self.pointer = Some((x, y));
-                match self.drag_offset {
-                    Some((ox, oy)) => {
-                        self.pos = ((x - ox) as f32, (y - oy) as f32);
-                        self.clamp_to_surface();
-                        Reaction::BOTH
+                if let Some((ox, oy)) = self.drag_offset {
+                    let moved =
+                        ((x - ox) as f32 - self.pos.0).abs() + ((y - oy) as f32 - self.pos.1).abs();
+                    if moved > DRAG_THRESHOLD {
+                        self.drag_moved = true;
+                        if let Actor::Pet(pet) = &mut self.actor {
+                            // 真被拎起来了才播害怕:轻点一下不该惊动它
+                            if pet.activity != Activity::Dragged {
+                                let len = pet.clip_seconds(PetReaction::PickedUp);
+                                pet.react(PetReaction::PickedUp, len);
+                                pet.activity = Activity::Dragged;
+                            }
+                        }
                     }
-                    None => Reaction::NONE,
+                    self.pos = ((x - ox) as f32, (y - oy) as f32);
+                    self.clamp_to_surface();
+                    return Reaction::BOTH;
                 }
+                // 没在拖:看看是不是在头上来回蹭
+                self.feed_petting(x, y)
             }
             StageEvent::PointerPressed { x, y } => {
                 self.pointer = Some((x, y));
@@ -288,9 +435,7 @@ impl Stage {
                     return Reaction::NONE;
                 }
                 self.drag_offset = Some((x - self.pos.0 as f64, y - self.pos.1 as f64));
-                if let Actor::Pet(pet) = &mut self.actor {
-                    pet.activity = Activity::Dragged;
-                }
+                self.drag_moved = false;
                 Reaction::REDRAW
             }
             StageEvent::PointerReleased | StageEvent::PointerLeft => {
@@ -300,9 +445,18 @@ impl Stage {
                 if self.drag_offset.take().is_none() {
                     return Reaction::NONE;
                 }
+                let clicked = !self.drag_moved;
+                self.drag_moved = false;
                 if let Actor::Pet(pet) = &mut self.actor {
-                    // 松手就落回地面。真正的下落动画(Jump_Fall)排 Phase 2
-                    pet.activity = Activity::Idle { remaining: 1.5 };
+                    if clicked {
+                        // 只是点了一下 → 受惊
+                        let len = pet.clip_seconds(PetReaction::Startled);
+                        pet.react(PetReaction::Startled, len);
+                    } else {
+                        // 拎着放下 → 落回地面(下落动画等有 JumpFall 再说)
+                        pet.activity = Activity::Idle { remaining: 1.5 };
+                        pet.player.play(pet.clips.idle);
+                    }
                 }
                 self.pos.1 = match self.actor {
                     Actor::Pet(_) => self.ground_y(),
@@ -318,6 +472,60 @@ impl Stage {
         }
     }
 
+    /// 装上新回读到的轮廓掩码(见 pet/mask.rs),顺带刷新输入区。
+    pub fn set_pet_mask(&mut self, mask: Mask) -> Reaction {
+        if let Actor::Pet(pet) = &mut self.actor {
+            pet.mask = Some(mask);
+            self.coverage = self.actor.coverage();
+            return Reaction {
+                redraw: false,
+                regions_dirty: true,
+            };
+        }
+        Reaction::NONE
+    }
+
+    /// 指针在宠物头部区域移动:来回蹭够次数就算摸头。
+    fn feed_petting(&mut self, x: f64, y: f64) -> Reaction {
+        if self.passthrough || !self.hit_test(x, y) {
+            if let Actor::Pet(pet) = &mut self.actor {
+                pet.petting.reset();
+            }
+            return Reaction::NONE;
+        }
+        let local_y = (y - self.pos.1 as f64) as f32;
+        let Actor::Pet(pet) = &mut self.actor else {
+            return Reaction::NONE;
+        };
+        // 只认头部:身上蹭不算摸头
+        if local_y > pet.size.1 as f32 * HEAD_ZONE {
+            pet.petting.reset();
+            return Reaction::NONE;
+        }
+        if !pet.petting.feed(x) {
+            return Reaction::NONE;
+        }
+        // 正在被拎着或已经在反应中就不打断
+        if matches!(pet.activity, Activity::Dragged | Activity::React { .. }) {
+            return Reaction::NONE;
+        }
+        let len = pet.clip_seconds(PetReaction::Petted);
+        pet.react(PetReaction::Petted, len);
+        Reaction::REDRAW
+    }
+
+    /// 下一次推进该隔多久:有事发生时 30fps,待机时降到 12fps 省合成开销。
+    pub fn tick_interval(&self) -> Duration {
+        let hz = match &self.actor {
+            Actor::Pet(pet) => match pet.activity {
+                Activity::Idle { .. } if self.drag_offset.is_none() => IDLE_HZ,
+                _ => ACTIVE_HZ,
+            },
+            Actor::Sprite(_) => ACTIVE_HZ,
+        };
+        Duration::from_secs_f32(1.0 / hz)
+    }
+
     /// 推进时间:宠物的行为与动画。返回是否要重画/重设输入区。
     pub fn tick(&mut self, dt: f32) -> Reaction {
         let surface_width = self.size.0 as f32;
@@ -326,10 +534,25 @@ impl Stage {
             return Reaction::NONE;
         };
 
+        pet.petting.tick(dt);
         let mut moved = false;
         if !dragging {
             match pet.activity {
-                Activity::Dragged => pet.activity = Activity::Idle { remaining: 1.0 },
+                Activity::Dragged => {
+                    pet.activity = Activity::Idle { remaining: 1.0 };
+                    pet.player.play(pet.clips.idle);
+                }
+                Activity::React { remaining } => {
+                    let remaining = remaining - dt;
+                    if remaining > 0.0 {
+                        pet.activity = Activity::React { remaining };
+                    } else {
+                        pet.activity = Activity::Idle {
+                            remaining: 1.0 + pet.rng.next_f32() * 2.0,
+                        };
+                        pet.player.play(pet.clips.idle);
+                    }
+                }
                 Activity::Idle { remaining } => {
                     let remaining = remaining - dt;
                     if remaining > 0.0 {
@@ -500,5 +723,164 @@ mod tests {
             let v = rng.next_f32();
             assert!((0.0..1.0).contains(&v), "越界: {v}");
         }
+    }
+}
+
+#[cfg(test)]
+mod pet_tests {
+    use super::*;
+
+    /// 一只测试宠物:200×200 的画布,脚底在 180,走速 100px/s。
+    fn pet_stage() -> Stage {
+        let model = Model::for_test(&["Idle", "Walk", "Shock", "Happy", "Fear"]);
+        let actor = Actor::Pet(PetActor::new(model, (200, 200), 180.0, 100.0, 7));
+        Stage::new(actor, (1000, 600))
+    }
+
+    fn activity(stage: &Stage) -> Activity {
+        match stage.actor() {
+            Actor::Pet(pet) => pet.activity,
+            _ => panic!("不是宠物"),
+        }
+    }
+
+    /// 宠物中心附近的表面坐标(必落在包围盒内)。
+    fn center(stage: &Stage) -> (f64, f64) {
+        let (x, y) = stage.actor_pos();
+        (x as f64 + 100.0, y as f64 + 100.0)
+    }
+
+    #[test]
+    fn stands_on_the_ground_line() {
+        let s = pet_stage();
+        // 脚底(180)应落在屏幕底边上方 GROUND_MARGIN 处
+        assert_eq!(s.actor_pos().1 + 180.0, 600.0 - GROUND_MARGIN);
+    }
+
+    #[test]
+    fn click_without_moving_startles() {
+        let mut s = pet_stage();
+        let (x, y) = center(&s);
+        s.handle(StageEvent::PointerPressed { x, y });
+        // 没移动就松手 = 点了一下
+        s.handle(StageEvent::PointerReleased);
+        assert!(
+            matches!(activity(&s), Activity::React { .. }),
+            "点击应触发反应(受惊)"
+        );
+        // 反应播完回到待机
+        for _ in 0..40 {
+            s.tick(0.05);
+        }
+        assert!(
+            matches!(activity(&s), Activity::Idle { .. }),
+            "反应结束该回待机"
+        );
+    }
+
+    #[test]
+    fn dragging_picks_up_then_lands() {
+        let mut s = pet_stage();
+        let (x, y) = center(&s);
+        s.handle(StageEvent::PointerPressed { x, y });
+        s.handle(StageEvent::PointerMoved {
+            x: x + 60.0,
+            y: y - 120.0,
+        });
+        assert_eq!(activity(&s), Activity::Dragged, "移动超过阈值算拎起来");
+        assert!(s.is_dragging());
+        s.handle(StageEvent::PointerReleased);
+        assert!(matches!(activity(&s), Activity::Idle { .. }));
+        // 松手落回地面
+        assert_eq!(s.actor_pos().1 + 180.0, 600.0 - GROUND_MARGIN);
+    }
+
+    #[test]
+    fn rubbing_the_head_pets_it() {
+        let mut s = pet_stage();
+        let (x, y) = center(&s);
+        let head_y = y - 60.0; // 落在上 45% 的头部区域
+        // 只蹭一下不算:得来回换向够 PET_REVERSALS 次
+        s.handle(StageEvent::PointerMoved { x, y: head_y });
+        s.handle(StageEvent::PointerMoved {
+            x: x + 30.0,
+            y: head_y,
+        });
+        assert!(
+            matches!(activity(&s), Activity::Idle { .. }),
+            "单向划过不该算摸头"
+        );
+        for dx in [-30.0, 30.0, -30.0] {
+            s.handle(StageEvent::PointerMoved {
+                x: x + dx,
+                y: head_y,
+            });
+        }
+        assert!(
+            matches!(activity(&s), Activity::React { .. }),
+            "来回蹭够次数应触发反应(开心)"
+        );
+    }
+
+    #[test]
+    fn rubbing_the_body_does_not_count() {
+        let mut s = pet_stage();
+        let (x, y) = center(&s);
+        let body_y = y + 60.0; // 头部区域之外
+        for dx in [0.0, 30.0, -30.0, 30.0, -30.0, 30.0] {
+            s.handle(StageEvent::PointerMoved {
+                x: x + dx,
+                y: body_y,
+            });
+        }
+        assert!(
+            matches!(activity(&s), Activity::Idle { .. }),
+            "在身上蹭不算摸头"
+        );
+    }
+
+    #[test]
+    fn idle_ticks_slower_than_walking() {
+        let mut s = pet_stage();
+        let idle = s.tick_interval();
+        // 逼它走起来:待机计时耗尽后会挑目标点
+        for _ in 0..100 {
+            s.tick(0.1);
+            if matches!(activity(&s), Activity::Walk { .. }) {
+                break;
+            }
+        }
+        assert!(
+            matches!(activity(&s), Activity::Walk { .. }),
+            "待机够久该开始走"
+        );
+        assert!(s.tick_interval() < idle, "行走时该比待机更勤地推进");
+    }
+
+    #[test]
+    fn walking_reaches_its_target_and_faces_that_way() {
+        let mut s = pet_stage();
+        for _ in 0..100 {
+            s.tick(0.1);
+            if matches!(activity(&s), Activity::Walk { .. }) {
+                break;
+            }
+        }
+        let Activity::Walk { target_x } = activity(&s) else {
+            panic!("没走起来")
+        };
+        let going_right = target_x > s.actor_pos().0;
+        // 朝向与目标方向一致(camera_yaw 的符号在 pet/target.rs 里有回归测试)
+        match s.actor() {
+            Actor::Pet(pet) => assert_eq!(pet.target_yaw, camera_yaw(going_right)),
+            _ => panic!("不是宠物"),
+        }
+        for _ in 0..200 {
+            s.tick(0.05);
+            if matches!(activity(&s), Activity::Idle { .. }) {
+                break;
+            }
+        }
+        assert!((s.actor_pos().0 - target_x).abs() < 1.0, "该走到目标点");
     }
 }

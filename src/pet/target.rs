@@ -33,6 +33,15 @@ impl PetTarget {
         &self.color_view
     }
 
+    /// 供掩码回读拷贝用(纹理建的时候带了 COPY_SRC)。
+    pub fn texture(&self) -> &wgpu::Texture {
+        &self.color
+    }
+
+    pub fn size(&self) -> (u32, u32) {
+        self.size
+    }
+
     /// 宠物在屏幕上的显示尺寸变了(缩放/换形态)就重建。
     pub fn resize(&mut self, device: &wgpu::Device, size: (u32, u32)) -> bool {
         let size = (size.0.max(1), size.1.max(1));

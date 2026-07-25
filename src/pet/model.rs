@@ -386,3 +386,36 @@ fn bind_pose_bounds(vertices: &[Vertex], _skeleton: &Skeleton) -> (Vec3, Vec3) {
     }
     (min, max)
 }
+
+#[cfg(test)]
+impl Model {
+    /// 造一个只有骨架与空动作的模型:让 stage 的行为逻辑能脱离宠物包做单测。
+    /// 单节点骨架 + 每段动作 1 秒,没有顶点(测试不碰 GPU)。
+    pub fn for_test(clip_names: &[&str]) -> Self {
+        let skeleton = Skeleton {
+            bind: vec![Trs::IDENTITY],
+            parents: vec![-1],
+            order: vec![0],
+            joints: vec![0],
+            inverse_bind: vec![Mat4::IDENTITY],
+            root_joint: 0,
+        };
+        let clips = clip_names
+            .iter()
+            .map(|name| Clip {
+                name: (*name).to_string(),
+                duration: 1.0,
+                channels: Vec::new(),
+            })
+            .collect();
+        Self {
+            vertices: Vec::new(),
+            indices: Vec::new(),
+            primitives: Vec::new(),
+            materials: Vec::new(),
+            skeleton,
+            clips,
+            bounds: (Vec3::new(-0.5, 0.0, -0.5), Vec3::new(0.5, 1.0, 0.5)),
+        }
+    }
+}

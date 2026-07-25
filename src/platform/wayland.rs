@@ -3,7 +3,7 @@
 //! 关键选择(理由见 docs/design.md §3.2):
 //! - `Layer::Top` 而不是 `Overlay`:Overlay 会盖住菜单与通知;
 //! - 四边 anchor + `set_size(0, 0)`:表面铺满整个 output,宠物是表面内的实体;
-//! - `exclusive_zone(-1)`:不参与布局,不挤压其他窗口;
+//! - `exclusive_zone(0)`:不占地方但尊重别人的独占区,于是拿到的是去掉任务栏的工作区;
 //! - `KeyboardInteractivity::None`:永不抢键盘焦点;
 //! - `set_input_region` 给出宠物轮廓的矩形近似,区域外的点击直接落到下层窗口。
 //!
@@ -48,6 +48,7 @@ use smithay_client_toolkit::{
 };
 
 use crate::pack::{Form, Pack};
+use crate::pet::mask::MaskReadback;
 use crate::pet::target::{PetTarget, view_proj};
 use crate::pet::{Model, PetGpu};
 use crate::render::{Gpu, Quad, QuadDraw, Target};
@@ -56,8 +57,7 @@ use crate::stage::{Actor, PetActor, Reaction, Stage, StageEvent};
 
 use super::Options;
 
-/// 宠物动画的推进频率。桌宠不需要跟满刷新率,30fps 已经够顺,还省合成开销。
-/// (待机/睡觉时进一步降帧排在 Phase 2,连同 damage 区域一起做。)
+/// 定时器的起始间隔;之后每次由 `Stage::tick_interval` 按状态决定(待机降频)。
 const TICK_HZ: f32 = 30.0;
 
 /// 离屏画布相对宠物身高留的余量:跳跃/伸展类动作会超出绑定姿势包围盒。
@@ -138,7 +138,8 @@ pub fn run(options: &Options) -> Result<()> {
                 Timer::from_duration(interval),
                 move |_, _, app: &mut App| {
                     app.tick();
-                    TimeoutAction::ToDuration(interval)
+                    // 间隔随状态变:待机降到 12fps,交互/行走回到 30fps
+                    TimeoutAction::ToDuration(app.tick_interval())
                 },
             )
             .map_err(|e| anyhow::anyhow!("挂动画定时器失败: {e}"))?;
@@ -213,6 +214,8 @@ struct PetSurfaces {
     gpu: PetGpu,
     canvas: PetTarget,
     quad: Quad,
+    /// 轮廓掩码的异步回读:每帧提交一次,好了就换上(滞后一两帧无所谓)。
+    readback: MaskReadback,
 }
 
 impl StageWindow {
@@ -368,9 +371,29 @@ impl App {
             if !self.stages[index].configured {
                 continue;
             }
-            let reaction = self.stages[index].stage.tick(dt);
+            let mut reaction = self.stages[index].stage.tick(dt);
+
+            // 看看上一帧要的轮廓回来了没
+            if let (Some(gpu), Some(surfaces)) =
+                (self.gpu.as_ref(), self.stages[index].pet.as_mut())
+            {
+                if let Some(mask) = surfaces.readback.poll(&gpu.device) {
+                    let mask_reaction = self.stages[index].stage.set_pet_mask(mask);
+                    reaction.redraw |= mask_reaction.redraw;
+                    reaction.regions_dirty |= mask_reaction.regions_dirty;
+                }
+            }
             self.apply(index, reaction);
         }
+    }
+
+    /// 所有 stage 里最急的那个推进间隔(待机时会自动放慢)。
+    fn tick_interval(&self) -> Duration {
+        self.stages
+            .iter()
+            .map(|s| s.stage.tick_interval())
+            .min()
+            .unwrap_or_else(|| Duration::from_secs_f32(1.0 / TICK_HZ))
     }
 
     fn create_wgpu_surface(
@@ -483,6 +506,14 @@ impl App {
             surfaces
                 .canvas
                 .render(&gpu.device, &gpu.queue, &surfaces.gpu);
+            // 顺手要一份轮廓:拷贝很小(几十 KB)且是异步的,不阻塞出帧;
+            // 回读结果在后续 tick 里 poll(见 App::tick)
+            surfaces
+                .readback
+                .resize(&gpu.device, surfaces.canvas.size());
+            surfaces
+                .readback
+                .request(&gpu.device, &gpu.queue, surfaces.canvas.texture());
         }
 
         let stage = &mut self.stages[index];
@@ -531,10 +562,12 @@ impl App {
                     Ok(pet_gpu) => {
                         let canvas = PetTarget::new(&gpu.device, gpu.format(), canvas_size);
                         let quad = gpu.create_quad(canvas.view());
+                        let readback = MaskReadback::new(&gpu.device, canvas_size);
                         self.stages[index].pet = Some(PetSurfaces {
                             gpu: pet_gpu,
                             canvas,
                             quad,
+                            readback,
                         });
                     }
                     Err(e) => {

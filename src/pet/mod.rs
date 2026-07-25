@@ -2,6 +2,7 @@
 
 pub mod anim;
 pub mod gpu;
+pub mod mask;
 pub mod model;
 pub mod target;
 
