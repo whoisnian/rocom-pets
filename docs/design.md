@@ -93,6 +93,7 @@ alpha 置顶窗口 + 命中穿透。现成引擎恰好都在这两点撞墙：
 | 命中/穿透 | `wl_surface.set_input_region` = 宠物轮廓并集；全局穿透 = 置空区域 | `WM_NCHITTEST` 返回 `HTTRANSPARENT`；全局穿透 = 加 `WS_EX_TRANSPARENT` |
 | 定位 | layer surface 的 anchor + margin | `SetWindowPos`(整屏窗口，宠物坐标在窗口内) |
 | 多屏 | `zwlr_layer_shell_v1.get_layer_surface` 指定 `wl_output`，跟随 output 热插拔重建 | 枚举显示器，每个一个窗口 |
+| 缩放 | `wp_fractional_scale_v1` 拿精确 scale(1/120 单位) + `wp_viewporter` 把物理像素 buffer 映射回逻辑尺寸;**此时 `set_buffer_scale` 必须留 1**,且要忽略 `wl_output` 的整数 scale 事件 | DPI 感知 + `GetDpiForWindow` |
 
 已确认：开发环境 KDE Plasma 6.7.3 / kwin_wayland，`libkwin.so` 导出 `zwlr_layer_shell_v1` 与
 `zwlr_layer_surface_v1`，layer-shell 可用。KWin 相关注意点：
@@ -278,7 +279,8 @@ missing_clips = ["hide"]
 实测:自身 CPU **1.2% 单核**(30fps 推进动画)、RSS 152MB(debug 依赖 + NVIDIA Vulkan)。
 
 **待做**:托盘菜单退出与全局热键(KGlobalAccel/portal)、配置文件、
-拖起/落地用 `Fear`/`JumpFall` 动作、待机降帧与 damage 局部提交、轮廓命中(见 Phase 2)。
+落地用 `JumpFall` 动作、damage 局部提交。
+(分数缩放已补,见 [spike-s1.md](spike-s1.md) item 9;轮廓命中与降帧见 Phase 2。)
 
 ### Phase 2 — 鼠标交互
 

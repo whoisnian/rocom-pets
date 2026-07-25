@@ -21,6 +21,8 @@ use raw_window_handle::{
 use smithay_client_toolkit::{
     compositor::{CompositorHandler, CompositorState, Region},
     delegate_dispatch2, delegate_registry,
+    dispatch2::Dispatch2,
+    globals::GlobalData,
     output::{OutputHandler, OutputState},
     reexports::calloop::{
         EventLoop, channel,
@@ -31,6 +33,13 @@ use smithay_client_toolkit::{
         Connection, Proxy, QueueHandle,
         globals::registry_queue_init,
         protocol::{wl_output, wl_pointer, wl_seat, wl_surface},
+    },
+    reexports::protocols::wp::{
+        fractional_scale::v1::client::{
+            wp_fractional_scale_manager_v1::WpFractionalScaleManagerV1,
+            wp_fractional_scale_v1::{self, WpFractionalScaleV1},
+        },
+        viewporter::client::{wp_viewport::WpViewport, wp_viewporter::WpViewporter},
     },
     registry::{ProvidesRegistryState, RegistryState},
     registry_handlers,
@@ -80,6 +89,30 @@ pub fn run(options: &Options) -> Result<()> {
     let compositor = CompositorState::bind(&globals, &qh).context("拿不到 wl_compositor")?;
     let layer_shell = LayerShell::bind(&globals, &qh)
         .context("合成器不支持 wlr-layer-shell(本项目只支持 KDE Plasma Wayland)")?;
+    // 这两个是「有则更好」:缺了只是画面略软,不影响功能。
+    // ROCOM_PETS_NO_FRACTIONAL=1 可强制退回整数缩放,用来对比效果 / 排查合成器差异。
+    let force_integer = std::env::var_os("ROCOM_PETS_NO_FRACTIONAL").is_some();
+    if force_integer {
+        log::warn!("ROCOM_PETS_NO_FRACTIONAL 已设:强制走整数缩放");
+    }
+    let fractional_scale = (!force_integer)
+        .then(|| {
+            globals
+                .bind::<WpFractionalScaleManagerV1, _, _>(&qh, 1..=1, GlobalData)
+                .inspect_err(|e| {
+                    log::warn!("拿不到 wp_fractional_scale_manager_v1({e}),退回整数缩放")
+                })
+                .ok()
+        })
+        .flatten();
+    let viewporter = (!force_integer)
+        .then(|| {
+            globals
+                .bind::<WpViewporter, _, _>(&qh, 1..=1, GlobalData)
+                .inspect_err(|e| log::warn!("拿不到 wp_viewporter({e}),退回整数缩放"))
+                .ok()
+        })
+        .flatten();
 
     // 包在起窗口前就读掉:manifest 有问题要立刻报错,而不是等到画第一帧
     let form = match &options.pack {
@@ -113,6 +146,8 @@ pub fn run(options: &Options) -> Result<()> {
         seat_state: SeatState::new(&globals, &qh),
         compositor,
         layer_shell,
+        fractional_scale,
+        viewporter,
         instance,
         gpu: None,
         sprite: Sprite::test_pattern(192),
@@ -202,7 +237,13 @@ struct StageWindow {
     stage: Stage,
     /// 逻辑尺寸(合成器给的),物理尺寸 = 逻辑 × scale。
     logical: (u32, u32),
-    scale: u32,
+    /// 精确缩放系数:有 wp_fractional_scale 时是它给的 n/120(如 1.5),
+    /// 否则退回 wl_output 的整数 scale。
+    scale: f32,
+    /// viewport 把物理像素的 buffer 映射到逻辑尺寸;没有它就只能用整数 buffer_scale。
+    viewport: Option<WpViewport>,
+    /// 分数缩放对象要持有着才会继续收事件。
+    _fractional: Option<WpFractionalScaleV1>,
     configured: bool,
     /// 上次推进动画的时刻,用来算 dt。
     last_tick: Option<Instant>,
@@ -219,8 +260,20 @@ struct PetSurfaces {
 }
 
 impl StageWindow {
+    /// 该渲多大的 buffer(物理像素)。
     fn physical(&self) -> (u32, u32) {
-        (self.logical.0 * self.scale, self.logical.1 * self.scale)
+        (
+            ((self.logical.0 as f32 * self.scale).round() as u32).max(1),
+            ((self.logical.1 as f32 * self.scale).round() as u32).max(1),
+        )
+    }
+
+    /// 有 viewport 时告诉合成器「这张 buffer 该显示成多大」(逻辑像素)。
+    /// 不设的话合成器会按 buffer_scale=1 把物理像素当逻辑像素,画面就大一圈。
+    fn apply_viewport(&self) {
+        if let Some(viewport) = &self.viewport {
+            viewport.set_destination(self.logical.0.max(1) as i32, self.logical.1.max(1) as i32);
+        }
     }
 }
 
@@ -230,6 +283,11 @@ struct App {
     seat_state: SeatState,
     compositor: CompositorState,
     layer_shell: LayerShell,
+    /// 分数缩放:KDE 的 150% 缩放在 wl_output 上只能报整数 2,靠这个协议才能拿到精确的 1.5。
+    /// 合成器不支持时为 None,退回整数 buffer_scale(画面会被降采样,略软)。
+    fractional_scale: Option<WpFractionalScaleManagerV1>,
+    /// 配合分数缩放:buffer 按物理像素做,viewport 把它映射到逻辑尺寸。
+    viewporter: Option<WpViewporter>,
     instance: wgpu::Instance,
     gpu: Option<Gpu>,
     sprite: Sprite,
@@ -274,7 +332,22 @@ impl App {
         layer.set_size(0, 0);
         layer.set_exclusive_zone(0);
         layer.set_keyboard_interactivity(KeyboardInteractivity::None);
-        layer.wl_surface().set_buffer_scale(scale as i32);
+        // 走 viewport 时 buffer_scale 必须留在 1:缩放交给 viewport 的 destination,
+        // 两个机制叠加会把尺寸乘两次
+        let viewport = self
+            .viewporter
+            .as_ref()
+            .map(|v| v.get_viewport(layer.wl_surface(), qh, GlobalData));
+        let fractional = self.fractional_scale.as_ref().map(|m| {
+            m.get_fractional_scale(
+                layer.wl_surface(),
+                qh,
+                FractionalScaleData(layer.wl_surface().clone()),
+            )
+        });
+        if viewport.is_none() {
+            layer.wl_surface().set_buffer_scale(scale as i32);
+        }
         // 首次提交必须不带 buffer,等合成器回 configure
         layer.commit();
 
@@ -309,7 +382,10 @@ impl App {
             sprite_quad: None,
             stage: Stage::new(actor, (1, 1)),
             logical: (1, 1),
-            scale,
+            // 先用 wl_output 的整数 scale 兜着,分数缩放的 preferred_scale 一到就覆盖
+            scale: scale as f32,
+            viewport,
+            _fractional: fractional,
             configured: false,
             last_tick: None,
         });
@@ -357,6 +433,47 @@ impl App {
             walk_speed_cm * self.px_per_cm,
             seed,
         )))
+    }
+
+    /// 合成器告知这个表面的精确缩放(单位 1/120)。
+    fn fractional_scale_changed(&mut self, surface: &wl_surface::WlSurface, scale_120: u32) {
+        let Some(index) = self.stage_index(surface) else {
+            return;
+        };
+        let scale = (scale_120 as f32 / 120.0).max(0.1);
+        if (self.stages[index].scale - scale).abs() < 1e-4 {
+            return;
+        }
+        log::info!(
+            "stage {index}: 精确缩放 {scale}(wl_output 的整数值只能报到 {})",
+            scale.ceil()
+        );
+        self.stages[index].scale = scale;
+        self.resize_surfaces(index);
+        self.render(index);
+    }
+
+    /// 缩放或逻辑尺寸变了:重配表面、重建宠物画布与掩码缓冲。
+    fn resize_surfaces(&mut self, index: usize) {
+        let Some(gpu) = self.gpu.as_ref() else { return };
+        let physical = self.stages[index].physical();
+        self.stages[index].apply_viewport();
+        if let Some(target) = self.stages[index].target.as_mut() {
+            target.resize(gpu, physical);
+        }
+        // 宠物画布跟着缩放走:换算在 render 里做,这里只要保证 buffer 尺寸对上
+        let (aw, ah) = self.stages[index].stage.actor().size();
+        let scale = self.stages[index].scale;
+        let canvas = (
+            ((aw as f32 * scale) as u32).max(1),
+            ((ah as f32 * scale) as u32).max(1),
+        );
+        if let Some(surfaces) = self.stages[index].pet.as_mut() {
+            if surfaces.canvas.resize(&gpu.device, canvas) {
+                surfaces.quad = gpu.create_quad(surfaces.canvas.view());
+            }
+            surfaces.readback.resize(&gpu.device, canvas);
+        }
     }
 
     /// 定时器驱动:推进所有 stage 的行为与动画。
@@ -595,8 +712,12 @@ impl CompositorHandler for App {
         let Some(index) = self.stage_index(surface) else {
             return;
         };
-        let scale = new_factor.max(1) as u32;
-        if self.stages[index].scale == scale {
+        // 有 wp_fractional_scale 时精确值以它为准,整数事件忽略,否则两边来回改写
+        if self.stages[index].viewport.is_some() {
+            return;
+        }
+        let scale = new_factor.max(1) as f32;
+        if (self.stages[index].scale - scale).abs() < 1e-4 {
             return;
         }
         self.stages[index].scale = scale;
@@ -708,6 +829,7 @@ impl LayerShellHandler for App {
             return;
         }
         self.stages[index].logical = (w, h);
+        self.stages[index].apply_viewport();
         let physical = self.stages[index].physical();
 
         let first = !self.stages[index].configured;
@@ -823,4 +945,63 @@ impl ProvidesRegistryState for App {
         &mut self.registry_state
     }
     registry_handlers![OutputState, SeatState];
+}
+
+// ── 自己 dispatch 的两个协议 ────────────────────────────────────────
+// sctk 没封装分数缩放与 viewporter,而 delegate_dispatch2! 是「所有接口」的 blanket 实现,
+// 不能再手写 Dispatch,所以按 sctk 的路子给 UserData 实现 Dispatch2。
+
+/// 分数缩放对象的 UserData:记着它属于哪个表面,事件来了才知道改哪个 stage。
+struct FractionalScaleData(wl_surface::WlSurface);
+
+impl Dispatch2<WpFractionalScaleV1, App> for FractionalScaleData {
+    fn event(
+        &self,
+        app: &mut App,
+        _obj: &WpFractionalScaleV1,
+        event: wp_fractional_scale_v1::Event,
+        _conn: &Connection,
+        _qh: &QueueHandle<App>,
+    ) {
+        if let wp_fractional_scale_v1::Event::PreferredScale { scale } = event {
+            app.fractional_scale_changed(&self.0, scale);
+        }
+    }
+}
+
+// 这三个只发请求、不收事件
+impl Dispatch2<WpFractionalScaleManagerV1, App> for GlobalData {
+    fn event(
+        &self,
+        _: &mut App,
+        _: &WpFractionalScaleManagerV1,
+        _: <WpFractionalScaleManagerV1 as Proxy>::Event,
+        _: &Connection,
+        _: &QueueHandle<App>,
+    ) {
+    }
+}
+
+impl Dispatch2<WpViewporter, App> for GlobalData {
+    fn event(
+        &self,
+        _: &mut App,
+        _: &WpViewporter,
+        _: <WpViewporter as Proxy>::Event,
+        _: &Connection,
+        _: &QueueHandle<App>,
+    ) {
+    }
+}
+
+impl Dispatch2<WpViewport, App> for GlobalData {
+    fn event(
+        &self,
+        _: &mut App,
+        _: &WpViewport,
+        _: <WpViewport as Proxy>::Event,
+        _: &Connection,
+        _: &QueueHandle<App>,
+    ) {
+    }
 }
