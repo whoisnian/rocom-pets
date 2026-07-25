@@ -1,0 +1,12 @@
+# Rust
+/target/
+**/*.rs.bk
+
+# C# 导出器
+bin/
+obj/
+
+# 本地生成物:宠物包与中间产物一律不入仓库(见 docs/design.md §11)
+*.rkpet
+/packs/
+/out/

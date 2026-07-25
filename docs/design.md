@@ -1,0 +1,296 @@
+# 设计方案
+
+跨平台桌面宠物：把《洛克王国：世界》的宠物模型/动作/叫声做成本地生成的「宠物包」，
+由一个原生运行时在桌面上播放、交互、互动。本文是实现前的方案定稿，含待验证项与分阶段计划。
+
+- 目标平台：**Windows 10+** 与 **KDE Plasma Wayland**(kwin_wayland)。**不支持** GNOME/Mutter 等
+  不实现 wlr-layer-shell 的合成器，也不做 X11 回退——只维护两个后端，省下的复杂度换取实现深度。
+- 资产提取链路已在 [rocom-capture](../../rocom-capture) 里验证过(CUE4Parse 解包 + 骨骼网格/动画导出)，
+  本仓库只做**运行时**与**打包导出器**。
+- 原始素材与生成的宠物包**都不入仓库、不分发**，见 §11。
+
+## 0. 目标与非目标
+
+**做**：宠物在桌面上待机/行走/奔跑/睡觉/情绪动作；鼠标交互(点击受惊、摸头、拖放)；
+点击穿透可开关；多宠物同时在场并有跨物种互动；部分宠物叫声；按需启用的宠物包。
+
+**不做**：还原游戏的战斗/技能演出、场景与 BGM；1:1 复刻游戏的自研卡通着色器；
+移植游戏的行为树；任何联网/账号功能(抓包统计是 rocom-capture 的事)。
+
+## 1. 已验证的数据事实
+
+以下都在解包数据上实测过，是方案的地基(2026-07-25，客户端 pak 对应 `GAME_RocoKingdomWorld`)。
+
+| 事实 | 结论对方案的影响 |
+| --- | --- |
+| 宠物资产在 `NRC/Content/ArtRes/AnimSequence/Pets/<Asset>/`：1001 个目录、683 个带 `SKM_*`(蒙皮网格)，Pets 下 AnimSequence 共 2.9 万个 | 导出器的输入根；`ArtRes` 默认被 unpack.sh 排除，要 `--filter` 单独导 |
+| 喵喵 `SKM_Gra_MiaoMiao1_001_Skin`：4 级 LOD、LOD0 3095 顶点/4826 三角、44 骨骼、3 材质槽、8 套 UV + 顶点色 | 单只宠物的量级极小，多实体常驻可行；LOD1 可作为省内存档 |
+| 每只宠物 `Animation/` 约 60 个序列，含 `World_Idle/Walk/Run/Jump_Fall/Hide_*`、`Common_Happy/Sad/Anger/Fear/Relax/Show/Sleep_{Start,Loop,End}`、`Fight_*`、`Ride_Hug`、LookAt BlendSpace | 桌宠要的动作全都有，不需要自己做动画 |
+| 动作是**配置驱动**的：`MODEL_CONF.anim_conf_id` → `ANIM_CONF` 给出逻辑动作名 + 毫秒时长，`ANIM_ID_CONF` 给 id→名。喵喵 30+ 条 | 包 manifest 的「逻辑动作 → clip」可自动生成，并能出每只宠物的动作覆盖率报告 |
+| 逻辑名到资产名有规律：`Idle→World_Idle`、`Walk→World_Walk`、`SleepLoop→Common_Sleep_Loop` | 去前缀 + 忽略下划线大小写即可对齐，对不上的进报告人工兜 |
+| `anim_conf_id` 可以不等于 `model_conf` 的 id(珀尔鼬 model 14765 / anim_conf 14641) | 必须从 MODEL_CONF 读，不能拿 model id 当动作表 id |
+| 动画是 **ACL 压缩**的 | 导出器依赖 CUE4Parse-Natives 带 ACL 编译，见 §8 |
+| 进化链可从配置归组：`PETBASE_CONF.stage / evolution_pet_id`，且资源目录名数字后缀 = 阶段。喵喵链 = 3001 喵喵(`Gra_MiaoMiao1_001`) → 3025 喵呜(`…2_001`) → 3007 魔力猫(`…3_001`) | 「一条链一个包」可完全自动切分 |
+| `PETBASE_CONF` 含测试行与重复行(`9901 测试喵喵1`、`32000001 喵喵`) | 导出器要过滤：名称含「测试」、id 段异常、`legal_petbase` 等字段 |
+| `INTERACTIONTREE_CONF` 有「摸头」「亲昵」「查看信息」并带动作键 | 交互动作有官方对应关系可循 |
+| `NRC_AI_BEHAVIOR_CONF`(3077 行)只是指向 `Modules/AI/BehaviorTree/MFBT/…` 的自研 Dots 行为树资产 | **不移植**；但 `editor_name` 是中文可读的(如「【毛头小蛛】主动清扫」)，可作为「这只宠物该有什么行为」的选型参考 |
+| 捕尘长绒的资产家族是 `Wor_MaoTouXiaoZhu2_001`(毛头小蛛)，AI 表里正有「【毛头小蛛】主动清扫」 | §6 的第一个互动样例(珀尔鼬 × 捕尘长绒)有据可依 |
+| 叫声在 `WwiseAudio` 的 `Pet_Vo_*.bnk` + 流式 wem，`PetData.voice` 选组；粗嗓门/婉转声是运行时 Wwise pitch RTPC，wem 本身中性 | 复用 rocom-petvo 的提取管线；变调用播放速率复刻 |
+| CUE4Parse 的 BC7 解码有 R/B 通道对调的上游 bug | 导出贴图时必须换回，参照 rocom-capture 的 `FixBc7ChannelOrder` |
+| `UMaterialInstance.Deserialize` 在该版本抛 OverflowException，贴图槽拿到父材质默认值 | 贴图按命名约定接：材质名后缀 `_By/_Es/_Mh` ↔ `T_<Asset>_<槽>_D` |
+
+已验证的端到端结果：喵喵的 LOD0 网格 + 骨架 + `World_Idle/World_Walk/Common_Happy/Common_Sleep_Loop`
+经 CPU 蒙皮 + 软件光栅化渲出正确形体、贴图与姿态，说明**网格、骨架、蒙皮权重、动画关键帧、贴图全部可用**。
+
+## 2. 技术选型
+
+**结论：Rust + wgpu + 自写平台窗口层。**
+
+项目的成败不在渲染，而在两个平台集成点：Wayland 的置顶/定位/输入区，Windows 的逐像素
+alpha 置顶窗口 + 命中穿透。现成引擎恰好都在这两点撞墙：
+
+| 方案 | 优 | 致命处 |
+| --- | --- | --- |
+| **Rust + wgpu + 自写窗口层** | 两个平台集成点都能精确控制；单二进制、低内存、多实体便宜；包加载就是读 zip | 场景/骨骼动画/混合/toon 着色要自己写(工作量可控)；无编辑器 |
+| Godot 4 | glTF、AnimationTree、PCK 资源包、音频、导出全免费，出原型最快 | Wayland 后端无置顶与定位；`window_set_mouse_passthrough` 不覆盖 Wayland → Linux 只能退回 XWayland |
+| Electron/Tauri + three.js | Web 技术栈熟，Windows 上 `setIgnoreMouseEvents` 可用 | Wayland 透明+置顶不可靠；常驻多实体内存代价大；GB 级资产在 JS 侧流式加载别扭 |
+| Go(现有栈) | 与 rocom-capture 同语言 | 无可用的 wayland layer-shell 绑定，GPU 生态太薄 |
+
+选定栈的组件：`smithay-client-toolkit`(wlr-layer-shell) / `windows-rs`(Win32 + DirectComposition) /
+`wgpu`(Vulkan+DX12，`CompositeAlphaMode::PreMultiplied`) / `gltf` / `kira` 或 `rodio`(带播放速率，
+正好复刻叫声变调) / `mlua` 或 `rhai`(行为脚本) / `egui`(配置与包管理 UI，与 wgpu 同栈)。
+
+## 3. 运行时架构
+
+### 3.1 窗口模型：一屏一个透明 stage，宠物是其中的实体
+
+不采用「一只宠物一个窗口」：跨宠物互动、互相拖放、遮挡排序都需要同一个坐标空间与同一个场景，
+单 stage 让这些几乎免费；代价(全屏 alpha 合成)可以用提交策略压掉，见 §3.3。
+
+```
+ ┌─ stage(每个显示器一个透明置顶表面) ────────────────────────┐
+ │  ECS/slotmap: 实体 = {物种/形态, 位置, 状态机, 需求, 脚本VM}  │
+ │  ├ 场景更新 → 骨骼动画采样/混合 → wgpu 渲染(premultiplied)  │
+ │  ├ 每 N 帧渲一张 64×64 alpha mask → 命中测试 + 输入区        │
+ │  └ 事件总线: 鼠标 / 邻近 / 屏幕边界 / 定时器 / 脚本 Intent    │
+ └───────────────┬──────────────────────────┬────────────────┘
+       平台层 trait│                          │
+   ┌───────────────▼────────┐   ┌─────────────▼──────────────┐
+   │ KDE Wayland:           │   │ Windows:                   │
+   │ wlr-layer-shell        │   │ layered 窗口 + DComp       │
+   └────────────────────────┘   └────────────────────────────┘
+```
+
+### 3.2 平台层
+
+| 关注点 | KDE Plasma Wayland | Windows |
+| --- | --- | --- |
+| 表面 | 每 output 一个 layer surface，`layer=top`(不用 `overlay`，那会盖住菜单/通知)，四边 anchor，`exclusive_zone=-1`，`keyboard_interactivity=none` | 每显示器一个 `WS_EX_LAYERED|TOPMOST|TOOLWINDOW|NOACTIVATE` 窗口 + DirectComposition 交换链 |
+| 逐像素 alpha | wgpu `CompositeAlphaMode::PreMultiplied` | 必须 `CreateSwapChainForComposition`(GDI 的 `UpdateLayeredWindow` 路径不适合 GPU 渲染) |
+| 命中/穿透 | `wl_surface.set_input_region` = 宠物轮廓并集；全局穿透 = 置空区域 | `WM_NCHITTEST` 返回 `HTTRANSPARENT`；全局穿透 = 加 `WS_EX_TRANSPARENT` |
+| 定位 | layer surface 的 anchor + margin | `SetWindowPos`(整屏窗口，宠物坐标在窗口内) |
+| 多屏 | `zwlr_layer_shell_v1.get_layer_surface` 指定 `wl_output`，跟随 output 热插拔重建 | 枚举显示器，每个一个窗口 |
+
+已确认：开发环境 KDE Plasma 6.7.3 / kwin_wayland，`libkwin.so` 导出 `zwlr_layer_shell_v1` 与
+`zwlr_layer_surface_v1`，layer-shell 可用。KWin 相关注意点：
+
+- `zwlr_layer_shell_v1` 是 wlroots 系的**非正式协议**，KWin 只是兼容实现，跨大版本可能变化；
+  Phase 0 S1 要记录实测的 KWin 版本，升级 Plasma 后重跑 S1 的验收项。
+- `layer=top` 与全屏窗口、锁屏、通知/OSD 的叠放次序由 KWin 决定，不可假设，S1 里逐项实测。
+- KWin 的窗口规则/脚本(KWin Script、`kwriteconfig` 规则)可作为定位与置顶的**备选**手段，
+  但那是 xdg-toplevel 路线，交互不如 layer surface 干净，仅在 S1 失败时才考虑。
+
+### 3.3 渲染与帧率
+
+- 每形态一个 glb：mesh + skin + 全部所需 clip。骨骼动画在 GPU(或 CPU 蒙皮 + 顶点缓冲上传，
+  实体数少时都够)；clip 间做交叉淡入淡出。
+- 卡通着色：base color + ramp 光照 + 描边(法线外扩或屏幕空间)。**目标是「像」不是「同」**——
+  游戏是自研 shader，含 RampTex/MatCap/描边/StarStick/Fragments 等几十个参数，且材质实例参数还解不全。
+- 提交策略(全屏透明层的合成开销主要靠这些压掉)：
+  - 无动画/交互时不提交帧；
+  - 用 `wl_surface.damage_buffer` / DXGI dirty rect 只提交宠物所在矩形；
+  - 空闲降帧(待机 15fps、睡觉 5fps)，交互中 60fps；
+  - 检测到前台全屏窗口(游戏/视频)时自动隐藏 stage。
+- 命中测试与输入区共用**低分辨率 alpha mask**：每隔几帧把宠物渲到 64×64 离屏 RT 回读，
+  延迟一帧无感，避免每帧 CPU 侧算轮廓。
+
+## 4. 宠物包(插件)
+
+### 4.1 分包原则
+
+**一条进化链一个包**，包内多形态，启用后可在 UI 切换形态(不重导)。链的切分完全由
+`PETBASE_CONF.stage / evolution_pet_id` 推出，资源目录名的数字后缀作为交叉校验。
+
+### 4.2 结构
+
+```
+<链名>.rkpet                     # zip 归档
+├── manifest.toml
+├── forms/<asset>/model.glb      # mesh + skin + 已合并的全部 clip
+├── forms/<asset>/tex/*.ktx2     # 基色/遮罩，已修正 BC7 通道序
+├── voice/*.opus
+└── behaviors/*.lua              # 可选:该物种特有行为/互动
+```
+
+### 4.3 manifest schema 草案
+
+```toml
+schema = 1            # manifest 格式版本
+runtime_abi = 1       # 需要的运行时 ABI，运行时拒绝不兼容包
+source_version = "…"  # 导出时的游戏版本/pak 指纹，便于排查
+generated_at = "2026-07-25"
+
+[species]
+id      = 3001        # 链首 PETBASE_CONF.id
+name    = "喵喵"
+chain   = [3001, 3025, 3007]
+
+[[forms]]
+id        = 3001
+name      = "喵喵"
+stage     = 1
+asset     = "Gra_MiaoMiao1_001"
+model     = "forms/Gra_MiaoMiao1_001/model.glb"
+scale     = 1.00      # MODEL_CONF.model_scale / 100
+height    = 80        # 绑定姿势包围盒高度(cm)，用于换算屏幕像素
+locomotion= "ground"  # ground|hover|swim ← PETBASE_CONF.move_type
+voice     = "voice/vo_3001"
+tags      = []        # 互动能力标签，如 ["cleaner"]/["commander"]
+
+  [forms.clips]              # 由 ANIM_CONF 自动生成
+  idle   = { clip = "World_Idle",   ms = 1333, loop = true }
+  walk   = { clip = "World_Walk",   ms = 1133, loop = true, in_place = true, speed = 60 }
+  run    = { clip = "World_Run",    ms =  600, loop = true, in_place = true, speed = 160 }
+  happy  = { clip = "Common_Happy", ms = 1500 }
+  anger  = { clip = "Common_Anger", ms = 1500 }
+  shock  = { clip = "Common_Shock", ms = 1500 }
+  sleep  = { start = "Common_Sleep_Start", loop = "Common_Sleep_Loop", end = "Common_Sleep_End" }
+  callout= { clip = "Common_Show",  ms = 1500, voice = "callout" }
+
+[report]              # 导出覆盖率,缺失动作让运行时降级而不是报错
+missing_clips = ["hide"]
+```
+
+`speed`(像素/秒基准值)与 `in_place` 需实测填入，见 §5 待验证项。
+
+### 4.4 加载与体积
+
+- 发现路径 `~/.local/share/rocom-pets/packs/`、`%APPDATA%\rocom-pets\packs\`；
+  启动只读各包 manifest(轻)，**启用某形态时**才流式读该形态的 glb 与贴图。
+- 体积(喵喵实测外推，需抽样复核)：每形态 mesh ≈0.4MB + 裁剪到 ~12 段动作 ≈1.5MB +
+  512 贴图 ≈0.3MB ≈ **2MB/形态**；一条链 6–8MB；683 个形态全量 ≈1.5GB。
+- 压体积手段：只导桌宠用得到的 clip 集合、LOD1 网格、贴图降到 512、KTX2/BasisU。
+
+## 5. 动作与行为
+
+- **逻辑动作层**：运行时只认 `idle/walk/run/happy/anger/sad/fear/shock/show/relax/sleep/callout/…`，
+  具体 clip 由 manifest 映射，缺失则降级(如无 `run` 就用 `walk` 提速)。
+- **三段式(Start/Loop/End)是一等公民**：睡觉、隐藏、技能都是这个结构；Loop 时长由状态机需求决定。
+- 每实体一个状态机 + 需求值(困倦/心情/无聊) + 作息时钟；转移由事件驱动：鼠标、邻近实体、
+  屏幕边界、定时器、脚本 Intent。
+- 进阶：LookAt BlendSpace → 视线跟随鼠标。
+- **待验证(Phase 0 spike 3 定论)**：
+  - `World_Walk/Run` 是否原地循环(决定位移由程序推进还是取 root motion)；
+  - 朝向与单位(UE cm、Z-up)到屏幕像素的换算，`MODEL_CONF.model_scale`、`SMR`、
+    `PET_SHOW_SPEED_CONF` 各自的含义；
+  - `INTERACTIONTREE_CONF` 的 `anim_key*` 到动作表的确切映射(「摸头」指向的 id 20 在
+    `ANIM_ID_CONF` 里叫 `Sad`，字面对不上，需实机核对)；
+  - stage 0 目录(如 `Gra_MiaoMiao0_001`)只有 Mat/Tex 没有 SKM，是蛋还是共享皮，包里怎么表达。
+
+## 6. 多实体与跨宠物互动
+
+- 同一 stage 内多实体：同物种可多开(一个包创建多个实体)，不同包可同时启用。
+- **事件总线**：`Intent{from, kind, target}` + `Perception{邻近实体, 鼠标, 屏幕边界}`。
+- **互动包(interaction pack)**声明依赖，双方都在场且距离够近才可触发：
+
+  ```toml
+  [interaction]
+  id = "peel_commands_cleaner"
+  requires = [{ species = 3758 }, { species = 3604 }]   # 珀尔鼬 × 捕尘长绒
+  trigger  = { kind = "proximity", max_distance = 200, cooldown = "3m" }
+  ```
+
+- 编排用**演出脚本(时间轴)**而非让两个状态机自发协商：谁在第几秒播哪个 clip、走到哪、
+  何时出声，可靠且可调。脚本用 Lua(自产包)，若将来接受第三方包则换 WASM 沙箱。
+- 诚实的限制：「清扫」这类游戏里由行为树驱动、没有独立 clip 的行为，只能用现成动作拼近似
+  (`walk` 往返 + `show`/`attack1` 当动作)。
+
+## 7. 音频
+
+- 来源：复用 rocom-petvo 已跑通的 `Pet_Vo_*.bnk` + wem → vgmstream 管线，转 opus 进包；
+  `PetData.voice` 决定用哪一组。
+- 粗嗓门/婉转声是运行时 pitch RTPC，用播放速率/变调复刻，不需要额外音频文件。
+- 触发点：启用召唤、受惊、摸头满意、睡醒。默认低音量、可静音、可全局关。
+- **不做 BGM**(体积、版权、干扰)。
+
+## 8. 导出器
+
+`pak → 宠物包` 的本地工具，输入是用户自己的游戏安装。
+
+1. 读配置(`PETBASE_CONF`/`MODEL_CONF`/`ANIM_CONF`/`ANIM_ID_CONF`)，过滤测试与重复行，
+   按 `stage/evolution_pet_id` 归成链，输出待导清单。
+2. 用 CUE4Parse 导每个形态的 `SKM_*`(glb) + 所需 `AnimSequence`(psa) + `Tex/*`(png)。
+3. **把 psa 动画合并进 glb**：glTF 导出器不产动画，且 glb 做过 UE→glTF 轴转换而 psa 保持
+   UE 空间，合并时要补变换(或统一走 psk+psa / UEFormat 对再转)。psa 结构简单
+   (BONENAMES + 逐帧 quat/pos)，已在 rocom-capture 侧验证过这条数据通路正确。
+4. 贴图修正 BC7 通道序、按材质名后缀 `_By/_Es/_Mh` 接槽位、转 KTX2/webp。
+5. 叫声转码，生成 manifest 与覆盖率报告，打包 zip。
+
+依赖与坑：
+- CUE4Parse-Natives **必须带 ACL 编译**，否则动画解压报 `nAllocate` 找不到：
+  `git submodule update --init --recursive CUE4Parse-Natives/ACL/external/acl`，
+  再 `cmake -B builddir -DCMAKE_BUILD_TYPE=RelWithDebInfo . && cmake --build builddir`。
+  build type **必须避开 Debug/Release**——那两个会命中 `install(TARGETS … RUNTIME DESTINATION)`，
+  Linux 上 SHARED 库属 LIBRARY 产物无 destination，cmake 报错会让 `dotnet build` 挂在 MSB3073。
+- 语言：导出器留在 C#(CUE4Parse 在那边)，运行时是 Rust；两者只通过包格式耦合。
+
+## 9. 实施阶段
+
+### Phase 0 — 技术验证(spike，各 1–2 天，失败即换路线)
+
+必须先做，因为结论会改架构。
+
+| # | 内容 | 验收标准 |
+| --- | --- | --- |
+| S1 | 平台层：KDE Wayland(layer-shell) 与 Windows(DComp) 各画一张半透明贴图 | 两平台都能：置顶于普通窗口之上、指定坐标、逐像素 alpha 正确(无黑边/无不透明底)、贴图内点击被自己接到而贴图外点击落到下层窗口、运行时切换全局穿透生效、多显示器各自一个 stage 且 output 热插拔不崩；另记录 KWin 下 `layer=top` 与全屏窗口/锁屏/通知的实际叠放次序，以及空闲与活动时的 CPU/GPU 占用。**这是全项目成败点。** |
+| S2 | 渲染：wgpu 加载 glb 播骨骼动画 + toon 着色 | 离屏渲染出的帧与 rocom-capture 那份 CPU 蒙皮参考图形体一致；两个 clip 间淡入淡出无跳变；1 只宠物 60fps 时 GPU 占用可忽略 |
+| S3 | 导出器：psa→glb 动画合并，跑通喵喵整条链(3001/3025/3007) | 合并后的 glb 在第三方查看器(Blender/gltf 校验器)里骨架与动画正确；确认 `walk/run` 是否原地循环、朝向与单位换算；产出一份填好 `speed`/`in_place` 的 manifest |
+
+### Phase 1 — 单宠物 MVP
+一个形态：`idle` 循环 + 沿屏幕底边行走、穿透开关(热键)、托盘菜单退出、配置文件。
+
+### Phase 2 — 鼠标交互
+alpha mask 命中测试、点击受惊(`shock`)、摸头、拖起放下、多显示器与 HiDPI、空闲降帧。
+
+### Phase 3 — 行为引擎
+状态机 + 需求/作息(睡觉三段式)、随机情绪、边界与地面约束、视线跟随鼠标。
+
+### Phase 4 — 包格式定稿与导出器成品
+manifest schema 落地、进化链打包、形态切换、按需启用/停用、包管理(先 CLI，再 egui GUI)。
+
+### Phase 5 — 多实体与跨宠物互动
+事件总线、proximity 判定、演出脚本、第一个互动包(珀尔鼬 × 捕尘长绒)。
+
+### Phase 6 — 音频
+叫声 + 变调；成本低，可提前插到 Phase 2 之后。
+
+### Phase 7 — 打磨与分发
+配置 GUI、开机自启(KDE autostart / Windows 启动项)、N 只宠物的性能与内存、
+Windows 安装包 / Linux AppImage。
+
+## 10. 风险与未决问题
+
+| 风险 | 缓解 |
+| --- | --- |
+| Windows 逐像素 alpha + GPU 交换链 | 必须走 `CreateSwapChainForComposition`；wgpu 可能要用 `SurfaceTargetUnsafe` 自建 surface，S1 定论 |
+| KWin 对 wlr-layer-shell 的支持随 Plasma 版本变化(非正式协议) | 平台层抽象成 trait；S1 的验收项固化成回归清单，升级 Plasma 后重跑；实测的 KWin 版本写进 README 支持矩阵 |
+| 全屏透明层的合成开销 | §3.3 的提交策略；S1 里就要量一次空闲/活动时的 CPU/GPU 占用 |
+| 材质只能近似 | 明确目标是「像」；把 ramp/描边参数做成包内可调 |
+| 游戏版本更新改路径/命名 | 导出器带版本适配与覆盖率报告，缺失动作降级而非报错 |
+| 第三方包的脚本安全 | 自产包用 Lua；一旦开放第三方，换 WASM 沙箱 + 能力白名单 |
+
+## 11. 法务与分发
+
+- 素材版权属腾讯/发行方。仓库**只有代码、schema 与导出器**；原始解包数据、生成的宠物包
+  都不入仓库、不随发布分发，用户用自己的游戏安装本地生成(沿用 rocom-capture / rocom-petvo 的约定)。
+- 运行时不读游戏内存、不注入进程、不联网上报。
