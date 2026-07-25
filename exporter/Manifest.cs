@@ -22,7 +22,7 @@ public static class Manifest
     private const int Schema = 1;
     private const int RuntimeAbi = 1;
 
-    public static string Render(Chain chain, List<FormReport> forms, int lodIndex)
+    public static string Render(Chain chain, List<FormReport> forms, int lodIndex, string sourceVersion)
     {
         var sb = new StringBuilder();
         sb.AppendLine("# 由 rocom-pets-export 生成,勿手改(素材本地生成物,不入仓库)");
@@ -30,6 +30,8 @@ public static class Manifest
         sb.AppendLine($"runtime_abi = {RuntimeAbi}");
         sb.AppendLine($"generated_at = {Quote(DateTime.UtcNow.ToString("yyyy-MM-dd'T'HH:mm:ss'Z'", CultureInfo.InvariantCulture))}");
         sb.AppendLine($"lod = {lodIndex}");
+        // 导出时的 pak 指纹:换游戏版本重导后这里会变,便于排查「这包是哪版导的」
+        sb.AppendLine($"source_version = {Quote(sourceVersion)}");
         sb.AppendLine();
 
         sb.AppendLine("[species]");

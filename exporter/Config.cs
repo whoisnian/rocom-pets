@@ -62,6 +62,27 @@ public class GameConfig
                ?? throw new InvalidDataException($"{table}.json 没有 RocoDataRows");
     }
 
+    /// 列出所有正式宠物的 id(过滤测试行/影子行),供 --all 用。
+    public IEnumerable<int> AllPetIds()
+    {
+        foreach (var (key, row) in _petBase)
+            if (int.TryParse(key, out var id) && IsRealPet(id, row))
+                yield return id;
+    }
+
+    /// 共享同一个 `anim_conf_id` 的其他资产目录名。
+    /// 有些形态自己没有 Animation/ 目录,动画挂在同组的另一个资产下(见 Program.cs 的用法)。
+    public IEnumerable<string> AssetsSharingAnimConf(int animConfId, string exclude)
+    {
+        foreach (var (_, model) in _model)
+        {
+            if (model?["anim_conf_id"]?.Value<int>() != animConfId) continue;
+            var asset = ExtractAsset(model?["path"]?.Value<string>() ?? "");
+            if (asset is null || asset == exclude) continue;
+            yield return asset;
+        }
+    }
+
     /// 从任意一个成员出发,拿到它所属的完整进化链(按 stage 升序)。
     public Chain ResolveChain(int petId)
     {

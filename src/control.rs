@@ -15,6 +15,8 @@ pub enum Control {
     TogglePassthrough,
     /// 把宠物召回到屏幕中间(它跑到边角或看不见时用)。
     Recall,
+    /// 切到进化链上的第几个形态(下标)。
+    SwitchForm(usize),
     /// 退出。
     Quit,
 }
@@ -24,6 +26,9 @@ pub struct Tray {
     sender: Sender<Control>,
     passthrough: bool,
     pet_name: String,
+    /// 进化链上的形态名(用于菜单),与 `current_form` 的下标对应。
+    forms: Vec<String>,
+    current_form: usize,
 }
 
 impl ksni::Tray for Tray {
@@ -45,8 +50,8 @@ impl ksni::Tray for Tray {
     }
 
     fn menu(&self) -> Vec<ksni::MenuItem<Self>> {
-        use ksni::menu::{CheckmarkItem, StandardItem};
-        vec![
+        use ksni::menu::{CheckmarkItem, RadioGroup, RadioItem, StandardItem, SubMenu};
+        let mut items: Vec<ksni::MenuItem<Self>> = vec![
             CheckmarkItem {
                 label: "鼠标穿透".into(),
                 checked: self.passthrough,
@@ -61,7 +66,39 @@ impl ksni::Tray for Tray {
                 ..Default::default()
             }
             .into(),
-            ksni::MenuItem::Separator,
+        ];
+
+        // 进化链有多个形态才给切换菜单(单形态的包不必多这一层)
+        if self.forms.len() > 1 {
+            items.push(
+                SubMenu {
+                    label: "形态".into(),
+                    submenu: vec![
+                        RadioGroup {
+                            selected: self.current_form,
+                            select: Box::new(|tray: &mut Self, index| {
+                                tray.send(Control::SwitchForm(index))
+                            }),
+                            options: self
+                                .forms
+                                .iter()
+                                .map(|name| RadioItem {
+                                    label: name.clone(),
+                                    ..Default::default()
+                                })
+                                .collect(),
+                            ..Default::default()
+                        }
+                        .into(),
+                    ],
+                    ..Default::default()
+                }
+                .into(),
+            );
+        }
+
+        items.push(ksni::MenuItem::Separator);
+        items.push(
             StandardItem {
                 label: "退出".into(),
                 icon_name: "application-exit".into(),
@@ -69,7 +106,8 @@ impl ksni::Tray for Tray {
                 ..Default::default()
             }
             .into(),
-        ]
+        );
+        items
     }
 }
 
@@ -90,6 +128,14 @@ impl TrayHandle {
         self.0
             .update(move |tray: &mut Tray| tray.passthrough = passthrough);
     }
+
+    /// 形态换了之后同步单选与标题。
+    pub fn set_form(&self, index: usize, name: String) {
+        self.0.update(move |tray: &mut Tray| {
+            tray.current_form = index;
+            tray.pet_name = name;
+        });
+    }
 }
 
 /// 起托盘。失败不致命(没有托盘宿主的桌面照样能跑),调用方只记个日志。
@@ -97,12 +143,16 @@ pub fn spawn_tray(
     sender: Sender<Control>,
     pet_name: String,
     passthrough: bool,
+    forms: Vec<String>,
+    current_form: usize,
 ) -> Result<TrayHandle> {
     use ksni::blocking::TrayMethods;
     let handle = Tray {
         sender,
         passthrough,
         pet_name,
+        forms,
+        current_form,
     }
     .spawn()
     .context("注册托盘图标失败(桌面没有 StatusNotifier 宿主?)")?;
@@ -312,6 +362,8 @@ pub fn send_dbus_command(control: Control) -> Result<()> {
         Control::TogglePassthrough => "TogglePassthrough",
         Control::Recall => "Recall",
         Control::Quit => "Quit",
+        // 换形态要带下标,命令行没暴露(托盘菜单里选更直观)
+        Control::SwitchForm(_) => anyhow::bail!("换形态请用托盘菜单"),
     };
     proxy
         .call::<_, _, ()>(method, &())

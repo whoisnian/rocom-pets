@@ -314,8 +314,26 @@ impl Model {
 }
 
 /// 按材质名后缀找基色贴图:`MI_..._By` → `T_..._By_D.png`(见 docs/design.md §1)。
+///
+/// 找不到本槽的贴图时退到本体槽(`By`):有些宠物的眼/特效槽指向**共享贴图**
+/// (CommonTexture 里的眼睛图集之类),而共享贴图是哪张只写在材质实例的参数里,
+/// 那份参数在本作解不出来(§1 的 OverflowException)。退到本体色至少是同色系,
+/// 比留一块纯白好看;真要正确还得先把材质参数解出来。
 fn find_base_color(tex_dir: &Path, material_name: &str) -> Option<Image> {
     let slot = material_name.rsplit('_').next()?.to_ascii_lowercase();
+    load_slot_texture(tex_dir, &slot).or_else(|| {
+        if slot == "by" {
+            return None;
+        }
+        let fallback = load_slot_texture(tex_dir, "by");
+        if fallback.is_some() {
+            log::debug!("材质 {material_name} 没有 {slot}_D 贴图,退用本体贴图");
+        }
+        fallback
+    })
+}
+
+fn load_slot_texture(tex_dir: &Path, slot: &str) -> Option<Image> {
     let entries = std::fs::read_dir(tex_dir).ok()?;
     let mut candidates: Vec<_> = entries.filter_map(|e| e.ok().map(|e| e.path())).collect();
     candidates.sort();
@@ -338,7 +356,6 @@ fn find_base_color(tex_dir: &Path, material_name: &str) -> Option<Image> {
             }
         }
     }
-    log::warn!("材质 {material_name} 找不到 {slot}_D 基色贴图,用白色兜底");
     None
 }
 

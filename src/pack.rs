@@ -16,6 +16,9 @@ const SUPPORTED_SCHEMA: u32 = 1;
 #[derive(Deserialize)]
 struct RawManifest {
     schema: u32,
+    /// 导出时的 pak 指纹;只用于日志/排查,不参与逻辑。
+    #[serde(default)]
+    source_version: Option<String>,
     species: RawSpecies,
     #[serde(default)]
     forms: Vec<RawForm>,
@@ -92,9 +95,60 @@ pub struct Pack {
     pub species_id: i64,
     pub species_name: String,
     pub forms: Vec<Form>,
+    /// 包目录,列表显示与相对路径都要用。
+    pub dir: PathBuf,
 }
 
 impl Pack {
+    /// 默认包目录:`$XDG_DATA_HOME/rocom-pets/packs`。
+    pub fn default_dir() -> Option<PathBuf> {
+        let base = std::env::var_os("XDG_DATA_HOME")
+            .map(PathBuf::from)
+            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))?;
+        Some(base.join("rocom-pets").join("packs"))
+    }
+
+    /// 列出包目录下所有能读的包(按名字排序)。读不动的只警告,不让一个坏包挡住其他的。
+    pub fn list(dir: &Path) -> Vec<Pack> {
+        let mut entries: Vec<PathBuf> = match std::fs::read_dir(dir) {
+            Ok(read) => read
+                .filter_map(|e| e.ok().map(|e| e.path()))
+                .filter(|p| p.join("manifest.toml").is_file())
+                .collect(),
+            Err(e) => {
+                log::debug!("包目录 {dir:?} 读不了: {e}");
+                return Vec::new();
+            }
+        };
+        entries.sort();
+        entries
+            .iter()
+            .filter_map(|path| match Pack::load(path) {
+                Ok(pack) => Some(pack),
+                Err(e) => {
+                    log::warn!("跳过 {path:?}: {e:#}");
+                    None
+                }
+            })
+            .collect()
+    }
+
+    /// 按「路径」或「包名」定位一个包:优先当路径用,否则在包目录里按物种名/目录名找。
+    pub fn resolve(value: &str, packs_dir: Option<&Path>) -> Result<Pack> {
+        let as_path = crate::config::Config::expand_path(value);
+        if as_path.join("manifest.toml").is_file() {
+            return Pack::load(&as_path);
+        }
+        if let Some(dir) = packs_dir {
+            for pack in Pack::list(dir) {
+                if pack.species_name == value || pack.dir.file_name().is_some_and(|n| n == value) {
+                    return Ok(pack);
+                }
+            }
+        }
+        bail!("找不到宠物包 {value}(既不是包目录,也不在 {packs_dir:?} 里)")
+    }
+
     /// `dir` 是包目录(含 manifest.toml)。
     pub fn load(dir: &Path) -> Result<Self> {
         let path = dir.join("manifest.toml");
@@ -109,6 +163,9 @@ impl Pack {
             );
         }
 
+        if let Some(version) = &raw.source_version {
+            log::debug!("{path:?} 由源 {version} 导出");
+        }
         let species_id = raw.species.id;
         let species_name = raw.species.name;
         let forms = raw
@@ -150,17 +207,18 @@ impl Pack {
             species_id,
             species_name,
             forms,
+            dir: dir.to_path_buf(),
         })
     }
 
-    /// 按资产名选形态,给 None 就取第一个(链首,通常是最小的那形态)。
-    pub fn form(&self, asset: Option<&str>) -> Result<&Form> {
+    /// 形态在 `forms` 里的下标(按资产名或中文名);给 None 就是 0。
+    pub fn form_index(&self, asset: Option<&str>) -> Result<usize> {
         match asset {
-            None => Ok(&self.forms[0]),
+            None => Ok(0),
             Some(want) => self
                 .forms
                 .iter()
-                .find(|f| f.asset == want || f.name == want)
+                .position(|f| f.asset == want || f.name == want)
                 .with_context(|| {
                     format!(
                         "包里没有形态 {want};有的是: {}",

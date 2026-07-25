@@ -110,24 +110,26 @@ pub fn run(options: &Options) -> Result<()> {
         .flatten();
 
     // 包在起窗口前就读掉:manifest 有问题要立刻报错,而不是等到画第一帧
-    let form = match &options.pack {
+    let (pack, current_form) = match &options.pack {
         Some(dir) => {
             let pack = Pack::load(dir)?;
-            let form = pack.form(options.form.as_deref())?.clone();
+            let index = pack.form_index(options.form.as_deref())?;
+            let form = &pack.forms[index];
             log::info!(
-                "宠物包 {}({}):形态 {}({}),高 {:.0}cm,{} 个动作",
+                "宠物包 {}({}):{} 个形态,当前 {}({}),高 {:.0}cm,{} 个动作",
                 pack.species_name,
                 pack.species_id,
+                pack.forms.len(),
                 form.name,
                 form.asset,
                 form.height_cm,
                 form.clips.len()
             );
-            Some(form)
+            (Some(pack), index)
         }
         None => {
             log::info!("没给 --pack,用调试精灵(平台层验收模式)");
-            None
+            (None, 0)
         }
     };
 
@@ -146,7 +148,8 @@ pub fn run(options: &Options) -> Result<()> {
         instance,
         gpu: None,
         sprite: Sprite::test_pattern(192),
-        form,
+        pack,
+        current_form,
         px_per_cm: options.px_per_cm,
         stages: Vec::new(),
         pointer: None,
@@ -164,12 +167,20 @@ pub fn run(options: &Options) -> Result<()> {
     let (control_tx, control_rx) = channel::channel();
     install_signal_source(control_tx.clone())?;
     if options.tray {
-        let name = app
-            .form
-            .as_ref()
-            .map(|f| f.name.clone())
-            .unwrap_or_default();
-        match control::spawn_tray(control_tx.clone(), name, options.passthrough) {
+        let (name, forms) = match &app.pack {
+            Some(pack) => (
+                pack.forms[app.current_form].name.clone(),
+                pack.forms.iter().map(|f| f.name.clone()).collect(),
+            ),
+            None => (String::new(), Vec::new()),
+        };
+        match control::spawn_tray(
+            control_tx.clone(),
+            name,
+            options.passthrough,
+            forms,
+            app.current_form,
+        ) {
             Ok(tray) => app.tray = Some(tray),
             Err(e) => log::warn!("托盘不可用({e:#});用 kill -USR1 或热键代替"),
         }
@@ -190,7 +201,7 @@ pub fn run(options: &Options) -> Result<()> {
         .map_err(|e| anyhow::anyhow!("挂控制通道失败: {e}"))?;
 
     // 只有宠物需要推进时间;精灵模式保持「只在事件时出帧」,空闲 CPU 才能是 0
-    if app.form.is_some() {
+    if app.pack.is_some() {
         let interval = Duration::from_secs_f32(1.0 / TICK_HZ);
         handle
             .insert_source(
@@ -305,8 +316,10 @@ struct App {
     instance: wgpu::Instance,
     gpu: Option<Gpu>,
     sprite: Sprite,
-    /// 要显示的形态(来自宠物包);None = 调试精灵模式。
-    form: Option<Form>,
+    /// 宠物包(整条进化链都在里面,供形态切换);None = 调试精灵模式。
+    pack: Option<Pack>,
+    /// 当前形态在 `pack.forms` 里的下标。
+    current_form: usize,
     px_per_cm: f32,
     stages: Vec<StageWindow>,
     pointer: Option<wl_pointer::WlPointer>,
@@ -378,7 +391,7 @@ impl App {
         };
 
         // 宠物模式下每个 stage 各加载一份模型:Model 不便共享,而加载只有几十毫秒
-        let actor = match &self.form {
+        let actor = match self.pack.as_ref().map(|p| &p.forms[self.current_form]) {
             Some(form) => match self.build_pet_actor(form) {
                 Ok(actor) => actor,
                 Err(e) => {
@@ -569,7 +582,42 @@ impl App {
         match control {
             Control::TogglePassthrough => self.toggle_passthrough(),
             Control::Recall => self.recall(),
+            Control::SwitchForm(index) => self.switch_form(index),
             Control::Quit => self.exit = true,
+        }
+    }
+
+    /// 切到进化链上的另一个形态:重建模型与那套 GPU 资源,位置重新落地。
+    fn switch_form(&mut self, index: usize) {
+        let Some(pack) = self.pack.as_ref() else {
+            return;
+        };
+        if index >= pack.forms.len() || index == self.current_form {
+            return;
+        }
+        let form = pack.forms[index].clone();
+        log::info!("切换形态 → {}({})", form.name, form.asset);
+        self.current_form = index;
+        for stage_index in 0..self.stages.len() {
+            match self.build_pet_actor(&form) {
+                Ok(actor) => {
+                    self.stages[stage_index].stage.replace_actor(actor);
+                    // 网格/贴图/画布/掩码缓冲全都跟形态绑,一并重建
+                    self.stages[stage_index].pet = None;
+                    self.rebuild_pet_surfaces(stage_index);
+                    self.apply(
+                        stage_index,
+                        Reaction {
+                            redraw: true,
+                            regions_dirty: true,
+                        },
+                    );
+                }
+                Err(e) => log::error!("切形态失败: {e:#}"),
+            }
+        }
+        if let Some(tray) = &self.tray {
+            tray.set_form(index, form.name);
         }
     }
 
@@ -721,29 +769,38 @@ impl App {
         let physical = self.stages[index].physical();
         self.stages[index].target = Some(gpu.create_target(surface, physical));
 
-        let scale = self.stages[index].scale as f32;
+        self.rebuild_pet_surfaces(index);
+    }
+
+    /// (重)建当前形态的 GPU 资源:管线、离屏画布、合成四边形、掩码回读。
+    /// 首次 configure 与切形态都走这里。
+    fn rebuild_pet_surfaces(&mut self, index: usize) {
+        let Some(gpu) = self.gpu.as_ref() else { return };
+        let scale = self.stages[index].scale;
         let (aw, ah) = self.stages[index].stage.actor().size();
+        let canvas_size = (
+            ((aw as f32 * scale) as u32).max(1),
+            ((ah as f32 * scale) as u32).max(1),
+        );
         match self.stages[index].stage.actor() {
-            Actor::Pet(pet) => {
-                let canvas_size = ((aw as f32 * scale) as u32, (ah as f32 * scale) as u32);
-                match PetGpu::new(&gpu.device, &gpu.queue, &pet.model, gpu.format()) {
-                    Ok(pet_gpu) => {
-                        let canvas = PetTarget::new(&gpu.device, gpu.format(), canvas_size);
-                        let quad = gpu.create_quad(canvas.view());
-                        let readback = MaskReadback::new(&gpu.device, canvas_size);
-                        self.stages[index].pet = Some(PetSurfaces {
-                            gpu: pet_gpu,
-                            canvas,
-                            quad,
-                            readback,
-                        });
-                    }
-                    Err(e) => {
-                        log::error!("建宠物管线失败: {e:#}");
-                        self.exit = true;
-                    }
+            Actor::Pet(pet) => match PetGpu::new(&gpu.device, &gpu.queue, &pet.model, gpu.format())
+            {
+                Ok(pet_gpu) => {
+                    let canvas = PetTarget::new(&gpu.device, gpu.format(), canvas_size);
+                    let quad = gpu.create_quad(canvas.view());
+                    let readback = MaskReadback::new(&gpu.device, canvas_size);
+                    self.stages[index].pet = Some(PetSurfaces {
+                        gpu: pet_gpu,
+                        canvas,
+                        quad,
+                        readback,
+                    });
                 }
-            }
+                Err(e) => {
+                    log::error!("建宠物管线失败: {e:#}");
+                    self.exit = true;
+                }
+            },
             Actor::Sprite(sprite) => {
                 let view = gpu.upload_sprite(sprite);
                 self.stages[index].sprite_quad = Some(gpu.create_quad(&view));

@@ -7,6 +7,7 @@ mod config;
 mod control;
 mod offscreen;
 mod pack;
+mod pack_list;
 mod pet;
 mod platform;
 mod render;
@@ -14,6 +15,8 @@ mod sprite;
 mod stage;
 
 use std::path::PathBuf;
+
+use anyhow::Context;
 
 const USAGE: &str = "\
 用法:
@@ -28,6 +31,11 @@ stage 模式(不给参数时读 ~/.config/rocom-pets/config.toml,首次运行会
   --config <文件>    换个配置文件
   --no-tray          不起托盘图标
   --passthrough      启动就开鼠标穿透
+
+包管理:
+  --list             列出包目录里的宠物包(默认 ~/.local/share/rocom-pets/packs)
+  --packs-dir <目录> 换个包目录
+  (--pack 既接受目录路径,也接受包名/物种名,后者在包目录里找)
 
 控制已在运行的实例(走 D-Bus,可绑到 KDE 自定义快捷键):
   --toggle-passthrough  切换鼠标穿透
@@ -62,11 +70,13 @@ fn main() -> anyhow::Result<()> {
     let mut request: Option<offscreen::Request> = None;
     // 命令行先收集成 Option,最后再与配置文件合并(命令行优先)
     let mut config_path: Option<PathBuf> = None;
-    let mut cli_pack: Option<PathBuf> = None;
     let mut cli_form: Option<String> = None;
     let mut cli_px_per_cm: Option<f32> = None;
     let mut cli_passthrough = false;
     let mut no_tray = false;
+    let mut cli_pack_name: Option<String> = None;
+    let mut cli_packs_dir: Option<PathBuf> = None;
+    let mut list_packs = false;
     let next = |flag: &str, args: &mut dyn Iterator<Item = String>| -> anyhow::Result<String> {
         args.next()
             .ok_or_else(|| anyhow::anyhow!("{flag} 缺少参数值\n{USAGE}"))
@@ -94,7 +104,10 @@ fn main() -> anyhow::Result<()> {
                     bench: 0,
                 });
             }
-            "--pack" => cli_pack = Some(PathBuf::from(next("--pack", &mut args)?)),
+            // --pack 可以是路径也可以是包名,到下面统一解析
+            "--pack" => cli_pack_name = Some(next("--pack", &mut args)?),
+            "--packs-dir" => cli_packs_dir = Some(PathBuf::from(next("--packs-dir", &mut args)?)),
+            "--list" => list_packs = true,
             "--px-per-cm" => cli_px_per_cm = Some(next("--px-per-cm", &mut args)?.parse()?),
             "--config" => config_path = Some(PathBuf::from(next("--config", &mut args)?)),
             "--no-tray" => no_tray = true,
@@ -135,6 +148,12 @@ fn main() -> anyhow::Result<()> {
         return offscreen::render(&request);
     }
 
+    let packs_dir = cli_packs_dir.or_else(pack::Pack::default_dir);
+
+    if list_packs {
+        return pack_list::run(packs_dir.as_deref());
+    }
+
     // stage 模式:配置文件打底,命令行覆盖
     let path = config_path.or_else(config::Config::default_path);
     let file = match &path {
@@ -144,8 +163,18 @@ fn main() -> anyhow::Result<()> {
             config::Config::default()
         }
     };
+    // 包的来源:命令行 --pack(路径或包名)优先,否则配置文件里的 pack
+    let wanted = cli_pack_name.or_else(|| file.pack.clone());
+    let pack_dir = match wanted {
+        Some(value) => Some(
+            pack::Pack::resolve(&value, packs_dir.as_deref())
+                .map(|pack| pack.dir)
+                .with_context(|| format!("解析 --pack {value} 失败"))?,
+        ),
+        None => None,
+    };
     let options = platform::Options {
-        pack: cli_pack.or_else(|| file.pack.as_deref().map(config::Config::expand_path)),
+        pack: pack_dir,
         form: cli_form.or(file.form),
         px_per_cm: cli_px_per_cm.unwrap_or(file.px_per_cm),
         passthrough: cli_passthrough || file.passthrough,

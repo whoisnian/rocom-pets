@@ -15,6 +15,7 @@ using CUE4Parse.UE4.Assets.Exports.SkeletalMesh;
 using CUE4Parse.UE4.Objects.Core.Misc;
 using CUE4Parse.UE4.Versions;
 using CUE4Parse_Conversion.Textures;
+using System.Text;
 using RocomPets.Export;
 using Serilog;
 using Serilog.Events;
@@ -30,8 +31,13 @@ const string usage = """
       --aes <hex>       pak 主密钥(默认内置)
       --lod <n>         用第几级 LOD(默认 0)
       --all-clips       导出 ANIM_CONF 里的全部动作,而不是桌宠动作白名单
+      --all             导出全部宠物(按进化链去重);与 --species 二选一
+      --limit <n>       配合 --all:只导前 n 条链(试跑用)
+      --skip-existing   跳过已经有 manifest.toml 的包(增量重跑)
       --zip             额外打成 <链名>.rkpet
       -h, --help        本帮助
+
+    批量导出会在输出目录写 report.txt:每个形态的动作命中/缺失、体积、警告,末尾是汇总。
     """;
 
 // 桌宠真正用得到的动作:名字是 ANIM_ID_CONF 里的逻辑名。
@@ -52,6 +58,9 @@ var species = new List<int>();
 var lodIndex = 0;
 var allClips = false;
 var zip = false;
+var all = false;
+var limit = int.MaxValue;
+var skipExisting = false;
 
 for (var i = 0; i < args.Length; i++)
 {
@@ -67,6 +76,9 @@ for (var i = 0; i < args.Length; i++)
         case "--aes": aesKey = Next(ref i); break;
         case "--lod": lodIndex = int.Parse(Next(ref i)); break;
         case "--all-clips": allClips = true; break;
+        case "--all": all = true; break;
+        case "--limit": limit = int.Parse(Next(ref i)); break;
+        case "--skip-existing": skipExisting = true; break;
         case "--zip": zip = true; break;
         case "-h" or "--help": Console.WriteLine(usage); return 0;
         default:
@@ -74,9 +86,9 @@ for (var i = 0; i < args.Length; i++)
             return 1;
     }
 }
-if (species.Count == 0)
+if (species.Count == 0 && !all)
 {
-    Console.Error.WriteLine($"缺 --species\n{usage}");
+    Console.Error.WriteLine($"缺 --species(或 --all)\n{usage}");
     return 1;
 }
 
@@ -115,28 +127,115 @@ if (provider.Files.Count == 0)
 }
 Console.WriteLine($"挂载 {provider.MountedVfs.Count} 个包,{provider.Files.Count} 个文件");
 
+// 源指纹:同一版本的 pak 组合应当稳定,换版本就会变。写进 manifest 便于日后排查
+// 「这个包是哪个版本导的」。用 pak 文件名+长度的哈希,不去读内容(那要几十秒)。
+var sourceVersion = Fingerprint(paksPath, provider.Files.Count);
+
+// 索引「哪些资产目录真的有动画」,按族名分组:
+// 实测 197/827 个形态自己没有 Animation/(变体资产,如 Win_ShiJiu1**Ar**_001、
+// 或换了属性前缀的 Gra_DiMo2_001),它们与同族的基础资产共用骨架与动画。
+var animIndex = BuildAnimIndex(provider);
+Console.WriteLine($"动画索引: {animIndex.Count} 个族,{animIndex.Sum(kv => kv.Value.Count)} 个带动画的资产");
+
+// --all:遍历全部宠物,按链首去重(一条链只导一次)
+var targets = new List<Chain>();
+var seenChains = new HashSet<int>();
+var chainErrors = new List<string>();
+var skipped = 0;
+foreach (var petId in all ? config.AllPetIds() : species)
+{
+    Chain chain;
+    try
+    {
+        chain = config.ResolveChain(petId);
+    }
+    catch (Exception e)
+    {
+        chainErrors.Add($"宠物 {petId} 归链失败: {e.Message}");
+        continue;
+    }
+    if (!seenChains.Add(chain.RootId)) continue;
+    // 先按「已导出」过滤再计 limit:否则 --limit 永远只覆盖前 n 条链,分批续跑推不动
+    if (skipExisting && File.Exists(Path.Combine(outDir, SafeName(chain.Name), "manifest.toml")))
+    {
+        skipped++;
+        continue;
+    }
+    targets.Add(chain);
+    if (targets.Count >= limit) break;
+}
+Console.WriteLine($"待导 {targets.Count} 条进化链,{targets.Sum(c => c.Forms.Count)} 个形态" +
+                  (chainErrors.Count > 0 ? $"({chainErrors.Count} 条归链失败)" : ""));
+
+var report = new StringBuilder();
+report.AppendLine($"# rocom-pets 导出报告  {DateTime.Now:yyyy-MM-dd HH:mm}");
+report.AppendLine($"# 源指纹 {sourceVersion}");
+foreach (var e in chainErrors) report.AppendLine($"[归链失败] {e}");
+
 var failed = 0;
-foreach (var petId in species)
+var doneForms = 0;
+var formSkipped = 0;
+var chainSkipped = 0;
+var totalBytes = 0L;
+var stopwatch = System.Diagnostics.Stopwatch.StartNew();
+foreach (var chain in targets)
 {
     try
     {
-        var chain = config.ResolveChain(petId);
+        var packDir = Path.Combine(outDir, SafeName(chain.Name));
         Console.WriteLine($"\n=== {chain.Name}(链首 {chain.RootId},{chain.Forms.Count} 个形态)");
-        var packDir = Path.Combine(outDir, chain.Name);
         var forms = new List<FormReport>();
 
         foreach (var form in chain.Forms)
         {
-            var report = ExportForm(provider, form, packDir, lodIndex, allClips ? null : defaultClips);
-            forms.Add(report);
+            // 一个形态缺资产(有些进化阶段这版本根本没做)不该拖垮整条链
+            FormReport formReport;
+            try
+            {
+                formReport = ExportForm(provider, form, packDir, lodIndex, allClips ? null : defaultClips);
+            }
+            catch (Exception e)
+            {
+                Console.WriteLine($"  {form.Name}({form.Asset}): 跳过 — {e.Message}");
+                report.AppendLine($"  {form.Name}({form.Asset}) stage {form.Stage}: 跳过 — {e.Message}");
+                formSkipped++;
+                continue;
+            }
+            forms.Add(formReport);
             Console.WriteLine(
                 $"  {form.Name}(id {form.Id} stage {form.Stage} {form.Asset}): " +
-                $"{report.Clips.Count}/{form.Clips.Count} 个动作,glb {report.GlbBytes / 1024}KB," +
-                $"{report.Textures.Count} 张贴图");
-            foreach (var warning in report.Warnings) Console.WriteLine($"    [warn] {warning}");
+                $"{formReport.Clips.Count}/{form.Clips.Count} 个动作,glb {formReport.GlbBytes / 1024}KB," +
+                $"{formReport.Textures.Count} 张贴图");
+            foreach (var warning in formReport.Warnings) Console.WriteLine($"    [warn] {warning}");
         }
 
-        var manifest = Manifest.Render(chain, forms, lodIndex);
+        report.AppendLine();
+        report.AppendLine($"## {chain.Name}(链首 {chain.RootId})");
+        foreach (var form in forms)
+        {
+            var got = form.Clips.Select(c => c.Logical).ToHashSet();
+            var wanted = (allClips ? form.Form.Clips.Select(c => c.Logical) : defaultClips)
+                .Distinct().ToList();
+            var missing = wanted.Where(w => !got.Contains(w)).ToList();
+            report.AppendLine(
+                $"  {form.Form.Name}({form.Form.Asset}) stage {form.Form.Stage}: " +
+                $"动作 {form.Clips.Count}/{wanted.Count},glb {form.GlbBytes / 1024}KB," +
+                $"贴图 {form.Textures.Count},高 {form.HeightCm:F0}cm");
+            if (missing.Count > 0) report.AppendLine($"    缺动作: {string.Join(", ", missing)}");
+            foreach (var w in form.Warnings) report.AppendLine($"    [warn] {w}");
+            doneForms++;
+            totalBytes += form.GlbBytes;
+        }
+
+        if (forms.Count == 0)
+        {
+            Console.WriteLine($"  {chain.Name}: 一个形态都没导出来,跳过整条链");
+            report.AppendLine($"  (整条链没有可用形态)");
+            chainSkipped++;
+            continue;
+        }
+
+        var manifest = Manifest.Render(chain, forms, lodIndex, sourceVersion);
         Directory.CreateDirectory(packDir);
         File.WriteAllText(Path.Combine(packDir, "manifest.toml"), manifest);
         Console.WriteLine($"  → {packDir}");
@@ -151,10 +250,24 @@ foreach (var petId in species)
     }
     catch (Exception e)
     {
-        Console.Error.WriteLine($"宠物 {petId} 导出失败: {e.Message}");
+        Console.Error.WriteLine($"{chain.Name} 导出失败: {e.Message}");
+        report.AppendLine($"## {chain.Name}:导出失败 — {e.Message}");
         failed++;
     }
 }
+
+report.AppendLine();
+report.AppendLine($"# 汇总:{targets.Count - failed - chainSkipped} 条链成功、{skipped} 条已存在跳过、" +
+                  $"{chainSkipped} 条无可用形态、{failed} 条失败;{doneForms} 个形态导出成功、" +
+                  $"{formSkipped} 个形态跳过;glb 合计 {totalBytes / 1024 / 1024}MB," +
+                  $"用时 {stopwatch.Elapsed.TotalMinutes:F1} 分钟");
+Directory.CreateDirectory(outDir);
+var reportPath = Path.Combine(outDir, "report.txt");
+File.WriteAllText(reportPath, report.ToString());
+Console.WriteLine($"\n{targets.Count - failed - chainSkipped} 条链成功、{skipped} 已存在跳过、" +
+                  $"{chainSkipped} 条无可用形态、{failed} 失败;{doneForms} 个形态成功、{formSkipped} 个跳过;" +
+                  $"glb 合计 {totalBytes / 1024 / 1024}MB,用时 {stopwatch.Elapsed.TotalMinutes:F1} 分钟");
+Console.WriteLine($"报告: {reportPath}");
 return failed == 0 ? 0 : 2;
 
 FormReport ExportForm(
@@ -168,15 +281,61 @@ FormReport ExportForm(
     var assetDir = $"{petsRoot}/{form.Asset}";
     var warnings = new List<string>();
 
-    var meshPath = $"{assetDir}/SKM_{form.Asset}_Skin";
-    var mesh = fileProvider.LoadPackageObject<USkeletalMesh>(meshPath);
+    // 网格名多数是 SKM_<资产>_Skin,但不能硬编码:枚举目录直属的 SKM_* 更稳
+    // (LOD_/ABP_ 前缀的是别的东西,要排掉)
+    var meshCandidates = Textures.TopLevelFiles(fileProvider, assetDir)
+        .Select(path => Path.GetFileNameWithoutExtension(path))
+        .Where(name => name.StartsWith("SKM_", StringComparison.Ordinal))
+        .OrderByDescending(name => name.EndsWith("_Skin", StringComparison.Ordinal))
+        .ToList();
+    if (meshCandidates.Count == 0)
+        throw new InvalidOperationException($"{form.Asset} 目录下没有 SKM_*(这个形态这版本没做?)");
+    var mesh = fileProvider.LoadPackageObject<USkeletalMesh>($"{assetDir}/{meshCandidates[0]}");
 
     // 逻辑动作 → AnimSequence:文件名去掉类别前缀(World_/Common_/Fight_…)再忽略下划线大小写比对
+    // 有些形态自己没有 Animation/ 目录(如 Gra_DiMo2_001),动画挂在共享同一 anim_conf_id
+    // 的另一个资产下——按 anim_conf_id 找过去,这也解释了 anim_conf_id 为什么能与 model 不同
+    var animDir = $"{assetDir}/Animation";
     var byNormalized = new Dictionary<string, string>(StringComparer.Ordinal);
-    foreach (var path in Textures.TopLevelFiles(fileProvider, $"{assetDir}/Animation"))
+    void Collect(string dir)
     {
-        var name = Path.GetFileNameWithoutExtension(path);
-        byNormalized.TryAdd(Normalize(name), name);
+        foreach (var path in Textures.TopLevelFiles(fileProvider, dir))
+            byNormalized.TryAdd(Normalize(Path.GetFileNameWithoutExtension(path)), path);
+    }
+    Collect(animDir);
+    if (byNormalized.Count == 0)
+    {
+        // 先试同 anim_conf_id 的资产(配置层面的显式共享)
+        foreach (var sibling in config.AssetsSharingAnimConf(form.AnimConfId, form.Asset))
+        {
+            Collect($"{petsRoot}/{sibling}/Animation");
+            if (byNormalized.Count > 0)
+            {
+                warnings.Add($"自己没有 Animation/,借用同 anim_conf {form.AnimConfId} 的 {sibling}");
+                break;
+            }
+        }
+    }
+    if (byNormalized.Count == 0)
+    {
+        // 再试同族资产:优先同阶段,其次任意阶段。骨架不匹配时 GlbBuilder 会按骨骼名对不上
+        // 直接跳过那段动画,所以借错了只会少动作,不会渲出鬼东西
+        var (family, stage) = FamilyOf(form.Asset);
+        if (animIndex.TryGetValue(family, out var candidates))
+        {
+            foreach (var (sibling, siblingStage) in candidates
+                         .Where(c => !c.Asset.Equals(form.Asset, StringComparison.OrdinalIgnoreCase))
+                         .OrderByDescending(c => c.Stage == stage))
+            {
+                Collect($"{petsRoot}/{sibling}/Animation");
+                if (byNormalized.Count > 0)
+                {
+                    warnings.Add(
+                        $"自己没有 Animation/,借用同族 {sibling}(族 {family},阶段 {siblingStage} vs {stage})");
+                    break;
+                }
+            }
+        }
     }
 
     var clips = new List<(string Logical, string Clip, UAnimSequence Sequence)>();
@@ -191,8 +350,10 @@ FormReport ExportForm(
         }
         try
         {
-            clips.Add((clip.Logical, file,
-                fileProvider.LoadPackageObject<UAnimSequence>($"{assetDir}/Animation/{file}")));
+            // file 是完整虚拟路径(可能借自别的资产目录),去掉扩展名喂给加载器
+            var objectPath = file[..file.LastIndexOf('.')];
+            clips.Add((clip.Logical, Path.GetFileNameWithoutExtension(file),
+                fileProvider.LoadPackageObject<UAnimSequence>(objectPath)));
         }
         catch (Exception e)
         {
@@ -220,6 +381,76 @@ static string Normalize(string name)
     if (parts.Count > 1 && categories.Contains(parts[0], StringComparer.OrdinalIgnoreCase))
         parts.RemoveAt(0);
     return string.Concat(parts).ToLowerInvariant();
+}
+
+/// 扫一遍 VFS,找出所有「Animation/ 下有东西」的宠物资产,按族名分组。
+/// 族名 = 资产名中段去掉末尾的变体后缀(Ar)与阶段数字:
+/// `Win_ShiJiu1Ar_001` → 族 shijiu / 阶段 1;`Gra_DiMo2_001` → 族 dimo / 阶段 2。
+static Dictionary<string, List<(string Asset, int Stage)>> BuildAnimIndex(AbstractVfsFileProvider provider)
+{
+    const string prefix = "NRC/Content/ArtRes/AnimSequence/Pets/";
+    var assets = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+    foreach (var file in provider.Files.Values)
+    {
+        var path = file.Path;
+        if (!path.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)) continue;
+        var rest = path[prefix.Length..];
+        var slash = rest.IndexOf('/');
+        if (slash < 0) continue;
+        var asset = rest[..slash];
+        var tail = rest[(slash + 1)..];
+        // 只认目录直属的 Animation/*.uasset(子目录里是 CG/BlendSpace 之类)
+        if (!tail.StartsWith("Animation/", StringComparison.OrdinalIgnoreCase)) continue;
+        if (tail.IndexOf('/', "Animation/".Length) >= 0) continue;
+        if (!tail.EndsWith(".uasset", StringComparison.OrdinalIgnoreCase)) continue;
+        assets.Add(asset);
+    }
+
+    var index = new Dictionary<string, List<(string, int)>>(StringComparer.Ordinal);
+    foreach (var asset in assets)
+    {
+        var (family, stage) = FamilyOf(asset);
+        if (family.Length == 0) continue;
+        if (!index.TryGetValue(family, out var list)) index[family] = list = [];
+        list.Add((asset, stage));
+    }
+    return index;
+}
+
+/// 资产名 → (族名, 阶段)。`Win_ShiJiu1Ar_001` → ("shijiu", 1)。
+static (string Family, int Stage) FamilyOf(string asset)
+{
+    var parts = asset.Split('_');
+    if (parts.Length < 2) return ("", 0);
+    var core = parts[1];
+    // 变体后缀:Ar(骑乘/变体皮)等,去掉后才是同族
+    if (core.EndsWith("Ar", StringComparison.Ordinal)) core = core[..^2];
+    var digits = new string(core.SkipWhile(c => !char.IsDigit(c)).TakeWhile(char.IsDigit).ToArray());
+    var family = new string(core.TakeWhile(c => !char.IsDigit(c)).ToArray()).ToLowerInvariant();
+    return (family, int.TryParse(digits, out var stage) ? stage : 0);
+}
+
+/// pak 目录(或 apk)的指纹:文件名 + 长度 + 挂载后的文件数。
+static string Fingerprint(string paksPath, int fileCount)
+{
+    var parts = new List<string>();
+    if (Directory.Exists(paksPath))
+        foreach (var file in Directory.EnumerateFiles(paksPath).OrderBy(f => f, StringComparer.Ordinal))
+            parts.Add($"{Path.GetFileName(file)}:{new FileInfo(file).Length}");
+    else if (File.Exists(paksPath))
+        parts.Add($"{Path.GetFileName(paksPath)}:{new FileInfo(paksPath).Length}");
+    parts.Add($"files:{fileCount}");
+    var bytes = System.Text.Encoding.UTF8.GetBytes(string.Join('|', parts));
+    var hash = System.Security.Cryptography.SHA256.HashData(bytes);
+    return Convert.ToHexString(hash)[..12].ToLowerInvariant();
+}
+
+/// 物种名直接当目录名:大多是中文,但个别名字可能带斜杠之类,做一层净化。
+static string SafeName(string name)
+{
+    var invalid = Path.GetInvalidFileNameChars();
+    var safe = new string(name.Select(c => invalid.Contains(c) ? '_' : c).ToArray()).Trim();
+    return safe.Length == 0 ? "pet" : safe;
 }
 
 string Next(ref int i)

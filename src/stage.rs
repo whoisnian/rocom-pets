@@ -561,6 +561,15 @@ impl Stage {
         &self.actor
     }
 
+    /// 换角色(切形态):尺寸与轮廓都变了,重算覆盖区并重新落地。
+    pub fn replace_actor(&mut self, actor: Actor) {
+        self.actor = actor;
+        self.coverage = self.actor.coverage();
+        self.drag_offset = None;
+        self.drag_moved = false;
+        self.reset_position();
+    }
+
     /// 只给测试用:直接改角色状态(比如把困倦顶到阈值,省去等几分钟)。
     #[cfg(test)]
     pub fn actor_mut_for_test(&mut self) -> &mut Actor {
