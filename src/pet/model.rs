@@ -11,6 +11,7 @@ use anyhow::{Context, Result, bail};
 use glam::{Mat4, Quat, Vec3};
 
 use super::anim::Pose;
+use crate::pack::Material as PackMaterial;
 
 /// 顶点布局:位置/法线/UV/关节索引/权重。与 pet.wgsl 的 `@location` 一一对应。
 #[repr(C)]
@@ -122,8 +123,17 @@ pub struct Model {
 }
 
 impl Model {
-    /// `glb_path` 同级的 `tex/` 目录用于找贴图。
+    /// 不带材质表的载入(旧包 / 只给了一个 glb 路径时):贴图退回命名约定猜。
     pub fn load(glb_path: &Path) -> Result<Self> {
+        Self::load_with_materials(glb_path, &HashMap::new())
+    }
+
+    /// `materials` 是 manifest 的 `[forms.materials]`:glb 材质名 → 画什么。
+    /// 空表就退回按贴图命名约定猜(`_By/_Es/_Mh` ↔ `T_*_<槽>_D`),那是旧行为。
+    pub fn load_with_materials(
+        glb_path: &Path,
+        materials_spec: &HashMap<String, PackMaterial>,
+    ) -> Result<Self> {
         let bytes = std::fs::read(glb_path).with_context(|| format!("读不到 {glb_path:?}"))?;
         let (doc, buffers, _images) =
             gltf::import_slice(&bytes).with_context(|| format!("解析 {glb_path:?} 失败"))?;
@@ -195,7 +205,8 @@ impl Model {
         let mut materials: Vec<Material> = Vec::new();
         let mut material_index = HashMap::new();
         let tex_dir = glb_path.parent().unwrap_or(Path::new(".")).join("tex");
-        let decorative_effects = should_drop_effect_layers(&mesh);
+        // 没有材质表时才用几何占比猜特效层(旧包兜底)
+        let guess_effects = materials_spec.is_empty() && should_drop_effect_layers(&mesh);
 
         for primitive in mesh.primitives() {
             let material_name = primitive
@@ -203,9 +214,19 @@ impl Model {
                 .name()
                 .unwrap_or("material")
                 .to_string();
-            if let Some(reason) = effect_drop_reason(&material_name, decorative_effects) {
-                log::debug!("跳过特效层材质 {material_name}({reason})");
-                continue;
+            match materials_spec.get(&material_name) {
+                // 有材质表:**没有基色就是纯特效层**(火焰/水壳/光晕的固有色是 shader 算的,
+                // 材质里根本没有 BaseTex/EyeTex)。这比按几何占比或贴图亮度猜靠谱得多。
+                Some(spec) if spec.base_color.is_none() => {
+                    log::debug!("跳过特效层材质 {material_name}(材质没有基色参数)");
+                    continue;
+                }
+                Some(_) => {}
+                None if guess_effects && is_effect_slot(&material_name) => {
+                    log::debug!("跳过特效层材质 {material_name}(旧包,按几何占比猜)");
+                    continue;
+                }
+                None => {}
             }
             let reader = primitive.reader(get);
             let positions: Vec<[f32; 3]> =
@@ -249,7 +270,14 @@ impl Model {
 
             let name = material_name;
             let material = *material_index.entry(name.clone()).or_insert_with(|| {
-                let base_color = find_base_color(&tex_dir, &name);
+                let base_color = match materials_spec.get(&name) {
+                    // 材质表给了确切的贴图与 alpha 语义,不用再猜
+                    Some(spec) => spec
+                        .base_color
+                        .as_deref()
+                        .and_then(|path| load_texture(path, spec.mask_alpha)),
+                    None => find_base_color(&tex_dir, &name),
+                };
                 materials.push(Material {
                     name: name.clone(),
                     base_color,
@@ -377,31 +405,17 @@ fn is_body_slot(slot: &str) -> bool {
 /// 阈值落在 40% 两边都不敏感。
 const EFFECT_BODY_SHARE: f32 = 0.4;
 
-/// 这个特效层材质要不要丢掉;返回 `Some(原因)` 表示丢。
-///
-/// `_Fx*` 槽有两种用途,按几何占比分:
-///
-/// - **装饰**(占比极低,几个三角的小面片):加色光晕、拖尾。照着不透明画就是几块
-///   凭空浮着的实心片 → 丢。
-/// - **本体**:火花 78%、小鼓象 89%、幽星光三阶 78% 那一身火焰/星光**就是** Fx 层做的,
-///   丢了只剩眼睛和配饰 → 留。
-///
-/// **两类已知渲不好的**(都要等半透/加色材质支持,见 design.md 横向待办;不是这个函数能救的):
-///
-/// - 水蓝蓝那种半透水体:Fx 是内外两层壳(三角数一模一样)+ 一张噪声贴图,靠半透混合出水感。
-///   保留就画成一团噪声,丢掉只剩蝴蝶结和脸。
-/// - 幽星光一阶那种加色发光体:Fx 壳的贴图是**黑底 + 粉色星点**(黑是加色的单位元),
-///   不透明地画就是一坨黑盖住粉本体。
-///   **试过按「贴图接近纯黑」把它丢掉,结果更糟**:那层壳同时也是身体的轮廓,
-///   丢完只剩一个青色光环飘着,连形都没了。黑团至少形是对的,所以宁可留着。
-fn effect_drop_reason(material_name: &str, decorative: bool) -> Option<&'static str> {
-    if !is_effect_slot(material_name) {
-        return None;
-    }
-    decorative.then_some("占比低,当装饰")
-}
-
 /// 特效层是不是「装饰」级别(几何占比低)。
+///
+/// **这是旧包的兜底猜法,新包不走这条。** 新包的 manifest 带 `[forms.materials]`,
+/// 导出器从游戏材质实例里读出「有没有 BaseTex/EyeTex」,没有就是纯特效层——那是确定的事实,
+/// 不用猜。留着这条是为了还能读没有材质表的旧包。
+///
+/// 猜法本身也记一下当时的依据:`_Fx*` 槽的几何占比 <20% 的 59 个、>60% 的 24 个,
+/// 中间很稀,所以按 40% 分「装饰 / 本体」。它对火花(78%,是本体)判对了,
+/// 但对幽星光一阶判错了——那层壳占 79%、按占比该留,可它的贴图是黑底粉星点,
+/// 不透明地画就是一坨黑盖住粉本体。**真相是材质里 `BaseTex` 指的是粉色本体贴图**,
+/// 我把 `NoiseTex` 当成基色了;这类错误只有读材质才能避免。
 fn should_drop_effect_layers(mesh: &gltf::Mesh) -> bool {
     let mut effect = 0usize;
     let mut body = 0usize;
@@ -445,6 +459,34 @@ fn is_effect_slot(material_name: &str) -> bool {
     lower
         .strip_prefix("fx")
         .is_some_and(|rest| rest.chars().all(|c| c.is_ascii_digit()))
+}
+
+/// 按材质表给的路径读基色贴图。
+///
+/// `mask_alpha` 决定 alpha 怎么处理,这是两类贴图的分水岭(见 pet.wgsl 里的说明):
+/// - `true`(眼/嘴的表情图集):alpha 是真遮罩,原样留着让 shader 按阈值剔;
+/// - `false`(本体):alpha 是美术塞的遮罩通道,**刷成不透明**,否则身体会被剔掉。
+fn load_texture(path: &Path, mask_alpha: bool) -> Option<Image> {
+    let img = match image::open(path) {
+        Ok(img) => img,
+        Err(e) => {
+            log::warn!("贴图 {path:?} 读取失败: {e}");
+            return None;
+        }
+    };
+    let rgba = img.to_rgba8();
+    let (width, height) = (rgba.width(), rgba.height());
+    let mut rgba = rgba.into_raw();
+    if !mask_alpha {
+        for pixel in rgba.chunks_exact_mut(4) {
+            pixel[3] = 255;
+        }
+    }
+    Some(Image {
+        width,
+        height,
+        rgba,
+    })
 }
 
 fn load_slot_texture(tex_dir: &Path, slot: &str) -> Option<Image> {

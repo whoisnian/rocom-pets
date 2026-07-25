@@ -46,6 +46,21 @@ struct RawForm {
     locomotion: String,
     #[serde(default)]
     clips: HashMap<String, RawClip>,
+    #[serde(default)]
+    materials: HashMap<String, RawMaterial>,
+}
+
+/// `[forms.materials]` 一条:导出器从游戏材质实例里解出来的「这个槽该画什么」。
+#[derive(Deserialize)]
+struct RawMaterial {
+    /// 基色贴图的包内相对路径。**缺失 = 纯特效层**(火焰/水壳/光晕:材质里没有
+    /// BaseTex/EyeTex,固有色是 shader 算的),运行时整片跳过。
+    #[serde(default)]
+    base_color: Option<String>,
+    /// 贴图 alpha 是不是真遮罩。眼/嘴的表情图集是(不剔就是一块方糊),
+    /// 本体贴图不是(它的 alpha 是美术塞的遮罩通道,拿来剔会把身体啃掉)。
+    #[serde(default)]
+    mask_alpha: bool,
 }
 
 #[derive(Deserialize)]
@@ -70,6 +85,14 @@ pub struct Clip {
     pub speed_cm_s: f32,
 }
 
+/// 一个材质槽该怎么画。由导出器解析游戏材质实例得出,取代原来按贴图命名约定的猜法。
+#[derive(Clone)]
+pub struct Material {
+    /// 基色贴图的绝对路径;None = 纯特效层,不画。
+    pub base_color: Option<PathBuf>,
+    pub mask_alpha: bool,
+}
+
 #[allow(dead_code)]
 #[derive(Clone)]
 pub struct Form {
@@ -83,6 +106,8 @@ pub struct Form {
     pub height_cm: f32,
     pub locomotion: String,
     pub clips: HashMap<String, Clip>,
+    /// glb 里的材质名 → 该画什么。空表示这个包是旧版导的,载入时退回命名约定。
+    pub materials: HashMap<String, Material>,
 }
 
 impl Form {
@@ -194,6 +219,19 @@ impl Pack {
                             Clip {
                                 seconds: clip.ms as f32 / 1000.0,
                                 speed_cm_s: clip.speed_cm_s,
+                            },
+                        )
+                    })
+                    .collect(),
+                materials: form
+                    .materials
+                    .into_iter()
+                    .map(|(name, mat)| {
+                        (
+                            name,
+                            Material {
+                                base_color: mat.base_color.map(|rel| dir.join(rel)),
+                                mask_alpha: mat.mask_alpha,
                             },
                         )
                     })

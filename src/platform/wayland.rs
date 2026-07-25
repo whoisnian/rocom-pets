@@ -430,7 +430,7 @@ impl App {
 
     /// 把 manifest 里的厘米单位换成屏幕像素,算出画布尺寸与脚底位置。
     fn build_pet_actor(&self, form: &Form) -> Result<Actor> {
-        let model = Model::load(&form.model)?;
+        let model = Model::load_with_materials(&form.model, &form.materials)?;
         // 两个包围盒各管一件事:**尺寸**按绑定姿势(站姿高度不能随动作变),
         // **取景**按动作包围盒(否则伸手/张翅/跳跃会被画布裁掉,见 model.rs 的 motion_bounds)
         let stand = model.bounds.1 - model.bounds.0;

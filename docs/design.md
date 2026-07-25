@@ -37,9 +37,9 @@
 | 捕尘长绒的资产家族是 `Wor_MaoTouXiaoZhu2_001`(毛头小蛛)，AI 表里正有「【毛头小蛛】主动清扫」 | §6 的第一个互动样例(珀尔鼬 × 捕尘长绒)有据可依 |
 | 叫声在 `WwiseAudio` 的 `Pet_Vo_*.bnk` + 流式 wem，`PetData.voice` 选组；粗嗓门/婉转声是运行时 Wwise pitch RTPC，wem 本身中性 | 复用 rocom-petvo 的提取管线；变调用播放速率复刻 |
 | CUE4Parse 的 BC7 解码有 R/B 通道对调的上游 bug | 导出贴图时必须换回，参照 rocom-capture 的 `FixBc7ChannelOrder` |
-| `UMaterialInstance.Deserialize` 在该版本抛 OverflowException，贴图槽拿到父材质默认值 | 贴图按命名约定接：材质名后缀 `_By/_Es/_Mh` ↔ `T_<Asset>_<槽>_D` |
-| **alpha 的含义按材质槽分两种**：本体 `_By_D` 的 alpha 是美术塞的遮罩通道(813 张里 160 张通过率 <95%、60 张 <5%:火花 4.8%、迪莫 0.39%；而喵喵恰好全 255，所以这个 bug 藏了很久)，叠加片 `_Es/_Mh` 的贴图则是**带透明背景的表情图集**，那儿的 alpha 是真遮罩 | 载入时**把本体贴图的 alpha 刷成 255**，shader 保留统一的 alpha 测试:本体不再被啃掉，眼/嘴图集照旧剔干净(菊花梨的眼睛、学院呱呱的眼镜靠它)。判据要看「**最终用的哪张贴图**」而非槽名——非本体槽缺图会退用本体贴图，按槽名判会漏掉(火神一身肌肉就这么被剔光过) |
-| **`_Fx*` 材质槽有两种用途**，只能按几何占比区分：装饰(几个三角的加色光晕)vs **本体**(火花 78%、小鼓象 89%、幽星光三阶 78% 的身体就是 Fx 层做的)。122 个形态带 Fx | 运行时按占比取舍：<40% 当装饰丢掉，≥40% 当本体保留 |
+| **材质实例是能正常读的**——「`UMaterialInstance.Deserialize` 抛 OverflowException」这条旧结论**是错的**。实测本作 2792 个宠物材质全部强类型加载成功、参数一条不少。当初大概是把 CUE4Parse 为**别的**资产刷的 OverflowException 日志当成了材质的 | 贴图**不按命名约定猜**,直接读材质的 `TextureParameterValues`:`BaseTex`=本体基色、`EyeTex`=眼/嘴基色,`MaskTex/MainTex/StarStickTex/MatCap/Noise` 是别的通道。参数是继承的,要顺 `Parent` 链合并(子覆盖父) |
+| **alpha 的含义分两种,由基色参数名决定**:`EyeTex`(眼/嘴)的贴图是**带透明背景的表情图集**,alpha 是真遮罩;`BaseTex`(本体)的 alpha 是美术塞的遮罩通道(813 张 `_By_D` 里 160 张通过率 <95%、60 张 <5%) | 导出器把这个区分写进 manifest 的 `mask_alpha`:载入时本体贴图的 alpha 刷成 255、表情图集原样保留,shader 里一个统一的 alpha 测试就够。阈值用材质给的 `OpacityMaskClipValue`,全量实测都是 0.3333 |
+| **「这个材质画不画固有色」看它有没有 `BaseTex`/`EyeTex`**。纯特效层(火焰、水壳、光晕)压根没有:火花的 `Fx` 父材质是 `M_FX_Fire_Mat`、只有 Mask+Noise;水蓝蓝的 `Fx` 父材质是 `M_Wat_ShuiLanLan_PP`、只有一张 MatCap | 这个判据取代了原来按**几何占比**和**贴图亮度**猜的两套启发式。猜法在幽星光一阶上是错的:它的 Fx 壳占 79% 几何、贴图是黑底粉星点,而材质里 `BaseTex` 指的是**粉色本体贴图**,黑星点绑在 `NoiseTex` 上——我把噪声当基色了 |
 | **召唤/落地类动作会整只挪到别处**：喵喵 `CallOut` 起始几帧悬在 y=1.44..2.47m(其余动作都在 0..1.0)，单帧形体只有 1.19 倍，但并集一下取景盒高度就从 0.8m 撑到 2.48m | 量取景盒时丢掉「中心偏离绑定中心超过一个身高」的姿势。阈值不能太紧:**悬浮类宠物**是正常的(空空颅幽灵的 `Alert` 常态浮在 45–56%)，而落地是 160–197%，中间很宽 |
 | CUE4Parse 把空 morph target 写成**没有 bufferView 的 accessor**;按 glTF 规范那等价「全零」是合法的，但 Rust `gltf` crate 判 `Missing data` 直接拒绝加载。826 个形态里 32 个带 morph target 且**全部**加载失败 | 导出器 `ExportMorphTargets = false`——我们从不驱动它们(既无 morph 通道也无 `mesh.weights`) |
 | 伸展/张翅/小跳的姿势明显超出**绑定姿势**包围盒：120 个抽样形态 × 四个动作各查一次，按绑定盒取景 11 个会裁掉肢体 | 取景用各动作采样的并集包围盒(`Model::motion_bounds`)→ 剩 1 个被裁，代价是画布面积平均 1.64 倍；尺寸换算仍用绑定盒(站姿高度不能随动作变)。采样时剥的位移要**和运行时一模一样**(只剥 root 的 X/Z、保留 Y)，否则带纵向起伏的动作会顶出画布 |
@@ -179,6 +179,12 @@ tags      = []        # 互动能力标签，如 ["cleaner"]/["commander"]
   shock  = { clip = "Common_Shock", ms = 1500 }
   sleep  = { start = "Common_Sleep_Start", loop = "Common_Sleep_Loop", end = "Common_Sleep_End" }
   callout= { clip = "Common_Show",  ms = 1500, voice = "callout" }
+
+  [forms.materials]          # 从游戏材质实例解出来的「这个槽画什么」,见 §1
+  # base_color 缺失 = 纯特效层(材质里没有 BaseTex/EyeTex),运行时整片跳过;
+  # 这类条目额外记下父链与全部贴图参数,留给将来的特效通道用。
+  MI_Gra_Miaomiao1_001_By = { base_color = "forms/…/tex/T_…_By_D.png", mask_alpha = false, mask_clip = 0.3333, blend = "BLEND_Opaque" }
+  MI_Gra_Miaomiao1_001_Es = { base_color = "forms/…/tex/T_…_Es_D.png", mask_alpha = true,  mask_clip = 0.3333, blend = "BLEND_Opaque" }
 
 [report]              # 导出覆盖率,缺失动作让运行时降级而不是报错
 missing_clips = ["hide"]
@@ -489,8 +495,8 @@ N 只宠物的性能与内存实测、Windows 安装包 / Linux AppImage。
 
 | 事项 | 为什么 | 代价 |
 | --- | --- | --- |
-| **材质实例参数解析** | 890 个资产里 352 个至少缺一张槽贴图，眼睛等现在退用本体贴图——**是权宜之计不是正确解**，每张截图都看得见。目前保真度性价比最高的一项 | 未知：要先弄清 §1 那个 `OverflowException` 的成因 |
-| **半透 / 加色材质** | 两类都靠它:① 水蓝蓝那种**半透水体**(Fx 是内外两层壳 + 噪声贴图，靠半透混合出水感)；② 幽星光一阶那种**加色发光体**(Fx 壳贴图是黑底粉星点，黑是加色的单位元，不透明地画就是一坨黑盖住粉本体)。拿实机截图逐只比过，这两只是唯一明显不像的。试过按「贴图接近纯黑」把加色壳丢掉，**结果更糟**——那层壳同时就是身体轮廓，丢完只剩一个青色光环飘着；黑团至少形是对的，所以宁可留着 | 中：要加半透/加色管线与排序，且依赖上面那条解出混合模式 |
+| ~~材质实例参数解析~~ **已完成** | 见 §1:材质能正常读,贴图改按 `TextureParameterValues` 接。全量 2043 个材质槽里修正了 **258 个**(246 个原来猜不到→退用本体色、12 个猜错)。幽星光一阶从「一坨黑」变成正确的粉色;水蓝蓝一族不再是噪声 | 已做 |
+| **特效层通道(火焰/水壳/光晕)** | 现在纯特效层被整片跳过——它们的材质里没有 `BaseTex`,固有色是 shader 算的。加回来需要一个半透/加色通道 + 排序:火焰是 `M_FX_Fire_Mat`(Mask+Noise 卷动 + 加色)、水壳是 `M_Wat_ShuiLanLan_PP`(MatCap + 菲涅尔 + 半透)、光晕是 `NoiseTex` 叠加。**调研已经做完**:导出器把这些材质的父链与全部贴图参数都写进了 manifest,实现时照着补导贴图即可,不用再翻材质。影响 122 个形态(约 15%) | 中:一个半透 pass + 按父材质族各写一个近似公式 |
 | 直接读 `.rkpet`(zip) | 导出器已能打 zip，运行时只读解开的目录；分发前必须补，也是体积优化的前提 | 中：资产访问要先抽一层 |
 | 贴图 KTX2 + 关键帧精简 | 全量 3.0GB，单形态 2.1–5.0MB 里动画通道占大头 | 中 |
 | 64 个零动作形态 | 同族里也找不到带动画的资产，属素材本身不全；可能得放弃或用同阶段近亲代播 | 小(调查)，修不一定可行 |

@@ -64,6 +64,7 @@ var all = false;
 var limit = int.MaxValue;
 var skipExisting = false;
 var jobs = Environment.ProcessorCount;
+var probeAsset = (string?)null;
 
 for (var i = 0; i < args.Length; i++)
 {
@@ -84,13 +85,14 @@ for (var i = 0; i < args.Length; i++)
         case "--skip-existing": skipExisting = true; break;
         case "-j": jobs = Math.Max(1, int.Parse(Next(ref i))); break;
         case "--zip": zip = true; break;
+        case "--probe-material": probeAsset = Next(ref i); break;
         case "-h" or "--help": Console.WriteLine(usage); return 0;
         default:
             Console.Error.WriteLine($"未知参数: {args[i]}\n{usage}");
             return 1;
     }
 }
-if (species.Count == 0 && !all)
+if (species.Count == 0 && !all && probeAsset is null)
 {
     Console.Error.WriteLine($"缺 --species(或 --all)\n{usage}");
     return 1;
@@ -130,6 +132,12 @@ if (provider.Files.Count == 0)
     return 1;
 }
 Console.WriteLine($"挂载 {provider.MountedVfs.Count} 个包,{provider.Files.Count} 个文件");
+
+if (probeAsset is not null)
+{
+    MaterialProbe.Run(provider, probeAsset);
+    return 0;
+}
 
 // 源指纹:同一版本的 pak 组合应当稳定,换版本就会变。写进 manifest 便于日后排查
 // 「这个包是哪个版本导的」。用 pak 文件名+长度的哈希,不去读内容(那要几十秒)。
@@ -416,10 +424,32 @@ FormReport ExportForm(
     var formDir = Path.Combine(packDir, "forms", form.Asset);
     Directory.CreateDirectory(formDir);
     File.WriteAllBytes(Path.Combine(formDir, "model.glb"), glb);
-    var textures = Textures.Export(fileProvider, assetDir, Path.Combine(formDir, "tex"), warnings);
+    var texDir = Path.Combine(formDir, "tex");
+    var textures = Textures.Export(fileProvider, assetDir, texDir, warnings);
+
+    // 材质:哪个槽画哪张贴图、alpha 该不该当遮罩剔。这一步取代原来的命名约定猜法
+    // (实测全量 2043 个槽里 258 个猜错或猜不到,详见 docs/design.md §1)。
+    var materials = new List<MaterialEntry>();
+    foreach (var (name, info) in Materials.Load(fileProvider, assetDir, warnings))
+    {
+        // 游戏自带的描边材质我们不用(自己按法线外扩画描边)
+        if (name.EndsWith("_Ol", StringComparison.OrdinalIgnoreCase)) continue;
+        string? baseColor = null;
+        if (info.BaseColorTexture is { } objectPath)
+        {
+            // 基色贴图可能不在本资产的 Tex/ 下(共享图集/别的槽的贴图),那就补导一份
+            var file = Textures.ExportByObjectPath(fileProvider, objectPath, texDir, textures, warnings);
+            // 路径写成**包内相对**(和上面的 model 字段一致),运行时是拿包目录去 join 的;
+            // 注意别跟 [forms.textures] 那节的 form 内相对路径搞混
+            if (file is not null) baseColor = $"forms/{form.Asset}/tex/{file}";
+            else warnings.Add($"材质 {name} 的基色贴图导不出来: {objectPath}");
+        }
+        materials.Add(new MaterialEntry(name, baseColor, info.IsFacePatch,
+            info.OpacityMaskClipValue, info.BlendMode.ToString(), info.ParentChain, info.Textures));
+    }
 
     var bounds = mesh.ImportedBounds;
-    return new FormReport(form, written, textures, glb.Length, bounds.BoxExtent.Z * 2f, warnings);
+    return new FormReport(form, written, textures, materials, glb.Length, bounds.BoxExtent.Z * 2f, warnings);
 }
 
 // "World_Idle" → "idle";"Common_Sleep_Loop" → "sleeploop";逻辑名 "SleepLoop" → "sleeploop"

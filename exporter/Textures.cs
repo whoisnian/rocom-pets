@@ -52,6 +52,42 @@ public static class Textures
         return result;
     }
 
+    /// 按资产对象路径导一张贴图(材质参数给的就是这种路径)。已经导过就直接返回文件名。
+    /// 用于基色贴图不在本资产 `Tex/` 下的情况:共享图集,或槽名与贴图名对不上。
+    /// 返回文件名(不含目录),失败返回 null。
+    public static string? ExportByObjectPath(
+        AbstractVfsFileProvider provider,
+        string objectPath,
+        string outDir,
+        List<TextureFile> exported,
+        List<string> warnings)
+    {
+        // 对象路径形如 `路径/T_Xxx.T_Xxx`,取包路径部分
+        var packagePath = objectPath.Contains('.') ? objectPath[..objectPath.LastIndexOf('.')] : objectPath;
+        var name = Path.GetFileNameWithoutExtension(packagePath);
+        var already = exported.FirstOrDefault(t => t.Name.Equals(name, StringComparison.OrdinalIgnoreCase));
+        if (already is not null) return Path.GetFileName(already.RelativePath);
+
+        try
+        {
+            var texture = provider.LoadPackageObject<UTexture>(packagePath);
+            var decoded = texture.Decode()
+                          ?? throw new InvalidOperationException($"解码返回空({texture.Format})");
+            FixBc7ChannelOrder(texture, decoded);
+            Directory.CreateDirectory(outDir);
+            var png = decoded.Encode(ETextureFormat.Png, false, out _);
+            File.WriteAllBytes(Path.Combine(outDir, name + ".png"), png);
+            var (slot, kind) = Classify(name);
+            exported.Add(new TextureFile(name, $"tex/{name}.png", decoded.Width, decoded.Height, slot, kind));
+            return name + ".png";
+        }
+        catch (Exception e)
+        {
+            warnings.Add($"贴图 {name} 补导失败: {e.Message}");
+            return null;
+        }
+    }
+
     /// 只取目录直属文件(跳过 CG/ 之类子目录里的另一套资产)。
     public static IEnumerable<string> TopLevelFiles(AbstractVfsFileProvider provider, string dir)
     {

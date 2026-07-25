@@ -35,7 +35,12 @@ pub struct Request {
 
 pub fn render(request: &Request) -> Result<()> {
     let glb = locate_glb(&request.pack, request.form.as_deref())?;
-    let model = Model::load(&glb)?;
+    // 有 manifest 就按材质表载入(贴图与 alpha 语义都由它定),否则退回命名约定。
+    // 调试渲图必须走同一条路径,否则「渲出来对不对」验的不是运行时的行为。
+    let model = match load_materials(&request.pack, &glb) {
+        Some(spec) => Model::load_with_materials(&glb, &spec)?,
+        None => Model::load(&glb)?,
+    };
     log::info!(
         "{}: {} 顶点 / {} 三角 / {} 关节 / {} 段动作",
         glb.display(),
@@ -404,6 +409,23 @@ fn write_sheet(out: &Path, size: u32, tiles: &[(String, Vec<u8>)]) -> Result<()>
 }
 
 /// 从包目录里定位形态的 glb(也接受直接给 .glb)。
+/// 从包的 manifest 里取这个形态的材质表。给的是裸 glb、或包没有材质表时返回 None。
+fn load_materials(
+    pack: &Path,
+    glb: &Path,
+) -> Option<std::collections::HashMap<String, crate::pack::Material>> {
+    let dir = if pack.extension().is_some_and(|e| e == "glb") {
+        // 裸 glb:往上两级找包目录(forms/<资产>/model.glb)
+        pack.parent()?.parent()?.parent()?
+    } else {
+        pack
+    };
+    let loaded = crate::pack::Pack::load(dir).ok()?;
+    let asset = glb.parent()?.file_name()?.to_str()?;
+    let form = loaded.forms.iter().find(|f| f.asset == asset)?;
+    (!form.materials.is_empty()).then(|| form.materials.clone())
+}
+
 fn locate_glb(pack: &Path, form: Option<&str>) -> Result<PathBuf> {
     if pack.extension().is_some_and(|e| e == "glb") {
         return Ok(pack.to_path_buf());

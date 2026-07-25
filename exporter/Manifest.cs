@@ -8,10 +8,26 @@ using System.Text;
 
 namespace RocomPets.Export;
 
+/// 一个材质槽写进 manifest 的内容:运行时按 glb 里的材质名查这张表。
+public record MaterialEntry(
+    string Name,
+    /// 基色贴图在包内的相对路径;null = 这个材质不画固有色(纯 VFX),运行时目前整片跳过。
+    string? BaseColor,
+    /// 贴图 alpha 是不是真遮罩(眼/嘴的表情图集是,本体贴图不是)。
+    bool MaskAlpha,
+    float MaskClip,
+    string Blend,
+    /// 父链(由近及远),排查用;也是「这是哪一族特效」的线索(如 M_FX_Fire_Mat)。
+    List<string> ParentChain,
+    /// 全部贴图参数 → 资产对象路径。基色之外的(Noise/Mask/MatCap/StarStickTex…)现在不导文件,
+    /// 但**记下来**:将来做半透/加色通道时照着这里补导即可,不必重新调研材质。
+    Dictionary<string, string> AllTextures);
+
 public record FormReport(
     Form Form,
     List<ClipResult> Clips,
     List<TextureFile> Textures,
+    List<MaterialEntry> Materials,
     int GlbBytes,
     float HeightCm,
     List<string> Warnings);
@@ -81,6 +97,25 @@ public static class Manifest
                         $"  {ClipKey(tex.Name)} = {{ path = {Quote(tex.RelativePath)}, " +
                         $"slot = {Quote(tex.Slot)}, kind = {Quote(tex.Kind)}, " +
                         $"size = [{tex.Width}, {tex.Height}] }}");
+            }
+
+            if (report.Materials.Count > 0)
+            {
+                sb.AppendLine();
+                sb.AppendLine("  [forms.materials]   # glb 里的材质名 → 该画什么。base_color 缺失 = 纯特效层");
+                foreach (var mat in report.Materials)
+                {
+                    var baseColor = mat.BaseColor is null ? "" : $"base_color = {Quote(mat.BaseColor)}, ";
+                    var extra = mat.BaseColor is null
+                        // 特效层:记下父链与全部贴图参数,留给将来的半透/加色通道
+                        ? $", parents = [{string.Join(", ", mat.ParentChain.Select(Quote))}]" +
+                          $", textures = {{ {string.Join(", ", mat.AllTextures.OrderBy(kv => kv.Key)
+                              .Select(kv => $"{ClipKey(kv.Key)} = {Quote(kv.Value)}"))} }}"
+                        : "";
+                    sb.AppendLine(
+                        $"  {ClipKey(mat.Name)} = {{ {baseColor}mask_alpha = {(mat.MaskAlpha ? "true" : "false")}, " +
+                        $"mask_clip = {Num(mat.MaskClip)}, blend = {Quote(mat.Blend)}{extra} }}");
+                }
             }
 
             if (report.Warnings.Count > 0)
