@@ -13,6 +13,9 @@ use crate::pet::{Model, PetGpu, Player, gpu::DEPTH_FORMAT, orthographic_view};
 
 /// 输出纹理格式:和 stage 表面一致(非 sRGB,预乘 alpha)。
 const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
+/// 取景余量。包围盒已经含了各动作的伸展(`Model::motion_bounds`),这里只需给描边与
+/// 边缘光留一点点边;与平台层的 `CANVAS_PADDING` 保持一致。
+const RENDER_PADDING: f32 = 1.15;
 
 pub struct Request {
     pub pack: PathBuf,
@@ -109,7 +112,11 @@ pub fn render(request: &Request) -> Result<()> {
         mapped_at_creation: false,
     });
 
-    let view_proj = orthographic_view(model.bounds, request.yaw_degrees.to_radians(), 1.35);
+    let view_proj = orthographic_view(
+        model.motion_bounds,
+        request.yaw_degrees.to_radians(),
+        RENDER_PADDING,
+    );
     // 光从左前上方来,和桌面场景里「屏幕外有光源」的直觉一致
     let light_dir = Vec3::new(-0.4, 0.8, 0.6);
     // 描边宽度按模型尺寸走,免得大小形态粗细不一
@@ -223,7 +230,7 @@ fn benchmark(
 ) {
     let clip = 0;
     let mut player = Player::new(model, clip);
-    let view_proj = orthographic_view(model.bounds, 0.0, 1.35);
+    let view_proj = orthographic_view(model.motion_bounds, 0.0, RENDER_PADDING);
     let light = Vec3::new(-0.4, 0.8, 0.6);
     let start = std::time::Instant::now();
     for _ in 0..frames {

@@ -70,8 +70,9 @@ use super::Options;
 /// 定时器的起始间隔;之后每次由 `Stage::tick_interval` 按状态决定(待机降频)。
 const TICK_HZ: f32 = 30.0;
 
-/// 离屏画布相对宠物身高留的余量:跳跃/伸展类动作会超出绑定姿势包围盒。
-const CANVAS_PADDING: f32 = 1.35;
+/// 离屏画布的取景余量。伸展类动作已经算进 `Model::motion_bounds` 了,
+/// 这里只需给描边外扩与边缘光留一点边。
+const CANVAS_PADDING: f32 = 1.15;
 
 /// 鼠标左键(linux input event code)。
 const BTN_LEFT: u32 = 0x110;
@@ -430,16 +431,26 @@ impl App {
     /// 把 manifest 里的厘米单位换成屏幕像素,算出画布尺寸与脚底位置。
     fn build_pet_actor(&self, form: &Form) -> Result<Actor> {
         let model = Model::load(&form.model)?;
-        let extent = model.bounds.1 - model.bounds.0;
+        // 两个包围盒各管一件事:**尺寸**按绑定姿势(站姿高度不能随动作变),
+        // **取景**按动作包围盒(否则伸手/张翅/跳跃会被画布裁掉,见 model.rs 的 motion_bounds)
+        let stand = model.bounds.1 - model.bounds.0;
+        let (frame_min, frame_max) = model.motion_bounds;
+        let frame_extent = frame_max - frame_min;
+        let frame_center = (frame_min + frame_max) * 0.5;
         let height_px = form.height_cm * form.scale * self.px_per_cm;
-        // 画布是方的(取景按包围盒最长边),边长 = 身高像素 × 余量 × (最长边/身高)
-        let longest = extent.x.max(extent.y).max(extent.z).max(1e-4);
-        let side = (height_px * CANVAS_PADDING * longest / extent.y.max(1e-4))
+        // 画布是方的,取景按动作包围盒最长边;正交框半径 = 最长边/2 × 余量
+        let longest = frame_extent
+            .x
+            .max(frame_extent.y)
+            .max(frame_extent.z)
+            .max(1e-4);
+        let radius = longest * 0.5 * CANVAS_PADDING;
+        // 画布边长 = 正交框的 2×半径(米),按「站姿高 ↔ height_px」的比例换成像素
+        let side = (height_px * 2.0 * radius / stand.y.max(1e-4))
             .round()
             .max(16.0);
-        // 脚底在画布里的位置:正交框半径 = 最长边/2 × 余量,包围盒下沿的 NDC 是 -(高/2)/半径
-        let radius = longest * 0.5 * CANVAS_PADDING;
-        let ndc_bottom = -(extent.y * 0.5) / radius;
+        // 脚底 = 绑定姿势下沿在正交框里的 NDC 位置(框心是动作包围盒中心,不一定等于站姿中心)
+        let ndc_bottom = (model.bounds.0.y - frame_center.y) / radius;
         let foot_offset = (1.0 - ndc_bottom) * 0.5 * side;
 
         // 走路速度优先用动画自带位移反推的值(见 spike-s3.md),没有就给个常速
@@ -709,12 +720,13 @@ impl App {
                 // 画布重建了,合成用的四边形绑的是旧纹理,要重绑
                 surfaces.quad = gpu.create_quad(surfaces.canvas.view());
             }
-            let bounds = pet.model.bounds;
-            let extent = bounds.1 - bounds.0;
+            // 取景用动作包围盒(与 build_pet_actor 的画布尺寸算法必须一致),
+            // 描边宽度用绑定姿势的尺度:免得动作一伸展描边就跟着变粗
+            let extent = pet.model.bounds.1 - pet.model.bounds.0;
             let outline = extent.length() * 0.004;
             surfaces.gpu.update(
                 &gpu.queue,
-                view_proj(bounds, pet.yaw, CANVAS_PADDING),
+                view_proj(pet.model.motion_bounds, pet.yaw, CANVAS_PADDING),
                 Vec3::new(-0.4, 0.8, 0.6),
                 outline,
                 &pet.player.matrices,

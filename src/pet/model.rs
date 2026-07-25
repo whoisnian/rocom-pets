@@ -10,6 +10,8 @@ use std::path::Path;
 use anyhow::{Context, Result, bail};
 use glam::{Mat4, Quat, Vec3};
 
+use super::anim::Pose;
+
 /// 顶点布局:位置/法线/UV/关节索引/权重。与 pet.wgsl 的 `@location` 一一对应。
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -109,8 +111,13 @@ pub struct Model {
     pub materials: Vec<Material>,
     pub skeleton: Skeleton,
     pub clips: Vec<Clip>,
-    /// 绑定姿势的包围盒(米),用来摆相机与换算屏幕尺寸。
+    /// 绑定姿势的包围盒(米)。**只用来换算屏幕尺寸**(`height_cm` 对应的就是这个高度),
+    /// 站姿高度必须稳定,不能跟着动作变。
     pub bounds: (Vec3, Vec3),
+    /// 把所有动作都采样一遍取到的包围盒,`bounds` 的超集。**画布与相机取景用这个**:
+    /// 伸手、张翅、跳跃的姿势会明显超出绑定姿势,只按 `bounds` 取景会把肢体裁掉
+    /// (实测 120 个抽样形态里 11 个被裁,阿米亚特/波波拉肉眼可见)。
+    pub motion_bounds: (Vec3, Vec3),
 }
 
 impl Model {
@@ -187,8 +194,18 @@ impl Model {
         let mut materials: Vec<Material> = Vec::new();
         let mut material_index = HashMap::new();
         let tex_dir = glb_path.parent().unwrap_or(Path::new(".")).join("tex");
+        let drop_effects = should_drop_effect_layers(&mesh);
 
         for primitive in mesh.primitives() {
+            let material_name = primitive
+                .material()
+                .name()
+                .unwrap_or("material")
+                .to_string();
+            if drop_effects && is_effect_slot(&material_name) {
+                log::debug!("跳过特效层材质 {material_name}");
+                continue;
+            }
             let reader = primitive.reader(get);
             let positions: Vec<[f32; 3]> =
                 reader.read_positions().context("缺 POSITION")?.collect();
@@ -229,11 +246,7 @@ impl Model {
             let index_count = prim_indices.len() as u32;
             indices.extend(prim_indices);
 
-            let name = primitive
-                .material()
-                .name()
-                .unwrap_or("material")
-                .to_string();
+            let name = material_name;
             let material = *material_index.entry(name.clone()).or_insert_with(|| {
                 let base_color = find_base_color(&tex_dir, &name);
                 materials.push(Material {
@@ -297,6 +310,7 @@ impl Model {
         }
 
         let bounds = bind_pose_bounds(&vertices, &skeleton);
+        let motion_bounds = animated_bounds(&vertices, &skeleton, &clips, bounds);
         Ok(Self {
             vertices,
             indices,
@@ -305,6 +319,7 @@ impl Model {
             skeleton,
             clips,
             bounds,
+            motion_bounds,
         })
     }
 
@@ -331,6 +346,68 @@ fn find_base_color(tex_dir: &Path, material_name: &str) -> Option<Image> {
         }
         fallback
     })
+}
+
+/// `_Fx*` 槽占三角面的比例低于这个值就当装饰层丢掉,高于则当本体保留。
+/// 全量统计:122 个带 Fx 的形态里,占比 <20% 的 59 个、>60% 的 24 个,中间空得很稀,
+/// 阈值落在 40% 两边都不敏感。
+const EFFECT_BODY_SHARE: f32 = 0.4;
+
+/// 要不要丢掉这个形态的特效层。
+///
+/// `_Fx*` 槽有**两种完全不同的用途**,只能按几何占比区分:
+///
+/// - **装饰**(占比极低,几个三角的小面片):加色光晕、拖尾。靠游戏自研 shader 的加色/
+///   半透混合才成立,我们只有不透明 toon 着色,照画就是几块凭空浮着的实心片 → 丢掉。
+/// - **本体**(占比过半):火花 79%、幽星光 92%、小鼓象 91% —— 火焰/星光那一身就是 Fx 层做的,
+///   丢了整只宠物只剩眼睛和配饰 → 必须留。
+///
+/// **已知渲不好的一类**:水蓝蓝这种半透水体,Fx 是内外两层壳(三角数一模一样)+ 一张噪声贴图,
+/// 靠半透混合出水感。占比 79% 走「保留」分支,于是画成一团噪声;要正确得先支持半透材质,
+/// 依赖材质实例参数解析(见 design.md 横向待办)。丢掉又会让它只剩蝴蝶结和脸,两头都不对。
+fn should_drop_effect_layers(mesh: &gltf::Mesh) -> bool {
+    let mut effect = 0usize;
+    let mut body = 0usize;
+    for primitive in mesh.primitives() {
+        let name = primitive.material().name().unwrap_or("");
+        // 顶点数就够比例判断,不必真去读索引
+        let count = primitive
+            .get(&gltf::Semantic::Positions)
+            .map_or(0, |a| a.count());
+        if is_effect_slot(name) {
+            effect += count;
+        } else {
+            body += count;
+        }
+    }
+    if effect == 0 {
+        return false;
+    }
+    let share = effect as f32 / (effect + body) as f32;
+    let drop = share < EFFECT_BODY_SHARE;
+    log::debug!(
+        "特效层占顶点 {:.0}% → {}",
+        share * 100.0,
+        if drop {
+            "当装饰丢掉"
+        } else {
+            "当本体保留"
+        }
+    );
+    drop
+}
+
+/// 材质槽是不是特效层(`MI_<资产>_Fx` / `_Fx1` / `_FX2` …)。
+/// 只认 `Fx` 打头加可选数字;`Dynamic\d` 不算——那是身上会动的部件(布料/尾饰),
+/// 属于宠物本体,实测渲出来是对的。
+fn is_effect_slot(material_name: &str) -> bool {
+    let Some(slot) = material_name.rsplit('_').next() else {
+        return false;
+    };
+    let lower = slot.to_ascii_lowercase();
+    lower
+        .strip_prefix("fx")
+        .is_some_and(|rest| rest.chars().all(|c| c.is_ascii_digit()))
 }
 
 fn load_slot_texture(tex_dir: &Path, slot: &str) -> Option<Image> {
@@ -392,6 +469,52 @@ fn topological_order(parents: &[i32]) -> Vec<usize> {
     order
 }
 
+/// 每段动作采样几个时刻算包围盒。取 5 个:首尾加中间三点,够抓住伸展最大的那一帧,
+/// 又不至于让载入变慢(最大的模型 1.2 万顶点 × 16 段 × 5 次 ≈ 100 万次蒙皮,实测几毫秒)。
+const BOUNDS_SAMPLES: usize = 5;
+
+/// 把每段动作采样几帧、CPU 蒙皮一遍,取所有姿势的包围盒并集(含绑定姿势兜底)。
+///
+/// 水平位移按 `Player` 的规则剥掉(见 `anim.rs` 的 `strip_root_motion`):走跑动作的
+/// root 位移由程序推进屏幕坐标,若算进包围盒会把画布撑到几米宽。
+fn animated_bounds(
+    vertices: &[Vertex],
+    skeleton: &Skeleton,
+    clips: &[Clip],
+    bind: (Vec3, Vec3),
+) -> (Vec3, Vec3) {
+    let (mut min, mut max) = bind;
+    if vertices.is_empty() {
+        return (min, max);
+    }
+    let mut pose = Pose::bind(skeleton);
+    let mut matrices = Vec::new();
+    let root_bind = skeleton.bind[skeleton.root_joint].translation;
+    for clip in clips {
+        for step in 0..BOUNDS_SAMPLES {
+            let time = clip.duration * step as f32 / (BOUNDS_SAMPLES - 1).max(1) as f32;
+            pose.sample(skeleton, clip, time);
+            let local = &mut pose.locals[skeleton.root_joint];
+            local.translation.x = root_bind.x;
+            local.translation.z = root_bind.z;
+            pose.joint_matrices(skeleton, &mut matrices);
+            for v in vertices {
+                let mut skin = Mat4::ZERO;
+                for i in 0..4 {
+                    let w = v.weights[i];
+                    if w > 0.0 {
+                        skin += matrices[v.joints[i] as usize] * w;
+                    }
+                }
+                let p = skin.transform_point3(Vec3::from(v.pos));
+                min = min.min(p);
+                max = max.max(p);
+            }
+        }
+    }
+    (min, max)
+}
+
 /// 绑定姿势下的顶点包围盒(蒙皮矩阵在绑定姿势是单位矩阵,直接取顶点即可)。
 fn bind_pose_bounds(vertices: &[Vertex], _skeleton: &Skeleton) -> (Vec3, Vec3) {
     let mut min = Vec3::splat(f32::INFINITY);
@@ -433,6 +556,8 @@ impl Model {
             skeleton,
             clips,
             bounds: (Vec3::new(-0.5, 0.0, -0.5), Vec3::new(0.5, 1.0, 0.5)),
+            // 合成模型没有顶点,动作包围盒就等于绑定姿势
+            motion_bounds: (Vec3::new(-0.5, 0.0, -0.5), Vec3::new(0.5, 1.0, 0.5)),
         }
     }
 }
