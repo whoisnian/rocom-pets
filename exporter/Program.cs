@@ -34,6 +34,8 @@ const string usage = """
       --all             导出全部宠物(按进化链去重);与 --species 二选一
       --limit <n>       配合 --all:只导前 n 条链(试跑用)
       --skip-existing   跳过已经有 manifest.toml 的包(增量重跑)
+      -j <n>            并行度(默认 CPU 核数;每个并行任务会同时持有一个形态的数据,
+                        内存吃紧就调小)
       --zip             额外打成 <链名>.rkpet
       -h, --help        本帮助
 
@@ -61,6 +63,7 @@ var zip = false;
 var all = false;
 var limit = int.MaxValue;
 var skipExisting = false;
+var jobs = Environment.ProcessorCount;
 
 for (var i = 0; i < args.Length; i++)
 {
@@ -79,6 +82,7 @@ for (var i = 0; i < args.Length; i++)
         case "--all": all = true; break;
         case "--limit": limit = int.Parse(Next(ref i)); break;
         case "--skip-existing": skipExisting = true; break;
+        case "-j": jobs = Math.Max(1, int.Parse(Next(ref i))); break;
         case "--zip": zip = true; break;
         case "-h" or "--help": Console.WriteLine(usage); return 0;
         default:
@@ -156,7 +160,7 @@ foreach (var petId in all ? config.AllPetIds() : species)
     }
     if (!seenChains.Add(chain.RootId)) continue;
     // 先按「已导出」过滤再计 limit:否则 --limit 永远只覆盖前 n 条链,分批续跑推不动
-    if (skipExisting && File.Exists(Path.Combine(outDir, SafeName(chain.Name), "manifest.toml")))
+    if (skipExisting && ChainAlreadyExported(outDir, chain))
     {
         skipped++;
         continue;
@@ -164,7 +168,7 @@ foreach (var petId in all ? config.AllPetIds() : species)
     targets.Add(chain);
     if (targets.Count >= limit) break;
 }
-Console.WriteLine($"待导 {targets.Count} 条进化链,{targets.Sum(c => c.Forms.Count)} 个形态" +
+Console.WriteLine($"待导 {targets.Count} 条进化链,{targets.Sum(c => c.Forms.Count)} 个形态,并行度 {jobs}" +
                   (chainErrors.Count > 0 ? $"({chainErrors.Count} 条归链失败)" : ""));
 
 var report = new StringBuilder();
@@ -178,82 +182,43 @@ var formSkipped = 0;
 var chainSkipped = 0;
 var totalBytes = 0L;
 var stopwatch = System.Diagnostics.Stopwatch.StartNew();
-foreach (var chain in targets)
+// 并行导出:每条链一个任务。链之间没有共享可变状态(各写自己的包目录),
+// provider 的并行读在 rocom-capture 的解包脚本里已经压过(16 线程),这里同样只读。
+// 控制台与报告文本先按链攒着,跑完按原顺序合并 —— 并行下直接打印会交错到没法看。
+// 同名物种不少(实测「棋契陛下」有 10 条链、72 个名字重复),直接拿名字当目录会互相覆盖,
+// 并行下甚至可能两条链交错写同一个目录。重名的追加链首 id。
+var nameCounts = targets.GroupBy(c => SafeName(c.Name))
+    .ToDictionary(g => g.Key, g => g.Count());
+var packDirName = new Func<Chain, string>(chain =>
 {
-    try
-    {
-        var packDir = Path.Combine(outDir, SafeName(chain.Name));
-        Console.WriteLine($"\n=== {chain.Name}(链首 {chain.RootId},{chain.Forms.Count} 个形态)");
-        var forms = new List<FormReport>();
+    var name = SafeName(chain.Name);
+    return nameCounts.TryGetValue(name, out var n) && n > 1 ? $"{name}-{chain.RootId}" : name;
+});
+var duplicated = nameCounts.Count(kv => kv.Value > 1);
+if (duplicated > 0)
+    Console.WriteLine($"{duplicated} 个物种名被多条链共用,这些包目录会带链首 id 后缀");
 
-        foreach (var form in chain.Forms)
-        {
-            // 一个形态缺资产(有些进化阶段这版本根本没做)不该拖垮整条链
-            FormReport formReport;
-            try
-            {
-                formReport = ExportForm(provider, form, packDir, lodIndex, allClips ? null : defaultClips);
-            }
-            catch (Exception e)
-            {
-                Console.WriteLine($"  {form.Name}({form.Asset}): 跳过 — {e.Message}");
-                report.AppendLine($"  {form.Name}({form.Asset}) stage {form.Stage}: 跳过 — {e.Message}");
-                formSkipped++;
-                continue;
-            }
-            forms.Add(formReport);
-            Console.WriteLine(
-                $"  {form.Name}(id {form.Id} stage {form.Stage} {form.Asset}): " +
-                $"{formReport.Clips.Count}/{form.Clips.Count} 个动作,glb {formReport.GlbBytes / 1024}KB," +
-                $"{formReport.Textures.Count} 张贴图");
-            foreach (var warning in formReport.Warnings) Console.WriteLine($"    [warn] {warning}");
-        }
+var results = new ChainResult[targets.Count];
+var completed = 0;
+Parallel.For(0, targets.Count, new ParallelOptions { MaxDegreeOfParallelism = jobs }, index =>
+{
+    var result = ExportChain(targets[index]);
+    results[index] = result;
+    // 进度只打一行,详细内容留给最后按序输出
+    var done = Interlocked.Increment(ref completed);
+    Console.WriteLine($"[{done}/{targets.Count}] {targets[index].Name}{result.Summary}");
+});
 
-        report.AppendLine();
-        report.AppendLine($"## {chain.Name}(链首 {chain.RootId})");
-        foreach (var form in forms)
-        {
-            var got = form.Clips.Select(c => c.Logical).ToHashSet();
-            var wanted = (allClips ? form.Form.Clips.Select(c => c.Logical) : defaultClips)
-                .Distinct().ToList();
-            var missing = wanted.Where(w => !got.Contains(w)).ToList();
-            report.AppendLine(
-                $"  {form.Form.Name}({form.Form.Asset}) stage {form.Form.Stage}: " +
-                $"动作 {form.Clips.Count}/{wanted.Count},glb {form.GlbBytes / 1024}KB," +
-                $"贴图 {form.Textures.Count},高 {form.HeightCm:F0}cm");
-            if (missing.Count > 0) report.AppendLine($"    缺动作: {string.Join(", ", missing)}");
-            foreach (var w in form.Warnings) report.AppendLine($"    [warn] {w}");
-            doneForms++;
-            totalBytes += form.GlbBytes;
-        }
-
-        if (forms.Count == 0)
-        {
-            Console.WriteLine($"  {chain.Name}: 一个形态都没导出来,跳过整条链");
-            report.AppendLine($"  (整条链没有可用形态)");
-            chainSkipped++;
-            continue;
-        }
-
-        var manifest = Manifest.Render(chain, forms, lodIndex, sourceVersion);
-        Directory.CreateDirectory(packDir);
-        File.WriteAllText(Path.Combine(packDir, "manifest.toml"), manifest);
-        Console.WriteLine($"  → {packDir}");
-
-        if (zip)
-        {
-            var rkpet = packDir + ".rkpet";
-            if (File.Exists(rkpet)) File.Delete(rkpet);
-            System.IO.Compression.ZipFile.CreateFromDirectory(packDir, rkpet);
-            Console.WriteLine($"  → {rkpet}({new FileInfo(rkpet).Length / 1024}KB)");
-        }
-    }
-    catch (Exception e)
-    {
-        Console.Error.WriteLine($"{chain.Name} 导出失败: {e.Message}");
-        report.AppendLine($"## {chain.Name}:导出失败 — {e.Message}");
-        failed++;
-    }
+foreach (var result in results)
+{
+    if (result is null) continue;
+    report.Append(result.Report);
+    doneForms += result.Forms;
+    formSkipped += result.FormsSkipped;
+    totalBytes += result.Bytes;
+    if (result.Failed) failed++;
+    if (result.NoForms) chainSkipped++;
+    if (result.Detail.Length > 0) Console.Write(result.Detail);
 }
 
 report.AppendLine();
@@ -269,6 +234,90 @@ Console.WriteLine($"\n{targets.Count - failed - chainSkipped} 条链成功、{sk
                   $"glb 合计 {totalBytes / 1024 / 1024}MB,用时 {stopwatch.Elapsed.TotalMinutes:F1} 分钟");
 Console.WriteLine($"报告: {reportPath}");
 return failed == 0 ? 0 : 2;
+
+/// 导出一条进化链。**不碰任何共享可变状态**,这样才能并行跑。
+ChainResult ExportChain(Chain chain)
+{
+    var detail = new StringBuilder();
+    var chainReport = new StringBuilder();
+    var forms = new List<FormReport>();
+    var formsSkipped = 0;
+    var bytes = 0L;
+    try
+    {
+        var packDir = Path.Combine(outDir, packDirName(chain));
+        detail.AppendLine($"=== {chain.Name}(链首 {chain.RootId},{chain.Forms.Count} 个形态)");
+
+        chainReport.AppendLine();
+        chainReport.AppendLine($"## {chain.Name}(链首 {chain.RootId})");
+        foreach (var form in chain.Forms)
+        {
+            // 一个形态缺资产(有些进化阶段这版本根本没做)不该拖垮整条链
+            FormReport formReport;
+            try
+            {
+                formReport = ExportForm(provider, form, packDir, lodIndex, allClips ? null : defaultClips);
+            }
+            catch (Exception e)
+            {
+                detail.AppendLine($"  {form.Name}({form.Asset}): 跳过 — {e.Message}");
+                chainReport.AppendLine($"  {form.Name}({form.Asset}) stage {form.Stage}: 跳过 — {e.Message}");
+                formsSkipped++;
+                continue;
+            }
+            forms.Add(formReport);
+            detail.AppendLine(
+                $"  {form.Name}(id {form.Id} stage {form.Stage} {form.Asset}): " +
+                $"{formReport.Clips.Count}/{form.Clips.Count} 个动作,glb {formReport.GlbBytes / 1024}KB," +
+                $"{formReport.Textures.Count} 张贴图");
+            foreach (var warning in formReport.Warnings) detail.AppendLine($"    [warn] {warning}");
+
+            var got = formReport.Clips.Select(c => c.Logical).ToHashSet();
+            var wanted = (allClips ? form.Clips.Select(c => c.Logical) : defaultClips)
+                .Distinct().ToList();
+            var missing = wanted.Where(w => !got.Contains(w)).ToList();
+            chainReport.AppendLine(
+                $"  {form.Name}({form.Asset}) stage {form.Stage}: " +
+                $"动作 {formReport.Clips.Count}/{wanted.Count},glb {formReport.GlbBytes / 1024}KB," +
+                $"贴图 {formReport.Textures.Count},高 {formReport.HeightCm:F0}cm");
+            if (missing.Count > 0) chainReport.AppendLine($"    缺动作: {string.Join(", ", missing)}");
+            foreach (var w in formReport.Warnings) chainReport.AppendLine($"    [warn] {w}");
+            bytes += formReport.GlbBytes;
+        }
+
+        if (forms.Count == 0)
+        {
+            detail.AppendLine($"  {chain.Name}: 一个形态都没导出来,跳过整条链");
+            chainReport.AppendLine("  (整条链没有可用形态)");
+            return new ChainResult(":无可用形态", detail.ToString(), chainReport.ToString(),
+                0, formsSkipped, 0, false, true);
+        }
+
+        var manifest = Manifest.Render(chain, forms, lodIndex, sourceVersion);
+        Directory.CreateDirectory(packDir);
+        File.WriteAllText(Path.Combine(packDir, "manifest.toml"), manifest);
+
+        if (zip)
+        {
+            var rkpet = packDir + ".rkpet";
+            if (File.Exists(rkpet)) File.Delete(rkpet);
+            System.IO.Compression.ZipFile.CreateFromDirectory(packDir, rkpet);
+            detail.AppendLine($"  → {rkpet}({new FileInfo(rkpet).Length / 1024}KB)");
+        }
+
+        return new ChainResult(
+            $":{forms.Count} 个形态 {bytes / 1024 / 1024}MB", detail.ToString(), chainReport.ToString(),
+            forms.Count, formsSkipped, bytes, false, false);
+    }
+    catch (Exception e)
+    {
+        detail.AppendLine($"{chain.Name} 导出失败: {e.Message}");
+        chainReport.AppendLine();
+        chainReport.AppendLine($"## {chain.Name}:导出失败 — {e.Message}");
+        return new ChainResult($":失败({e.Message})", detail.ToString(), chainReport.ToString(),
+            0, formsSkipped, 0, true, false);
+    }
+}
 
 FormReport ExportForm(
     AbstractVfsFileProvider fileProvider,
@@ -445,6 +494,15 @@ static string Fingerprint(string paksPath, int fileCount)
     return Convert.ToHexString(hash)[..12].ToLowerInvariant();
 }
 
+/// --skip-existing 用:两种命名(裸名字 / 名字-链首id)任一存在就算导过。
+/// 去重命名依赖全量名字统计,而这个判断发生在统计之前,所以两种都查。
+static bool ChainAlreadyExported(string outDir, Chain chain)
+{
+    var bare = Path.Combine(outDir, SafeName(chain.Name), "manifest.toml");
+    var suffixed = Path.Combine(outDir, $"{SafeName(chain.Name)}-{chain.RootId}", "manifest.toml");
+    return File.Exists(bare) || File.Exists(suffixed);
+}
+
 /// 物种名直接当目录名:大多是中文,但个别名字可能带斜杠之类,做一层净化。
 static string SafeName(string name)
 {
@@ -462,3 +520,14 @@ string Next(ref int i)
     }
     return args[++i];
 }
+
+/// 一条链的导出结果。文本先攒起来,避免并行时控制台/报告乱序。
+record ChainResult(
+    string Summary,
+    string Detail,
+    string Report,
+    int Forms,
+    int FormsSkipped,
+    long Bytes,
+    bool Failed,
+    bool NoForms);
