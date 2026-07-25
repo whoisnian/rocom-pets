@@ -64,6 +64,9 @@ pub struct Skeleton {
     /// 每个节点的绑定局部变换。
     pub bind: Vec<Trs>,
     pub parents: Vec<i32>,
+    /// 骨架根关节所在的节点:走跑动画的位移就挂在它上面(见 docs/spike-s3.md),
+    /// 运行时要把这份位移剥掉,改由程序推进屏幕坐标,否则宠物会「走两份」。
+    pub root_joint: usize,
     /// 拓扑序(父一定排在子之前),算世界变换时按这个顺序一遍过。
     pub order: Vec<usize>,
     /// skin.joints:关节序号 → 节点索引。
@@ -151,12 +154,23 @@ impl Model {
                 joints.len()
             );
         }
+        // 根关节 = 父节点不在关节集合里的那个(通常就是 joints[0])
+        let joint_set: std::collections::HashSet<usize> = joints.iter().copied().collect();
+        let root_joint = joints
+            .iter()
+            .copied()
+            .find(|&node| match parents[node] {
+                -1 => true,
+                parent => !joint_set.contains(&(parent as usize)),
+            })
+            .unwrap_or_else(|| joints.first().copied().unwrap_or(0));
         let skeleton = Skeleton {
             bind,
             parents,
             order,
             joints,
             inverse_bind,
+            root_joint,
         };
 
         // ── 网格 ────────────────────────────────────────────────────

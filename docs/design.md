@@ -88,7 +88,7 @@ alpha 置顶窗口 + 命中穿透。现成引擎恰好都在这两点撞墙：
 
 | 关注点 | KDE Plasma Wayland | Windows |
 | --- | --- | --- |
-| 表面 | 每 output 一个 layer surface，`layer=top`(不用 `overlay`，那会盖住菜单/通知)，四边 anchor，`exclusive_zone=-1`，`keyboard_interactivity=none` | 每显示器一个 `WS_EX_LAYERED|TOPMOST|TOOLWINDOW|NOACTIVATE` 窗口 + DirectComposition 交换链 |
+| 表面 | 每 output 一个 layer surface，`layer=top`(不用 `overlay`，那会盖住菜单/通知)，四边 anchor，**`exclusive_zone=0`**，`keyboard_interactivity=none` | 每显示器一个 `WS_EX_LAYERED|TOPMOST|TOOLWINDOW|NOACTIVATE` 窗口 + DirectComposition 交换链 |
 | 逐像素 alpha | wgpu `CompositeAlphaMode::PreMultiplied` | 必须 `CreateSwapChainForComposition`(GDI 的 `UpdateLayeredWindow` 路径不适合 GPU 渲染) |
 | 命中/穿透 | `wl_surface.set_input_region` = 宠物轮廓并集；全局穿透 = 置空区域 | `WM_NCHITTEST` 返回 `HTTRANSPARENT`；全局穿透 = 加 `WS_EX_TRANSPARENT` |
 | 定位 | layer surface 的 anchor + margin | `SetWindowPos`(整屏窗口，宠物坐标在窗口内) |
@@ -102,6 +102,9 @@ alpha 置顶窗口 + 命中穿透。现成引擎恰好都在这两点撞墙：
 - `layer=top` 与全屏窗口、锁屏、通知/OSD 的叠放次序由 KWin 决定，不可假设，S1 里逐项实测。
 - KWin 的窗口规则/脚本(KWin Script、`kwriteconfig` 规则)可作为定位与置顶的**备选**手段，
   但那是 xdg-toplevel 路线，交互不如 layer surface 干净，仅在 S1 失败时才考虑。
+- **`exclusive_zone` 取 0 而不是 -1**:0 是「自己不占地方，但尊重别人占的地方」，合成器给的
+  configure 就是**去掉任务栏后的工作区**(实测 2560×1440 → 2560×1368)，宠物正好踩在任务栏
+  上沿；-1 是「连别人的独占区一起无视」，那样宠物的脚会藏到面板后面。两者都不会挤压其他窗口布局。
 
 ### 3.3 渲染与帧率
 
@@ -268,7 +271,14 @@ missing_clips = ["hide"]
 | S3 | 导出器：动画合并进 glb，跑通喵喵整条链(3001/3025/3007) | **✅ 见 [spike-s3.md](spike-s3.md)**：三形态动画正确(途中修掉 CUE4Parse 的骨骼旋转 bug)；root motion/朝向/单位已定论；manifest 已产出 |
 
 ### Phase 1 — 单宠物 MVP
-一个形态：`idle` 循环 + 沿屏幕底边行走、穿透开关(热键)、托盘菜单退出、配置文件。
+
+**已完成**:`--pack` 载入宠物包(读 manifest)、宠物站在工作区底边(踩任务栏上沿)、
+`Idle` 循环、随机挑目标点用 `Walk` 走过去并平滑转身、拖放(松手落回地面)、
+`SIGUSR1` 切穿透、宠物按 `height_cm × --px-per-cm` 换算屏幕尺寸。
+实测:自身 CPU **1.2% 单核**(30fps 推进动画)、RSS 152MB(debug 依赖 + NVIDIA Vulkan)。
+
+**待做**:托盘菜单退出与全局热键(KGlobalAccel/portal)、配置文件、
+拖起/落地用 `Fear`/`JumpFall` 动作、待机降帧与 damage 局部提交、轮廓命中(见 Phase 2)。
 
 ### Phase 2 — 鼠标交互
 alpha mask 命中测试、点击受惊(`shock`)、摸头、拖起放下、多显示器与 HiDPI、空闲降帧。

@@ -4,6 +4,7 @@
 //! `--render` 是离屏模式,不开窗口,把宠物渲成对比图用于验收与回归(见 offscreen.rs)。
 
 mod offscreen;
+mod pack;
 mod pet;
 mod platform;
 mod render;
@@ -14,8 +15,14 @@ use std::path::PathBuf;
 
 const USAGE: &str = "\
 用法:
-  rocom-pets                              起 stage(KDE Plasma Wayland / Windows)
+  rocom-pets --pack <包目录> [选项]        起 stage,把宠物放到桌面上
+  rocom-pets                              起 stage,但用调试精灵(平台层验收模式)
   rocom-pets --render <包目录|glb> [选项]  离屏渲染宠物到 PNG
+
+stage 模式:
+  --pack <目录>      宠物包目录(含 manifest.toml)
+  --form <资产名>    选形态,默认包里第一个(链首)
+  --px-per-cm <n>    每厘米多少逻辑像素(默认 2.0:80cm 的喵喵 → 160px 高)
 
   --render <路径>    宠物包目录(含 forms/)或直接给 model.glb
   --form <资产名>    选形态,默认包里第一个
@@ -34,6 +41,11 @@ fn main() -> anyhow::Result<()> {
 
     let mut args = std::env::args().skip(1);
     let mut request: Option<offscreen::Request> = None;
+    let mut options = platform::Options {
+        pack: None,
+        form: None,
+        px_per_cm: 2.0,
+    };
     let next = |flag: &str, args: &mut dyn Iterator<Item = String>| -> anyhow::Result<String> {
         args.next()
             .ok_or_else(|| anyhow::anyhow!("{flag} 缺少参数值\n{USAGE}"))
@@ -61,6 +73,10 @@ fn main() -> anyhow::Result<()> {
                     bench: 0,
                 });
             }
+            "--pack" => options.pack = Some(PathBuf::from(next("--pack", &mut args)?)),
+            "--px-per-cm" => options.px_per_cm = next("--px-per-cm", &mut args)?.parse()?,
+            // --form 两个模式都用得到
+            "--form" if request.is_none() => options.form = Some(next("--form", &mut args)?),
             other => {
                 let Some(request) = request.as_mut() else {
                     anyhow::bail!("{other} 只在 --render 模式下有意义\n{USAGE}");
@@ -88,6 +104,6 @@ fn main() -> anyhow::Result<()> {
 
     match request {
         Some(request) => offscreen::render(&request),
-        None => platform::run(),
+        None => platform::run(&options),
     }
 }

@@ -1,21 +1,25 @@
-//! wgpu 渲染:把预乘 alpha 的精灵贴图画到透明表面上。
+//! stage 表面的合成层:把若干张预乘 alpha 的纹理画成屏幕上的四边形。
 //!
 //! 关键点全在 alpha 上:表面按 `PreMultiplied` 配置(拿不到就退 `Auto` 并告警)、
 //! 清屏用全透明、混合用 `PREMULTIPLIED_ALPHA_BLENDING`、贴图数据本身也是预乘的。
 //! 任一环节用了非预乘约定,软边就会出现暗边或亮边——这正是 S1 要肉眼验的东西。
+//!
+//! 宠物不直接画在这里:它先被渲进一张小的离屏纹理(见 pet/target.rs,自带深度缓冲),
+//! 再作为一张普通纹理合成进来。这样 stage 不需要全屏尺寸的深度缓冲(4K 下要几十 MB),
+//! 宠物的渲染分辨率与屏幕分辨率解耦,而且 Phase 2 的轮廓命中测试可以直接回读那张小纹理。
 
 use anyhow::{Context, Result};
 
 use crate::sprite::Sprite;
 
-/// 与 WGSL 里的 `U` 对应。
+/// 与 quad.wgsl 里的 `U` 对应。
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct Uniform {
     surface: [f32; 2],
     pos: [f32; 2],
     size: [f32; 2],
-    /// >0.5 时给精灵加一点提亮,用来肉眼确认「拖动中」状态。
+    /// >0.5 时给整块加一点提亮,用来肉眼确认「拖动中」状态。
     highlight: f32,
     _pad: f32,
 }
@@ -26,7 +30,6 @@ pub struct Gpu {
     pub queue: wgpu::Queue,
     pipeline: wgpu::RenderPipeline,
     bind_layout: wgpu::BindGroupLayout,
-    sprite_view: wgpu::TextureView,
     sampler: wgpu::Sampler,
     format: wgpu::TextureFormat,
     alpha_mode: wgpu::CompositeAlphaMode,
@@ -34,11 +37,7 @@ pub struct Gpu {
 
 impl Gpu {
     /// `compatible` 只用于挑适配器与探测表面能力,之后每个 stage 各自建表面。
-    pub fn new(
-        instance: &wgpu::Instance,
-        compatible: &wgpu::Surface<'static>,
-        sprite: &Sprite,
-    ) -> Result<Self> {
+    pub fn new(instance: &wgpu::Instance, compatible: &wgpu::Surface<'static>) -> Result<Self> {
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::LowPower,
             compatible_surface: Some(compatible),
@@ -62,9 +61,8 @@ impl Gpu {
         let caps = compatible.get_capabilities(&adapter);
         log::info!("表面能力: formats={:?}", caps.formats);
         log::info!("表面能力: alpha_modes={:?}", caps.alpha_modes);
-        log::info!("表面能力: present_modes={:?}", caps.present_modes);
 
-        // 优先非 sRGB 的 8 位格式:精灵字节已是最终颜色,过一道 sRGB 编码只会偏色
+        // 优先非 sRGB 的 8 位格式:纹理字节已是最终颜色,过一道 sRGB 编码只会偏色
         let format = caps
             .formats
             .iter()
@@ -83,49 +81,14 @@ impl Gpu {
         };
         log::info!("选定 format={format:?} alpha_mode={alpha_mode:?}");
 
-        let texture = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("sprite"),
-            size: wgpu::Extent3d {
-                width: sprite.width,
-                height: sprite.height,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8Unorm,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
-        queue.write_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture: &texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            &sprite.rgba,
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(sprite.width * 4),
-                rows_per_image: Some(sprite.height),
-            },
-            wgpu::Extent3d {
-                width: sprite.width,
-                height: sprite.height,
-                depth_or_array_layers: 1,
-            },
-        );
-        let sprite_view = texture.create_view(&wgpu::TextureViewDescriptor::default());
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("sprite"),
+            label: Some("quad"),
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
             ..Default::default()
         });
-
         let bind_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("stage"),
+            label: Some("quad"),
             entries: &[
                 wgpu::BindGroupLayoutEntry {
                     binding: 0,
@@ -157,16 +120,16 @@ impl Gpu {
         });
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("sprite"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("sprite.wgsl").into()),
+            label: Some("quad"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("quad.wgsl").into()),
         });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("sprite"),
+            label: Some("quad"),
             bind_group_layouts: &[Some(&bind_layout)],
             immediate_size: 0,
         });
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("sprite"),
+            label: Some("quad"),
             layout: Some(&pipeline_layout),
             vertex: wgpu::VertexState {
                 module: &shader,
@@ -199,23 +162,26 @@ impl Gpu {
             queue,
             pipeline,
             bind_layout,
-            sprite_view,
             sampler,
             format,
             alpha_mode,
         })
     }
 
-    /// 为一个已建好的表面创建渲染目标。
-    pub fn create_target(&self, surface: wgpu::Surface<'static>, size: (u32, u32)) -> Target {
+    pub fn format(&self) -> wgpu::TextureFormat {
+        self.format
+    }
+
+    /// 为一张纹理建一个可绘制的四边形(自带 uniform)。
+    pub fn create_quad(&self, view: &wgpu::TextureView) -> Quad {
         let uniform = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("stage-uniform"),
+            label: Some("quad-uniform"),
             size: size_of::<Uniform>() as u64,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("stage"),
+            label: Some("quad"),
             layout: &self.bind_layout,
             entries: &[
                 wgpu::BindGroupEntry {
@@ -224,7 +190,7 @@ impl Gpu {
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: wgpu::BindingResource::TextureView(&self.sprite_view),
+                    resource: wgpu::BindingResource::TextureView(view),
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
@@ -232,23 +198,76 @@ impl Gpu {
                 },
             ],
         });
-        let mut target = Target {
-            surface,
-            size,
+        Quad {
             uniform,
             bind_group,
-        };
+        }
+    }
+
+    /// 把精灵位图上传成纹理(仅 `--sprite` 调试模式用)。
+    pub fn upload_sprite(&self, sprite: &Sprite) -> wgpu::TextureView {
+        let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("sprite"),
+            size: wgpu::Extent3d {
+                width: sprite.width,
+                height: sprite.height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        self.queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &sprite.rgba,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(sprite.width * 4),
+                rows_per_image: Some(sprite.height),
+            },
+            wgpu::Extent3d {
+                width: sprite.width,
+                height: sprite.height,
+                depth_or_array_layers: 1,
+            },
+        );
+        texture.create_view(&wgpu::TextureViewDescriptor::default())
+    }
+
+    /// 为一个已建好的表面创建渲染目标。
+    pub fn create_target(&self, surface: wgpu::Surface<'static>, size: (u32, u32)) -> Target {
+        let mut target = Target { surface, size };
         target.configure(self);
         target
     }
+}
+
+/// 一张纹理 + 它的 uniform,可以被反复摆到不同位置绘制。
+pub struct Quad {
+    uniform: wgpu::Buffer,
+    bind_group: wgpu::BindGroup,
+}
+
+/// 一次绘制请求:把 `quad` 摆在表面的 (pos, size) 处(物理像素)。
+pub struct QuadDraw<'a> {
+    pub quad: &'a Quad,
+    pub pos: (f32, f32),
+    pub size: (f32, f32),
+    pub highlight: bool,
 }
 
 /// 一个 stage 表面对应的渲染目标。
 pub struct Target {
     surface: wgpu::Surface<'static>,
     size: (u32, u32),
-    uniform: wgpu::Buffer,
-    bind_group: wgpu::BindGroup,
 }
 
 impl Target {
@@ -260,7 +279,7 @@ impl Target {
                 format: gpu.format,
                 view_formats: vec![],
                 alpha_mode: gpu.alpha_mode,
-                // 精灵字节就是最终颜色,交给后端按格式默认处理即可
+                // 纹理字节就是最终颜色,交给后端按格式默认处理即可
                 color_space: wgpu::SurfaceColorSpace::Auto,
                 width: self.size.0.max(1),
                 height: self.size.1.max(1),
@@ -278,25 +297,21 @@ impl Target {
         self.configure(gpu);
     }
 
-    /// 画一帧:清成全透明,再画精灵。
-    pub fn render(
-        &mut self,
-        gpu: &Gpu,
-        sprite_pos: (f32, f32),
-        sprite_size: (u32, u32),
-        highlight: bool,
-    ) -> Result<()> {
-        gpu.queue.write_buffer(
-            &self.uniform,
-            0,
-            bytemuck::bytes_of(&Uniform {
-                surface: [self.size.0 as f32, self.size.1 as f32],
-                pos: [sprite_pos.0, sprite_pos.1],
-                size: [sprite_size.0 as f32, sprite_size.1 as f32],
-                highlight: if highlight { 1.0 } else { 0.0 },
-                _pad: 0.0,
-            }),
-        );
+    /// 画一帧:清成全透明,再按顺序画各个四边形。
+    pub fn render(&mut self, gpu: &Gpu, draws: &[QuadDraw<'_>]) -> Result<()> {
+        for draw in draws {
+            gpu.queue.write_buffer(
+                &draw.quad.uniform,
+                0,
+                bytemuck::bytes_of(&Uniform {
+                    surface: [self.size.0 as f32, self.size.1 as f32],
+                    pos: [draw.pos.0, draw.pos.1],
+                    size: [draw.size.0, draw.size.1],
+                    highlight: if draw.highlight { 1.0 } else { 0.0 },
+                    _pad: 0.0,
+                }),
+            );
+        }
 
         use wgpu::CurrentSurfaceTexture as Cst;
         let frame = match self.surface.get_current_texture() {
@@ -323,7 +338,7 @@ impl Target {
             });
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("sprite"),
+                label: Some("quads"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &view,
                     depth_slice: None,
@@ -339,8 +354,10 @@ impl Target {
                 multiview_mask: None,
             });
             pass.set_pipeline(&gpu.pipeline);
-            pass.set_bind_group(0, &self.bind_group, &[]);
-            pass.draw(0..4, 0..1);
+            for draw in draws {
+                pass.set_bind_group(0, &draw.quad.bind_group, &[]);
+                pass.draw(0..4, 0..1);
+            }
         }
         gpu.queue.submit(Some(encoder.finish()));
         // wgpu 30 起 present 挂在 queue 上

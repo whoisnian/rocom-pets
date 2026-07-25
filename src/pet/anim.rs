@@ -121,6 +121,10 @@ pub struct Player {
     /// 淡出中的上一段:(clip 下标, 停在哪一刻, 剩余淡化时间)
     previous: Option<(usize, f32, f32)>,
     fade_duration: f32,
+    /// 是否剥掉根骨骼的水平位移。桌宠的位置由行为逻辑推进(速度取自 manifest 的
+    /// speed_cm_s),动画里那份位移必须抵消,否则宠物会一边被程序推、一边自己走出画布。
+    /// 垂直分量保留:跳跃类动作靠它起跳。
+    pub strip_root_motion: bool,
     pose: Pose,
     scratch: Pose,
     pub matrices: Vec<Mat4>,
@@ -134,6 +138,7 @@ impl Player {
             time: 0.0,
             previous: None,
             fade_duration: 0.18,
+            strip_root_motion: true,
             pose: pose.clone(),
             scratch: pose,
             matrices: Vec::new(),
@@ -190,6 +195,13 @@ impl Player {
             // 以旧姿势为底,按权重混向新姿势
             std::mem::swap(&mut self.pose, &mut self.scratch);
             self.pose.blend_from(&self.scratch, weight);
+        }
+        if self.strip_root_motion {
+            let root = skeleton.root_joint;
+            let bind = skeleton.bind[root].translation;
+            let local = &mut self.pose.locals[root];
+            local.translation.x = bind.x;
+            local.translation.z = bind.z;
         }
         self.pose.joint_matrices(skeleton, &mut self.matrices);
     }

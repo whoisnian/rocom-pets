@@ -58,13 +58,13 @@ scale，再用 `wp_viewporter` 把 buffer 映射到逻辑尺寸，按 1.5 渲染
 | W2 | 与**锁屏**的叠放次序（绝不能盖住锁屏） | ✅ 锁屏盖在 stage 之上，安全 |
 | W3 | 与**通知/OSD**（音量条、通知气泡）的叠放次序 | ✅ 通知盖在 stage 之上，不会被宠物挡住 |
 | W4 | 与**Krunner / 任务切换器 / 桌面预览**的叠放次序 | ✅ 均盖在 stage 之上 |
-| W5 | `exclusive_zone=-1` 确认没有挤压其他窗口布局（最大化窗口仍占满屏） | ⏳ 👀 未单独确认（W1 全屏正常说明至少不影响全屏布局） |
+| W5 | `exclusive_zone` 不挤压其他窗口布局 | ✅ 也顺带定论了取值:**用 0 而不是 -1**。0 = 自己不占地方但尊重别人的独占区,configure 回的是工作区(2560×1440 → 2560×1368),宠物踩在任务栏上沿;-1 会让脚藏到面板后面。两者都不挤压别人 |
 | W6 | 实测环境（升级 Plasma 后本清单需重跑） | Plasma 6.7.3 / kwin 6.7.3-1、NVIDIA RTX 3070 / Vulkan、单显示器 DP-3 3840×2160@1.5x、rustc 1.97.1、wgpu 30.0.0、sctk 0.21.1(`system` feature) |
 
 ### 已确认的实现细节
 
 - `zwlr_layer_shell_v1` 在 KWin 6.7.3 可用，`Layer::Top` + 四边 anchor + `set_size(0,0)`
-  拿到铺满 output 的表面，`exclusive_zone(-1)` 不参与布局。
+  拿到铺满工作区的表面，`exclusive_zone(0)` 不参与布局(取值理由见 W5)。
 - 表面能力：`formats=[Rgba8UnormSrgb, Bgra8UnormSrgb, Rgb10a2Unorm, Rgba8Unorm, Bgra8Unorm,
   Rgba16Float]`、`alpha_modes=[Opaque, PreMultiplied]`、`present_modes=[Mailbox, Fifo, Immediate]`。
   选 `Rgba8Unorm`（非 sRGB，精灵字节即最终颜色）+ `PreMultiplied`。

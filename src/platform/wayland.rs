@@ -11,8 +11,10 @@
 //! 正式实现要走 KGlobalAccel 的 D-Bus 注册或 XDG GlobalShortcuts portal)。
 
 use std::ptr::NonNull;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
+use glam::Vec3;
 use raw_window_handle::{
     RawDisplayHandle, RawWindowHandle, WaylandDisplayHandle, WaylandWindowHandle,
 };
@@ -20,7 +22,10 @@ use smithay_client_toolkit::{
     compositor::{CompositorHandler, CompositorState, Region},
     delegate_dispatch2, delegate_registry,
     output::{OutputHandler, OutputState},
-    reexports::calloop::{EventLoop, channel},
+    reexports::calloop::{
+        EventLoop, channel,
+        timer::{TimeoutAction, Timer},
+    },
     reexports::calloop_wayland_source::WaylandSource,
     reexports::client::{
         Connection, Proxy, QueueHandle,
@@ -42,9 +47,21 @@ use smithay_client_toolkit::{
     },
 };
 
-use crate::render::{Gpu, Target};
+use crate::pack::{Form, Pack};
+use crate::pet::target::{PetTarget, view_proj};
+use crate::pet::{Model, PetGpu};
+use crate::render::{Gpu, Quad, QuadDraw, Target};
 use crate::sprite::Sprite;
-use crate::stage::{Reaction, Stage, StageEvent};
+use crate::stage::{Actor, PetActor, Reaction, Stage, StageEvent};
+
+use super::Options;
+
+/// 宠物动画的推进频率。桌宠不需要跟满刷新率,30fps 已经够顺,还省合成开销。
+/// (待机/睡觉时进一步降帧排在 Phase 2,连同 damage 区域一起做。)
+const TICK_HZ: f32 = 30.0;
+
+/// 离屏画布相对宠物身高留的余量:跳跃/伸展类动作会超出绑定姿势包围盒。
+const CANVAS_PADDING: f32 = 1.35;
 
 /// 鼠标左键(linux input event code)。
 const BTN_LEFT: u32 = 0x110;
@@ -55,7 +72,7 @@ enum Control {
     Quit,
 }
 
-pub fn run() -> Result<()> {
+pub fn run(options: &Options) -> Result<()> {
     let conn = Connection::connect_to_env().context("连不上 Wayland 合成器")?;
     let (globals, event_queue) = registry_queue_init(&conn).context("注册表初始化失败")?;
     let qh = event_queue.handle();
@@ -63,6 +80,28 @@ pub fn run() -> Result<()> {
     let compositor = CompositorState::bind(&globals, &qh).context("拿不到 wl_compositor")?;
     let layer_shell = LayerShell::bind(&globals, &qh)
         .context("合成器不支持 wlr-layer-shell(本项目只支持 KDE Plasma Wayland)")?;
+
+    // 包在起窗口前就读掉:manifest 有问题要立刻报错,而不是等到画第一帧
+    let form = match &options.pack {
+        Some(dir) => {
+            let pack = Pack::load(dir)?;
+            let form = pack.form(options.form.as_deref())?.clone();
+            log::info!(
+                "宠物包 {}({}):形态 {}({}),高 {:.0}cm,{} 个动作",
+                pack.species_name,
+                pack.species_id,
+                form.name,
+                form.asset,
+                form.height_cm,
+                form.clips.len()
+            );
+            Some(form)
+        }
+        None => {
+            log::info!("没给 --pack,用调试精灵(平台层验收模式)");
+            None
+        }
+    };
 
     let mut instance_desc = wgpu::InstanceDescriptor::new_without_display_handle();
     instance_desc.backends = wgpu::Backends::VULKAN;
@@ -77,6 +116,8 @@ pub fn run() -> Result<()> {
         instance,
         gpu: None,
         sprite: Sprite::test_pattern(192),
+        form,
+        px_per_cm: options.px_per_cm,
         stages: Vec::new(),
         pointer: None,
         exit: false,
@@ -88,6 +129,20 @@ pub fn run() -> Result<()> {
         .insert(handle.clone())
         .map_err(|e| anyhow::anyhow!("挂 Wayland 事件源失败: {e}"))?;
     install_signal_source(&handle)?;
+
+    // 只有宠物需要推进时间;精灵模式保持「只在事件时出帧」,空闲 CPU 才能是 0
+    if app.form.is_some() {
+        let interval = Duration::from_secs_f32(1.0 / TICK_HZ);
+        handle
+            .insert_source(
+                Timer::from_duration(interval),
+                move |_, _, app: &mut App| {
+                    app.tick();
+                    TimeoutAction::ToDuration(interval)
+                },
+            )
+            .map_err(|e| anyhow::anyhow!("挂动画定时器失败: {e}"))?;
+    }
 
     log::info!("pid {} — kill -USR1 切换全局穿透", std::process::id());
     while !app.exit {
@@ -139,11 +194,25 @@ struct StageWindow {
     /// 建好但还没配置尺寸时先存着,首次 configure 后移进 `target`。
     pending_surface: Option<wgpu::Surface<'static>>,
     target: Option<Target>,
+    /// 宠物的离屏画布 + 它在 stage 上的合成四边形;精灵模式下是 None。
+    pet: Option<PetSurfaces>,
+    /// 精灵模式的合成四边形。
+    sprite_quad: Option<Quad>,
     stage: Stage,
     /// 逻辑尺寸(合成器给的),物理尺寸 = 逻辑 × scale。
     logical: (u32, u32),
     scale: u32,
     configured: bool,
+    /// 上次推进动画的时刻,用来算 dt。
+    last_tick: Option<Instant>,
+}
+
+/// 宠物在某个 stage 上的一套 GPU 资源。
+/// 网格/贴图目前每个 stage 各一份:多显示器时略浪费,等真有多屏需求再做共享。
+struct PetSurfaces {
+    gpu: PetGpu,
+    canvas: PetTarget,
+    quad: Quad,
 }
 
 impl StageWindow {
@@ -161,6 +230,9 @@ struct App {
     instance: wgpu::Instance,
     gpu: Option<Gpu>,
     sprite: Sprite,
+    /// 要显示的形态(来自宠物包);None = 调试精灵模式。
+    form: Option<Form>,
+    px_per_cm: f32,
     stages: Vec<StageWindow>,
     pointer: Option<wl_pointer::WlPointer>,
     exit: bool,
@@ -191,10 +263,13 @@ impl App {
             Some("rocom-pets"),
             Some(&output),
         );
-        // 铺满整个 output,但不参与布局
+        // 铺满可用区域,但不参与布局:
+        // exclusive_zone = 0 表示「不占地方,但尊重别人占的地方」,于是合成器给的是
+        // 去掉任务栏之后的工作区——宠物正好踩在任务栏上沿,而不是藏到面板后面。
+        // (-1 是「连别人的独占区一起无视」,那样脚底会被面板挡住。)
         layer.set_anchor(Anchor::TOP | Anchor::BOTTOM | Anchor::LEFT | Anchor::RIGHT);
         layer.set_size(0, 0);
-        layer.set_exclusive_zone(-1);
+        layer.set_exclusive_zone(0);
         layer.set_keyboard_interactivity(KeyboardInteractivity::None);
         layer.wl_surface().set_buffer_scale(scale as i32);
         // 首次提交必须不带 buffer,等合成器回 configure
@@ -208,17 +283,94 @@ impl App {
             }
         };
 
+        // 宠物模式下每个 stage 各加载一份模型:Model 不便共享,而加载只有几十毫秒
+        let actor = match &self.form {
+            Some(form) => match self.build_pet_actor(form) {
+                Ok(actor) => actor,
+                Err(e) => {
+                    log::error!("output {name}: 加载宠物失败: {e:#}");
+                    self.exit = true;
+                    return;
+                }
+            },
+            None => Actor::Sprite(self.sprite.clone()),
+        };
+
         log::info!("output {name} 上新建 stage(scale {scale})");
         self.stages.push(StageWindow {
             output,
             layer,
             pending_surface: Some(surface),
             target: None,
-            stage: Stage::new(self.sprite.clone(), (1, 1)),
+            pet: None,
+            sprite_quad: None,
+            stage: Stage::new(actor, (1, 1)),
             logical: (1, 1),
             scale,
             configured: false,
+            last_tick: None,
         });
+    }
+
+    /// 把 manifest 里的厘米单位换成屏幕像素,算出画布尺寸与脚底位置。
+    fn build_pet_actor(&self, form: &Form) -> Result<Actor> {
+        let model = Model::load(&form.model)?;
+        let extent = model.bounds.1 - model.bounds.0;
+        let height_px = form.height_cm * form.scale * self.px_per_cm;
+        // 画布是方的(取景按包围盒最长边),边长 = 身高像素 × 余量 × (最长边/身高)
+        let longest = extent.x.max(extent.y).max(extent.z).max(1e-4);
+        let side = (height_px * CANVAS_PADDING * longest / extent.y.max(1e-4))
+            .round()
+            .max(16.0);
+        // 脚底在画布里的位置:正交框半径 = 最长边/2 × 余量,包围盒下沿的 NDC 是 -(高/2)/半径
+        let radius = longest * 0.5 * CANVAS_PADDING;
+        let ndc_bottom = -(extent.y * 0.5) / radius;
+        let foot_offset = (1.0 - ndc_bottom) * 0.5 * side;
+
+        // 走路速度优先用动画自带位移反推的值(见 spike-s3.md),没有就给个常速
+        let walk_speed_cm = form
+            .clip("Walk")
+            .map(|c| c.speed_cm_s)
+            .filter(|v| *v > 1.0)
+            .unwrap_or(40.0);
+        let seed = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0x5eed)
+            ^ (self.stages.len() as u64 * 0x9E3779B97F4A7C15);
+
+        log::info!(
+            "  {} 屏幕高 {:.0}px(画布 {}px,脚底 {:.0}px),走速 {:.0}cm/s",
+            form.name,
+            height_px,
+            side as u32,
+            foot_offset,
+            walk_speed_cm
+        );
+        Ok(Actor::Pet(PetActor::new(
+            model,
+            (side as u32, side as u32),
+            foot_offset,
+            walk_speed_cm * self.px_per_cm,
+            seed,
+        )))
+    }
+
+    /// 定时器驱动:推进所有 stage 的行为与动画。
+    fn tick(&mut self) {
+        let now = Instant::now();
+        for index in 0..self.stages.len() {
+            let dt = match self.stages[index].last_tick {
+                Some(prev) => (now - prev).as_secs_f32().min(0.25), // 卡顿后别一次跳太远
+                None => 1.0 / TICK_HZ,
+            };
+            self.stages[index].last_tick = Some(now);
+            if !self.stages[index].configured {
+                continue;
+            }
+            let reaction = self.stages[index].stage.tick(dt);
+            self.apply(index, reaction);
+        }
     }
 
     fn create_wgpu_surface(
@@ -303,33 +455,61 @@ impl App {
     fn render(&mut self, index: usize) {
         let Some(gpu) = self.gpu.as_ref() else { return };
         let stage = &mut self.stages[index];
-        let Some(target) = stage.target.as_mut() else {
+        if stage.target.is_none() {
             return;
-        };
+        }
         let scale = stage.scale as f32;
-        let (px, py) = stage.stage.sprite_pos();
-        let sprite = stage.stage.sprite();
-        let size = (
-            (sprite.width as f32 * scale) as u32,
-            (sprite.height as f32 * scale) as u32,
-        );
-        if let Err(e) = target.render(
-            gpu,
-            (px * scale, py * scale),
-            size,
-            stage.stage.is_dragging(),
-        ) {
+        let (px, py) = stage.stage.actor_pos();
+        let (aw, ah) = stage.stage.actor().size();
+        let highlight = stage.stage.is_dragging();
+
+        // 宠物:先画进离屏画布,再把画布作为一张纹理合成到 stage 上
+        if let (Actor::Pet(pet), Some(surfaces)) = (stage.stage.actor(), stage.pet.as_mut()) {
+            let canvas_size = ((aw as f32 * scale) as u32, (ah as f32 * scale) as u32);
+            if surfaces.canvas.resize(&gpu.device, canvas_size) {
+                // 画布重建了,合成用的四边形绑的是旧纹理,要重绑
+                surfaces.quad = gpu.create_quad(surfaces.canvas.view());
+            }
+            let bounds = pet.model.bounds;
+            let extent = bounds.1 - bounds.0;
+            let outline = extent.length() * 0.004;
+            surfaces.gpu.update(
+                &gpu.queue,
+                view_proj(bounds, pet.yaw, CANVAS_PADDING),
+                Vec3::new(-0.4, 0.8, 0.6),
+                outline,
+                &pet.player.matrices,
+            );
+            surfaces
+                .canvas
+                .render(&gpu.device, &gpu.queue, &surfaces.gpu);
+        }
+
+        let stage = &mut self.stages[index];
+        let quad = match (stage.pet.as_ref(), stage.sprite_quad.as_ref()) {
+            (Some(surfaces), _) => &surfaces.quad,
+            (None, Some(quad)) => quad,
+            (None, None) => return,
+        };
+        let target = stage.target.as_mut().expect("上面已判过");
+        let draws = [QuadDraw {
+            quad,
+            pos: (px * scale, py * scale),
+            size: (aw as f32 * scale, ah as f32 * scale),
+            highlight,
+        }];
+        if let Err(e) = target.render(gpu, &draws) {
             log::error!("stage {index} 出帧失败: {e:#}");
         }
     }
 
-    /// 首次 configure:惰性初始化 GPU(要有表面才能挑适配器),建渲染目标。
+    /// 首次 configure:惰性初始化 GPU(要有表面才能挑适配器),建渲染目标与合成资源。
     fn ensure_target(&mut self, index: usize) {
         let Some(surface) = self.stages[index].pending_surface.take() else {
             return;
         };
         if self.gpu.is_none() {
-            match Gpu::new(&self.instance, &surface, &self.sprite) {
+            match Gpu::new(&self.instance, &surface) {
                 Ok(gpu) => self.gpu = Some(gpu),
                 Err(e) => {
                     log::error!("初始化 GPU 失败: {e:#}");
@@ -341,6 +521,33 @@ impl App {
         let gpu = self.gpu.as_ref().expect("上面刚建好");
         let physical = self.stages[index].physical();
         self.stages[index].target = Some(gpu.create_target(surface, physical));
+
+        let scale = self.stages[index].scale as f32;
+        let (aw, ah) = self.stages[index].stage.actor().size();
+        match self.stages[index].stage.actor() {
+            Actor::Pet(pet) => {
+                let canvas_size = ((aw as f32 * scale) as u32, (ah as f32 * scale) as u32);
+                match PetGpu::new(&gpu.device, &gpu.queue, &pet.model, gpu.format()) {
+                    Ok(pet_gpu) => {
+                        let canvas = PetTarget::new(&gpu.device, gpu.format(), canvas_size);
+                        let quad = gpu.create_quad(canvas.view());
+                        self.stages[index].pet = Some(PetSurfaces {
+                            gpu: pet_gpu,
+                            canvas,
+                            quad,
+                        });
+                    }
+                    Err(e) => {
+                        log::error!("建宠物管线失败: {e:#}");
+                        self.exit = true;
+                    }
+                }
+            }
+            Actor::Sprite(sprite) => {
+                let view = gpu.upload_sprite(sprite);
+                self.stages[index].sprite_quad = Some(gpu.create_quad(&view));
+            }
+        }
     }
 }
 
@@ -490,7 +697,7 @@ impl LayerShellHandler for App {
             height: h,
         });
         if first {
-            self.stages[index].stage.center();
+            self.stages[index].stage.reset_position();
         }
         self.apply(
             index,

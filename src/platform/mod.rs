@@ -4,16 +4,31 @@
 //! 与 Windows 的 layered 窗口 + DirectComposition。所有状态逻辑在 `crate::stage`,
 //! 后端只负责造表面、收事件、提交帧、设输入区。
 
+use std::path::PathBuf;
+
 #[cfg(target_os = "linux")]
 mod wayland;
 #[cfg(target_os = "windows")]
 mod windows;
 
-pub fn run() -> anyhow::Result<()> {
+/// 起 stage 时的配置。给不出宠物包时退回 `--sprite` 调试精灵(S1 的验收对象)。
+pub struct Options {
+    /// 宠物包目录(含 manifest.toml);None = 调试精灵。
+    pub pack: Option<PathBuf>,
+    /// 用哪个形态(资产名或中文名),None = 包里第一个。
+    pub form: Option<String>,
+    /// 每厘米多少逻辑像素:宠物的屏幕高度 = height_cm × 这个值。
+    pub px_per_cm: f32,
+}
+
+pub fn run(options: &Options) -> anyhow::Result<()> {
     #[cfg(target_os = "linux")]
-    return wayland::run();
+    return wayland::run(options);
     #[cfg(target_os = "windows")]
-    return windows::run();
+    return windows::run(options);
     #[cfg(not(any(target_os = "linux", target_os = "windows")))]
-    anyhow::bail!("不支持的平台:只支持 KDE Plasma Wayland 与 Windows");
+    {
+        let _ = options;
+        anyhow::bail!("不支持的平台:只支持 KDE Plasma Wayland 与 Windows");
+    }
 }

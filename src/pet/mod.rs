@@ -3,6 +3,7 @@
 pub mod anim;
 pub mod gpu;
 pub mod model;
+pub mod target;
 
 pub use anim::Player;
 pub use gpu::{PetGpu, orthographic_view};

@@ -1,4 +1,4 @@
-// 把精灵贴图画成一个四边形。顶点由 vertex_index 生成,不用顶点缓冲。
+// 把一张纹理画成一个四边形(精灵、或宠物的离屏渲染结果)。顶点由 vertex_index 生成,不用顶点缓冲。
 // 颜色保持预乘 alpha:片元里做任何调整都必须维持 rgb <= a 的不变式。
 
 struct U {
@@ -10,8 +10,8 @@ struct U {
 };
 
 @group(0) @binding(0) var<uniform> u: U;
-@group(0) @binding(1) var sprite_tex: texture_2d<f32>;
-@group(0) @binding(2) var sprite_smp: sampler;
+@group(0) @binding(1) var quad_tex: texture_2d<f32>;
+@group(0) @binding(2) var quad_smp: sampler;
 
 struct VsOut {
     @builtin(position) clip: vec4<f32>,
@@ -34,7 +34,7 @@ fn vs(@builtin(vertex_index) idx: u32) -> VsOut {
 
 @fragment
 fn fs(in: VsOut) -> @location(0) vec4<f32> {
-    var c = textureSample(sprite_tex, sprite_smp, in.uv);
+    var c = textureSample(quad_tex, quad_smp, in.uv);
     if u.highlight > 0.5 {
         // 提亮但不破坏预乘:上限是 alpha
         c = vec4<f32>(min(c.rgb + vec3<f32>(0.18) * c.a, vec3<f32>(c.a)), c.a);
