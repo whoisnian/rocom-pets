@@ -60,7 +60,14 @@ public static class GlbBuilder
             MeshFormat = EMeshFormat.Gltf2,
             LodFormat = lodIndex == 0 ? ELodFormat.FirstLod : ELodFormat.AllLods,
             ExportMaterials = false, // 贴图另走命名约定,见 Textures.cs
-            ExportMorphTargets = true,
+            // 不导 morph target(表情 blend shape)。我们只播骨骼动画,从不驱动它们
+            // (glb 里既没有 morph 通道也没有 mesh.weights),纯属死重;
+            // 更要命的是 CUE4Parse 会把空的 morph 写成**没有 bufferView 的 accessor**——
+            // 按 glTF 规范那等价于「全零」是合法的,但 Rust 的 gltf crate 判定
+            // 「accessors[N].bufferView: Missing data」直接拒绝加载。
+            // 实测全量 826 个形态里 32 个带 morph target,这 32 个**全部**加载失败。
+            // 将来若真要做表情,除了打开这个开关还得把 AnimSequence 的曲线转成 morph 通道。
+            ExportMorphTargets = false,
         };
 
         var exporter = new MeshExporter(mesh, options);
