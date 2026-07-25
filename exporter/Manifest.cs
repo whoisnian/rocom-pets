@@ -29,7 +29,9 @@ public record MaterialEntry(
     float[] Flow,
     /// 特效的形状/流动贴图,包内相对路径。
     string? MaskTexture,
-    string? NoiseTexture);
+    string? NoiseTexture,
+    /// 遮罩贴图是不是 MatCap(要按视空间法线采样,不能用网格 UV)。
+    bool MaskIsMatcap);
 
 public record FormReport(
     Form Form,
@@ -126,7 +128,11 @@ public static class Manifest
                         parts.Add($"opacity = {Num(mat.Opacity)}");
                         parts.Add($"glow = {Num(mat.Glow)}");
                         parts.Add($"flow = [{string.Join(", ", mat.Flow.Select(Num))}]");
-                        if (mat.MaskTexture is not null) parts.Add($"mask_tex = {Quote(mat.MaskTexture)}");
+                        if (mat.MaskTexture is not null)
+                        {
+                            parts.Add($"mask_tex = {Quote(mat.MaskTexture)}");
+                            if (mat.MaskIsMatcap) parts.Add("mask_matcap = true");
+                        }
                         if (mat.NoiseTexture is not null) parts.Add($"noise_tex = {Quote(mat.NoiseTexture)}");
                         parts.Add($"parents = [{string.Join(", ", mat.ParentChain.Select(Quote))}]");
                     }

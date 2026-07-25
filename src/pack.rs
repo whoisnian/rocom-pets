@@ -75,6 +75,8 @@ struct RawMaterial {
     mask_tex: Option<String>,
     #[serde(default)]
     noise_tex: Option<String>,
+    #[serde(default)]
+    mask_matcap: bool,
 }
 
 #[derive(Deserialize)]
@@ -120,6 +122,8 @@ pub struct Effect {
     pub flow: [f32; 4],
     pub mask: Option<PathBuf>,
     pub noise: Option<PathBuf>,
+    /// 遮罩是 MatCap:要按**视空间法线**采样(球面反射查找表),不是网格 UV。
+    pub mask_matcap: bool,
 }
 
 impl Effect {
@@ -279,6 +283,7 @@ impl Pack {
                                     flow: mat.flow.unwrap_or([0.0, 0.0, 1.0, 1.0]),
                                     mask: mat.mask_tex.map(|rel| dir.join(rel)),
                                     noise: mat.noise_tex.map(|rel| dir.join(rel)),
+                                    mask_matcap: mat.mask_matcap,
                                 },
                             },
                         )

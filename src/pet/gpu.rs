@@ -31,7 +31,13 @@ struct MaterialUniform {
     flow: [f32; 4],
     /// [opacity, glow, additive(0/1), 是否有噪声贴图(0/1)]
     params: [f32; 4],
+    /// [遮罩是否 matcap(0/1), 备用, 备用, 备用]
+    flags: [f32; 4],
 }
+
+/// 本体贴图 alpha 里那层线条遮罩的提亮倍数。游戏里那些纹路(水灵身上的竖条、
+/// 多数宠物的身体分块线)比底色亮一档,这里用乘法近似,数值按实机截图对出来的。
+const LINE_BOOST: f32 = 1.55;
 
 /// 一只宠物的 GPU 资源(网格与贴图按形态共享,实例状态另说)。
 pub struct PetGpu {
@@ -169,6 +175,13 @@ impl PetGpu {
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
             mipmap_filter: wgpu::MipmapFilterMode::Linear,
+            // **必须 Repeat,不能用 wgpu 默认的 ClampToEdge。** UE 的贴图默认是 wrap,
+            // 而这些网格的 UV 大量落在 [0,1] 之外(水灵实测 u/v 都到 -1.0)。
+            // 夹取会把区间外的全压到贴图边缘,图案摊平成一片纯色——
+            // 水灵身上那一道道竖向浅色条纹就是这么丢的。
+            address_mode_u: wgpu::AddressMode::Repeat,
+            address_mode_v: wgpu::AddressMode::Repeat,
+            address_mode_w: wgpu::AddressMode::Repeat,
             ..Default::default()
         });
         let white = super::model::Image {
@@ -201,12 +214,20 @@ impl PetGpu {
                         if effect.additive { 1.0 } else { 0.0 },
                         if effect.noise.is_some() { 1.0 } else { 0.0 },
                     ],
+                    flags: [if effect.mask_matcap { 1.0 } else { 0.0 }, 0.0, 0.0, 0.0],
                 },
-                // 普通材质:tint 全 1 相当于不改色
+                // 主通道材质:params.x 说明 alpha 怎么解释(1=镂空遮罩,0=线条遮罩),
+                // params.y 是线条的提亮倍数
                 None => MaterialUniform {
                     tint: [1.0; 4],
                     flow: [0.0, 0.0, 1.0, 1.0],
-                    params: [1.0, 1.0, 0.0, 0.0],
+                    params: [
+                        if material.cutout { 1.0 } else { 0.0 },
+                        LINE_BOOST,
+                        0.0,
+                        0.0,
+                    ],
+                    flags: [0.0; 4],
                 },
             };
             let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {

@@ -466,7 +466,7 @@ FormReport ExportForm(
         }
         materials.Add(new MaterialEntry(name, baseColor, info.IsFacePatch,
             info.OpacityMaskClipValue, info.BlendMode.ToString(), info.ParentChain,
-            info.Tint, info.Opacity, info.Glow, info.Flow, maskFile, noiseFile));
+            info.Tint, info.Opacity, info.Glow, info.Flow, maskFile, noiseFile, info.MaskIsMatcap));
 
         string? ExportEffectTexture(string? objectPath)
         {

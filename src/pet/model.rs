@@ -36,6 +36,8 @@ pub struct Material {
     pub name: String,
     /// 基色贴图(RGBA8),路径来自 manifest 的材质表;读失败才是 None,渲染时用白色兜底。
     pub base_color: Option<Image>,
+    /// 贴图 alpha 是**镂空遮罩**(眼/嘴的表情图集)还是**线条遮罩**(本体的纹路)。
+    pub cutout: bool,
     /// 特效层的画法(火焰/水壳/光晕)。`None` = 普通不透明材质,走主通道。
     pub effect: Option<EffectMaterial>,
 }
@@ -47,6 +49,7 @@ pub struct EffectMaterial {
     pub glow: f32,
     pub flow: [f32; 4],
     pub additive: bool,
+    pub mask_matcap: bool,
     pub mask: Option<Image>,
     pub noise: Option<Image>,
 }
@@ -282,6 +285,7 @@ impl Model {
                     glow: spec.effect.glow,
                     flow: spec.effect.flow,
                     additive: spec.effect.additive(),
+                    mask_matcap: spec.effect.mask_matcap,
                     mask: spec
                         .effect
                         .mask
@@ -296,6 +300,7 @@ impl Model {
                 materials.push(Material {
                     name: name.clone(),
                     base_color,
+                    cutout: spec.mask_alpha,
                     effect,
                 });
                 materials.len() - 1
@@ -382,13 +387,13 @@ impl Model {
     }
 }
 
-/// 按材质表给的路径读基色贴图。
+/// 按材质表给的路径读基色贴图。**alpha 原样保留**,怎么解释交给 shader:
 ///
-/// `mask_alpha` 决定 alpha 怎么处理,这是两类贴图的分水岭(见 pet.wgsl 里的说明):
-/// - `true`(眼/嘴的表情图集):alpha 是真遮罩,原样留着让 shader 按阈值剔;
-/// - `false`(本体):alpha 是美术塞的遮罩通道,**刷成不透明**,否则身体会被剔掉
-///   (火花通过率 4.8% → 只剩眼睛,迪莫 0.39% → 整只消失)。
-fn load_texture(path: &Path, mask_alpha: bool) -> Option<Image> {
+/// - 眼/嘴的表情图集:alpha 是真遮罩,按阈值剔(`mask_alpha = true`);
+/// - 本体:alpha 是**线条/细节遮罩**——RGB 是完整的固有色图集,alpha 里画着身上的纹路
+///   (水灵身上那一道道竖向浅色条纹就在 alpha 里,白线正好压在纹路上)。
+///   曾经把它刷成 255「省事」,结果纹路全丢;拿它当不透明度剔像素更糟,身体会被啃掉。
+fn load_texture(path: &Path, _mask_alpha: bool) -> Option<Image> {
     let img = match image::open(path) {
         Ok(img) => img,
         Err(e) => {
@@ -398,12 +403,7 @@ fn load_texture(path: &Path, mask_alpha: bool) -> Option<Image> {
     };
     let rgba = img.to_rgba8();
     let (width, height) = (rgba.width(), rgba.height());
-    let mut rgba = rgba.into_raw();
-    if !mask_alpha {
-        for pixel in rgba.chunks_exact_mut(4) {
-            pixel[3] = 255;
-        }
-    }
+    let rgba = rgba.into_raw();
     Some(Image {
         width,
         height,

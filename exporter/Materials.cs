@@ -67,6 +67,13 @@ public record MaterialInfo(
     public string? MaskTexture =>
         FirstTexture("Mask", "MaskTex", "BaseMap", "Base Color", "MatCap", "MatCapTex");
 
+    /// 遮罩是不是 MatCap。**这决定采样方式**:matcap 要按视空间法线采(球面反射查找表),
+    /// 拿网格 UV 采会变成一块块的斑,水灵的水膜就是这么糊掉的。
+    public bool MaskIsMatcap =>
+        !Textures.ContainsKey("Mask") && !Textures.ContainsKey("MaskTex")
+        && !Textures.ContainsKey("BaseMap") && !Textures.ContainsKey("Base Color")
+        && (Textures.ContainsKey("MatCap") || Textures.ContainsKey("MatCapTex"));
+
     public string? NoiseTexture => FirstTexture("Noise", "NoiseTex", "FlowTexture");
 
     /// UV 卷动:速度与平铺。火焰靠它动起来。
