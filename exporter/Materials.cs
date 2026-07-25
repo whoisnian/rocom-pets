@@ -66,7 +66,11 @@ public static class Materials
             try
             {
                 var material = provider.LoadPackageObject<UMaterialInstance>(path[..path.LastIndexOf('.')]);
-                result[name] = Resolve(name, material);
+                // **键用对象名而不是文件名。** 本作的 pak 里两者大小写能对不上,而且方向还不一致:
+                // 喵呜的文件是 `MI_Gra_MiaoMiao2_001_By`、对象名是 `…Miaomiao2…`,魔力猫正好反过来。
+                // glb 里的材质名取的是对象名,键不一致运行时就查不到 → 整只宠物一片都画不出来。
+                var key = string.IsNullOrEmpty(material.Name) ? name : material.Name;
+                result[key] = Resolve(key, material);
             }
             catch (Exception e)
             {

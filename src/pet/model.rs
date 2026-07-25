@@ -1,8 +1,9 @@
 //! 读宠物包里的 glb:网格、骨架、动画、材质。
 //!
 //! 包是导出器(exporter/)产出的:一个 glb 里装着「网格 + 蒙皮 + 全部逻辑动作」,
-//! 贴图独立成 PNG 放在 `tex/`,材质名后缀(`_By/_Es/_Mh`)对应贴图 `T_*_<槽>_D`
-//! (见 docs/design.md §1、§4.2)。这里只做加载与整形,不碰 GPU。
+//! 贴图独立成 PNG 放在 `tex/`,**哪个材质画哪张贴图由 manifest 的 `[forms.materials]` 指定**
+//! (导出器从游戏材质实例里解出来,见 docs/design.md §1、§4.3)。
+//! 这里只做加载与整形,不碰 GPU。
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -33,7 +34,7 @@ pub struct Primitive {
 
 pub struct Material {
     pub name: String,
-    /// 基色贴图(RGBA8),按命名约定从 `tex/` 找;找不到就是 None,渲染时用白色兜底。
+    /// 基色贴图(RGBA8),路径来自 manifest 的材质表;读失败才是 None,渲染时用白色兜底。
     pub base_color: Option<Image>,
 }
 
@@ -123,17 +124,13 @@ pub struct Model {
 }
 
 impl Model {
-    /// 不带材质表的载入(旧包 / 只给了一个 glb 路径时):贴图退回命名约定猜。
-    pub fn load(glb_path: &Path) -> Result<Self> {
-        Self::load_with_materials(glb_path, &HashMap::new())
-    }
-
-    /// `materials` 是 manifest 的 `[forms.materials]`:glb 材质名 → 画什么。
-    /// 空表就退回按贴图命名约定猜(`_By/_Es/_Mh` ↔ `T_*_<槽>_D`),那是旧行为。
-    pub fn load_with_materials(
-        glb_path: &Path,
-        materials_spec: &HashMap<String, PackMaterial>,
-    ) -> Result<Self> {
+    /// `materials_spec` 是 manifest 的 `[forms.materials]`:glb 材质名 → 该画什么
+    /// (基色贴图、alpha 语义)。**这是唯一的贴图来源**,导出器从游戏材质实例里解出来,
+    /// 不再按贴图命名约定猜(猜法错 258 处,见 docs/design.md §1)。
+    pub fn load(glb_path: &Path, materials_spec: &HashMap<String, PackMaterial>) -> Result<Self> {
+        if materials_spec.is_empty() {
+            bail!("{glb_path:?} 所属的包没有 [forms.materials](旧版导出的包),重导一次");
+        }
         let bytes = std::fs::read(glb_path).with_context(|| format!("读不到 {glb_path:?}"))?;
         let (doc, buffers, _images) =
             gltf::import_slice(&bytes).with_context(|| format!("解析 {glb_path:?} 失败"))?;
@@ -204,9 +201,6 @@ impl Model {
         let mut primitives = Vec::new();
         let mut materials: Vec<Material> = Vec::new();
         let mut material_index = HashMap::new();
-        let tex_dir = glb_path.parent().unwrap_or(Path::new(".")).join("tex");
-        // 没有材质表时才用几何占比猜特效层(旧包兜底)
-        let guess_effects = materials_spec.is_empty() && should_drop_effect_layers(&mesh);
 
         for primitive in mesh.primitives() {
             let material_name = primitive
@@ -214,19 +208,17 @@ impl Model {
                 .name()
                 .unwrap_or("material")
                 .to_string();
-            match materials_spec.get(&material_name) {
-                // 有材质表:**没有基色就是纯特效层**(火焰/水壳/光晕的固有色是 shader 算的,
-                // 材质里根本没有 BaseTex/EyeTex)。这比按几何占比或贴图亮度猜靠谱得多。
-                Some(spec) if spec.base_color.is_none() => {
-                    log::debug!("跳过特效层材质 {material_name}(材质没有基色参数)");
-                    continue;
-                }
-                Some(_) => {}
-                None if guess_effects && is_effect_slot(&material_name) => {
-                    log::debug!("跳过特效层材质 {material_name}(旧包,按几何占比猜)");
-                    continue;
-                }
-                None => {}
+            // 键在 Pack::load 里统一成了小写,见那边的说明
+            let Some(spec) = materials_spec.get(&material_name.to_ascii_lowercase()) else {
+                // manifest 与 glb 出自同一次导出,对不上就是包坏了;宁可少画一片也不猜
+                log::warn!("材质 {material_name} 不在 manifest 的材质表里,跳过这一片");
+                continue;
+            };
+            // **没有基色就是纯特效层**(火焰/水壳/光晕的固有色是 shader 算的,材质里
+            // 根本没有 BaseTex/EyeTex)。这是确定的事实,不是启发式。
+            if spec.base_color.is_none() {
+                log::debug!("跳过特效层材质 {material_name}(材质没有基色参数)");
+                continue;
             }
             let reader = primitive.reader(get);
             let positions: Vec<[f32; 3]> =
@@ -270,14 +262,10 @@ impl Model {
 
             let name = material_name;
             let material = *material_index.entry(name.clone()).or_insert_with(|| {
-                let base_color = match materials_spec.get(&name) {
-                    // 材质表给了确切的贴图与 alpha 语义,不用再猜
-                    Some(spec) => spec
-                        .base_color
-                        .as_deref()
-                        .and_then(|path| load_texture(path, spec.mask_alpha)),
-                    None => find_base_color(&tex_dir, &name),
-                };
+                let base_color = spec
+                    .base_color
+                    .as_deref()
+                    .and_then(|path| load_texture(path, spec.mask_alpha));
                 materials.push(Material {
                     name: name.clone(),
                     base_color,
@@ -338,6 +326,15 @@ impl Model {
             });
         }
 
+        if vertices.is_empty() {
+            // 曾经的表现是 wgpu 深处 panic「buffer slice can not be empty」,查半天才定位到
+            // 材质名大小写对不上。这里直接说清楚。
+            bail!(
+                "{glb_path:?} 一片网格都没留下:{} 个材质全被跳过(材质表里查不到,或全是特效层)",
+                mesh.primitives().len()
+            );
+        }
+
         let bounds = bind_pose_bounds(&vertices, &skeleton);
         let motion_bounds = animated_bounds(&vertices, &skeleton, &clips, bounds);
         Ok(Self {
@@ -357,115 +354,12 @@ impl Model {
     }
 }
 
-/// 按材质名后缀找基色贴图:`MI_..._By` → `T_..._By_D.png`(见 docs/design.md §1)。
-///
-/// 找不到本槽的贴图时退到本体槽(`By`):有些宠物的眼/特效槽指向**共享贴图**
-/// (CommonTexture 里的眼睛图集之类),而共享贴图是哪张只写在材质实例的参数里,
-/// 那份参数在本作解不出来(§1 的 OverflowException)。退到本体色至少是同色系,
-/// 比留一块纯白好看;真要正确还得先把材质参数解出来。
-fn find_base_color(tex_dir: &Path, material_name: &str) -> Option<Image> {
-    let slot = material_name.rsplit('_').next()?.to_ascii_lowercase();
-    let mut used_body_texture = is_body_slot(&slot);
-    let mut image = load_slot_texture(tex_dir, &slot).or_else(|| {
-        if is_body_slot(&slot) {
-            return None;
-        }
-        let fallback = load_slot_texture(tex_dir, "by");
-        if fallback.is_some() {
-            log::debug!("材质 {material_name} 没有 {slot}_D 贴图,退用本体贴图");
-            used_body_texture = true;
-        }
-        fallback
-    })?;
-    // **用了本体贴图就要把 alpha 刷成不透明。** `_By_D` 的 alpha 不是不透明度,是美术塞的
-    // 遮罩通道:813 张里 160 张通过率 <95%、60 张 <5%,拿去做 alpha 测试会把身体啃掉
-    // (火花 4.8% → 只剩眼睛,迪莫 0.39% → 整只消失)。而叠加片(眼/嘴)自己的贴图是**带透明
-    // 背景的表情图集**,那儿的 alpha 是真遮罩,必须留着剔——菊花梨的眼睛不剔就是一块方糊。
-    // 于是差别放在载入这一步,shader 里只留一个统一的 alpha 测试。
-    //
-    // 判据是「**最终用的是哪张贴图**」而不是「材质槽叫什么」:非本体槽缺贴图时会退用本体贴图,
-    // 那张一样是遮罩 alpha。火神踩过这个坑——它一身肌肉是 Fx 层做的、Fx 槽没自己的贴图,
-    // 按槽名判就漏掉了,整个身体被 alpha 测试剔光,只剩翅膀角和尾巴。
-    if used_body_texture {
-        for pixel in image.rgba.chunks_exact_mut(4) {
-            pixel[3] = 255;
-        }
-    }
-    Some(image)
-}
-
-/// 是不是本体槽:`By`、`By1`、`By2`…(数字后缀是同一只宠物拆开的多张本体贴图)。
-fn is_body_slot(slot: &str) -> bool {
-    slot.strip_prefix("by")
-        .is_some_and(|rest| rest.chars().all(|c| c.is_ascii_digit()))
-}
-
-/// `_Fx*` 槽占三角面的比例低于这个值就当装饰层丢掉,高于则当本体保留。
-/// 全量统计:122 个带 Fx 的形态里,占比 <20% 的 59 个、>60% 的 24 个,中间空得很稀,
-/// 阈值落在 40% 两边都不敏感。
-const EFFECT_BODY_SHARE: f32 = 0.4;
-
-/// 特效层是不是「装饰」级别(几何占比低)。
-///
-/// **这是旧包的兜底猜法,新包不走这条。** 新包的 manifest 带 `[forms.materials]`,
-/// 导出器从游戏材质实例里读出「有没有 BaseTex/EyeTex」,没有就是纯特效层——那是确定的事实,
-/// 不用猜。留着这条是为了还能读没有材质表的旧包。
-///
-/// 猜法本身也记一下当时的依据:`_Fx*` 槽的几何占比 <20% 的 59 个、>60% 的 24 个,
-/// 中间很稀,所以按 40% 分「装饰 / 本体」。它对火花(78%,是本体)判对了,
-/// 但对幽星光一阶判错了——那层壳占 79%、按占比该留,可它的贴图是黑底粉星点,
-/// 不透明地画就是一坨黑盖住粉本体。**真相是材质里 `BaseTex` 指的是粉色本体贴图**,
-/// 我把 `NoiseTex` 当成基色了;这类错误只有读材质才能避免。
-fn should_drop_effect_layers(mesh: &gltf::Mesh) -> bool {
-    let mut effect = 0usize;
-    let mut body = 0usize;
-    for primitive in mesh.primitives() {
-        let name = primitive.material().name().unwrap_or("");
-        // 顶点数就够比例判断,不必真去读索引
-        let count = primitive
-            .get(&gltf::Semantic::Positions)
-            .map_or(0, |a| a.count());
-        if is_effect_slot(name) {
-            effect += count;
-        } else {
-            body += count;
-        }
-    }
-    if effect == 0 {
-        return false;
-    }
-    let share = effect as f32 / (effect + body) as f32;
-    let drop = share < EFFECT_BODY_SHARE;
-    log::debug!(
-        "特效层占顶点 {:.0}% → {}",
-        share * 100.0,
-        if drop {
-            "当装饰丢掉"
-        } else {
-            "当本体保留"
-        }
-    );
-    drop
-}
-
-/// 材质槽是不是特效层(`MI_<资产>_Fx` / `_Fx1` / `_FX2` …)。
-/// 只认 `Fx` 打头加可选数字;`Dynamic\d` 不算——那是身上会动的部件(布料/尾饰),
-/// 属于宠物本体,实测渲出来是对的。
-fn is_effect_slot(material_name: &str) -> bool {
-    let Some(slot) = material_name.rsplit('_').next() else {
-        return false;
-    };
-    let lower = slot.to_ascii_lowercase();
-    lower
-        .strip_prefix("fx")
-        .is_some_and(|rest| rest.chars().all(|c| c.is_ascii_digit()))
-}
-
 /// 按材质表给的路径读基色贴图。
 ///
 /// `mask_alpha` 决定 alpha 怎么处理,这是两类贴图的分水岭(见 pet.wgsl 里的说明):
 /// - `true`(眼/嘴的表情图集):alpha 是真遮罩,原样留着让 shader 按阈值剔;
-/// - `false`(本体):alpha 是美术塞的遮罩通道,**刷成不透明**,否则身体会被剔掉。
+/// - `false`(本体):alpha 是美术塞的遮罩通道,**刷成不透明**,否则身体会被剔掉
+///   (火花通过率 4.8% → 只剩眼睛,迪莫 0.39% → 整只消失)。
 fn load_texture(path: &Path, mask_alpha: bool) -> Option<Image> {
     let img = match image::open(path) {
         Ok(img) => img,
@@ -487,32 +381,6 @@ fn load_texture(path: &Path, mask_alpha: bool) -> Option<Image> {
         height,
         rgba,
     })
-}
-
-fn load_slot_texture(tex_dir: &Path, slot: &str) -> Option<Image> {
-    let entries = std::fs::read_dir(tex_dir).ok()?;
-    let mut candidates: Vec<_> = entries.filter_map(|e| e.ok().map(|e| e.path())).collect();
-    candidates.sort();
-    for path in candidates {
-        let stem = path.file_stem()?.to_string_lossy().to_string();
-        let mut parts = stem.rsplitn(3, '_');
-        let kind = parts.next().unwrap_or("");
-        let tex_slot = parts.next().unwrap_or("");
-        if kind == "D" && tex_slot.to_ascii_lowercase() == slot {
-            match image::open(&path) {
-                Ok(img) => {
-                    let rgba = img.to_rgba8();
-                    return Some(Image {
-                        width: rgba.width(),
-                        height: rgba.height(),
-                        rgba: rgba.into_raw(),
-                    });
-                }
-                Err(e) => log::warn!("贴图 {path:?} 读取失败: {e}"),
-            }
-        }
-    }
-    None
 }
 
 /// 父节点一定排在子节点之前的遍历序。

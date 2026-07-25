@@ -195,8 +195,10 @@ var stopwatch = System.Diagnostics.Stopwatch.StartNew();
 // 控制台与报告文本先按链攒着,跑完按原顺序合并 —— 并行下直接打印会交错到没法看。
 // 同名物种不少(实测「棋契陛下」有 10 条链、72 个名字重复),直接拿名字当目录会互相覆盖,
 // 并行下甚至可能两条链交错写同一个目录。重名的追加链首 id。
-var nameCounts = targets.GroupBy(c => SafeName(c.Name))
-    .ToDictionary(g => g.Key, g => g.Count());
+// **统计范围必须是全部宠物,不能只看这次要导的那几条。** 否则同一条链的包目录名会随
+// 批次变化:单独重导「迪莫」时这批里没有同名链,目录就叫 `迪莫`;而全量导时它叫 `迪莫-3004`。
+// 那样增量重导会另起一个目录、把原来的孤立掉(实测踩过:重导 14 条链后有 3 个包名变了)。
+var nameCounts = AllChainNames(config).GroupBy(n => n).ToDictionary(g => g.Key, g => g.Count());
 var packDirName = new Func<Chain, string>(chain =>
 {
     var name = SafeName(chain.Name);
@@ -531,6 +533,22 @@ static bool ChainAlreadyExported(string outDir, Chain chain)
     var bare = Path.Combine(outDir, SafeName(chain.Name), "manifest.toml");
     var suffixed = Path.Combine(outDir, $"{SafeName(chain.Name)}-{chain.RootId}", "manifest.toml");
     return File.Exists(bare) || File.Exists(suffixed);
+}
+
+/// 全部进化链的物种名(按链首去重)。只用来判「这个名字是不是被多条链共用」,
+/// 所以必须覆盖整个配置表,与这次要导哪几条无关——否则包目录名会随批次漂移。
+static List<string> AllChainNames(GameConfig config)
+{
+    var names = new List<string>();
+    var seen = new HashSet<int>();
+    foreach (var petId in config.AllPetIds())
+    {
+        Chain chain;
+        try { chain = config.ResolveChain(petId); }
+        catch { continue; }
+        if (seen.Add(chain.RootId)) names.Add(SafeName(chain.Name));
+    }
+    return names;
 }
 
 /// 物种名直接当目录名:大多是中文,但个别名字可能带斜杠之类,做一层净化。

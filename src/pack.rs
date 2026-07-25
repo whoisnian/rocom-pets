@@ -54,7 +54,8 @@ struct RawForm {
 #[derive(Deserialize)]
 struct RawMaterial {
     /// 基色贴图的包内相对路径。**缺失 = 纯特效层**(火焰/水壳/光晕:材质里没有
-    /// BaseTex/EyeTex,固有色是 shader 算的),运行时整片跳过。
+    /// BaseTex/EyeTex,固有色是 shader 算的),运行时整片跳过;
+    /// 将来做特效通道时改成按 blend 走半透/加色,见 design.md 横向待办。
     #[serde(default)]
     base_color: Option<String>,
     /// 贴图 alpha 是不是真遮罩。眼/嘴的表情图集是(不剔就是一块方糊),
@@ -106,7 +107,8 @@ pub struct Form {
     pub height_cm: f32,
     pub locomotion: String,
     pub clips: HashMap<String, Clip>,
-    /// glb 里的材质名 → 该画什么。空表示这个包是旧版导的,载入时退回命名约定。
+    /// glb 里的材质名 → 该画什么。**载入模型必需**,空的话 `Model::load` 直接报错
+    /// (旧版导出的包没有这一节,重导即可)。
     pub materials: HashMap<String, Material>,
 }
 
@@ -228,7 +230,9 @@ impl Pack {
                     .into_iter()
                     .map(|(name, mat)| {
                         (
-                            name,
+                            // 键统一小写:材质名在「资产文件名」与「对象名」之间大小写会漂
+                            // (喵呜是 MiaoMiao/Miaomiao、魔力猫反过来),查表必须不区分大小写
+                            name.to_ascii_lowercase(),
                             Material {
                                 base_color: mat.base_color.map(|rel| dir.join(rel)),
                                 mask_alpha: mat.mask_alpha,

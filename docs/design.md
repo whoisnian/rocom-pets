@@ -39,6 +39,7 @@
 | CUE4Parse 的 BC7 解码有 R/B 通道对调的上游 bug | 导出贴图时必须换回，参照 rocom-capture 的 `FixBc7ChannelOrder` |
 | **材质实例是能正常读的**——「`UMaterialInstance.Deserialize` 抛 OverflowException」这条旧结论**是错的**。实测本作 2792 个宠物材质全部强类型加载成功、参数一条不少。当初大概是把 CUE4Parse 为**别的**资产刷的 OverflowException 日志当成了材质的 | 贴图**不按命名约定猜**,直接读材质的 `TextureParameterValues`:`BaseTex`=本体基色、`EyeTex`=眼/嘴基色,`MaskTex/MainTex/StarStickTex/MatCap/Noise` 是别的通道。参数是继承的,要顺 `Parent` 链合并(子覆盖父) |
 | **alpha 的含义分两种,由基色参数名决定**:`EyeTex`(眼/嘴)的贴图是**带透明背景的表情图集**,alpha 是真遮罩;`BaseTex`(本体)的 alpha 是美术塞的遮罩通道(813 张 `_By_D` 里 160 张通过率 <95%、60 张 <5%) | 导出器把这个区分写进 manifest 的 `mask_alpha`:载入时本体贴图的 alpha 刷成 255、表情图集原样保留,shader 里一个统一的 alpha 测试就够。阈值用材质给的 `OpacityMaskClipValue`,全量实测都是 0.3333 |
+| **材质名在「资产文件名」与「对象名」之间大小写会漂,方向还不一致**:喵呜的文件是 `MI_Gra_MiaoMiao2_001_By`、对象名是 `…Miaomiao2…`,魔力猫正好反过来 | glb 里的材质名取的是**对象名**,所以 manifest 的键也要用对象名,运行时查表再统一小写。两头对不上的表现是**整只宠物一片都画不出来**,而且报错是 wgpu 深处一句 `buffer slice can not be empty`——现在载入时加了空网格守卫,直接说清楚 |
 | **「这个材质画不画固有色」看它有没有 `BaseTex`/`EyeTex`**。纯特效层(火焰、水壳、光晕)压根没有:火花的 `Fx` 父材质是 `M_FX_Fire_Mat`、只有 Mask+Noise;水蓝蓝的 `Fx` 父材质是 `M_Wat_ShuiLanLan_PP`、只有一张 MatCap | 这个判据取代了原来按**几何占比**和**贴图亮度**猜的两套启发式。猜法在幽星光一阶上是错的:它的 Fx 壳占 79% 几何、贴图是黑底粉星点,而材质里 `BaseTex` 指的是**粉色本体贴图**,黑星点绑在 `NoiseTex` 上——我把噪声当基色了 |
 | **召唤/落地类动作会整只挪到别处**：喵喵 `CallOut` 起始几帧悬在 y=1.44..2.47m(其余动作都在 0..1.0)，单帧形体只有 1.19 倍，但并集一下取景盒高度就从 0.8m 撑到 2.48m | 量取景盒时丢掉「中心偏离绑定中心超过一个身高」的姿势。阈值不能太紧:**悬浮类宠物**是正常的(空空颅幽灵的 `Alert` 常态浮在 45–56%)，而落地是 160–197%，中间很宽 |
 | CUE4Parse 把空 morph target 写成**没有 bufferView 的 accessor**;按 glTF 规范那等价「全零」是合法的，但 Rust `gltf` crate 判 `Missing data` 直接拒绝加载。826 个形态里 32 个带 morph target 且**全部**加载失败 | 导出器 `ExportMorphTargets = false`——我们从不驱动它们(既无 morph 通道也无 `mesh.weights`) |
@@ -430,6 +431,10 @@ missing_clips = ["hide"]
    45–56%,而它就在表情池里,于是运行时照样顶出画布)。
    另一个坑:采样时剥的位移必须**和运行时一模一样**(只剥 root 的 X/Z、保留 Y),
    否则量出来的盒子比实际渲的低,带纵向起伏的动作会顶出去。
+
+**分批重导踩的一个坑**:包目录的重名后缀原来是按「这次要导的链」统计的,于是单独重导「迪莫」时
+这批里没有同名链、目录就叫 `迪莫`,而全量导时它叫 `迪莫-3004`——增量重导会另起一个目录、
+把原来的孤立掉(实测重导 14 条链后 3 个包名变了)。改成按**全部宠物**统计重名,与批次无关。
 
 **待做**:直接读 `.rkpet`(zip)而不是解开的目录——现在导出器能打 zip、运行时只读目录,
 资产访问要先抽一层;egui 的包管理 GUI;贴图转 KTX2 与关键帧精简(体积);

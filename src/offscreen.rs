@@ -35,12 +35,11 @@ pub struct Request {
 
 pub fn render(request: &Request) -> Result<()> {
     let glb = locate_glb(&request.pack, request.form.as_deref())?;
-    // 有 manifest 就按材质表载入(贴图与 alpha 语义都由它定),否则退回命名约定。
-    // 调试渲图必须走同一条路径,否则「渲出来对不对」验的不是运行时的行为。
-    let model = match load_materials(&request.pack, &glb) {
-        Some(spec) => Model::load_with_materials(&glb, &spec)?,
-        None => Model::load(&glb)?,
-    };
+    // 材质表是必需的(贴图与 alpha 语义都由它定)。调试渲图必须走和运行时同一条路径,
+    // 否则「渲出来对不对」验的不是运行时的行为。
+    let spec = load_materials(&request.pack, &glb)
+        .with_context(|| format!("{:?} 里找不到这个形态的材质表,重导一次包", request.pack))?;
+    let model = Model::load(&glb, &spec)?;
     log::info!(
         "{}: {} 顶点 / {} 三角 / {} 关节 / {} 段动作",
         glb.display(),
