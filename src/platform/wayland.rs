@@ -77,6 +77,14 @@ const CANVAS_PADDING: f32 = 1.15;
 /// 鼠标左键(linux input event code)。
 const BTN_LEFT: u32 = 0x110;
 
+/// 特效层的 UV 卷动需要一个连续时间源。取进程启动至今的秒数就够——
+/// 它只驱动噪声流动,不参与任何逻辑,不必和动画时钟对齐。
+fn effect_time() -> f32 {
+    use std::sync::OnceLock;
+    static START: OnceLock<Instant> = OnceLock::new();
+    START.get_or_init(Instant::now).elapsed().as_secs_f32()
+}
+
 pub fn run(options: &Options) -> Result<()> {
     let conn = Connection::connect_to_env().context("连不上 Wayland 合成器")?;
     let (globals, event_queue) = registry_queue_init(&conn).context("注册表初始化失败")?;
@@ -729,6 +737,7 @@ impl App {
                 view_proj(pet.model.motion_bounds, pet.yaw, CANVAS_PADDING),
                 Vec3::new(-0.4, 0.8, 0.6),
                 outline,
+                effect_time(),
                 &pet.player.matrices,
             );
             surfaces

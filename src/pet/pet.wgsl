@@ -8,6 +8,20 @@ struct Camera {
     // 光照方向(指向光源)与描边参数打包进一个 vec4 省 binding
     light_dir: vec3<f32>,
     outline_width: f32,
+    // 秒;特效层的 UV 卷动靠它推进
+    time: f32,
+    // 不要在这儿补 vec3 占位:WGSL 里 vec3 要 16 字节对齐,会把结构体从 96 撑到 112,
+    // 和 Rust 侧的 96 对不上(wgpu 会报 "bound with size 96 where the shader expects 112")。
+    // mat4x4 已经让整个结构按 16 对齐,尾部的 12 字节填充由规则自动补上。
+};
+
+/// 每材质一份。普通材质也有(tint 全 1、params.z=0),两条通道共用布局。
+struct MaterialParams {
+    tint: vec4<f32>,
+    // [u 速度, v 速度, u 平铺, v 平铺]
+    flow: vec4<f32>,
+    // [不透明度, 发光强度, 是否加色, 有没有噪声贴图]
+    params: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> camera: Camera;
@@ -15,6 +29,9 @@ struct Camera {
 @group(0) @binding(1) var<storage, read> joints: array<mat4x4<f32>>;
 @group(1) @binding(0) var base_color: texture_2d<f32>;
 @group(1) @binding(1) var base_sampler: sampler;
+// 特效层的噪声贴图;普通材质这里是 1×1 白图
+@group(1) @binding(2) var noise_tex: texture_2d<f32>;
+@group(1) @binding(3) var<uniform> material: MaterialParams;
 
 struct VsIn {
     @location(0) pos: vec3<f32>,
@@ -105,4 +122,43 @@ fn fs_outline(in: VsOut) -> @location(0) vec4<f32> {
     }
     // 描边取基色的暗版而不是纯黑,卡通渲染里这样更自然
     return vec4<f32>(tex.rgb * 0.25, 1.0);
+}
+
+// 特效层(火焰 / 水壳 / 光晕)。**不是复刻游戏 shader,是够用的近似**:
+// 主色 × 遮罩 × 卷动噪声,加色或半透二选一。参数全部来自游戏材质实例:
+// 火花 `M_FX_Fire_Mat` 给 Color01=(6,0.8,0)(R>1 的 HDR 橙,说明是加色)+ Mask/Noise + 流速;
+// 水蓝蓝 `M_Wat_ShuiLanLan_PP` 给 MainColor 浅蓝 + Opacity=0.8 + MatCap(当遮罩用)。
+//
+// 输出**预乘 alpha**,于是一条混合状态覆盖两种模式:
+// - 加色:alpha 输出 0 → dst + rgb,黑色不加东西,正好是加色的语义;
+// - 半透:alpha 输出不透明度 → 常规 src + dst*(1-a)。
+@fragment
+fn fs_effect(in: VsOut) -> @location(0) vec4<f32> {
+    let opacity = material.params.x;
+    let glow = material.params.y;
+    let additive = material.params.z > 0.5;
+    let has_noise = material.params.w > 0.5;
+
+    // 遮罩决定形状;卷动只作用在噪声上(火焰的动感来自噪声流过固定遮罩)
+    let mask = textureSample(base_color, base_sampler, in.uv);
+    var flow_amount = 1.0;
+    if has_noise {
+        let uv = in.uv * material.flow.zw + vec2<f32>(material.flow.x, material.flow.y) * camera.time;
+        flow_amount = textureSample(noise_tex, base_sampler, uv).r;
+    }
+
+    // 边缘处更亮/更实:水壳的菲涅尔感与火焰的边缘都靠这个
+    let n = normalize(in.normal);
+    let facing = 1.0 - abs(dot(n, normalize(in.view_dir)));
+    let rim = mix(0.35, 1.0, facing);
+
+    let strength = mask.a * flow_amount * rim;
+    let color = material.tint.rgb * glow * strength;
+    if additive {
+        // 加色:alpha=0,只往目标上加光
+        return vec4<f32>(color, 0.0);
+    }
+    let alpha = clamp(strength * opacity * material.tint.a, 0.0, 1.0);
+    // 预乘
+    return vec4<f32>(material.tint.rgb * alpha, alpha);
 }

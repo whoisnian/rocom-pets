@@ -11,10 +11,22 @@ using CUE4Parse.FileProvider;
 using CUE4Parse.FileProvider.Vfs;
 using CUE4Parse.UE4.Assets.Exports;
 using CUE4Parse.UE4.Assets.Exports.Material;
+using CUE4Parse.UE4.Assets.Exports.SkeletalMesh;
 using CUE4Parse.UE4.Assets.Objects;
 using CUE4Parse.UE4.Assets.Objects.Properties;
 
 namespace RocomPets.Export;
+
+/// 一个特效父族的参数汇总(调查用)。
+internal class EffectFamily
+{
+    public int Count;
+    public string? Sample;
+    public readonly HashSet<string> Blends = new(StringComparer.OrdinalIgnoreCase);
+    public readonly HashSet<string> Textures = new(StringComparer.OrdinalIgnoreCase);
+    public readonly HashSet<string> Vectors = new(StringComparer.OrdinalIgnoreCase);
+    public readonly HashSet<string> Scalars = new(StringComparer.OrdinalIgnoreCase);
+}
 
 public static class MaterialProbe
 {
@@ -45,6 +57,7 @@ public static class MaterialProbe
         var slotParam = new Dictionary<string, Dictionary<string, int>>(StringComparer.OrdinalIgnoreCase);
         var shared = new List<string>();
         var nonOpaque = new List<string>();
+        var effectFamily = new Dictionary<string, EffectFamily>(StringComparer.OrdinalIgnoreCase);
         var failed = 0;
         var materialCount = 0;
 
@@ -53,7 +66,7 @@ public static class MaterialProbe
             var assetDir = $"{petsRoot}/{asset}";
             var warnings = new List<string>();
             Dictionary<string, MaterialInfo> mats;
-            try { mats = Materials.Load(provider, assetDir, warnings); }
+            try { mats = Materials.Load(LoadMesh(provider, assetDir)!, warnings); }
             catch { failed++; continue; }
             failed += warnings.Count;
             foreach (var (name, info) in mats)
@@ -74,6 +87,20 @@ public static class MaterialProbe
                     slotParam[slot] = counts = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
                 foreach (var p in info.Textures.Keys) counts[p] = counts.GetValueOrDefault(p) + 1;
 
+                // 特效层:按父族攒参数名,看要写几套近似公式
+                if (info.BaseColorTexture is null && !name.EndsWith("_Ol", StringComparison.OrdinalIgnoreCase))
+                {
+                    var family = info.ParentChain.Count > 0 ? info.ParentChain[^1] : "(无父)";
+                    if (!effectFamily.TryGetValue(family, out var acc))
+                        effectFamily[family] = acc = new EffectFamily();
+                    acc.Count++;
+                    acc.Sample ??= $"{asset}/{name}";
+                    acc.Blends.Add(info.BlendMode.ToString());
+                    foreach (var t in info.Textures.Keys) acc.Textures.Add(t);
+                    foreach (var v in info.Vectors.Keys) acc.Vectors.Add(v);
+                    foreach (var sc in info.Scalars.Keys) acc.Scalars.Add(sc);
+                }
+
                 // 基色候选落在别的目录 = 共享贴图
                 foreach (var (param, tex) in info.Textures)
                     if (IsBaseColorParam(param) && !tex.StartsWith(assetDir + "/", StringComparison.OrdinalIgnoreCase))
@@ -93,6 +120,17 @@ public static class MaterialProbe
         Console.WriteLine("\n=== 材质槽 → 贴图参数");
         foreach (var (slot, counts) in slotParam.OrderByDescending(kv => kv.Value.Values.Sum()).Take(14))
             Console.WriteLine($"  {slot,-12} {string.Join(", ", counts.OrderByDescending(c => c.Value).Select(c => $"{c.Key}×{c.Value}"))}");
+        // 特效层按「父材质族」归类:每一族要写一个近似公式,所以先看有几族、各多少
+        Console.WriteLine("\n=== 特效层(无基色参数)按父材质族分布");
+        foreach (var (k, v) in effectFamily.OrderByDescending(kv => kv.Value.Count))
+        {
+            Console.WriteLine($"  {v.Count,5} 个  父族 {k}");
+            Console.WriteLine($"        贴图参数: {string.Join(", ", v.Textures.OrderBy(x => x))}");
+            Console.WriteLine($"        颜色参数: {string.Join(", ", v.Vectors.OrderBy(x => x))}");
+            Console.WriteLine($"        标量参数: {string.Join(", ", v.Scalars.OrderBy(x => x).Take(12))}");
+            Console.WriteLine($"        混合: {string.Join(", ", v.Blends.OrderBy(x => x))}  例: {v.Sample}");
+        }
+
         Console.WriteLine($"\n=== 基色指向共享贴图(资产目录之外)的 {shared.Count} 处");
         foreach (var s in shared.Take(20)) Console.WriteLine("  " + s);
 
@@ -108,7 +146,7 @@ public static class MaterialProbe
                 .Where(n => n is not null)
                 .ToList();
             Dictionary<string, MaterialInfo> mats;
-            try { mats = Materials.Load(provider, assetDir, []); }
+            try { mats = Materials.Load(LoadMesh(provider, assetDir)!, []); }
             catch { continue; }
             foreach (var (name, info) in mats)
             {
@@ -143,6 +181,19 @@ public static class MaterialProbe
         }
         Console.WriteLine($"  一致 {same} / 只有材质给得出 {matOnly} / 只有约定给得出 {convOnly} / 两者不同 {differ} / 都没有 {neither}");
         foreach (var e in examples) Console.WriteLine(e);
+    }
+
+    /// 找资产目录直属的 `SKM_*` 蒙皮网格(与导出器同一套规则)。
+    private static USkeletalMesh? LoadMesh(AbstractVfsFileProvider provider, string assetDir)
+    {
+        var candidates = Textures.TopLevelFiles(provider, assetDir)
+            .Select(Path.GetFileNameWithoutExtension)
+            .Where(n => n is not null && n.StartsWith("SKM_", StringComparison.OrdinalIgnoreCase))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .OrderByDescending(n => n!.EndsWith("_Skin", StringComparison.OrdinalIgnoreCase))
+            .ToList();
+        if (candidates.Count == 0) return null;
+        return provider.LoadPackageObject<USkeletalMesh>($"{assetDir}/{candidates[0]}");
     }
 
     /// 哪些参数名承载「基色」。按普查结果定:本体是 BaseTex,眼/嘴是 EyeTex。
@@ -194,12 +245,16 @@ public static class MaterialProbe
         // 先打「解析后的结论」——这才是导出器要吃的东西
         Console.WriteLine("\n=== 解析结果(顺父链合并后)");
         var warnings = new List<string>();
-        foreach (var (name, info) in Materials.Load(provider, assetDir, warnings))
+        foreach (var (name, info) in Materials.Load(LoadMesh(provider, assetDir)!, warnings))
         {
             Console.WriteLine($"  {name}  混合={info.BlendMode} 遮罩阈值={info.OpacityMaskClipValue:0.####}");
             Console.WriteLine($"    父链: {string.Join(" ← ", info.ParentChain)}");
             foreach (var (param, tex) in info.Textures.OrderBy(kv => kv.Key))
-                Console.WriteLine($"    {param,-22} → {tex}");
+                Console.WriteLine($"    tex {param,-20} → {tex}");
+            foreach (var (param, c) in info.Vectors.OrderBy(kv => kv.Key))
+                Console.WriteLine($"    col {param,-20} = ({c[0]:0.###}, {c[1]:0.###}, {c[2]:0.###}, {c[3]:0.###})");
+            foreach (var (param, v) in info.Scalars.OrderBy(kv => kv.Key))
+                Console.WriteLine($"    num {param,-20} = {v:0.####}");
         }
         foreach (var w in warnings) Console.WriteLine($"  [warn] {w}");
 

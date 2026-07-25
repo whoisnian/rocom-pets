@@ -17,6 +17,20 @@ struct CameraUniform {
     view_proj: [[f32; 4]; 4],
     light_dir: [f32; 3],
     outline_width: f32,
+    /// 秒。特效层的 UV 卷动靠它推进(火焰在流动)。
+    time: f32,
+    _pad: [f32; 3],
+}
+
+/// 每个材质一份的特效参数。**普通材质也占一份**(tint 全 1、flags=0),
+/// 这样两条通道共用同一个 bind group 布局,少一套代码。
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct MaterialUniform {
+    tint: [f32; 4],
+    flow: [f32; 4],
+    /// [opacity, glow, additive(0/1), 是否有噪声贴图(0/1)]
+    params: [f32; 4],
 }
 
 /// 一只宠物的 GPU 资源(网格与贴图按形态共享,实例状态另说)。
@@ -30,7 +44,10 @@ pub struct PetGpu {
     material_binds: Vec<wgpu::BindGroup>,
     pipeline: wgpu::RenderPipeline,
     outline_pipeline: wgpu::RenderPipeline,
+    effect_pipeline: wgpu::RenderPipeline,
+    /// (首索引, 数量, 材质序号);按「是不是特效层」分成两批,特效层要最后画。
     draws: Vec<(u32, u32, usize)>,
+    effect_draws: Vec<(u32, u32, usize)>,
 }
 
 impl PetGpu {
@@ -108,6 +125,27 @@ impl PetGpu {
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                     count: None,
                 },
+                // 特效层的噪声贴图;普通材质绑一张 1×1 白图占位
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
             ],
         });
 
@@ -133,33 +171,68 @@ impl PetGpu {
             mipmap_filter: wgpu::MipmapFilterMode::Linear,
             ..Default::default()
         });
+        let white = super::model::Image {
+            width: 1,
+            height: 1,
+            rgba: vec![255, 255, 255, 255],
+        };
         let mut material_binds = Vec::new();
         for material in &model.materials {
-            let view = match &material.base_color {
-                Some(image) => upload_texture(device, queue, &material.name, image),
-                // 贴图缺失时用白色,至少形体还能看
-                None => upload_texture(
-                    device,
-                    queue,
-                    &material.name,
-                    &super::model::Image {
-                        width: 1,
-                        height: 1,
-                        rgba: vec![255, 255, 255, 255],
-                    },
-                ),
+            // 主贴图:普通材质是基色;特效层是遮罩(形状来源),缺了就用白图 = 常量 1
+            let main = match (&material.base_color, &material.effect) {
+                (Some(image), _) => image,
+                (None, Some(effect)) => effect.mask.as_ref().unwrap_or(&white),
+                (None, None) => &white,
             };
+            let main_view = upload_texture(device, queue, &material.name, main);
+            let noise = material
+                .effect
+                .as_ref()
+                .and_then(|e| e.noise.as_ref())
+                .unwrap_or(&white);
+            let noise_view = upload_texture(device, queue, &material.name, noise);
+            let uniform = match &material.effect {
+                Some(effect) => MaterialUniform {
+                    tint: effect.tint,
+                    flow: effect.flow,
+                    params: [
+                        effect.opacity,
+                        effect.glow,
+                        if effect.additive { 1.0 } else { 0.0 },
+                        if effect.noise.is_some() { 1.0 } else { 0.0 },
+                    ],
+                },
+                // 普通材质:tint 全 1 相当于不改色
+                None => MaterialUniform {
+                    tint: [1.0; 4],
+                    flow: [0.0, 0.0, 1.0, 1.0],
+                    params: [1.0, 1.0, 0.0, 0.0],
+                },
+            };
+            let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("pet-material-uniform"),
+                contents: bytemuck::bytes_of(&uniform),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
             material_binds.push(device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("pet-material"),
                 layout: &material_layout,
                 entries: &[
                     wgpu::BindGroupEntry {
                         binding: 0,
-                        resource: wgpu::BindingResource::TextureView(&view),
+                        resource: wgpu::BindingResource::TextureView(&main_view),
                     },
                     wgpu::BindGroupEntry {
                         binding: 1,
                         resource: wgpu::BindingResource::Sampler(&sampler),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::TextureView(&noise_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: uniform_buffer.as_entire_binding(),
                     },
                 ],
             }));
@@ -206,53 +279,65 @@ impl PetGpu {
                 },
             ],
         };
-        let make_pipeline = |label: &str, vs: &str, fs: &str, cull: wgpu::Face| {
-            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some(label),
-                layout: Some(&pipeline_layout),
-                vertex: wgpu::VertexState {
-                    module: &shader,
-                    entry_point: Some(vs),
-                    compilation_options: Default::default(),
-                    buffers: &[Some(vertex_layout.clone())],
-                },
-                primitive: wgpu::PrimitiveState {
-                    topology: wgpu::PrimitiveTopology::TriangleList,
-                    cull_mode: Some(cull),
-                    ..Default::default()
-                },
-                depth_stencil: Some(wgpu::DepthStencilState {
-                    format: DEPTH_FORMAT,
-                    depth_write_enabled: Some(true),
-                    depth_compare: Some(wgpu::CompareFunction::Less),
-                    stencil: Default::default(),
-                    bias: Default::default(),
-                }),
-                multisample: wgpu::MultisampleState::default(),
-                fragment: Some(wgpu::FragmentState {
-                    module: &shader,
-                    entry_point: Some(fs),
-                    compilation_options: Default::default(),
-                    targets: &[Some(wgpu::ColorTargetState {
-                        format: target_format,
-                        blend: Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
-                        write_mask: wgpu::ColorWrites::ALL,
-                    })],
-                }),
-                multiview_mask: None,
-                cache: None,
-            })
-        };
-        let pipeline = make_pipeline("pet", "vs_main", "fs_main", wgpu::Face::Back);
+        // depth_write:主通道写深度,特效通道只测不写(半透层之间不该互相挡)
+        let make_pipeline =
+            |label: &str, vs: &str, fs: &str, cull: Option<wgpu::Face>, depth_write: bool| {
+                device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                    label: Some(label),
+                    layout: Some(&pipeline_layout),
+                    vertex: wgpu::VertexState {
+                        module: &shader,
+                        entry_point: Some(vs),
+                        compilation_options: Default::default(),
+                        buffers: &[Some(vertex_layout.clone())],
+                    },
+                    primitive: wgpu::PrimitiveState {
+                        topology: wgpu::PrimitiveTopology::TriangleList,
+                        cull_mode: cull,
+                        ..Default::default()
+                    },
+                    depth_stencil: Some(wgpu::DepthStencilState {
+                        format: DEPTH_FORMAT,
+                        depth_write_enabled: Some(depth_write),
+                        depth_compare: Some(wgpu::CompareFunction::Less),
+                        stencil: Default::default(),
+                        bias: Default::default(),
+                    }),
+                    multisample: wgpu::MultisampleState::default(),
+                    fragment: Some(wgpu::FragmentState {
+                        module: &shader,
+                        entry_point: Some(fs),
+                        compilation_options: Default::default(),
+                        targets: &[Some(wgpu::ColorTargetState {
+                            format: target_format,
+                            blend: Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
+                            write_mask: wgpu::ColorWrites::ALL,
+                        })],
+                    }),
+                    multiview_mask: None,
+                    cache: None,
+                })
+            };
+        let pipeline = make_pipeline("pet", "vs_main", "fs_main", Some(wgpu::Face::Back), true);
         // 描边画背面:外扩后的壳只有背面能露在本体之外
-        let outline_pipeline =
-            make_pipeline("pet-outline", "vs_outline", "fs_outline", wgpu::Face::Front);
+        let outline_pipeline = make_pipeline(
+            "pet-outline",
+            "vs_outline",
+            "fs_outline",
+            Some(wgpu::Face::Front),
+            true,
+        );
+        // 特效层:**不剔面**(火焰/水壳是薄壳,正反两面都要看得见)、不写深度。
+        // 混合沿用预乘 alpha —— shader 输出 alpha=0 就等价于加色(dst + rgb),
+        // 输出 alpha=不透明度就是普通半透,一条管线覆盖火焰与水壳两种。
+        let effect_pipeline = make_pipeline("pet-effect", "vs_main", "fs_effect", None, false);
 
-        let draws = model
+        // 特效层最后画:它们要叠在本体之上
+        let (effect_draws, draws): (Vec<_>, Vec<_>) = model
             .primitives
             .iter()
             .map(|p| (p.first_index, p.index_count, p.material))
-            .collect();
+            .partition(|&(_, _, material)| model.materials[material].effect.is_some());
 
         Ok(Self {
             vertices,
@@ -264,7 +349,9 @@ impl PetGpu {
             material_binds,
             pipeline,
             outline_pipeline,
+            effect_pipeline,
             draws,
+            effect_draws,
         })
     }
 
@@ -275,6 +362,7 @@ impl PetGpu {
         view_proj: Mat4,
         light_dir: Vec3,
         outline_width: f32,
+        time: f32,
         matrices: &[Mat4],
     ) {
         queue.write_buffer(
@@ -284,6 +372,8 @@ impl PetGpu {
                 view_proj: view_proj.to_cols_array_2d(),
                 light_dir: light_dir.normalize().to_array(),
                 outline_width,
+                time,
+                _pad: [0.0; 3],
             }),
         );
         let count = matrices.len().min(self.joint_capacity);
@@ -305,6 +395,14 @@ impl PetGpu {
                 &self.pipeline
             });
             for &(first, count, material) in &self.draws {
+                pass.set_bind_group(1, &self.material_binds[material], &[]);
+                pass.draw_indexed(first..first + count, 0, 0..1);
+            }
+        }
+        // 特效层放最后:本体的深度已经写好,这里只测不写,叠在上面
+        if !self.effect_draws.is_empty() {
+            pass.set_pipeline(&self.effect_pipeline);
+            for &(first, count, material) in &self.effect_draws {
                 pass.set_bind_group(1, &self.material_binds[material], &[]);
                 pass.draw_indexed(first..first + count, 0, 0..1);
             }

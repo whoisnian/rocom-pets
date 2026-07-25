@@ -36,6 +36,19 @@ pub struct Material {
     pub name: String,
     /// 基色贴图(RGBA8),路径来自 manifest 的材质表;读失败才是 None,渲染时用白色兜底。
     pub base_color: Option<Image>,
+    /// 特效层的画法(火焰/水壳/光晕)。`None` = 普通不透明材质,走主通道。
+    pub effect: Option<EffectMaterial>,
+}
+
+/// 特效层要用的东西:主色 + 卷动 + 遮罩/噪声贴图。参数解释见 `pack::Effect`。
+pub struct EffectMaterial {
+    pub tint: [f32; 4],
+    pub opacity: f32,
+    pub glow: f32,
+    pub flow: [f32; 4],
+    pub additive: bool,
+    pub mask: Option<Image>,
+    pub noise: Option<Image>,
 }
 
 pub struct Image {
@@ -214,12 +227,8 @@ impl Model {
                 log::warn!("材质 {material_name} 不在 manifest 的材质表里,跳过这一片");
                 continue;
             };
-            // **没有基色就是纯特效层**(火焰/水壳/光晕的固有色是 shader 算的,材质里
-            // 根本没有 BaseTex/EyeTex)。这是确定的事实,不是启发式。
-            if spec.base_color.is_none() {
-                log::debug!("跳过特效层材质 {material_name}(材质没有基色参数)");
-                continue;
-            }
+            // 没有基色 = 纯特效层(火焰/水壳/光晕),不跳过了:走加色/半透的特效通道,
+            // 主色与卷动参数都在材质里,见 `pack::Effect`。
             let reader = primitive.reader(get);
             let positions: Vec<[f32; 3]> =
                 reader.read_positions().context("缺 POSITION")?.collect();
@@ -266,9 +275,28 @@ impl Model {
                     .base_color
                     .as_deref()
                     .and_then(|path| load_texture(path, spec.mask_alpha));
+                // 特效层的遮罩/噪声贴图 alpha 原样保留:形状全靠它
+                let effect = spec.base_color.is_none().then(|| EffectMaterial {
+                    tint: spec.effect.tint,
+                    opacity: spec.effect.opacity,
+                    glow: spec.effect.glow,
+                    flow: spec.effect.flow,
+                    additive: spec.effect.additive(),
+                    mask: spec
+                        .effect
+                        .mask
+                        .as_deref()
+                        .and_then(|p| load_texture(p, true)),
+                    noise: spec
+                        .effect
+                        .noise
+                        .as_deref()
+                        .and_then(|p| load_texture(p, true)),
+                });
                 materials.push(Material {
                     name: name.clone(),
                     base_color,
+                    effect,
                 });
                 materials.len() - 1
             });

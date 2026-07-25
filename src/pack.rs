@@ -62,6 +62,19 @@ struct RawMaterial {
     /// 本体贴图不是(它的 alpha 是美术塞的遮罩通道,拿来剔会把身体啃掉)。
     #[serde(default)]
     mask_alpha: bool,
+    /// 以下都只对特效层有意义(`base_color` 缺失时)。
+    #[serde(default)]
+    tint: Option<[f32; 4]>,
+    #[serde(default = "one")]
+    opacity: f32,
+    #[serde(default = "one")]
+    glow: f32,
+    #[serde(default)]
+    flow: Option<[f32; 4]>,
+    #[serde(default)]
+    mask_tex: Option<String>,
+    #[serde(default)]
+    noise_tex: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -89,9 +102,31 @@ pub struct Clip {
 /// 一个材质槽该怎么画。由导出器解析游戏材质实例得出,取代原来按贴图命名约定的猜法。
 #[derive(Clone)]
 pub struct Material {
-    /// 基色贴图的绝对路径;None = 纯特效层,不画。
+    /// 基色贴图的绝对路径;None = 纯特效层,走 `effect` 那套画法。
     pub base_color: Option<PathBuf>,
     pub mask_alpha: bool,
+    /// 只在 `base_color` 为 None 时有效。
+    pub effect: Effect,
+}
+
+/// 特效层(火焰/水壳/光晕)的画法参数,全部来自游戏材质。
+#[derive(Clone)]
+pub struct Effect {
+    /// 主色,**可能是 HDR**:火花的 `Color01` = (6, 0.8, 0)。任一通道 >1 就当加色发光。
+    pub tint: [f32; 4],
+    pub opacity: f32,
+    pub glow: f32,
+    /// [u 速度, v 速度, u 平铺, v 平铺]
+    pub flow: [f32; 4],
+    pub mask: Option<PathBuf>,
+    pub noise: Option<PathBuf>,
+}
+
+impl Effect {
+    /// 主色任一通道 >1 说明美术是当**加色发光**用的(黑=加零),此时不该按半透混合。
+    pub fn additive(&self) -> bool {
+        self.tint[0] > 1.0 || self.tint[1] > 1.0 || self.tint[2] > 1.0
+    }
 }
 
 #[allow(dead_code)]
@@ -236,6 +271,15 @@ impl Pack {
                             Material {
                                 base_color: mat.base_color.map(|rel| dir.join(rel)),
                                 mask_alpha: mat.mask_alpha,
+                                effect: Effect {
+                                    // 没给主色就用白,至少形体在
+                                    tint: mat.tint.unwrap_or([1.0; 4]),
+                                    opacity: mat.opacity,
+                                    glow: mat.glow,
+                                    flow: mat.flow.unwrap_or([0.0, 0.0, 1.0, 1.0]),
+                                    mask: mat.mask_tex.map(|rel| dir.join(rel)),
+                                    noise: mat.noise_tex.map(|rel| dir.join(rel)),
+                                },
                             },
                         )
                     })

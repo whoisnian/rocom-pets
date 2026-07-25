@@ -141,6 +141,7 @@ pub fn render(request: &Request) -> Result<()> {
             view_proj,
             light_dir,
             outline_width,
+            elapsed_seconds(),
             &player.matrices,
         );
         let pixels = draw_and_read(
@@ -174,6 +175,7 @@ pub fn render(request: &Request) -> Result<()> {
                 view_proj,
                 light_dir,
                 outline_width,
+                elapsed_seconds(),
                 &player.matrices,
             );
             let pixels = draw_and_read(
@@ -240,7 +242,14 @@ fn benchmark(
     for _ in 0..frames {
         player.advance(model, 1.0 / 60.0);
         player.update(model);
-        pet.update(queue, view_proj, light, 0.004, &player.matrices);
+        pet.update(
+            queue,
+            view_proj,
+            light,
+            0.004,
+            elapsed_seconds(),
+            &player.matrices,
+        );
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("bench"),
         });
@@ -423,6 +432,11 @@ fn load_materials(
     let asset = glb.parent()?.file_name()?.to_str()?;
     let form = loaded.forms.iter().find(|f| f.asset == asset)?;
     (!form.materials.is_empty()).then(|| form.materials.clone())
+}
+
+/// 渲图工具用固定时刻,免得同一条命令两次跑出不同的火焰形状(要看流动用 --bench 或实机)。
+fn elapsed_seconds() -> f32 {
+    0.0
 }
 
 fn locate_glb(pack: &Path, form: Option<&str>) -> Result<PathBuf> {

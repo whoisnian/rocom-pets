@@ -17,6 +17,7 @@
 using CUE4Parse.FileProvider;
 using CUE4Parse.FileProvider.Vfs;
 using CUE4Parse.UE4.Assets.Exports.Material;
+using CUE4Parse.UE4.Assets.Exports.SkeletalMesh;
 using CUE4Parse.UE4.Assets.Exports.Texture;
 using CUE4Parse.UE4.Assets.Objects;
 
@@ -27,10 +28,17 @@ public record MaterialInfo(
     string Name,
     /// 参数名 → 贴图对象路径(已顺父链合并,子覆盖父)。
     Dictionary<string, string> Textures,
+    /// 参数名 → 线性色(RGBA)。特效层的颜色就在这儿:火焰的 Color、光晕的 EmissColor 之类。
+    Dictionary<string, float[]> Vectors,
+    /// 参数名 → 标量。强度/流速/菲涅尔次数一类。
+    Dictionary<string, float> Scalars,
     EBlendMode BlendMode,
     float OpacityMaskClipValue,
     /// 父链上所有材质的名字,由近及远;排查用。
-    List<string> ParentChain)
+    List<string> ParentChain,
+    /// 材质资产是不是真的读到了。`false` = 网格引用的材质包在 pak 里根本不存在(悬空引用),
+    /// 参数全空,导出器会退回按贴图命名约定给基色,见 Program.cs。
+    bool Resolved = true)
 {
     /// 承载基色的参数名。`BaseTex` = 本体一类,`EyeTex` = 眼/嘴那种贴脸的小面片。
     /// 没有这两个参数 = 这个材质**不画固有色**(纯 VFX:火焰、水壳、光晕),桌宠该整片跳过。
@@ -45,6 +53,40 @@ public record MaterialInfo(
     /// 渲的时候要按阈值剔;本体贴图的 alpha 是美术塞的遮罩通道,不能拿来剔(会把身体啃掉)。
     public bool IsFacePatch =>
         BaseColorParam?.Equals("EyeTex", StringComparison.OrdinalIgnoreCase) == true;
+
+    /// 特效层的主色。这些材质没有基色贴图,固有色写在颜色参数里:
+    /// 火焰是 `Color01`(火花实测 (6, 0.8, 0) —— R>1 的 HDR 橙,说明是加色发光),
+    /// 水壳是 `MainColor`(水蓝蓝 (0.19, 0.65, 1)),其余族用 BaseColor 一类。
+    public float[]? Tint => FirstVector("Color01", "MainColor", "BaseColor", "BaseColor1",
+        "Emitter Color", "FresnelColor", "PatternColor", "BackColor");
+
+    /// 半透强度;没写就当全不透明。
+    public float Opacity => Scalars.TryGetValue("Opacity", out var v) ? v : 1f;
+
+    /// 遮罩/噪声贴图:特效的形状与流动来源。没有就当常量 1。
+    public string? MaskTexture =>
+        FirstTexture("Mask", "MaskTex", "BaseMap", "Base Color", "MatCap", "MatCapTex");
+
+    public string? NoiseTexture => FirstTexture("Noise", "NoiseTex", "FlowTexture");
+
+    /// UV 卷动:速度与平铺。火焰靠它动起来。
+    public float[] Flow =>
+    [
+        Scalar("Flow_U_Speed"), Scalar("Flow_V_Speed"),
+        Scalar("Flow_U_Tiling", 1f), Scalar("Flow_V_Tiling", 1f),
+    ];
+
+    /// 发光强度(火焰族有);没有就 1。
+    public float Glow => Scalar("Glow Intensity", 1f);
+
+    private float Scalar(string name, float fallback = 0f) =>
+        Scalars.TryGetValue(name, out var v) ? v : fallback;
+
+    private float[]? FirstVector(params string[] names) =>
+        names.Select(n => Vectors.TryGetValue(n, out var v) ? v : null).FirstOrDefault(v => v is not null);
+
+    private string? FirstTexture(params string[] names) =>
+        names.Select(n => Textures.TryGetValue(n, out var v) ? v : null).FirstOrDefault(v => v is not null);
 }
 
 public static class Materials
@@ -52,29 +94,41 @@ public static class Materials
     /// UE 默认的遮罩阈值;材质没覆盖时用它。
     private const float DefaultMaskClip = 0.3333f;
 
-    /// 解析一个资产目录下 `Mat/` 里的全部材质实例。键是材质名(与 glb 里的材质名一致)。
+    /// 解析**网格自己声明的**材质槽。键是材质对象名,与 glb 里的材质名一致。
+    ///
+    /// 为什么不去列 `<资产>/Mat/` 目录:那是个不成立的假设。小浣蛋(`Dem_XiaoHuanDan1_001`)
+    /// 的 `Mat/` 里只有描边材质,本体材质根本不在那儿;还有些资产把材质放在 `Yise/Mat/`
+    /// (异色变体)之类的子目录。网格的 `Materials` 数组是权威来源:它按槽序给出材质对象,
+    /// 不管对象存在哪个包里。实测这一改把 13 个「材质表为空」的形态全救回来了。
     public static Dictionary<string, MaterialInfo> Load(
-        AbstractVfsFileProvider provider,
-        string assetDir,
+        USkeletalMesh mesh,
         List<string> warnings)
     {
         var result = new Dictionary<string, MaterialInfo>(StringComparer.OrdinalIgnoreCase);
-        var matDir = $"{assetDir}/Mat";
-        foreach (var path in Textures.TopLevelFiles(provider, matDir))
+        foreach (var slot in mesh.Materials)
         {
-            var name = Path.GetFileNameWithoutExtension(path);
+            if (slot is null) continue;
             try
             {
-                var material = provider.LoadPackageObject<UMaterialInstance>(path[..path.LastIndexOf('.')]);
-                // **键用对象名而不是文件名。** 本作的 pak 里两者大小写能对不上,而且方向还不一致:
+                if (slot.Load() is not UMaterialInstance material)
+                {
+                    // 悬空引用:网格声明了这个材质,但 pak 里没有对应资产(实测 13 个形态如此,
+                    // 如小浣蛋的 `MI_Dem_XiaoHuanDan1_001_By`)。仍然登记一条空的,
+                    // 让导出器能按名字去凑基色贴图,免得整只宠物画不出来。
+                    warnings.Add($"材质 {slot.Name} 在 pak 里没有资产(悬空引用),退回按贴图名接基色");
+                    result[slot.Name.Text] = new MaterialInfo(slot.Name.Text, [], [], [],
+                        EBlendMode.BLEND_Opaque, DefaultMaskClip, [], Resolved: false);
+                    continue;
+                }
+                // **键用对象名。** 本作的 pak 里对象名与资产文件名的大小写能对不上,方向还不一致:
                 // 喵呜的文件是 `MI_Gra_MiaoMiao2_001_By`、对象名是 `…Miaomiao2…`,魔力猫正好反过来。
                 // glb 里的材质名取的是对象名,键不一致运行时就查不到 → 整只宠物一片都画不出来。
-                var key = string.IsNullOrEmpty(material.Name) ? name : material.Name;
-                result[key] = Resolve(key, material);
+                var key = material.Name;
+                if (!string.IsNullOrEmpty(key)) result[key] = Resolve(key, material);
             }
             catch (Exception e)
             {
-                warnings.Add($"材质 {name} 解析失败: {e.Message}");
+                warnings.Add($"材质槽 {slot.Name} 解析失败: {e.Message}");
             }
         }
         return result;
@@ -96,6 +150,8 @@ public static class Materials
         }
 
         var textures = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        var vectors = new Dictionary<string, float[]>(StringComparer.OrdinalIgnoreCase);
+        var scalars = new Dictionary<string, float>(StringComparer.OrdinalIgnoreCase);
         var blend = EBlendMode.BLEND_Opaque;
         var maskClip = DefaultMaskClip;
         // chain 是「自己 → 父 → 祖父」,倒着遍历 = 从祖先到自己
@@ -109,6 +165,15 @@ public static class Materials
                 if (!string.IsNullOrEmpty(param.Name) && !string.IsNullOrEmpty(path))
                     textures[param.Name] = path;
             }
+            foreach (var param in mi.GetOrDefault<FVectorParameterValue[]>("VectorParameterValues", []))
+            {
+                var c = param.ParameterValue;
+                if (!string.IsNullOrEmpty(param.Name) && c is not null)
+                    vectors[param.Name] = [c.Value.R, c.Value.G, c.Value.B, c.Value.A];
+            }
+            foreach (var param in mi.GetOrDefault<FScalarParameterValue[]>("ScalarParameterValues", []))
+                if (!string.IsNullOrEmpty(param.Name))
+                    scalars[param.Name] = param.ParameterValue;
             // BasePropertyOverrides 只在「勾了 override」时才有意义,但本作的实例普遍不写
             // bOverride_* 标记,所以按「有值就用」处理:BLEND_Opaque 是 0,等于没覆盖。
             var overrides = mi.BasePropertyOverrides;
@@ -118,6 +183,6 @@ public static class Materials
                 if (overrides.OpacityMaskClipValue > 0) maskClip = overrides.OpacityMaskClipValue;
             }
         }
-        return new MaterialInfo(name, textures, blend, maskClip, parents);
+        return new MaterialInfo(name, textures, vectors, scalars, blend, maskClip, parents);
     }
 }

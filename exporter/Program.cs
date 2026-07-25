@@ -431,9 +431,19 @@ FormReport ExportForm(
 
     // 材质:哪个槽画哪张贴图、alpha 该不该当遮罩剔。这一步取代原来的命名约定猜法
     // (实测全量 2043 个槽里 258 个猜错或猜不到,详见 docs/design.md §1)。
+    var resolved = Materials.Load(mesh, warnings);
+    // **材质资产全部悬空 = 这只宠物没做完。** 实测 13 个形态如此,而且都是未实装的:
+    // 4 个名字里直接带「占位」,全部 legal_petbase / completeness 皆空,id 集中在最新未上线段。
+    // 与其猜贴图硬渲出来,不如照「这个形态这版本没做」处理(和缺 SKM 那条一样)。
+    if (resolved.Count > 0 && resolved.Values.All(m => !m.Resolved))
+        throw new InvalidOperationException(
+            $"{form.Asset} 的材质资产在 pak 里全部缺失(疑似未实装的宠物)");
+
     var materials = new List<MaterialEntry>();
-    foreach (var (name, info) in Materials.Load(fileProvider, assetDir, warnings))
+    foreach (var (name, info) in resolved)
     {
+        // 个别槽悬空:不写进材质表,运行时会跳过那一片(总比拿别的贴图硬凑好)
+        if (!info.Resolved) continue;
         // 游戏自带的描边材质我们不用(自己按法线外扩画描边)
         if (name.EndsWith("_Ol", StringComparison.OrdinalIgnoreCase)) continue;
         string? baseColor = null;
@@ -446,8 +456,24 @@ FormReport ExportForm(
             if (file is not null) baseColor = $"forms/{form.Asset}/tex/{file}";
             else warnings.Add($"材质 {name} 的基色贴图导不出来: {objectPath}");
         }
+        // 特效层没有固有色贴图,靠主色 + 遮罩/噪声近似;那两张贴图要补导出来
+        string? maskFile = null;
+        string? noiseFile = null;
+        if (baseColor is null)
+        {
+            maskFile = ExportEffectTexture(info.MaskTexture);
+            noiseFile = ExportEffectTexture(info.NoiseTexture);
+        }
         materials.Add(new MaterialEntry(name, baseColor, info.IsFacePatch,
-            info.OpacityMaskClipValue, info.BlendMode.ToString(), info.ParentChain, info.Textures));
+            info.OpacityMaskClipValue, info.BlendMode.ToString(), info.ParentChain,
+            info.Tint, info.Opacity, info.Glow, info.Flow, maskFile, noiseFile));
+
+        string? ExportEffectTexture(string? objectPath)
+        {
+            if (objectPath is null) return null;
+            var file = Textures.ExportByObjectPath(fileProvider, objectPath, texDir, textures, warnings);
+            return file is null ? null : $"forms/{form.Asset}/tex/{file}";
+        }
     }
 
     var bounds = mesh.ImportedBounds;

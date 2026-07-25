@@ -19,9 +19,17 @@ public record MaterialEntry(
     string Blend,
     /// 父链(由近及远),排查用;也是「这是哪一族特效」的线索(如 M_FX_Fire_Mat)。
     List<string> ParentChain,
-    /// 全部贴图参数 → 资产对象路径。基色之外的(Noise/Mask/MatCap/StarStickTex…)现在不导文件,
-    /// 但**记下来**:将来做半透/加色通道时照着这里补导即可,不必重新调研材质。
-    Dictionary<string, string> AllTextures);
+    /// 特效层的主色(线性 RGBA)。**可能是 HDR**(火花的 Color01 = (6, 0.8, 0)),
+    /// 任一通道 >1 就说明这层是加色发光,运行时据此走加色而不是半透。
+    float[]? Tint,
+    float Opacity,
+    /// 发光强度(火焰族的 `Glow Intensity`)。
+    float Glow,
+    /// UV 卷动 [u速度, v速度, u平铺, v平铺];火焰靠它动。
+    float[] Flow,
+    /// 特效的形状/流动贴图,包内相对路径。
+    string? MaskTexture,
+    string? NoiseTexture);
 
 public record FormReport(
     Form Form,
@@ -105,16 +113,24 @@ public static class Manifest
                 sb.AppendLine("  [forms.materials]   # glb 里的材质名 → 该画什么。base_color 缺失 = 纯特效层");
                 foreach (var mat in report.Materials)
                 {
-                    var baseColor = mat.BaseColor is null ? "" : $"base_color = {Quote(mat.BaseColor)}, ";
-                    var extra = mat.BaseColor is null
-                        // 特效层:记下父链与全部贴图参数,留给将来的半透/加色通道
-                        ? $", parents = [{string.Join(", ", mat.ParentChain.Select(Quote))}]" +
-                          $", textures = {{ {string.Join(", ", mat.AllTextures.OrderBy(kv => kv.Key)
-                              .Select(kv => $"{ClipKey(kv.Key)} = {Quote(kv.Value)}"))} }}"
-                        : "";
-                    sb.AppendLine(
-                        $"  {ClipKey(mat.Name)} = {{ {baseColor}mask_alpha = {(mat.MaskAlpha ? "true" : "false")}, " +
-                        $"mask_clip = {Num(mat.MaskClip)}, blend = {Quote(mat.Blend)}{extra} }}");
+                    var parts = new List<string>();
+                    if (mat.BaseColor is not null) parts.Add($"base_color = {Quote(mat.BaseColor)}");
+                    parts.Add($"mask_alpha = {(mat.MaskAlpha ? "true" : "false")}");
+                    parts.Add($"mask_clip = {Num(mat.MaskClip)}");
+                    parts.Add($"blend = {Quote(mat.Blend)}");
+                    if (mat.BaseColor is null)
+                    {
+                        // 特效层:主色 + 卷动 + 遮罩/噪声,运行时靠这些近似画出火焰/水壳/光晕
+                        if (mat.Tint is { } t)
+                            parts.Add($"tint = [{Num(t[0])}, {Num(t[1])}, {Num(t[2])}, {Num(t[3])}]");
+                        parts.Add($"opacity = {Num(mat.Opacity)}");
+                        parts.Add($"glow = {Num(mat.Glow)}");
+                        parts.Add($"flow = [{string.Join(", ", mat.Flow.Select(Num))}]");
+                        if (mat.MaskTexture is not null) parts.Add($"mask_tex = {Quote(mat.MaskTexture)}");
+                        if (mat.NoiseTexture is not null) parts.Add($"noise_tex = {Quote(mat.NoiseTexture)}");
+                        parts.Add($"parents = [{string.Join(", ", mat.ParentChain.Select(Quote))}]");
+                    }
+                    sb.AppendLine($"  {ClipKey(mat.Name)} = {{ {string.Join(", ", parts)} }}");
                 }
             }
 
