@@ -61,6 +61,28 @@ const HEAD_ZONE: f32 = 0.45;
 const PET_WINDOW: f32 = 1.2;
 const PET_REVERSALS: u8 = 3;
 
+/// 需求值的时间尺度(秒)。桌宠的节奏要慢:困倦几分钟才攒满,不然一直在睡。
+/// 这些值是「手感常量」,不是从游戏数据来的——游戏里没有对应概念(AI 行为树不移植)。
+const SLEEPY_BUILD_SECS: f32 = 480.0;
+/// 睡这么久就睡饱了。
+const SLEEPY_RECOVER_SECS: f32 = 90.0;
+/// 待机这么久就无聊到想动一动。
+const BORED_BUILD_SECS: f32 = 6.0;
+/// 走动/互动能消掉多快的无聊。
+const BORED_RELIEF_SECS: f32 = 2.0;
+/// 困倦超过这个值就去睡,低于 SLEEPY_WAKE 就醒。
+const SLEEPY_SLEEP_AT: f32 = 0.85;
+const SLEEPY_WAKE_AT: f32 = 0.25;
+/// 无聊超过这个值就换个地方走走。
+const BORED_WALK_AT: f32 = 0.6;
+/// 无聊时不走动而是随手做个表情的概率。
+const EMOTE_CHANCE: f32 = 0.35;
+
+/// 指针悬在身上时,朝它侧一点身(不是完整转 90°,读起来像「瞥一眼」)。
+/// 真正的视线跟随需要 LookAt BlendSpace(没导出),而且 Wayland 下输入区外根本收不到
+/// 指针事件——想追全屏光标就得吃掉输入,不做。
+const GLANCE_RATIO: f32 = 0.45;
+
 /// 推进频率的上下限。
 ///
 /// 降频**只看姿势实际变化速度**,不按状态硬分档:待机动画本身带明显起伏
@@ -71,6 +93,19 @@ const ACTIVE_HZ: f32 = 30.0;
 const STILL_HZ: f32 = 10.0;
 /// 关节速度到多少就跑满帧(米/秒)。取 1.0:实测有动作的段都在 4m/s 以上,余量充足。
 const FULL_RATE_MOTION: f32 = 1.0;
+
+/// 状态的可读名字,只用于日志(睡觉的三段也分开,便于确认作息真的走完了)。
+fn activity_label(activity: &Activity) -> &'static str {
+    match activity {
+        Activity::Idle { .. } => "待机",
+        Activity::Walk { .. } => "行走",
+        Activity::Dragged => "被拎着",
+        Activity::React { .. } => "反应",
+        Activity::Sleeping(SleepPhase::Falling { .. }) => "入睡",
+        Activity::Sleeping(SleepPhase::Asleep) => "睡着",
+        Activity::Sleeping(SleepPhase::Waking { .. }) => "醒来",
+    }
+}
 
 /// 姿势变化速度 → 推进频率。
 fn hz_for_motion(motion: f32) -> f32 {
@@ -86,8 +121,63 @@ pub enum Activity {
     Walk { target_x: f32 },
     /// 被鼠标拎着。
     Dragged,
-    /// 一次性反应(受惊/开心…),播完 `remaining` 秒回到待机。
+    /// 一次性反应/表情,播完 `remaining` 秒回到待机。
     React { remaining: f32 },
+    /// 睡觉:三段式(入睡 → 循环 → 醒来),见 docs/design.md §5。
+    Sleeping(SleepPhase),
+}
+
+/// 睡觉的三段。`Loop` 会一直循环到睡饱或被打扰。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum SleepPhase {
+    Falling { remaining: f32 },
+    Asleep,
+    Waking { remaining: f32 },
+}
+
+/// 宠物的内部需求,驱动「接下来干什么」。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Needs {
+    /// 困倦 0..1。
+    pub sleepiness: f32,
+    /// 无聊 0..1。
+    pub boredom: f32,
+}
+
+impl Needs {
+    /// 需求值推进的倍速。`ROCOM_PETS_NEEDS_SPEED=20` 可以把作息压缩 20 倍,
+    /// 用来在几十秒内看完「困→睡→醒」整套,而不是等八分钟。
+    fn speed() -> f32 {
+        static SPEED: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+        *SPEED.get_or_init(|| {
+            std::env::var("ROCOM_PETS_NEEDS_SPEED")
+                .ok()
+                .and_then(|v| v.parse::<f32>().ok())
+                .filter(|v| *v > 0.0)
+                .unwrap_or(1.0)
+        })
+    }
+
+    fn tick(&mut self, dt: f32, activity: &Activity) {
+        let dt = dt * Self::speed();
+        match activity {
+            Activity::Sleeping(_) => {
+                self.sleepiness -= dt / SLEEPY_RECOVER_SECS;
+                self.boredom = 0.0;
+            }
+            Activity::Idle { .. } => {
+                self.sleepiness += dt / SLEEPY_BUILD_SECS;
+                self.boredom += dt / BORED_BUILD_SECS;
+            }
+            // 走动与互动都算「有事做」,消无聊
+            _ => {
+                self.sleepiness += dt / SLEEPY_BUILD_SECS;
+                self.boredom -= dt / BORED_RELIEF_SECS;
+            }
+        }
+        self.sleepiness = self.sleepiness.clamp(0.0, 1.0);
+        self.boredom = self.boredom.clamp(0.0, 1.0);
+    }
 }
 
 /// 宠物对鼠标的反应(播哪段一次性动作)。
@@ -118,6 +208,8 @@ pub struct PetActor {
     pub foot_offset: f32,
     /// 轮廓掩码(异步回读而来,见 pet/mask.rs);还没到就退化成包围盒判定。
     pub mask: Option<Mask>,
+    /// 内部需求(困倦/无聊),决定待机结束后干什么。
+    pub needs: Needs,
     clips: Clips,
     petting: Petting,
     rng: Rng,
@@ -178,6 +270,12 @@ struct Clips {
     startled: Option<usize>,
     happy: Option<usize>,
     afraid: Option<usize>,
+    /// 睡觉三段式;缺 Start/End 就直接进/出 Loop。
+    sleep_start: Option<usize>,
+    sleep_loop: Option<usize>,
+    sleep_end: Option<usize>,
+    /// 待机时随手做的表情池(有哪个算哪个)。
+    emotes: Vec<usize>,
 }
 
 impl PetActor {
@@ -194,6 +292,120 @@ impl PetActor {
                 remaining: model_len.max(0.3),
             };
         }
+    }
+
+    /// 待机结束后干什么:困了去睡,无聊了走动或做个表情,否则继续待机。
+    fn choose_next(&mut self, pos_x: f32, max_x: f32) {
+        if self.needs.sleepiness >= SLEEPY_SLEEP_AT && self.clips.sleep_loop.is_some() {
+            self.start_sleep();
+            return;
+        }
+        if self.needs.boredom >= BORED_WALK_AT {
+            // 无聊到想动:多数时候换个地方走走,偶尔只是做个表情
+            let emote = !self.clips.emotes.is_empty() && self.rng.next_f32() < EMOTE_CHANCE;
+            if !emote {
+                let target_x = self.rng.next_f32() * max_x;
+                let far_enough = (target_x - pos_x).abs() > self.size.0 as f32 * 0.25;
+                if let (Some(walk), true) = (self.clips.walk, far_enough) {
+                    self.activity = Activity::Walk { target_x };
+                    self.target_yaw = camera_yaw(target_x > pos_x);
+                    self.player.play(walk);
+                    self.needs.boredom = 0.0;
+                    return;
+                }
+            }
+            if let Some(&clip) = self.pick_emote() {
+                self.player.play(clip);
+                self.activity = Activity::React {
+                    remaining: self.model.clips[clip].duration.max(0.3),
+                };
+                self.needs.boredom = 0.0;
+                return;
+            }
+        }
+        self.activity = Activity::Idle {
+            remaining: 1.5 + self.rng.next_f32() * 3.0,
+        };
+    }
+
+    fn pick_emote(&mut self) -> Option<&usize> {
+        if self.clips.emotes.is_empty() {
+            return None;
+        }
+        let index = (self.rng.next_f32() * self.clips.emotes.len() as f32) as usize;
+        self.clips
+            .emotes
+            .get(index.min(self.clips.emotes.len() - 1))
+    }
+
+    /// 进入睡觉:有 SleepStart 就先播入睡,否则直接躺下。
+    fn start_sleep(&mut self) {
+        self.target_yaw = 0.0;
+        match self.clips.sleep_start {
+            Some(clip) => {
+                self.player.play(clip);
+                self.activity = Activity::Sleeping(SleepPhase::Falling {
+                    remaining: self.model.clips[clip].duration.max(0.2),
+                });
+            }
+            None => self.enter_asleep(),
+        }
+    }
+
+    fn enter_asleep(&mut self) {
+        if let Some(clip) = self.clips.sleep_loop {
+            self.player.play(clip);
+        }
+        self.activity = Activity::Sleeping(SleepPhase::Asleep);
+    }
+
+    /// 醒来:有 SleepEnd 就先播,否则直接站起。被打扰时也走这里。
+    fn wake_up(&mut self) {
+        match self.clips.sleep_end {
+            Some(clip) => {
+                self.player.play(clip);
+                self.activity = Activity::Sleeping(SleepPhase::Waking {
+                    remaining: self.model.clips[clip].duration.max(0.2),
+                });
+            }
+            None => {
+                self.player.play(self.clips.idle);
+                self.activity = Activity::Idle { remaining: 1.0 };
+            }
+        }
+    }
+
+    /// 睡觉三段式的推进。循环段一直睡到睡饱(困倦降到 SLEEPY_WAKE_AT)。
+    fn tick_sleep(&mut self, phase: SleepPhase, dt: f32) {
+        match phase {
+            SleepPhase::Falling { remaining } => {
+                let remaining = remaining - dt;
+                if remaining > 0.0 {
+                    self.activity = Activity::Sleeping(SleepPhase::Falling { remaining });
+                } else {
+                    self.enter_asleep();
+                }
+            }
+            SleepPhase::Asleep => {
+                if self.needs.sleepiness <= SLEEPY_WAKE_AT {
+                    self.wake_up();
+                }
+            }
+            SleepPhase::Waking { remaining } => {
+                let remaining = remaining - dt;
+                if remaining > 0.0 {
+                    self.activity = Activity::Sleeping(SleepPhase::Waking { remaining });
+                } else {
+                    self.player.play(self.clips.idle);
+                    self.activity = Activity::Idle { remaining: 1.0 };
+                }
+            }
+        }
+    }
+
+    /// 是否在睡(含入睡/醒来过程)。
+    pub fn is_sleeping(&self) -> bool {
+        matches!(self.activity, Activity::Sleeping(_))
     }
 
     /// 某段动作的时长(秒)。
@@ -222,6 +434,14 @@ impl PetActor {
         let startled = model.clip("Shock").or_else(|| model.clip("Alert"));
         let happy = model.clip("Happy").or_else(|| model.clip("Show"));
         let afraid = model.clip("Fear").or(startled);
+        let sleep_start = model.clip("SleepStart");
+        let sleep_loop = model.clip("SleepLoop").or_else(|| model.clip("SleepStand"));
+        let sleep_end = model.clip("SleepEnd");
+        // 表情池:待机时偶尔来一个,让它看着不是只会站桩
+        let emotes = ["Happy", "Sad", "Anger", "Show", "Relax", "Alert"]
+            .iter()
+            .filter_map(|name| model.clip(name))
+            .collect();
         let player = Player::new(&model, idle);
         Self {
             model,
@@ -233,12 +453,17 @@ impl PetActor {
             walk_speed,
             foot_offset,
             mask: None,
+            needs: Needs::default(),
             clips: Clips {
                 idle,
                 walk,
                 startled,
                 happy,
                 afraid,
+                sleep_start,
+                sleep_loop,
+                sleep_end,
+                emotes,
             },
             petting: Petting::default(),
             rng: Rng::new(seed),
@@ -334,6 +559,12 @@ impl Stage {
 
     pub fn actor(&self) -> &Actor {
         &self.actor
+    }
+
+    /// 只给测试用:直接改角色状态(比如把困倦顶到阈值,省去等几分钟)。
+    #[cfg(test)]
+    pub fn actor_mut_for_test(&mut self) -> &mut Actor {
+        &mut self.actor
     }
 
     /// 角色左上角位置(表面局部逻辑像素)。
@@ -448,11 +679,24 @@ impl Stage {
                 }
                 self.drag_offset = Some((x - self.pos.0 as f64, y - self.pos.1 as f64));
                 self.drag_moved = false;
+                if let Actor::Pet(pet) = &mut self.actor {
+                    // 睡着时被戳 → 醒过来(而不是原地受惊)
+                    if pet.is_sleeping() {
+                        pet.wake_up();
+                    }
+                }
                 Reaction::REDRAW
             }
             StageEvent::PointerReleased | StageEvent::PointerLeft => {
                 if event == StageEvent::PointerLeft {
                     self.pointer = None;
+                    // 指针走了:把瞥过去的身子转回正面
+                    if let Actor::Pet(pet) = &mut self.actor {
+                        if matches!(pet.activity, Activity::Idle { .. }) {
+                            pet.target_yaw = 0.0;
+                        }
+                        pet.petting.reset();
+                    }
                 }
                 if self.drag_offset.take().is_none() {
                     return Reaction::NONE;
@@ -460,11 +704,11 @@ impl Stage {
                 let clicked = !self.drag_moved;
                 self.drag_moved = false;
                 if let Actor::Pet(pet) = &mut self.actor {
-                    if clicked {
-                        // 只是点了一下 → 受惊
+                    if clicked && !pet.is_sleeping() {
+                        // 只是点了一下 → 受惊(正在醒来的那一下不算)
                         let len = pet.clip_seconds(PetReaction::Startled);
                         pet.react(PetReaction::Startled, len);
-                    } else {
+                    } else if !clicked {
                         // 拎着放下 → 落回地面(下落动画等有 JumpFall 再说)
                         pet.activity = Activity::Idle { remaining: 1.5 };
                         pet.player.play(pet.clips.idle);
@@ -506,10 +750,15 @@ impl Stage {
             return Reaction::NONE;
         }
         let local_y = (y - self.pos.1 as f64) as f32;
+        let center_x = self.pos.0 as f64 + self.actor.size().0 as f64 * 0.5;
         let Actor::Pet(pet) = &mut self.actor else {
             return Reaction::NONE;
         };
-        // 只认头部:身上蹭不算摸头
+        // 指针在身上(不限头部)就侧一点身,像是在瞥它
+        if matches!(pet.activity, Activity::Idle { .. }) {
+            pet.target_yaw = camera_yaw(x > center_x) * GLANCE_RATIO;
+        }
+        // 摸头只认头部:身上蹭不算
         if local_y > pet.size.1 as f32 * HEAD_ZONE {
             pet.petting.reset();
             return Reaction::NONE;
@@ -526,13 +775,17 @@ impl Stage {
         Reaction::REDRAW
     }
 
-    /// 下一次推进该隔多久。只有「正在播的动作几乎不动」时才降频(见 STILL_MOTION)。
+    /// 下一次推进该隔多久。只有「正在播的动作几乎不动」时才降频(见 `hz_for_motion`)。
     pub fn tick_interval(&self) -> Duration {
         let hz = match &self.actor {
             Actor::Pet(pet) => {
-                // 行走/拖动/反应中位置本身在变,不看姿势也得跑满
-                let busy =
-                    self.drag_offset.is_some() || !matches!(pet.activity, Activity::Idle { .. });
+                // 行走/拖动/反应中位置本身在变,不看姿势也得跑满;
+                // 待机与睡觉交给姿势速度决定(睡着几乎不动 → 自动落到下限)
+                let busy = self.drag_offset.is_some()
+                    || matches!(
+                        pet.activity,
+                        Activity::Walk { .. } | Activity::React { .. } | Activity::Dragged
+                    );
                 if busy {
                     ACTIVE_HZ
                 } else {
@@ -546,6 +799,25 @@ impl Stage {
 
     /// 推进时间:宠物的行为与动画。返回是否要重画/重设输入区。
     pub fn tick(&mut self, dt: f32) -> Reaction {
+        let before = match &self.actor {
+            Actor::Pet(pet) => Some(activity_label(&pet.activity)),
+            _ => None,
+        };
+        let reaction = self.tick_inner(dt);
+        if let (Some(before), Actor::Pet(pet)) = (before, &self.actor) {
+            if before != activity_label(&pet.activity) {
+                log::debug!(
+                    "宠物 → {}(困倦 {:.2} 无聊 {:.2})",
+                    activity_label(&pet.activity),
+                    pet.needs.sleepiness,
+                    pet.needs.boredom
+                );
+            }
+        }
+        reaction
+    }
+
+    fn tick_inner(&mut self, dt: f32) -> Reaction {
         let surface_width = self.size.0 as f32;
         let dragging = self.drag_offset.is_some();
         let Actor::Pet(pet) = &mut self.actor else {
@@ -553,10 +825,12 @@ impl Stage {
         };
 
         pet.petting.tick(dt);
+        pet.needs.tick(dt, &pet.activity);
         let mut moved = false;
         if !dragging {
             match pet.activity {
                 Activity::Dragged => {
+                    // 刚被放下
                     pet.activity = Activity::Idle { remaining: 1.0 };
                     pet.player.play(pet.clips.idle);
                 }
@@ -571,27 +845,15 @@ impl Stage {
                         pet.player.play(pet.clips.idle);
                     }
                 }
+                Activity::Sleeping(phase) => pet.tick_sleep(phase, dt),
                 Activity::Idle { remaining } => {
                     let remaining = remaining - dt;
                     if remaining > 0.0 {
                         pet.activity = Activity::Idle { remaining };
                     } else {
-                        // 挑一个新去处:走不动(没有 Walk 动作)就继续待机
+                        // 待机结束:按需求挑下一件事
                         let max_x = (surface_width - pet.size.0 as f32).max(0.0);
-                        let target_x = pet.rng.next_f32() * max_x;
-                        let far_enough = (target_x - self.pos.0).abs() > pet.size.0 as f32 * 0.25;
-                        match (pet.clips.walk, far_enough) {
-                            (Some(walk), true) => {
-                                pet.activity = Activity::Walk { target_x };
-                                pet.target_yaw = camera_yaw(target_x > self.pos.0);
-                                pet.player.play(walk);
-                            }
-                            _ => {
-                                pet.activity = Activity::Idle {
-                                    remaining: 1.5 + pet.rng.next_f32() * 3.0,
-                                }
-                            }
-                        }
+                        pet.choose_next(self.pos.0, max_x);
                     }
                 }
                 Activity::Walk { target_x } => {
@@ -750,7 +1012,16 @@ mod pet_tests {
 
     /// 一只测试宠物:200×200 的画布,脚底在 180,走速 100px/s。
     fn pet_stage() -> Stage {
-        let model = Model::for_test(&["Idle", "Walk", "Shock", "Happy", "Fear"]);
+        let model = Model::for_test(&[
+            "Idle",
+            "Walk",
+            "Shock",
+            "Happy",
+            "Fear",
+            "SleepStart",
+            "SleepLoop",
+            "SleepEnd",
+        ]);
         let actor = Actor::Pet(PetActor::new(model, (200, 200), 180.0, 100.0, 7));
         Stage::new(actor, (1000, 600))
     }
@@ -868,8 +1139,8 @@ mod pet_tests {
             still > Duration::from_secs_f32(1.0 / 20.0),
             "静止姿势该降频"
         );
-        // 逼它走起来:待机计时耗尽后会挑目标点
-        for _ in 0..100 {
+        // 逼它走起来:待机计时耗尽 + 无聊攒够才会挑目标点(中间可能先做几个表情)
+        for _ in 0..600 {
             s.tick(0.1);
             if matches!(activity(&s), Activity::Walk { .. }) {
                 break;
@@ -885,7 +1156,7 @@ mod pet_tests {
     #[test]
     fn walking_reaches_its_target_and_faces_that_way() {
         let mut s = pet_stage();
-        for _ in 0..100 {
+        for _ in 0..600 {
             s.tick(0.1);
             if matches!(activity(&s), Activity::Walk { .. }) {
                 break;
@@ -926,5 +1197,174 @@ mod rate_tests {
             mid > STILL_HZ && mid < ACTIVE_HZ,
             "中间值该连续过渡,实际 {mid}"
         );
+    }
+}
+
+#[cfg(test)]
+mod behaviour_tests {
+    use super::*;
+
+    fn pet_stage() -> Stage {
+        let model = Model::for_test(&[
+            "Idle",
+            "Walk",
+            "Shock",
+            "SleepStart",
+            "SleepLoop",
+            "SleepEnd",
+        ]);
+        let actor = Actor::Pet(PetActor::new(model, (200, 200), 180.0, 100.0, 99));
+        Stage::new(actor, (1000, 600))
+    }
+
+    fn pet(stage: &Stage) -> &PetActor {
+        match stage.actor() {
+            Actor::Pet(pet) => pet,
+            _ => panic!("不是宠物"),
+        }
+    }
+
+    /// 推进 `seconds` 秒(按 30Hz 切片),中途 `stop` 成立就停。
+    fn run(stage: &mut Stage, seconds: f32, stop: impl Fn(&Stage) -> bool) -> f32 {
+        let dt = 1.0 / 30.0;
+        let mut elapsed = 0.0;
+        while elapsed < seconds {
+            stage.tick(dt);
+            elapsed += dt;
+            if stop(stage) {
+                break;
+            }
+        }
+        elapsed
+    }
+
+    #[test]
+    fn boredom_builds_while_idle_and_drains_while_busy() {
+        let mut s = pet_stage();
+        run(&mut s, 3.0, |_| false);
+        let bored = pet(&s).needs.boredom;
+        assert!(bored > 0.3, "待机该攒无聊,实际 {bored}");
+        // 走起来之后无聊会被消掉
+        run(&mut s, 60.0, |s| {
+            matches!(pet(s).activity, Activity::Walk { .. })
+        });
+        run(&mut s, 1.0, |_| false);
+        assert!(pet(&s).needs.boredom < bored, "动起来该消无聊");
+    }
+
+    #[test]
+    fn sleeps_when_sleepy_and_runs_all_three_phases() {
+        let mut s = pet_stage();
+        // 直接把困倦顶到阈值,省去等 8 分钟
+        match s.actor_mut_for_test() {
+            Actor::Pet(pet) => pet.needs.sleepiness = 0.99,
+            _ => unreachable!(),
+        }
+        run(&mut s, 30.0, |s| pet(s).is_sleeping());
+        assert!(
+            matches!(
+                pet(&s).activity,
+                Activity::Sleeping(SleepPhase::Falling { .. })
+            ),
+            "该先播入睡,实际 {:?}",
+            pet(&s).activity
+        );
+        run(&mut s, 5.0, |s| {
+            matches!(pet(s).activity, Activity::Sleeping(SleepPhase::Asleep))
+        });
+        assert_eq!(
+            pet(&s).activity,
+            Activity::Sleeping(SleepPhase::Asleep),
+            "该进入睡眠循环"
+        );
+
+        // 睡饱了会自己醒:困倦降到 SLEEPY_WAKE_AT 以下
+        run(&mut s, SLEEPY_RECOVER_SECS + 5.0, |s| !pet(s).is_sleeping());
+        assert!(
+            pet(&s).needs.sleepiness <= SLEEPY_WAKE_AT + 0.05,
+            "睡够该不困了"
+        );
+        assert!(
+            matches!(pet(&s).activity, Activity::Idle { .. }),
+            "醒来该回待机"
+        );
+    }
+
+    #[test]
+    fn poking_wakes_it_up_instead_of_startling() {
+        let mut s = pet_stage();
+        match s.actor_mut_for_test() {
+            Actor::Pet(pet) => pet.needs.sleepiness = 0.99,
+            _ => unreachable!(),
+        }
+        run(&mut s, 30.0, |s| {
+            matches!(pet(s).activity, Activity::Sleeping(SleepPhase::Asleep))
+        });
+        let (x, y) = {
+            let (px, py) = s.actor_pos();
+            (px as f64 + 100.0, py as f64 + 100.0)
+        };
+        s.handle(StageEvent::PointerPressed { x, y });
+        assert!(
+            matches!(
+                pet(&s).activity,
+                Activity::Sleeping(SleepPhase::Waking { .. })
+            ),
+            "戳一下该转入醒来,实际 {:?}",
+            pet(&s).activity
+        );
+        s.handle(StageEvent::PointerReleased);
+        assert!(
+            !matches!(pet(&s).activity, Activity::React { .. }),
+            "叫醒的那一下不该再算受惊"
+        );
+        run(&mut s, 5.0, |s| {
+            matches!(pet(s).activity, Activity::Idle { .. })
+        });
+        assert!(matches!(pet(&s).activity, Activity::Idle { .. }));
+    }
+
+    #[test]
+    fn hovering_makes_it_glance_at_the_pointer() {
+        let mut s = pet_stage();
+        let (px, py) = s.actor_pos();
+        let center_x = px as f64 + 100.0;
+        let y = py as f64 + 100.0;
+        // 指针在右侧:朝右瞥(幅度小于完整转身)
+        s.handle(StageEvent::PointerMoved {
+            x: center_x + 40.0,
+            y,
+        });
+        let right = pet(&s).target_yaw;
+        assert!((right - camera_yaw(true) * GLANCE_RATIO).abs() < 1e-5);
+        assert!(
+            right.abs() < camera_yaw(true).abs(),
+            "瞥一眼的幅度该小于完整转身"
+        );
+        // 指针到左侧
+        s.handle(StageEvent::PointerMoved {
+            x: center_x - 40.0,
+            y,
+        });
+        assert!(pet(&s).target_yaw * right < 0.0, "换边该反向");
+        // 指针离开 → 转回正面
+        s.handle(StageEvent::PointerLeft);
+        assert_eq!(pet(&s).target_yaw, 0.0);
+    }
+
+    #[test]
+    fn sleep_pose_lets_the_frame_rate_drop() {
+        // 合成模型的动作没有通道 → 睡着时姿势不动,帧率该落到下限
+        let mut s = pet_stage();
+        match s.actor_mut_for_test() {
+            Actor::Pet(pet) => pet.needs.sleepiness = 0.99,
+            _ => unreachable!(),
+        }
+        run(&mut s, 30.0, |s| {
+            matches!(pet(s).activity, Activity::Sleeping(SleepPhase::Asleep))
+        });
+        // 刚切段时有 0.18s 交叉淡化,那段姿势在动、帧率理应还是满的;等淡化过去再看
+        run(&mut s, 0.5, |_| false);
+        assert_eq!(s.tick_interval(), Duration::from_secs_f32(1.0 / STILL_HZ));
     }
 }
