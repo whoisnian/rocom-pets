@@ -3,7 +3,10 @@
 跨平台桌面宠物：把《洛克王国：世界》的宠物模型、动作与叫声做成本地生成的「宠物包」，
 由一个原生运行时在桌面上播放与交互。宠物按需启用、可多只同时在场。
 
-**当前状态:Phase 0 的三个 spike 已完成(Windows 后端除外),Phase 1 的单宠物 MVP 可跑。** 方案见 [docs/design.md](docs/design.md)。
+**当前状态:单只宠物已完整可用**——上桌待机/走动/睡觉、鼠标交互(轮廓命中、受惊、摸头、拖放)、
+穿透开关、托盘与热键,全量宠物包已导完(530 条进化链 / 831 个形态)。
+**下一步是多实体与跨宠物互动;Windows 后端尚未开工。**
+需求对照与后续计划见 [docs/design.md](docs/design.md) §9。
 
 支持矩阵：**Windows 10+** 与 **KDE Plasma Wayland**(开发环境 Plasma 6.7.3 / kwin_wayland)。
 GNOME 等不实现 wlr-layer-shell 的合成器不在支持范围，也不做 X11 回退。
@@ -11,7 +14,7 @@ GNOME 等不实现 wlr-layer-shell 的合成器不在支持范围，也不做 X1
 - 运行时(`src/`)：Rust + wgpu，自写平台窗口层(wlr-layer-shell / Windows layered + DirectComposition)。
   当前进度:KDE Wayland 后端已跑通(透明置顶、轮廓命中、穿透开关,[docs/spike-s1.md](docs/spike-s1.md));
   骨骼动画 + toon 着色已跑通([docs/spike-s2.md](docs/spike-s2.md));
-  **宠物已经能站在桌面上待机、走动、被拖放**(Phase 1,见 design.md §9)。
+  **宠物已经能站在桌面上待机、走动、睡觉、被摸头与拖放**(Phase 1–4,见 design.md §9)。
 - 导出器(`exporter/`)：C# + CUE4Parse，从自己的游戏 pak 生成宠物包;
   一条进化链一个包(glb 含全部动作 + 贴图 + manifest.toml)，见 [docs/spike-s3.md](docs/spike-s3.md)。
 - 验证工具(`tools/verify_glb.py`)：按 glTF 规范自采样 + 蒙皮 + 光栅化，渲图肉眼核对动画正确性。
