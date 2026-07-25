@@ -38,6 +38,9 @@
 | 叫声在 `WwiseAudio` 的 `Pet_Vo_*.bnk` + 流式 wem，`PetData.voice` 选组；粗嗓门/婉转声是运行时 Wwise pitch RTPC，wem 本身中性 | 复用 rocom-petvo 的提取管线；变调用播放速率复刻 |
 | CUE4Parse 的 BC7 解码有 R/B 通道对调的上游 bug | 导出贴图时必须换回，参照 rocom-capture 的 `FixBc7ChannelOrder` |
 | `UMaterialInstance.Deserialize` 在该版本抛 OverflowException，贴图槽拿到父材质默认值 | 贴图按命名约定接：材质名后缀 `_By/_Es/_Mh` ↔ `T_<Asset>_<槽>_D` |
+| **CUE4Parse 的 glTF 骨骼旋转约定是错的**：Y/Z 交换是反射，正确四元数是 `(-x,-z,-y,w)`，上游写的 `(x,z,y,w)` 是它的共轭。绑定姿势下 world × IBM = I 掩盖了它，上游又不导 glTF 动画，故从未暴露 | 导出器必须改写骨骼旋转**并重算 inverseBindMatrices**，见 [spike-s3.md](spike-s3.md) §1；这是动画正确性的单点故障，也是回归重点 |
+| 走跑动画的 root motion 方向恒为 glTF +Z(= UE +Y，这些骨架朝 +Y)，但**逐 clip 不一致**：同一条链里有的带位移、有的原地 | manifest 逐 clip 给 `in_place`/`speed_cm_s`，运行时两种都要能处理 |
+| CUE4Parse 只有 `FRocoBinData` 解码器，**不解 `.non` schema**；全仓唯一实现是 rocom-capture 的 `scripts/bin2json.py` | 导出器读 rocom-capture 产出的配置 JSON，不重复实现，见 §8 |
 
 已验证的端到端结果：喵喵的 LOD0 网格 + 骨架 + `World_Idle/World_Walk/Common_Happy/Common_Sleep_Loop`
 经 CPU 蒙皮 + 软件光栅化渲出正确形体、贴图与姿态，说明**网格、骨架、蒙皮权重、动画关键帧、贴图全部可用**。
@@ -133,7 +136,7 @@ alpha 置顶窗口 + 命中穿透。现成引擎恰好都在这两点撞墙：
 └── behaviors/*.lua              # 可选:该物种特有行为/互动
 ```
 
-### 4.3 manifest schema 草案
+### 4.3 manifest schema(草案;实际产物见 spike-s3.md 与导出器 `Manifest.cs`)
 
 ```toml
 schema = 1            # manifest 格式版本
@@ -160,8 +163,8 @@ tags      = []        # 互动能力标签，如 ["cleaner"]/["commander"]
 
   [forms.clips]              # 由 ANIM_CONF 自动生成
   idle   = { clip = "World_Idle",   ms = 1333, loop = true }
-  walk   = { clip = "World_Walk",   ms = 1133, loop = true, in_place = true, speed = 60 }
-  run    = { clip = "World_Run",    ms =  600, loop = true, in_place = true, speed = 160 }
+  walk   = { clip = "Walk", ms = 1133, frames = 35, in_place = false, root_motion_cm = 53.06, speed_cm_s = 46.8 }
+  run    = { clip = "Run",  ms =  600, frames = 19, in_place = false, root_motion_cm = 180,   speed_cm_s = 300 }
   happy  = { clip = "Common_Happy", ms = 1500 }
   anger  = { clip = "Common_Anger", ms = 1500 }
   shock  = { clip = "Common_Shock", ms = 1500 }
@@ -172,15 +175,18 @@ tags      = []        # 互动能力标签，如 ["cleaner"]/["commander"]
 missing_clips = ["hide"]
 ```
 
-`speed`(像素/秒基准值)与 `in_place` 需实测填入，见 §5 待验证项。
+实际产物比这份草案更细(每 clip 带 `frames`/`root_motion_cm`/`speed_cm_s`，贴图带槽位与尺寸)，
+见 [spike-s3.md](spike-s3.md) 与导出器的 `Manifest.cs`。
 
 ### 4.4 加载与体积
 
 - 发现路径 `~/.local/share/rocom-pets/packs/`、`%APPDATA%\rocom-pets\packs\`；
   启动只读各包 manifest(轻)，**启用某形态时**才流式读该形态的 glb 与贴图。
-- 体积(喵喵实测外推，需抽样复核)：每形态 mesh ≈0.4MB + 裁剪到 ~12 段动作 ≈1.5MB +
-  512 贴图 ≈0.3MB ≈ **2MB/形态**；一条链 6–8MB；683 个形态全量 ≈1.5GB。
-- 压体积手段：只导桌宠用得到的 clip 集合、LOD1 网格、贴图降到 512、KTX2/BasisU。
+- 体积(S3 实测，喵喵链 16 个动作 + 1024 贴图)：每形态 **2.1–5.0MB** glb + 贴图，
+  一条链目录 13MB、`.rkpet` 6.9MB。比原估的 2MB/形态高一倍,动画通道是主要占比
+  (骨骼数 × clip 数 × 帧数)。
+- 压体积手段(已做)：只导桌宠动作白名单、恒定轨道不写通道/只写单帧。
+  (待做，Phase 4)：关键帧精简、贴图降到 512、KTX2/BasisU、只导当前启用的形态。
 
 ## 5. 动作与行为
 
@@ -190,10 +196,14 @@ missing_clips = ["hide"]
 - 每实体一个状态机 + 需求值(困倦/心情/无聊) + 作息时钟；转移由事件驱动：鼠标、邻近实体、
   屏幕边界、定时器、脚本 Intent。
 - 进阶：LookAt BlendSpace → 视线跟随鼠标。
-- **待验证(Phase 0 spike 3 定论)**：
-  - `World_Walk/Run` 是否原地循环(决定位移由程序推进还是取 root motion)；
-  - 朝向与单位(UE cm、Z-up)到屏幕像素的换算，`MODEL_CONF.model_scale`、`SMR`、
-    `PET_SHOW_SPEED_CONF` 各自的含义；
+- **已由 S3 定论**(详见 [spike-s3.md](spike-s3.md))：走跑动画**逐 clip 不一致**——同一条链里
+  有的带 root motion 有的原地，方向恒为 glTF +Z(= UE +Y)。故 manifest 逐 clip 给
+  `in_place`/`speed_cm_s`；运行时有速度就用它推进位置并原地循环播放，没有就按 locomotion
+  取默认值，并对离谱值钳制(魔力猫 Run 反推出 7.5m/s)。单位：glb 米制，`height_cm` 取
+  `ImportedBounds` 全高(喵喵链 80/104/204cm)。
+- **待验证**：
+  - `MODEL_CONF.SMR`、`PET_SHOW_SPEED_CONF` 各自的含义(现在速度直接从 root motion 反推，
+    够用；要与游戏内手感对齐再查)；
   - `INTERACTIONTREE_CONF` 的 `anim_key*` 到动作表的确切映射(「摸头」指向的 id 20 在
     `ANIM_ID_CONF` 里叫 `Sad`，字面对不上，需实机核对)；
   - stage 0 目录(如 `Gra_MiaoMiao0_001`)只有 Mat/Tex 没有 SKM，是蛋还是共享皮，包里怎么表达。

@@ -8,9 +8,17 @@
 支持矩阵：**Windows 10+** 与 **KDE Plasma Wayland**(开发环境 Plasma 6.7.3 / kwin_wayland)。
 GNOME 等不实现 wlr-layer-shell 的合成器不在支持范围，也不做 X11 回退。
 
-- 运行时：Rust + wgpu，自写平台窗口层(wlr-layer-shell / Windows layered + DirectComposition)。
-- 宠物包：一条进化链一个 `.rkpet`(zip)，含 glb 模型、贴图、叫声与 manifest。
-- 导出器：C#(CUE4Parse)，从用户自己的游戏 pak 生成宠物包。
+- 运行时(`src/`)：Rust + wgpu，自写平台窗口层(wlr-layer-shell / Windows layered + DirectComposition)。
+  当前进度:KDE Wayland 后端已跑通(透明置顶、轮廓命中、穿透开关),见 [docs/spike-s1.md](docs/spike-s1.md)。
+- 导出器(`exporter/`)：C# + CUE4Parse，从自己的游戏 pak 生成宠物包;
+  一条进化链一个包(glb 含全部动作 + 贴图 + manifest.toml)，见 [docs/spike-s3.md](docs/spike-s3.md)。
+- 验证工具(`tools/verify_glb.py`)：按 glTF 规范自采样 + 蒙皮 + 光栅化，渲图肉眼核对动画正确性。
+
+```sh
+cargo run                                                  # 运行时(KDE Wayland)
+dotnet run --project exporter -- --species 3001 --out packs # 导一条进化链
+python tools/verify_glb.py packs/喵喵 --clips Idle,Walk     # 渲图验证
+```
 
 资产提取链路在 [rocom-capture](../rocom-capture) 里验证；叫声提取管线复用 rocom-petvo。
 

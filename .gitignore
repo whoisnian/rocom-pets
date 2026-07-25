@@ -10,3 +10,9 @@ obj/
 *.rkpet
 /packs/
 /out/
+
+# 验证图
+/verify*.png
+
+# Python 缓存
+__pycache__/
