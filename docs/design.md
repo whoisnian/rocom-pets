@@ -278,9 +278,20 @@ missing_clips = ["hide"]
 `SIGUSR1` 切穿透、宠物按 `height_cm × --px-per-cm` 换算屏幕尺寸。
 实测:自身 CPU **1.2% 单核**(30fps 推进动画)、RSS 152MB(debug 依赖 + NVIDIA Vulkan)。
 
-**待做**:托盘菜单退出与全局热键(KGlobalAccel/portal)、配置文件、
-落地用 `JumpFall` 动作、damage 局部提交。
-(分数缩放已补,见 [spike-s1.md](spike-s1.md) item 9;轮廓命中与降帧见 Phase 2。)
+**已补**:配置文件(`~/.config/rocom-pets/config.toml`,首次运行生成带注释模板,
+命令行参数优先)、托盘菜单(StatusNotifierItem:鼠标穿透勾选 / 召回宠物 / 退出)、
+全局热键、自己的 D-Bus 控制接口。
+
+全局热键有两条路,都实测通过:
+
+1. **XDG GlobalShortcuts portal**(`org.freedesktop.portal.GlobalShortcuts`)。
+   应用只能*建议*按键,KDE 会**弹窗让用户确认**——在用户点之前 portal 不回应,
+   所以代码里放了看门狗提示去看弹窗(一开始误判成「KDE 丢弃了请求」,实机确认是等确认)。
+2. **`org.rocom.Pets` D-Bus 接口** + `rocom-pets --toggle-passthrough|--recall|--quit`。
+   在 KDE「自定义快捷键」里把任意键绑到这条命令即可,不依赖 portal,顺带让宠物可脚本化。
+
+**待做**:落地用 `JumpFall` 动作、damage 局部提交、开机自启(`packaging/rocom-pets.desktop`
+复制到 `~/.config/autostart/`)。
 
 ### Phase 2 — 鼠标交互
 

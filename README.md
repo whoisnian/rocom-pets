@@ -16,8 +16,13 @@ GNOME 等不实现 wlr-layer-shell 的合成器不在支持范围，也不做 X1
   一条进化链一个包(glb 含全部动作 + 贴图 + manifest.toml)，见 [docs/spike-s3.md](docs/spike-s3.md)。
 - 验证工具(`tools/verify_glb.py`)：按 glTF 规范自采样 + 蒙皮 + 光栅化，渲图肉眼核对动画正确性。
 
+配置在 `~/.config/rocom-pets/config.toml`(首次运行生成带注释模板);托盘菜单可切穿透、
+召回、退出;全局热键走 XDG GlobalShortcuts portal(KDE 会弹窗确认),或把 KDE 自定义快捷键
+绑到 `rocom-pets --toggle-passthrough`。
+
 ```sh
 cargo run --release -- --pack packs/喵喵                    # 把宠物放到桌面上
+rocom-pets --toggle-passthrough                            # 通知已在跑的实例(可绑快捷键)
 cargo run                                                  # 同上但用调试精灵(平台层验收模式)
 cargo run --release -- --render packs/喵喵 --bench 600      # 离屏渲宠物 + 测出帧耗时
 dotnet run --project exporter -- --species 3001 --out packs # 导一条进化链

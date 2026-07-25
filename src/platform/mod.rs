@@ -19,6 +19,12 @@ pub struct Options {
     pub form: Option<String>,
     /// 每厘米多少逻辑像素:宠物的屏幕高度 = height_cm × 这个值。
     pub px_per_cm: f32,
+    /// 启动就开鼠标穿透。
+    pub passthrough: bool,
+    /// 起托盘图标(没有托盘宿主的桌面上失败也不致命)。
+    pub tray: bool,
+    /// 全局热键的建议按键;None = 不申请。
+    pub hotkey: Option<String>,
 }
 
 pub fn run(options: &Options) -> anyhow::Result<()> {

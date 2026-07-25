@@ -1,0 +1,15 @@
+[Desktop Entry]
+Type=Application
+Name=rocom-pets
+Name[zh_CN]=洛克桌宠
+Comment=Desktop pet from Roco Kingdom World assets
+Comment[zh_CN]=洛克王国：世界 的桌面宠物
+Exec=rocom-pets
+Icon=face-smile
+Categories=Game;
+Terminal=false
+# 托盘图标由程序自己注册(StatusNotifierItem),不需要 X-GNOME-UsesNotifications
+StartupNotify=false
+# 装到 ~/.local/share/applications/ 后:
+#   - GlobalShortcuts portal 才能把快捷键记在这个应用名下;
+#   - 复制到 ~/.config/autostart/ 即可开机自启。

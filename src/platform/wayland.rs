@@ -56,6 +56,7 @@ use smithay_client_toolkit::{
     },
 };
 
+use crate::control::{self, Control, TrayHandle};
 use crate::pack::{Form, Pack};
 use crate::pet::mask::MaskReadback;
 use crate::pet::target::{PetTarget, view_proj};
@@ -74,12 +75,6 @@ const CANVAS_PADDING: f32 = 1.35;
 
 /// 鼠标左键(linux input event code)。
 const BTN_LEFT: u32 = 0x110;
-
-/// 外部信号转成的控制消息。
-enum Control {
-    TogglePassthrough,
-    Quit,
-}
 
 pub fn run(options: &Options) -> Result<()> {
     let conn = Connection::connect_to_env().context("连不上 Wayland 合成器")?;
@@ -155,6 +150,8 @@ pub fn run(options: &Options) -> Result<()> {
         px_per_cm: options.px_per_cm,
         stages: Vec::new(),
         pointer: None,
+        tray: None,
+        passthrough: options.passthrough,
         exit: false,
     };
 
@@ -163,7 +160,34 @@ pub fn run(options: &Options) -> Result<()> {
     WaylandSource::new(conn.clone(), event_queue)
         .insert(handle.clone())
         .map_err(|e| anyhow::anyhow!("挂 Wayland 事件源失败: {e}"))?;
-    install_signal_source(&handle)?;
+    // 托盘 / 热键 / 信号都往同一个通道发命令
+    let (control_tx, control_rx) = channel::channel();
+    install_signal_source(control_tx.clone())?;
+    if options.tray {
+        let name = app
+            .form
+            .as_ref()
+            .map(|f| f.name.clone())
+            .unwrap_or_default();
+        match control::spawn_tray(control_tx.clone(), name, options.passthrough) {
+            Ok(tray) => app.tray = Some(tray),
+            Err(e) => log::warn!("托盘不可用({e:#});用 kill -USR1 或热键代替"),
+        }
+    }
+    if let Some(trigger) = options.hotkey.clone() {
+        control::spawn_hotkey(control_tx.clone(), trigger);
+    }
+    // 自己的 D-Bus 接口:给「KDE 自定义快捷键绑命令」与脚本用
+    if let Err(e) = control::serve_dbus(control_tx.clone()) {
+        log::warn!("D-Bus 控制接口不可用({e:#})");
+    }
+    handle
+        .insert_source(control_rx, |event, _, app: &mut App| {
+            if let channel::Event::Msg(control) = event {
+                app.handle_control(control);
+            }
+        })
+        .map_err(|e| anyhow::anyhow!("挂控制通道失败: {e}"))?;
 
     // 只有宠物需要推进时间;精灵模式保持「只在事件时出帧」,空闲 CPU 才能是 0
     if app.form.is_some() {
@@ -180,7 +204,10 @@ pub fn run(options: &Options) -> Result<()> {
             .map_err(|e| anyhow::anyhow!("挂动画定时器失败: {e}"))?;
     }
 
-    log::info!("pid {} — kill -USR1 切换全局穿透", std::process::id());
+    log::info!(
+        "pid {} 就位:托盘菜单 / 全局热键 / `rocom-pets --toggle-passthrough` / kill -USR1 都能切穿透",
+        std::process::id()
+    );
     while !app.exit {
         event_loop
             .dispatch(None, &mut app)
@@ -189,13 +216,10 @@ pub fn run(options: &Options) -> Result<()> {
     Ok(())
 }
 
-/// 把 SIGUSR1(切换穿透)与 SIGINT/SIGTERM(退出)接进 calloop。
-fn install_signal_source(
-    handle: &smithay_client_toolkit::reexports::calloop::LoopHandle<'static, App>,
-) -> Result<()> {
+/// 把 SIGUSR1(切换穿透)与 SIGINT/SIGTERM(退出)接到控制通道上。
+fn install_signal_source(tx: channel::Sender<Control>) -> Result<()> {
     use signal_hook::consts::{SIGINT, SIGTERM, SIGUSR1};
 
-    let (tx, rx) = channel::channel();
     let mut signals = signal_hook::iterator::Signals::new([SIGUSR1, SIGINT, SIGTERM])
         .context("注册信号处理失败")?;
     std::thread::spawn(move || {
@@ -210,16 +234,6 @@ fn install_signal_source(
             }
         }
     });
-    handle
-        .insert_source(rx, |event, _, app| {
-            if let channel::Event::Msg(msg) = event {
-                match msg {
-                    Control::TogglePassthrough => app.toggle_passthrough(),
-                    Control::Quit => app.exit = true,
-                }
-            }
-        })
-        .map_err(|e| anyhow::anyhow!("挂信号事件源失败: {e}"))?;
     Ok(())
 }
 
@@ -296,6 +310,10 @@ struct App {
     px_per_cm: f32,
     stages: Vec<StageWindow>,
     pointer: Option<wl_pointer::WlPointer>,
+    /// 托盘句柄:拿着它才能把勾选状态同步回菜单;None = 没起托盘。
+    tray: Option<TrayHandle>,
+    /// 当前是否穿透(stage 各自也有,这里存一份用于新建 stage 与回显托盘)。
+    passthrough: bool,
     exit: bool,
 }
 
@@ -372,6 +390,11 @@ impl App {
             None => Actor::Sprite(self.sprite.clone()),
         };
 
+        let mut stage = Stage::new(actor, (1, 1));
+        if self.passthrough != stage.passthrough() {
+            stage.handle(StageEvent::TogglePassthrough);
+        }
+
         log::info!("output {name} 上新建 stage(scale {scale})");
         self.stages.push(StageWindow {
             output,
@@ -380,7 +403,7 @@ impl App {
             target: None,
             pet: None,
             sprite_quad: None,
-            stage: Stage::new(actor, (1, 1)),
+            stage,
             logical: (1, 1),
             // 先用 wl_output 的整数 scale 兜着,分数缩放的 preferred_scale 一到就覆盖
             scale: scale as f32,
@@ -542,6 +565,29 @@ impl App {
             .position(|s| s.layer.wl_surface() == surface)
     }
 
+    fn handle_control(&mut self, control: Control) {
+        match control {
+            Control::TogglePassthrough => self.toggle_passthrough(),
+            Control::Recall => self.recall(),
+            Control::Quit => self.exit = true,
+        }
+    }
+
+    /// 把宠物召回屏幕中间(跑到边角、或多屏切换后找不着了)。
+    fn recall(&mut self) {
+        for index in 0..self.stages.len() {
+            self.stages[index].stage.reset_position();
+            self.apply(
+                index,
+                Reaction {
+                    redraw: true,
+                    regions_dirty: true,
+                },
+            );
+        }
+        log::info!("宠物已召回");
+    }
+
     fn toggle_passthrough(&mut self) {
         let mut state = None;
         for i in 0..self.stages.len() {
@@ -550,6 +596,11 @@ impl App {
             self.apply(i, reaction);
         }
         if let Some(on) = state {
+            self.passthrough = on;
+            // 菜单里的勾选要跟上(穿透也可能是热键/信号切的)
+            if let Some(tray) = &self.tray {
+                tray.set_passthrough(on);
+            }
             log::info!(
                 "全局穿透: {}",
                 if on {

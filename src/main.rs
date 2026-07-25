@@ -3,6 +3,8 @@
 //! 默认起 stage(每个显示器一个透明置顶表面,见 platform/);
 //! `--render` 是离屏模式,不开窗口,把宠物渲成对比图用于验收与回归(见 offscreen.rs)。
 
+mod config;
+mod control;
 mod offscreen;
 mod pack;
 mod pet;
@@ -19,10 +21,18 @@ const USAGE: &str = "\
   rocom-pets                              起 stage,但用调试精灵(平台层验收模式)
   rocom-pets --render <包目录|glb> [选项]  离屏渲染宠物到 PNG
 
-stage 模式:
+stage 模式(不给参数时读 ~/.config/rocom-pets/config.toml,首次运行会生成模板):
   --pack <目录>      宠物包目录(含 manifest.toml)
   --form <资产名>    选形态,默认包里第一个(链首)
   --px-per-cm <n>    每厘米多少逻辑像素(默认 2.0:80cm 的喵喵 → 160px 高)
+  --config <文件>    换个配置文件
+  --no-tray          不起托盘图标
+  --passthrough      启动就开鼠标穿透
+
+控制已在运行的实例(走 D-Bus,可绑到 KDE 自定义快捷键):
+  --toggle-passthrough  切换鼠标穿透
+  --recall              把宠物召回屏幕中间
+  --quit                让它退出
 
   --render <路径>    宠物包目录(含 forms/)或直接给 model.glb
   --form <资产名>    选形态,默认包里第一个
@@ -37,15 +47,26 @@ stage 模式:
 ";
 
 fn main() -> anyhow::Result<()> {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    // zbus/tracing 的握手与派发日志是 INFO 级且极啰嗦(一次 D-Bus 调用刷十几行),
+    // 一律压到 warn。注意不能只写进 default_filter:RUST_LOG 一设就把默认整条替换掉了,
+    // 所以这里是在用户给的过滤器**后面**追加(用户显式点名 zbus/tracing 时不动)。
+    let mut filter = std::env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string());
+    for noisy in ["zbus", "tracing"] {
+        if !filter.contains(noisy) {
+            filter.push_str(&format!(",{noisy}=warn"));
+        }
+    }
+    env_logger::Builder::new().parse_filters(&filter).init();
 
     let mut args = std::env::args().skip(1);
     let mut request: Option<offscreen::Request> = None;
-    let mut options = platform::Options {
-        pack: None,
-        form: None,
-        px_per_cm: 2.0,
-    };
+    // 命令行先收集成 Option,最后再与配置文件合并(命令行优先)
+    let mut config_path: Option<PathBuf> = None;
+    let mut cli_pack: Option<PathBuf> = None;
+    let mut cli_form: Option<String> = None;
+    let mut cli_px_per_cm: Option<f32> = None;
+    let mut cli_passthrough = false;
+    let mut no_tray = false;
     let next = |flag: &str, args: &mut dyn Iterator<Item = String>| -> anyhow::Result<String> {
         args.next()
             .ok_or_else(|| anyhow::anyhow!("{flag} 缺少参数值\n{USAGE}"))
@@ -73,10 +94,18 @@ fn main() -> anyhow::Result<()> {
                     bench: 0,
                 });
             }
-            "--pack" => options.pack = Some(PathBuf::from(next("--pack", &mut args)?)),
-            "--px-per-cm" => options.px_per_cm = next("--px-per-cm", &mut args)?.parse()?,
+            "--pack" => cli_pack = Some(PathBuf::from(next("--pack", &mut args)?)),
+            "--px-per-cm" => cli_px_per_cm = Some(next("--px-per-cm", &mut args)?.parse()?),
+            "--config" => config_path = Some(PathBuf::from(next("--config", &mut args)?)),
+            "--no-tray" => no_tray = true,
+            "--passthrough" => cli_passthrough = true,
+            "--toggle-passthrough" => {
+                return control::send_dbus_command(control::Control::TogglePassthrough);
+            }
+            "--recall" => return control::send_dbus_command(control::Control::Recall),
+            "--quit" => return control::send_dbus_command(control::Control::Quit),
             // --form 两个模式都用得到
-            "--form" if request.is_none() => options.form = Some(next("--form", &mut args)?),
+            "--form" if request.is_none() => cli_form = Some(next("--form", &mut args)?),
             other => {
                 let Some(request) = request.as_mut() else {
                     anyhow::bail!("{other} 只在 --render 模式下有意义\n{USAGE}");
@@ -102,8 +131,26 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
-    match request {
-        Some(request) => offscreen::render(&request),
-        None => platform::run(&options),
+    if let Some(request) = request {
+        return offscreen::render(&request);
     }
+
+    // stage 模式:配置文件打底,命令行覆盖
+    let path = config_path.or_else(config::Config::default_path);
+    let file = match &path {
+        Some(path) => config::Config::load_or_create(path)?,
+        None => {
+            log::warn!("定不出配置文件位置(HOME/XDG_CONFIG_HOME 都没有),用内置默认值");
+            config::Config::default()
+        }
+    };
+    let options = platform::Options {
+        pack: cli_pack.or_else(|| file.pack.as_deref().map(config::Config::expand_path)),
+        form: cli_form.or(file.form),
+        px_per_cm: cli_px_per_cm.unwrap_or(file.px_per_cm),
+        passthrough: cli_passthrough || file.passthrough,
+        tray: !no_tray,
+        hotkey: file.hotkey,
+    };
+    platform::run(&options)
 }
