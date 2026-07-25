@@ -1,0 +1,22 @@
+[package]
+name = "rocom-pets"
+version = "0.0.0"
+edition = "2024"
+publish = false
+description = "桌面宠物运行时(Phase 0 spike:平台层验证)"
+
+[dependencies]
+anyhow = "1.0.104"
+bytemuck = "1.25.2"
+env_logger = "0.11.11"
+log = "0.4.33"
+pollster = "1.0.1"
+raw-window-handle = "0.6.2"
+wgpu = "30.0.0"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+signal-hook = "0.4.4"
+smithay-client-toolkit = { version = "0.21.1", features = ["system"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = "0.62.2"
