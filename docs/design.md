@@ -263,9 +263,9 @@ missing_clips = ["hide"]
 
 | # | 内容 | 验收标准 |
 | --- | --- | --- |
-| S1 | 平台层：KDE Wayland(layer-shell) 与 Windows(DComp) 各画一张半透明贴图 | 两平台都能：置顶于普通窗口之上、指定坐标、逐像素 alpha 正确(无黑边/无不透明底)、贴图内点击被自己接到而贴图外点击落到下层窗口、运行时切换全局穿透生效、多显示器各自一个 stage 且 output 热插拔不崩；另记录 KWin 下 `layer=top` 与全屏窗口/锁屏/通知的实际叠放次序，以及空闲与活动时的 CPU/GPU 占用。**这是全项目成败点。** |
-| S2 | 渲染：wgpu 加载 glb 播骨骼动画 + toon 着色 | 离屏渲染出的帧与 rocom-capture 那份 CPU 蒙皮参考图形体一致；两个 clip 间淡入淡出无跳变；1 只宠物 60fps 时 GPU 占用可忽略 |
-| S3 | 导出器：psa→glb 动画合并，跑通喵喵整条链(3001/3025/3007) | 合并后的 glb 在第三方查看器(Blender/gltf 校验器)里骨架与动画正确；确认 `walk/run` 是否原地循环、朝向与单位换算；产出一份填好 `speed`/`in_place` 的 manifest |
+| S1 | 平台层：KDE Wayland(layer-shell) 与 Windows(DComp) 各画一张半透明贴图 **(Wayland ✅ / Windows 未开始,见 [spike-s1.md](spike-s1.md))** | 两平台都能：置顶于普通窗口之上、指定坐标、逐像素 alpha 正确(无黑边/无不透明底)、贴图内点击被自己接到而贴图外点击落到下层窗口、运行时切换全局穿透生效、多显示器各自一个 stage 且 output 热插拔不崩；另记录 KWin 下 `layer=top` 与全屏窗口/锁屏/通知的实际叠放次序，以及空闲与活动时的 CPU/GPU 占用。**这是全项目成败点。** |
+| S2 | 渲染：wgpu 加载 glb 播骨骼动画 + toon 着色 | **✅ 见 [spike-s2.md](spike-s2.md)**：形体与 CPU 参考实现(`tools/verify_glb.py`)一致；淡化中点是平滑中间态；单只 0.040–0.054ms/帧(60fps 预算的 0.3%) |
+| S3 | 导出器：动画合并进 glb，跑通喵喵整条链(3001/3025/3007) | **✅ 见 [spike-s3.md](spike-s3.md)**：三形态动画正确(途中修掉 CUE4Parse 的骨骼旋转 bug)；root motion/朝向/单位已定论；manifest 已产出 |
 
 ### Phase 1 — 单宠物 MVP
 一个形态：`idle` 循环 + 沿屏幕底边行走、穿透开关(热键)、托盘菜单退出、配置文件。

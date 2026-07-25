@@ -9,13 +9,15 @@
 GNOME 等不实现 wlr-layer-shell 的合成器不在支持范围，也不做 X11 回退。
 
 - 运行时(`src/`)：Rust + wgpu，自写平台窗口层(wlr-layer-shell / Windows layered + DirectComposition)。
-  当前进度:KDE Wayland 后端已跑通(透明置顶、轮廓命中、穿透开关),见 [docs/spike-s1.md](docs/spike-s1.md)。
+  当前进度:KDE Wayland 后端已跑通(透明置顶、轮廓命中、穿透开关,[docs/spike-s1.md](docs/spike-s1.md));
+  骨骼动画 + toon 着色已跑通,离屏可渲图与测耗时([docs/spike-s2.md](docs/spike-s2.md))。
 - 导出器(`exporter/`)：C# + CUE4Parse，从自己的游戏 pak 生成宠物包;
   一条进化链一个包(glb 含全部动作 + 贴图 + manifest.toml)，见 [docs/spike-s3.md](docs/spike-s3.md)。
 - 验证工具(`tools/verify_glb.py`)：按 glTF 规范自采样 + 蒙皮 + 光栅化，渲图肉眼核对动画正确性。
 
 ```sh
 cargo run                                                  # 运行时(KDE Wayland)
+cargo run --release -- --render packs/喵喵 --bench 600      # 离屏渲宠物 + 测出帧耗时
 dotnet run --project exporter -- --species 3001 --out packs # 导一条进化链
 python tools/verify_glb.py packs/喵喵 --clips Idle,Walk     # 渲图验证
 ```
