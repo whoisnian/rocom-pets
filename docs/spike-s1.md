@@ -37,8 +37,8 @@ Wayland 一列的实测环境见 W6；带 👀 的项要人工肉眼/动手确�
 | 8 | 显示器热插拔/分辨率或缩放变更后不崩、自行重建 | ⏳ 同上，未验；`output_destroyed` 已会销毁对应 stage | ⏳ |
 | 9 | HiDPI：分数缩放下精灵不模糊、命中判定不偏 | ❌ **见下方「分数缩放」**，要补 `wp_fractional_scale_v1` + `wp_viewporter` | ⏳ |
 | 10 | 空闲（无动画）时不提交帧，CPU 占用 ≈0 | ✅ 5 秒内只涨 1 tick(10ms)≈0.2%；只在有事件时出帧，不挂 frame 回调 | ⏳ |
-| 11 | 拖动中 60fps 时的 CPU/GPU 占用（记录数值） | ⏳ 👀 需要真拖动才能测 | ⏳ |
-| 12 | 内存占用 | debug 构建 RSS ≈148MB（含 NVIDIA Vulkan 驱动）;release 待测 | ⏳ |
+| 11 | 拖动中 60fps 时的 CPU/GPU 占用（记录数值） | ✅ 人工确认拖动时 CPU/GPU 无明显变化 | ⏳ |
+| 12 | 内存占用 | ✅ debug 构建 htop RES 151MB（含 NVIDIA Vulkan 驱动）;release 待测 | ⏳ |
 
 ### 分数缩放（item 9 的细节）
 
@@ -54,11 +54,11 @@ scale，再用 `wp_viewporter` 把 buffer 映射到逻辑尺寸，按 1.5 渲染
 
 | # | 项 | 结果 |
 | --- | --- | --- |
-| W1 | `layer=top` 与**全屏窗口**（全屏视频/游戏）的叠放次序 | ⏳ 👀 |
-| W2 | 与**锁屏**的叠放次序（绝不能盖住锁屏） | ⏳ 👀 |
-| W3 | 与**通知/OSD**（音量条、通知气泡）的叠放次序 | ⏳ 👀 |
-| W4 | 与**Krunner / 任务切换器 / 桌面预览**的叠放次序 | ⏳ 👀 |
-| W5 | `exclusive_zone=-1` 确认没有挤压其他窗口布局（最大化窗口仍占满屏） | ⏳ 👀 |
+| W1 | `layer=top` 与**全屏窗口**（全屏视频/游戏）的叠放次序 | ✅ 全屏窗口盖在 stage 之上 → **不需要自己做「检测全屏就隐藏」**，KWin 已经代劳 |
+| W2 | 与**锁屏**的叠放次序（绝不能盖住锁屏） | ✅ 锁屏盖在 stage 之上，安全 |
+| W3 | 与**通知/OSD**（音量条、通知气泡）的叠放次序 | ✅ 通知盖在 stage 之上，不会被宠物挡住 |
+| W4 | 与**Krunner / 任务切换器 / 桌面预览**的叠放次序 | ✅ 均盖在 stage 之上 |
+| W5 | `exclusive_zone=-1` 确认没有挤压其他窗口布局（最大化窗口仍占满屏） | ⏳ 👀 未单独确认（W1 全屏正常说明至少不影响全屏布局） |
 | W6 | 实测环境（升级 Plasma 后本清单需重跑） | Plasma 6.7.3 / kwin 6.7.3-1、NVIDIA RTX 3070 / Vulkan、单显示器 DP-3 3840×2160@1.5x、rustc 1.97.1、wgpu 30.0.0、sctk 0.21.1(`system` feature) |
 
 ### 已确认的实现细节
@@ -88,6 +88,9 @@ scale，再用 `wp_viewporter` 把 buffer 映射到逻辑尺寸，按 1.5 渲染
 `PreMultiplied` 逐像素 alpha、轮廓命中与轮廓外穿透、全局穿透可运行时切换——程序侧与人工
 操作都已确认，没有需要改架构的发现。
 唯一的实现级欠账是分数缩放（补 `wp_fractional_scale_v1` + `wp_viewporter`，排 Phase 1）。
+
+叠放次序的实测结果比预期更省事：全屏窗口、锁屏、通知/OSD、Krunner 都盖在 `layer=top` 之上，
+所以 design.md §3.3 里「检测到前台全屏窗口时自动隐藏 stage」这条**不用自己实现**，KWin 已经代劳。
 
 **Windows 半边：未开始。** 路线见 `src/platform/windows.rs` 的注释；已确认 wgpu 30 提供
 `SurfaceTargetUnsafe::CompositionVisual`，即 N1 那条「自建 DComp visual 交给 wgpu」的路可行。
