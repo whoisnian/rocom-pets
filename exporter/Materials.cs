@@ -20,6 +20,7 @@ using CUE4Parse.UE4.Assets.Exports.Material;
 using CUE4Parse.UE4.Assets.Exports.SkeletalMesh;
 using CUE4Parse.UE4.Assets.Exports.Texture;
 using CUE4Parse.UE4.Assets.Objects;
+using CUE4Parse.UE4.Objects.UObject;
 
 namespace RocomPets.Export;
 
@@ -32,6 +33,10 @@ public record MaterialInfo(
     Dictionary<string, float[]> Vectors,
     /// 参数名 → 标量。强度/流速/菲涅尔次数一类。
     Dictionary<string, float> Scalars,
+    /// **静态开关**:参数名 → 开/关。这是「这个特性到底开没开」的**明写答案**,
+    /// 名字多半是中文(`是否使用MatCap`、`开启黑魔法效果`、`使用顶点色`)。
+    /// 在拿到它之前只能靠「美术有没有显式写某个参数」间接推断,那是猜。
+    Dictionary<string, bool> Switches,
     EBlendMode BlendMode,
     float OpacityMaskClipValue,
     /// 父链上所有材质的名字,由近及远;排查用。
@@ -89,14 +94,22 @@ public record MaterialInfo(
         Scalar("Flow_U_Tiling", 1f), Scalar("Flow_V_Tiling", 1f),
     ];
 
+    /// 静态开关查询。**开关只在美术真的打开时才写进实例**(全量统计里这些开关是「N 个开 / 0 个关」),
+    /// 所以「查不到这一条」= 用父材质的默认值,而这批开关的默认基本都是关。
+    public bool Switch(string name) => Switches.TryGetValue(name, out var v) && v;
+
     /// **卷动色带**:一张渐变图沿 UV 滚过表面,给固有色叠上流动的颜色。
     /// 暮星辰的环带就是它——`MI_P_Object_XingGuang_UVFlow_Morph` 给 `FlowTexture`
     /// = `T_..._Fx_D`(青↔粉竖条纹渐变)+ `Flow_U_Speed` = 0.25,于是青粉渐变绕着环跑;
     /// 基色贴图里环带那一条是**纯粉的**,渐变完全来自这张图。
     ///
-    /// 判据取「美术真给了流速」:`FlowTexture` 槽几乎人人都挂着,但只有 UVFlow 族在用。
+    /// **判据是「`UVFlow` 族(公式写死在父材质里)或静态开关 `是否需要BaseColor流动` 打开」。**
+    /// 原来只看「美术给了流速」,那会多出 17 个火焰族材质(火花/迪莫/守夜烛):它们的
+    /// `Flow_U_Speed` 是给**特效层自己的噪声卷动**用的,不是给固有色叠色带。
     public string? FlowTexture =>
-        Scalar("Flow_U_Speed") != 0f || Scalar("Flow_V_Speed") != 0f
+        (ParentChain.Any(p => p.Contains("UVFlow", StringComparison.OrdinalIgnoreCase))
+         || Switch("是否需要BaseColor流动"))
+        && (Scalar("Flow_U_Speed") != 0f || Scalar("Flow_V_Speed") != 0f)
             ? FirstTexture("FlowTexture")
             : null;
 
@@ -156,10 +169,12 @@ public record MaterialInfo(
 
     /// MatCap:球面反射查找表。暮星辰那两个球的玻璃感就是它 + `MatCapColor=(3,3,3)` 的 HDR 白。
     ///
-    /// 同样**只在美术显式设了 `MatCapColor` 时才算启用**。很多材质的 MatCap 槽绑的压根不是
-    /// 反射图(幽星光的 `By` 绑的是 `Fx_ID` 描边图),无条件当高光叠会把宠物冲成一片白。
+    /// **判据直接用静态开关 `是否使用MatCap`**(全量 17 个材质开着)。很多材质的 MatCap 槽绑的
+    /// 压根不是反射图(幽星光的 `By` 绑的是 `Fx_ID` 描边图),无条件当高光叠会把宠物冲成一片白。
+    /// 原来拿「美术有没有显式设 `MatCapColor`」当判据,数目正好也是 17 个但对错各有两处
+    /// (多算了果冻与翡翠水母、漏了莫比乌乌与风铃鲨三阶)—— 开关是明写的答案,不必再推断。
     public string? MatcapTexture =>
-        Vectors.ContainsKey("MatCapColor") ? FirstTexture("MatCap", "MatCapTex") : null;
+        Switch("是否使用MatCap") ? FirstTexture("MatCap", "MatCapTex") : null;
 
     public float[]? MatcapColor => FirstVector("MatCapColor");
 
@@ -209,7 +224,7 @@ public static class Materials
                     // 如小浣蛋的 `MI_Dem_XiaoHuanDan1_001_By`)。仍然登记一条空的,
                     // 让导出器能按名字去凑基色贴图,免得整只宠物画不出来。
                     warnings.Add($"材质 {slot.Name} 在 pak 里没有资产(悬空引用),退回按贴图名接基色");
-                    result[slot.Name.Text] = new MaterialInfo(slot.Name.Text, [], [], [],
+                    result[slot.Name.Text] = new MaterialInfo(slot.Name.Text, [], [], [], [],
                         EBlendMode.BLEND_Opaque, DefaultMaskClip, [], Resolved: false);
                     continue;
                 }
@@ -245,6 +260,7 @@ public static class Materials
         var textures = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         var vectors = new Dictionary<string, float[]>(StringComparer.OrdinalIgnoreCase);
         var scalars = new Dictionary<string, float>(StringComparer.OrdinalIgnoreCase);
+        var switches = new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
         var blend = EBlendMode.BLEND_Opaque;
         var maskClip = DefaultMaskClip;
         // chain 是「自己 → 父 → 祖父」,倒着遍历 = 从祖先到自己
@@ -267,6 +283,18 @@ public static class Materials
             foreach (var param in mi.GetOrDefault<FScalarParameterValue[]>("ScalarParameterValues", []))
                 if (!string.IsNullOrEmpty(param.Name))
                     scalars[param.Name] = param.ParameterValue;
+            // 静态开关。**`bOverride` 一律是 false 而 `Value` 却各不相同**(实测幽星光一族
+            // 100 条里没有一条 bOverride=true,但 `是否使用MatCap` 是 true、`GlassySwitch` 是
+            // false),说明本作存的是**合并后的有效值**而不是「我覆盖了什么」——
+            // 和 BasePropertyOverrides 那边一个套路。所以照样「有值就用、近的覆盖远的」。
+            var staticSet = mi.GetOrDefault<FStructFallback>("StaticParameters");
+            foreach (var entry in staticSet?.GetOrDefault<FStructFallback[]>("StaticSwitchParameters", [])
+                                 ?? [])
+            {
+                var pname = entry.GetOrDefault<FStructFallback>("ParameterInfo")
+                    ?.GetOrDefault<FName>("Name").Text;
+                if (!string.IsNullOrEmpty(pname)) switches[pname] = entry.GetOrDefault<bool>("Value");
+            }
             // BasePropertyOverrides 只在「勾了 override」时才有意义,但本作的实例普遍不写
             // bOverride_* 标记,所以按「有值就用」处理:BLEND_Opaque 是 0,等于没覆盖。
             var overrides = mi.BasePropertyOverrides;
@@ -276,6 +304,6 @@ public static class Materials
                 if (overrides.OpacityMaskClipValue > 0) maskClip = overrides.OpacityMaskClipValue;
             }
         }
-        return new MaterialInfo(name, textures, vectors, scalars, blend, maskClip, parents);
+        return new MaterialInfo(name, textures, vectors, scalars, switches, blend, maskClip, parents);
     }
 }

@@ -60,6 +60,11 @@ public static class MaterialProbe
         var effectFamily = new Dictionary<string, EffectFamily>(StringComparer.OrdinalIgnoreCase);
         var failed = 0;
         var materialCount = 0;
+        // 静态开关普查:开/关各多少,以及「开」的那些落在哪些材质上
+        var switchOn = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+        var switchOff = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+        var switchSample = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        var switchWho = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
 
         foreach (var asset in assets)
         {
@@ -101,6 +106,18 @@ public static class MaterialProbe
                     foreach (var sc in info.Scalars.Keys) acc.Scalars.Add(sc);
                 }
 
+                foreach (var (sw, on) in info.Switches)
+                {
+                    if (on)
+                    {
+                        switchOn[sw] = switchOn.GetValueOrDefault(sw) + 1;
+                        switchSample.TryAdd(sw, $"{asset}/{name}");
+                        if (!switchWho.TryGetValue(sw, out var who)) switchWho[sw] = who = [];
+                        who.Add($"{asset}/{name}");
+                    }
+                    else switchOff[sw] = switchOff.GetValueOrDefault(sw) + 1;
+                }
+
                 // 基色候选落在别的目录 = 共享贴图
                 foreach (var (param, tex) in info.Textures)
                     if (IsBaseColorParam(param) && !tex.StartsWith(assetDir + "/", StringComparison.OrdinalIgnoreCase))
@@ -112,6 +129,14 @@ public static class MaterialProbe
         Console.WriteLine("\n=== 根材质分布");
         foreach (var (k, v) in parentCount.OrderByDescending(kv => kv.Value))
             Console.WriteLine($"  {v,6}  {k}   贴图参数: {string.Join(", ", paramsByParent[k].OrderBy(x => x))}");
+        Console.WriteLine("\n=== 静态开关(「这个特性到底开没开」的明写答案)");
+        foreach (var sw in switchOn.Keys.Concat(switchOff.Keys).Distinct(StringComparer.OrdinalIgnoreCase)
+                     .OrderByDescending(s => switchOn.GetValueOrDefault(s)))
+            Console.WriteLine($"  开 {switchOn.GetValueOrDefault(sw),5} / 关 {switchOff.GetValueOrDefault(sw),5}  {sw}" +
+                              (switchSample.TryGetValue(sw, out var s) ? $"   例: {s}" : ""));
+        // 开着的数量少的,把是谁全列出来 —— 这批正是「哪些材质真的启用了某个特性」
+        foreach (var (sw, who) in switchWho.Where(kv => kv.Value.Count <= 20).OrderBy(kv => kv.Value.Count))
+            Console.WriteLine($"    [{sw}] 开在: {string.Join(", ", who)}");
         Console.WriteLine("\n=== 混合模式分布");
         foreach (var (k, v) in blendCount.OrderByDescending(kv => kv.Value))
             Console.WriteLine($"  {v,6}  {k}");
@@ -249,6 +274,10 @@ public static class MaterialProbe
         {
             Console.WriteLine($"  {name}  混合={info.BlendMode} 遮罩阈值={info.OpacityMaskClipValue:0.####}");
             Console.WriteLine($"    父链: {string.Join(" ← ", info.ParentChain)}");
+            // 静态开关放最前面:它是「这个特性到底开没开」的明写答案,比下面那堆参数值更有用
+            if (info.Switches.Count > 0)
+                Console.WriteLine("    开关 " + string.Join("  ",
+                    info.Switches.OrderBy(kv => kv.Key).Select(kv => $"{kv.Key}={(kv.Value ? "开" : "关")}")));
             foreach (var (param, tex) in info.Textures.OrderBy(kv => kv.Key))
                 Console.WriteLine($"    tex {param,-20} → {tex}");
             foreach (var (param, c) in info.Vectors.OrderBy(kv => kv.Key))
