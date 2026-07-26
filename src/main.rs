@@ -46,6 +46,7 @@ stage 模式(不给参数时读 ~/.config/rocom-pets/config.toml,首次运行会
   --form <资产名>    选形态,默认包里第一个
   --clips a,b,c      要渲的动作(默认 Idle,Walk,Happy,SleepLoop)
   --at <0..1>        采样时刻占动作时长的比例(默认 0.4)
+  --time <秒>        喂给 shader 的时间(默认 0);看火焰流动、球内星点闪烁用
   --size <px>        每格边长(默认 320)
   --yaw <度>         观察角,0 = 正面(宠物朝 +Z)
   --no-fade          不额外渲「淡化中点」那一格
@@ -97,6 +98,7 @@ fn main() -> anyhow::Result<()> {
                         .map(String::from)
                         .to_vec(),
                     at: 0.4,
+                    time: 0.0,
                     size: 320,
                     yaw_degrees: 0.0,
                     out: PathBuf::from("pet-render.png"),
@@ -135,6 +137,7 @@ fn main() -> anyhow::Result<()> {
                     "--at" => request.at = next("--at", &mut args)?.parse()?,
                     "--size" => request.size = next("--size", &mut args)?.parse()?,
                     "--yaw" => request.yaw_degrees = next("--yaw", &mut args)?.parse()?,
+                    "--time" => request.time = next("--time", &mut args)?.parse()?,
                     "--no-fade" => request.fade_probe = false,
                     "--bench" => request.bench = next("--bench", &mut args)?.parse()?,
                     "-o" | "--out" => request.out = PathBuf::from(next("--out", &mut args)?),

@@ -81,6 +81,9 @@ struct VsOut {
     @location(2) ndc: vec2<f32>,
     // 玻璃内部层的采样起点(直接透传顶点属性)
     @location(3) interior_pos: vec3<f32>,
+    // **物体空间**的法线与视线:玻璃内部层的折射必须在这个空间里算(见 `interior_star`)
+    @location(4) local_normal: vec3<f32>,
+    @location(5) local_view: vec3<f32>,
 };
 
 // 线性混合蒙皮:权重和不为 1 的顶点(导出误差)按权重和归一化,否则会缩水
@@ -102,6 +105,13 @@ fn skin(input: VsIn) -> VsOut {
     out.normal = normal;
     out.ndc = out.clip.xy;
     out.interior_pos = input.interior_pos;
+    // 物体空间:法线就是未蒙皮的顶点法线;视线用蒙皮矩阵的逆转过来。
+    // 刚体骨骼(旋转 + 平移、无缩放)下 `inverse(mat3(m)) == transpose(mat3(m))`,
+    // 那两颗球正是各自挂在一根骨头上刚体自转的,所以这个等价变换是准的。
+    let fwd = normalize(vec3<f32>(camera.view_proj[0][2], camera.view_proj[1][2], camera.view_proj[2][2]));
+    let r = mat3x3<f32>(m[0].xyz, m[1].xyz, m[2].xyz);
+    out.local_normal = normalize(input.normal);
+    out.local_view = normalize(vec3<f32>(dot(r[0], fwd), dot(r[1], fwd), dot(r[2], fwd)));
     return out;
 }
 
@@ -122,6 +132,8 @@ fn vs_outline(input: VsIn) -> VsOut {
     out.normal = normal;
     out.ndc = out.clip.xy;
     out.interior_pos = input.interior_pos;
+    out.local_normal = normalize(input.normal);
+    out.local_view = vec3<f32>(0.0, 0.0, 1.0);
     return out;
 }
 
@@ -131,6 +143,9 @@ const STAR_TILE_SCALE: f32 = 3.0;
 /// 球内星点的整体强度。汇编里这项是 `cb5[62].z`(未解出名字);根材质有个语义对得上的
 /// `StarIntensity` = 1,所以取 1。
 const INTERIOR_GAIN: f32 = 1.0;
+/// 星场的平铺标量(汇编里的 `cb5[61].y`,未解出名字)。根材质有个语义对得上的
+/// `StarTiling` = 0.4 —— 值越小采样范围越窄、星点看着越大。
+const STAR_FIELD_TILING: f32 = 0.4;
 /// 玻璃族 MatCap 高光的叠加量。游戏那边这项还乘着遮罩通道选出来的高光区,我们没有那张遮罩的
 /// 语义,只能整片叠,所以要压一档——满强度叠上去,幽星光那两颗球会泛成一团白。
 const GLASS_MATCAP_GAIN: f32 = 0.35;
@@ -229,11 +244,10 @@ fn flow_band(uv: vec2<f32>, albedo: vec3<f32>) -> vec3<f32> {
 /// 高度做的渐变色;这里只取「折射 + 三向投影星场 + 时间」这条主干。
 /// 卷动速度实机是个 cb 里的向量参数,而 cb 槽位与参数名的对应还没解出来(§1),
 /// 所以先用一个定值。
-fn interior_star(start: vec3<f32>, n: vec3<f32>) -> f32 {
+fn interior_star(start: vec3<f32>, n: vec3<f32>, forward: vec3<f32>) -> f32 {
     if material.interior.w < 0.5 {
         return 0.0;
     }
-    let forward = normalize(vec3<f32>(camera.view_proj[0][2], camera.view_proj[1][2], camera.view_proj[2][2]));
     // refract():WGSL 没有内建,照 Snell 写。eta 取 1/折射率(空气 → 介质)
     let eta = 1.0 / max(material.interior.x, 0.001);
     let cosi = dot(n, forward);
@@ -252,7 +266,10 @@ fn interior_star(start: vec3<f32>, n: vec3<f32>) -> f32 {
     // 星场里以某点为心、约一格大小的一块,这正是「每颗球稳定居中一颗星」的机制。
     let half_extent = 0.5 * length(material.bounds_size.xyz);
     let march = half_extent * 0.01 * material.interior.y;
-    let p = (start + dir * march) / max(half_extent, 0.0001);
+    // `tiling = <cb 标量> / halfExtent`。那个标量没解出名字,取根材质里语义对得上的
+    // `StarTiling` = 0.4:它把采样范围缩到 0.4 倍,于是星场被放大 2.5 倍 ——
+    // 取 1 时星点比实机小得多(用户实测「太小」)。
+    let p = (start + dir * march) * (STAR_FIELD_TILING / max(half_extent, 0.0001));
 
     // 三向投影:权重取 |法线| 的高次,归一化
     let w = pow(abs(n), vec3<f32>(8.0));
@@ -367,8 +384,18 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         // 我们只拿到其中的 `StarColor`(根默认 (0.33,0.67,2) 的 HDR 蓝),底色那两对与混合
         // 系数都是还没解出名字的 cb 槽位,所以这里退化成「按星点强度往 StarColor 混」——
         // 结构照汇编(lerp 而不是相加),缺的那几项当成中性。
-        albedo = mix(albedo, material.interior_color.rgb,
-                     saturate(interior_star(in.interior_pos, n)));
+        // **HDR 的材质色要先转到显示空间再用。** 那个 shader 的尾巴是
+        // `movc o0.xyz, (曝光 < 1), sqrt(色 × 曝光), 色` —— 输出前一次 gamma-0.5 编码;
+        // 而我们整条链路本来就跑在显示空间(没做第 ④ 步的反色调映射),所以拿线性 HDR 值
+        // 直接当显示值是错的。`StarColor` = (0.33, 0.67, **2.0**),sqrt 后 (0.58, 0.82, 1.0),
+        // 亮度从 153 抬到 199 —— 星这才亮得起来(实机那颗是 near-white)。
+        let star_color = sqrt(material.interior_color.rgb);
+        // **折射必须在物体空间算**(见 `interior_star`),所以这里传物体空间的法线与视线,
+        // 不是世界空间的 `n`。
+        albedo = mix(albedo, star_color,
+                     saturate(interior_star(in.interior_pos,
+                                            normalize(in.local_normal),
+                                            normalize(in.local_view))));
         // 玻璃族自身的整体不透明度;`alpha_is_opacity` 的材质已经从基色 alpha 拿到了,别覆盖
         if !alpha_is_opacity {
             alpha = clamp(material.star.w, 0.0, 1.0);

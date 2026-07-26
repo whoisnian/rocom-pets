@@ -24,6 +24,9 @@ pub struct Request {
     pub clips: Vec<String>,
     /// 采样时刻占动作时长的比例。
     pub at: f32,
+    /// 喂给 shader 的「秒」。默认 0(同一条命令两次跑结果一样);
+    /// 要看随时间变的东西(火焰流动、球内星点的闪烁)就给个非零值。
+    pub time: f32,
     pub size: u32,
     pub yaw_degrees: f32,
     pub out: PathBuf,
@@ -141,7 +144,7 @@ pub fn render(request: &Request) -> Result<()> {
             view_proj,
             light_dir,
             outline_width,
-            elapsed_seconds(),
+            request.time,
             &player.matrices,
         );
         let pixels = draw_and_read(
@@ -175,7 +178,7 @@ pub fn render(request: &Request) -> Result<()> {
                 view_proj,
                 light_dir,
                 outline_width,
-                elapsed_seconds(),
+                request.time,
                 &player.matrices,
             );
             let pixels = draw_and_read(
@@ -239,7 +242,10 @@ fn benchmark(
     let view_proj = orthographic_view(model.motion_bounds, 0.0, RENDER_PADDING);
     let light = Vec3::new(-0.4, 0.8, 0.6);
     let start = std::time::Instant::now();
+    // bench 是逐帧推进的,时间也跟着走 —— 正好顺带压到「随时间变的那几层」的开销
+    let mut frame_time = 0.0f32;
     for _ in 0..frames {
+        frame_time += 1.0 / 60.0;
         player.advance(model, 1.0 / 60.0);
         player.update(model);
         pet.update(
@@ -247,7 +253,7 @@ fn benchmark(
             view_proj,
             light,
             0.004,
-            elapsed_seconds(),
+            frame_time,
             &player.matrices,
         );
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -432,11 +438,6 @@ fn load_materials(
     let asset = glb.parent()?.file_name()?.to_str()?;
     let form = loaded.forms.iter().find(|f| f.asset == asset)?;
     (!form.materials.is_empty()).then(|| form.materials.clone())
-}
-
-/// 渲图工具用固定时刻,免得同一条命令两次跑出不同的火焰形状(要看流动用 --bench 或实机)。
-fn elapsed_seconds() -> f32 {
-    0.0
 }
 
 fn locate_glb(pack: &Path, form: Option<&str>) -> Result<PathBuf> {
