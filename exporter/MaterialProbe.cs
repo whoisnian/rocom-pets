@@ -311,6 +311,11 @@ public static class MaterialProbe
                 foreach (var (param, c) in rd.Vectors.OrderBy(kv => kv.Key))
                     if (!info.Vectors.ContainsKey(param))
                         Console.WriteLine($"    根col {param,-18} = ({c[0]:0.###}, {c[1]:0.###}, {c[2]:0.###}, {c[3]:0.###})");
+                // 标量默认值同样要能看到:汇编里读到一个 cb 标量槽却不知道是谁时,
+                // 「实例没覆盖 ⇒ 根默认就是实际值」是唯一能对上号的线索(见 RootDefaults.cs)
+                foreach (var (param, v) in rd.Scalars.OrderBy(kv => kv.Key))
+                    if (!info.Scalars.ContainsKey(param))
+                        Console.WriteLine($"    根num {param,-18} = {v:0.####}");
             }
         }
         foreach (var w in warnings) Console.WriteLine($"  [warn] {w}");

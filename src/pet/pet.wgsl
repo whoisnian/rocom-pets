@@ -286,7 +286,17 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
 
     let n = normalize(in.normal);
     let ndl = dot(n, normalize(camera.light_dir));
-    // 两段明暗:亮部原色,暗部压到 0.72,过渡带 0.08 宽度避免锯齿
+    // 两段明暗:亮部原色,暗部压到 0.72,过渡带 0.08 宽度避免锯齿。
+    //
+    // 实机是 `smoothstep(thr, hi, (N·L + 1) * 0.5)` 再 `lerp(暗色, 亮色, 结果)`
+    // (汇编:`mad r0.x, N·L+1, 0.5, -cb5[59].x` → `div/mul_sat` 归一 → `t*t*(3-2t)`
+    //  → `mad r4.xyz, r0.x, cb5[24]-cb5[25], cb5[25]` → `mul r3.xyz, 基色, r4.xyz`)。
+    // 两处差别:
+    // ① **半兰伯特只是换参数,不是结构差异** —— `smoothstep(a, b, (x+1)/2)` 恒等于
+    //    `smoothstep(2a-1, 2b-1, x)`,所以这里照旧对 `ndl` 取阈值;
+    // ② 实机的两端是**颜色对**而不是灰度系数(暗部会偏色)。那两个槽位(cb5[24]/[25])
+    //    是四对同构槽 (24,25)/(28,29)/(32,33)/(36,37) 之一,**参数名还没解出来**
+    //    (见 design.md「cb 槽位 ↔ 参数名」),所以暂时保留灰度对,不猜颜色。
     let lit = smoothstep(-0.04, 0.04, ndl);
     let shade = mix(0.72, 1.0, lit);
     let facing = facing_ratio(n);
@@ -295,7 +305,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
 
     // 固有色:卷动色带 → 整体着色 → 两段明暗 → 纹路提亮(alpha 高的地方比底色亮一档)
     let albedo = flow_band(in.uv, tex.rgb * material.main_color.rgb);
-    var lambert = shade;
+    // 玻璃族也吃它(见下面),所以不再有分支去改写这一项
     // 加上去的光。星点只轻轻一层;**不透明层不叠 MatCap**——游戏那边靠遮罩通道选择性反射,
     // 无条件叠会把宠物冲白(试过,整只发白),而 toon 着色本身对着截图已经够像。
     var glow = vec3<f32>(rim) + star_light(in.ndc) * 0.3;
@@ -316,10 +326,13 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
             * GLASS_GAIN
             + interior_star(in.interior_pos, n);
         alpha = clamp(material.star.w, 0.0, 1.0);
-        // **玻璃不吃两段明暗**:它的明暗来自反射(MatCap + 边缘光)而不是漫反射。
-        lambert = 1.0;
+        // **玻璃也吃两段明暗。** 这一族走的是同一条固有色链路:同一个 pixel shader 里
+        // `mul r3.xyz, 基色, lerp(暗色, 亮色, smoothstep(N·L))` 就在折射/matcap 那些
+        // 分支的下游,没有任何开关把玻璃排除掉。原来这儿硬写 `lambert = 1.0`,理由是
+        // 「开口薄壳自转时会在 0.72↔1.0 之间跳」—— 那个跳动是法线被写成切线造成的
+        // (见 design.md 法线那条),法线修好后不复存在,所以这个特例撤掉。
     }
-    let body = albedo * lambert * mix(1.0, material.params.y, line);
+    let body = albedo * shade * mix(1.0, material.params.y, line);
     // 输出预乘 alpha(见 render.rs)。**固有色乘 alpha、加上去的光不乘**:高光/星点/边缘光
     // 是打在表面上的光,半透表面照样该有,乘进去会随着变透明一起消失。
     return vec4<f32>(body * alpha + glow, alpha);
