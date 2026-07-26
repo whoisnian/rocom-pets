@@ -69,7 +69,8 @@ pub struct Material {
     pub rim_color: [f32; 3],
     pub rim_intensity: f32,
     pub rim_power: f32,
-    pub main_color: [f32; 3],
+    /// 基色 alpha 是不透明度(见 `pack::Material::alpha_opacity`)。
+    pub alpha_opacity: bool,
     /// 卷动色带:渐变图 + [u速度, v速度, u平铺, v平铺] + 混入强度。
     pub flow: Option<Image>,
     pub flow_uv: [f32; 4],
@@ -87,10 +88,12 @@ pub struct Material {
 
 impl Material {
     /// 这一片是否真的需要混合(→ 在不透明层之后画、不写深度)。纯特效层永远要;
-    /// 有基色的只在不透明度真的小于 1 时才要 —— 标着半透但不透明度是 1 的当不透明画,
-    /// 输出一模一样却不会闪(见 `translucent`)。全量 47 个「半透 + 有基色」里只有 7 个需要。
+    /// 有基色的两种情况要:不透明度真的小于 1,或者**基色 alpha 就是不透明度**
+    /// (`alpha_opacity`,静态开关 `Opacity or OpacityMask` 点名的那 11 个)。
+    /// 标着半透、不透明度是 1、alpha 又只是纹路遮罩的,当不透明画 ——
+    /// 输出一模一样却不会闪(见 `translucent`)。
     pub fn blended(&self) -> bool {
-        self.effect.is_some() || (self.translucent && self.opacity < 1.0)
+        self.effect.is_some() || (self.translucent && self.opacity < 1.0) || self.alpha_opacity
     }
 }
 
@@ -377,7 +380,7 @@ impl Model {
                     rim_color: spec.rim_color,
                     rim_intensity: spec.rim_intensity,
                     rim_power: spec.rim_power,
-                    main_color: spec.main_color,
+                    alpha_opacity: spec.alpha_opacity,
                     flow: spec.flow.as_deref().and_then(|p| load_texture(p, true)),
                     flow_uv: spec.flow_uv,
                     flow_power: spec.flow_power,

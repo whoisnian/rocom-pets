@@ -21,7 +21,7 @@ struct MaterialParams {
     // [u 速度, v 速度, u 平铺, v 平铺]
     flow: vec4<f32>,
     // 纯特效层:[不透明度, 发光强度, 是否加色, 有没有噪声贴图]
-    // 有基色的:  [alpha 是否镂空遮罩, 线条提亮倍数, -, -]
+    // 有基色的:  [alpha 是否镂空遮罩, 线条提亮倍数, alpha 是否不透明度, -]
     params: vec4<f32>,
     // 纯特效层:[遮罩是否 matcap, -, 有星点, 有 matcap]
     // 有基色的:  [-, 是否玻璃/纱(半透族), 有星点, 有 matcap]
@@ -33,8 +33,6 @@ struct MaterialParams {
     // MatCap 着色(rgb,可能是 HDR)
     matcap_color: vec4<f32>,
     rim_color: vec4<f32>,
-    // 半透材质的整体着色
-    main_color: vec4<f32>,
     // [边缘光衰减次数, 色带混入强度, -, 有没有色带]
     extra: vec4<f32>,
     // 玻璃内部那层:[折射率, march 深度, -, 有没有内部层]
@@ -138,9 +136,15 @@ const INTERIOR_GAIN: f32 = 1.6;
 /// 只有包围盒最长边的 0.2 上下 —— 平铺 1 时一整颗球只摊到星场的一个格子上,
 /// 出来就是「一颗被拉伸的星贴在表面」而不是「球里有颗星」。
 const INTERIOR_TILING: f32 = 1.0;
-/// 玻璃族高光的叠加量。游戏那边这项还乘着遮罩通道选出来的高光区,我们没有那张遮罩的语义,
-/// 只能整片叠,所以要压一档——满强度叠上去,幽星光那两颗球会泛成一团白。
-const GLASS_GAIN: f32 = 0.35;
+/// 玻璃族 MatCap 高光的叠加量。游戏那边这项还乘着遮罩通道选出来的高光区,我们没有那张遮罩的
+/// 语义,只能整片叠,所以要压一档——满强度叠上去,幽星光那两颗球会泛成一团白。
+const GLASS_MATCAP_GAIN: f32 = 0.35;
+/// 玻璃族边缘光的叠加量。汇编里这一项除了 `RimIntensity` 还乘着一个 cb 标量(`cb5[56].w`,
+/// 槽位没对上名字),所以系数只能标定。**两条独立测量给出同一个数**:
+/// ① 实机暮星辰裙子中位 (71,91,232) 减去基色贴图在那块 UV 的 (66,64,197),残差正好是
+///    0.144 × `Rim LightColor`(53,187,214),三通道同时吻合;
+/// ② 把整只渲图合成到实机背景色上、按「有/无边缘光」两版对裙子区解线性方程,得 0.35×0.46。
+const GLASS_RIM_GAIN: f32 = 0.16;
 
 /// 相机的右/上向量。正交投影没有透视错切,`view_proj` 的行向量归一化后就是它们,
 /// 所以不必额外往 uniform 里塞。
@@ -273,16 +277,18 @@ fn matcap_light(n: vec3<f32>) -> vec3<f32> {
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let tex = textureSample(base_color, base_sampler, in.uv);
-    // **alpha 有两种含义,由材质决定**(params.x):
-    // - 镂空遮罩(眼/嘴的表情图集):按阈值剔,不剔就是一块方糊;
-    // - 线条遮罩(本体):RGB 是完整固有色,alpha 里画着身上的纹路(水灵的竖条纹就在这儿)。
+    // **alpha 有三种含义,由材质决定**(params.x / params.z):
+    // - 镂空遮罩(眼/嘴的表情图集,params.x):按阈值剔,不剔就是一块方糊;
+    // - **不透明度**(params.z,静态开关 `Opacity or OpacityMask` 点名的 11 个材质);
+    // - 线条遮罩(其余本体):RGB 是完整固有色,alpha 里画着身上的纹路(水灵的竖条纹就在这儿)。
     //   这种**绝对不能拿来剔像素**——本体贴图的 alpha 覆盖率普遍很低(813 张里 60 张 <5%),
     //   剔了就只剩眼睛(火花)甚至整只消失(迪莫)。要做的是照着它提亮。
     let cutout = material.params.x > 0.5;
     if cutout && tex.a < 0.35 {
         discard;
     }
-    let line = select(tex.a, 0.0, cutout);
+    let alpha_is_opacity = material.params.z > 0.5;
+    let line = select(select(tex.a, 0.0, alpha_is_opacity), 0.0, cutout);
 
     let n = normalize(in.normal);
     let ndl = dot(n, normalize(camera.light_dir));
@@ -303,13 +309,27 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     // 边缘光:让轮廓从桌面背景里浮出来,桌宠场景下比环境光更有用
     let rim = pow(facing, 3.0) * 0.25;
 
-    // 固有色:卷动色带 → 整体着色 → 两段明暗 → 纹路提亮(alpha 高的地方比底色亮一档)
-    let albedo = flow_band(in.uv, tex.rgb * material.main_color.rgb);
-    // 玻璃族也吃它(见下面),所以不再有分支去改写这一项
+    // 固有色:卷动色带 → 两段明暗 → 纹路提亮(alpha 高的地方比底色亮一档)。
+    //
+    // **不再乘 `MainColor`。** 原来对半透族乘了一层 `MainColor`(暮星辰裙子 (0.39,0.4,0.63)),
+    // 理由是「不乘裙子会偏白」—— 那也是在错法线上看到的。对着实机截图量:裙子实测
+    // (71,91,232),而基色贴图在那块 UV 是 (66,64,197),**几乎就是基色原样**;乘上去只有
+    // (26,26,124),暗了三倍。另外静态开关 `GlassySwitch` 全库一个没开,而 `MainColor`
+    // 属于那条 glassy 通路 —— 两边都指向「这一乘是多余的」。
+    // 纯特效层的主色仍走 `tint`(那些材质压根没有基色贴图),不受影响。
+    let albedo = flow_band(in.uv, tex.rgb);
     // 加上去的光。星点只轻轻一层;**不透明层不叠 MatCap**——游戏那边靠遮罩通道选择性反射,
     // 无条件叠会把宠物冲白(试过,整只发白),而 toon 着色本身对着截图已经够像。
-    var glow = vec3<f32>(rim) + star_light(in.ndc) * 0.3;
-    var alpha = 1.0;
+    //
+    // 那层白色 `rim` 是我们自己加的(汇编里没有,桌宠场景下让轮廓从背景里浮出来)。
+    // **玻璃族不加**:它有材质自己的边缘光(`RimColor`/`RimIntensity`/`RimPower`),
+    // 两层叠起来轮廓会糊成一圈白 —— 暮星辰的裙子就是这么被冲成淡青的。
+    let generic_rim = select(rim, 0.0, material.flags.y > 0.5);
+    var glow = vec3<f32>(generic_rim) + star_light(in.ndc) * 0.3;
+    // **不透明度**:`alpha_is_opacity` 的材质取基色 alpha,并照汇编做那个重映射
+    // (`add r1.z, a, -0.04` → `mul_sat r1.z, r1.z, 1.1111`,即把 0.04..0.94 拉到 0..1)。
+    // 暮星辰裙子那块 UV 的 alpha 中位 0.537 → 0.55,与从实机截图水印衰减反推的 0.50 对得上。
+    var alpha = select(1.0, saturate((tex.a - 0.04) * 1.1111), alpha_is_opacity);
 
     // **玻璃 / 薄纱**(`MI_P_Object_Trans_*` 族:幽星光那两个球、暮星辰的裙子与球)。
     // 只有这一族叠 MatCap 高光与材质自己的边缘光。
@@ -321,11 +341,14 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         // **加上去的几层光是 `max` 合的,不是相加。** 汇编里连着两条:
         // `max r2.yzw, matcap*MatCapColor, spec*SpecColor` 再 `max r2.xyz, 上一步, rim`。
         // 相加会让高光与边缘光在轮廓处叠成一圈白边;取 max 则是「哪层亮听哪层」。
-        glow += max(matcap_light(n),
-                    material.rim_color.rgb * pow(facing, material.extra.x) * material.star.z)
-            * GLASS_GAIN
+        glow += max(matcap_light(n) * GLASS_MATCAP_GAIN,
+                    material.rim_color.rgb * pow(facing, material.extra.x) * material.star.z
+                        * GLASS_RIM_GAIN)
             + interior_star(in.interior_pos, n);
-        alpha = clamp(material.star.w, 0.0, 1.0);
+        // 玻璃族自身的整体不透明度;`alpha_is_opacity` 的材质已经从基色 alpha 拿到了,别覆盖
+        if !alpha_is_opacity {
+            alpha = clamp(material.star.w, 0.0, 1.0);
+        }
         // **玻璃也吃两段明暗。** 这一族走的是同一条固有色链路:同一个 pixel shader 里
         // `mul r3.xyz, 基色, lerp(暗色, 亮色, smoothstep(N·L))` 就在折射/matcap 那些
         // 分支的下游,没有任何开关把玻璃排除掉。原来这儿硬写 `lambert = 1.0`,理由是

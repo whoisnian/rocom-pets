@@ -76,17 +76,24 @@ public record MaterialInfo(
     /// 特效层的主色。这些材质没有基色贴图,固有色写在颜色参数里:
     /// 火焰是 `Color01`(火花实测 (6, 0.8, 0) —— R>1 的 HDR 橙,说明是加色发光),
     /// 水壳是 `MainColor`(水蓝蓝 (0.19, 0.65, 1)),其余族用 BaseColor 一类。
-    public float[]? Tint => FirstVector("Color01", "MainColor", "BaseColor", "BaseColor1",
+    /// **纯白的那个不算。** 这些名字里靠前的往往是父材质留下的中性默认值:果冻的内胆
+    /// (`M_ShuiMu_ByIn`)同时有 `MainColor = (1,1,1,1)` 与 `BaseColor = (0.117,0.283,0.054)`,
+    /// 按名字顺序取会拿到白色 —— 内胆于是渲成一颗白球(外壳不透明时看不见,一做成半透就露出来)。
+    /// 所以先挑非白的,全白才退回白色。
+    public float[]? Tint => FirstColor("Color01", "MainColor", "BaseColor", "BaseColor1",
         "Emitter Color", "FresnelColor", "PatternColor", "BackColor");
 
     /// 半透强度;没写就当全不透明。
     public float Opacity => Scalars.TryGetValue("Opacity", out var v) ? v : 1f;
 
-    /// 半透材质的整体着色。暮星辰的裙子 `MainColor` = (0.39, 0.4, 0.63) —— 蓝紫调,
-    /// 不乘上去裙子会偏白。只在显式给了、且不是纯白时才用。
-    public float[]? MainColor =>
-        Vectors.TryGetValue("MainColor", out var c) && (c[0] < 0.99f || c[1] < 0.99f || c[2] < 0.99f)
-            ? c : null;
+    /// **基色贴图的 alpha 是不透明度还是纹路遮罩,由这个静态开关决定。**
+    ///
+    /// 本体贴图的 alpha 平时是美术塞的纹路遮罩(绝不能拿来剔像素);但 `Opacity or OpacityMask`
+    /// 开着的那 11 个材质(蜜蜂/小甲虫的翅膀、果冻、暮星辰的裙子…)里,它就是不透明度。
+    /// 两处独立测量对上了:暮星辰裙子那块 UV 的基色 alpha 中位 0.537,经汇编里那个重映射
+    /// `saturate((a - 0.04) * 1.1111)` → 0.55;而拿实机截图的**水印对比度衰减**反推出来的
+    /// 单层区 α ≈ 0.50。所以这个开关就是「区分两种 alpha」的判据,不必再找启发式。
+    public bool AlphaIsOpacity => Switch("Opacity or OpacityMask");
 
     /// 遮罩/噪声贴图:特效的形状与流动来源。没有就当常量 1。
     public string? MaskTexture =>
@@ -253,6 +260,16 @@ public record MaterialInfo(
 
     private float[]? FirstVector(params string[] names) =>
         names.Select(n => Vectors.TryGetValue(n, out var v) ? v : null).FirstOrDefault(v => v is not null);
+
+    /// 同 `FirstVector`,但**优先跳过纯白**(纯白是颜色参数的中性默认值,不带信息)。
+    private float[]? FirstColor(params string[] names)
+    {
+        var present = names.Select(n => Vectors.TryGetValue(n, out var v) ? v : null)
+            .Where(v => v is not null)
+            .ToList();
+        return present.FirstOrDefault(v => v![0] < 0.99f || v[1] < 0.99f || v[2] < 0.99f)
+               ?? present.FirstOrDefault();
+    }
 
     private string? FirstTexture(params string[] names) =>
         names.Select(n => Textures.TryGetValue(n, out var v) ? v : null).FirstOrDefault(v => v is not null);

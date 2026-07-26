@@ -96,8 +96,9 @@ struct RawMaterial {
     rim_intensity: f32,
     #[serde(default = "three")]
     rim_power: f32,
+    /// 基色 alpha 是不透明度(而不是纹路遮罩)——静态开关 `Opacity or OpacityMask` 开着的那批
     #[serde(default)]
-    main_color: Option<[f32; 3]>,
+    alpha_opacity: bool,
     #[serde(default)]
     flow_tex: Option<String>,
     #[serde(default = "one")]
@@ -164,8 +165,9 @@ pub struct Material {
     pub rim_intensity: f32,
     /// 边缘光的衰减次数。**小于 1 = 整片泛色**(幽星光的球 0.35),不是一圈细边。
     pub rim_power: f32,
-    /// 半透材质的整体着色;None = 不改色。
-    pub main_color: [f32; 3],
+    /// **基色贴图的 alpha 是不透明度**(不是纹路遮罩)。判据是静态开关 `Opacity or OpacityMask`,
+    /// 开着的 11 个材质:蜜蜂/小甲虫的翅膀、果冻、暮星辰的裙子……
+    pub alpha_opacity: bool,
     /// 卷动色带:一张渐变图沿 UV 滚过表面,叠在固有色上(暮星辰环带的青↔粉渐变)。
     pub flow: Option<PathBuf>,
     /// [u 速度, v 速度, u 平铺, v 平铺] + 混入强度。
@@ -372,7 +374,7 @@ impl Pack {
                                 rim_color: mat.rim_color.unwrap_or([1.0; 3]),
                                 rim_intensity: mat.rim_intensity,
                                 rim_power: mat.rim_power,
-                                main_color: mat.main_color.unwrap_or([1.0; 3]),
+                                alpha_opacity: mat.alpha_opacity,
                                 flow: mat.flow_tex.map(|rel| dir.join(rel)),
                                 flow_uv: mat.flow.unwrap_or([0.0, 0.0, 1.0, 1.0]),
                                 flow_power: mat.flow_power,

@@ -45,8 +45,8 @@ public record MaterialEntry(
     float[]? RimColor,
     float RimIntensity,
     float RimPower,
-    /// 半透材质的整体着色(`MainColor`)。
-    float[]? MainColor,
+    /// 基色贴图的 alpha 是不透明度(而不是纹路遮罩)。
+    bool AlphaIsOpacity,
     /// 卷动色带:渐变图 + 混入强度(暮星辰的环带靠它出青↔粉渐变)。
     string? FlowTexture,
     float FlowPower,
@@ -192,8 +192,8 @@ public static class Manifest
                     }
                     // 每个键只许出现一次:重复键 TOML 直接解析失败(opacity/flow 都踩过)
                     parts.Add($"opacity = {Num(mat.Opacity)}");
-                    if (mat.MainColor is { } mn && mat.Translucent)
-                        parts.Add($"main_color = [{Num(mn[0])}, {Num(mn[1])}, {Num(mn[2])}]");
+                    // 基色 alpha 就是不透明度(见 MaterialInfo.AlphaIsOpacity)
+                    if (mat.AlphaIsOpacity) parts.Add("alpha_opacity = true");
                     // 父链对所有材质都记:它是「这一族该怎么画」的唯一线索
                     // (如 `M_FX_Fire_Mat` = 火焰、`..._Trans_XingGuang_WPO` = 需要顶点位移的纱)
                     parts.Add($"parents = [{string.Join(", ", mat.ParentChain.Select(Quote))}]");

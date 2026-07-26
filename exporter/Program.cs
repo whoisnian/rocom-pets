@@ -490,7 +490,7 @@ FormReport ExportForm(
             info.IsTranslucent,
             ExportEffectTexture(info.StarTexture), info.StarTiling, info.StarColor,
             info.MaskIsMatcap ? null : ExportEffectTexture(info.MatcapTexture), info.MatcapColor,
-            info.RimColor, info.RimIntensity, info.RimPower, info.MainColor,
+            info.RimColor, info.RimIntensity, info.RimPower, info.AlphaIsOpacity,
             ExportEffectTexture(info.FlowTexture), info.FlowPower,
             ExportEffectTexture(info.MaskIdTexture), info.MaskIdRange,
             ExportEffectTexture(info.InteriorTexture), info.InteriorColor,

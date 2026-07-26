@@ -45,8 +45,6 @@ struct MaterialUniform {
     // 顺序错了不会报错,只会静默取到旁边那个字段的值(rim/main 曾经就是这么对调的)。
     /// 边缘光颜色
     rim_color: [f32; 4],
-    /// 半透材质的整体着色
-    main_color: [f32; 4],
     /// [边缘光衰减次数, 色带混入强度, -, 有色带(0/1)]
     extra: [f32; 4],
     /// 玻璃内部那层:[折射率, march 深度, -, 有内部层(0/1)]
@@ -362,7 +360,6 @@ impl PetGpu {
                     ],
                     matcap_color: rgb(material.matcap_color),
                     rim_color: rgb(material.rim_color),
-                    main_color: rgb(material.main_color),
                     extra: extra(material),
                     interior: interior(material),
                     interior_color: rgb(material.interior_color),
@@ -370,7 +367,8 @@ impl PetGpu {
                     bounds_size: bsize,
                     mask_id: mask_id(material),
                 },
-                // 有基色的材质:params.x 说明 alpha 怎么解释(1=镂空遮罩,0=线条遮罩)
+                // 有基色的材质:params.x/.z 说明 alpha 怎么解释
+                // (x=1 镂空遮罩、z=1 不透明度,都为 0 则是线条遮罩)
                 None => MaterialUniform {
                     tint: [1.0; 4],
                     flow: material.flow_uv,
@@ -378,12 +376,12 @@ impl PetGpu {
                         has(material.cutout),
                         // alpha 恒定的贴图没有线条可提,提亮必须是空操作(1.0),
                         // 否则整只宠物被均匀调亮
-                        if material.line_detail {
+                        if material.line_detail && !material.alpha_opacity {
                             LINE_BOOST
                         } else {
                             1.0
                         },
-                        0.0,
+                        has(material.alpha_opacity),
                         0.0,
                     ],
                     // flags.y = 1 表示「玻璃/纱」:fs_main 据此加 MatCap 高光与材质边缘光,
@@ -412,7 +410,6 @@ impl PetGpu {
                     ],
                     matcap_color: rgb(material.matcap_color),
                     rim_color: rgb(material.rim_color),
-                    main_color: rgb(material.main_color),
                     extra: extra(material),
                     interior: interior(material),
                     interior_color: rgb(material.interior_color),
