@@ -130,8 +130,6 @@ fn vs_outline(input: VsIn) -> VsOut {
 
 /// 星点遮罩的额外平铺倍率(见 `star_light`)。
 const STAR_TILE_SCALE: f32 = 3.0;
-/// matcap 图里「算高光」的亮度门槛(见 `matcap_light`)。
-const SPEC_FLOOR: f32 = 0.35;
 /// 内部星层的卷动速度与叠加量。速度实机来自一个 cb 向量参数(槽位还没对上名字),
 /// 亮度那边 `StarColor` 是 HDR 的 (0.33, 0.67, 2),直接乘会过曝。
 const INTERIOR_SPEED: f32 = 0.03;
@@ -257,16 +255,19 @@ fn interior_star(start: vec3<f32>, n: vec3<f32>) -> vec3<f32> {
 
 /// MatCap 高光。`MatCapColor` 可能是 HDR(暮星辰那两个球是 (3,3,3)),所以直接相乘。
 ///
-/// **只取亮的那部分。** matcap 图是整颗球的反射查找表(实测 matcap26/Matcap35 均值 0.2、
-/// 只有 8% 的像素亮过 0.5),暗区是球体自己的暗面——连暗区一起加等于给整片抬一层灰,
-/// 再乘上 HDR 的 MatCapColor 就把球冲成一团白。这里减掉底再归一化,留下的就是那几块高光。
+/// **实机只取一张单通道当标量**,不是 rgb 查表:汇编里是
+/// `sample r2.w, (u, 1-v), t3.yzwx, s3` —— 目标只写 .w、资源 swizzle 第 4 位是 x,即取 **R**,
+/// 紧接着 `mul r4.xyz, r2.w, cb5[4]`(cb5[4] = `MatCapColor`)。两张 matcap 图实测都是灰度
+/// (三通道与亮度的相关系数 ≈ 1.000),所以 R 就是它的亮度,取单通道与取 rgb 数值上等价。
+/// UV 也对得上:实机 `r4.z = 1 - r4.y`,与这里的 `-dot(n, up) * 0.5 + 0.5` 同一个式子。
+///
+/// 之前那版「减掉 0.35 的底再归一化」是**猜的**,把整张图的暗区削成 0 →
+/// 球大部分时间不吃 matcap、高光块扫过来时又猛地一亮,反而放大了闪烁。
 fn matcap_light(n: vec3<f32>) -> vec3<f32> {
     if material.flags.w < 0.5 {
         return vec3<f32>(0.0);
     }
-    let m = textureSample(matcap_tex, base_sampler, matcap_uv(n));
-    let spec = max(m.rgb - vec3<f32>(SPEC_FLOOR), vec3<f32>(0.0)) / (1.0 - SPEC_FLOOR);
-    return material.matcap_color.rgb * spec;
+    return material.matcap_color.rgb * textureSample(matcap_tex, base_sampler, matcap_uv(n)).r;
 }
 
 @fragment
@@ -307,14 +308,15 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     // 那片平色圆盘。导出器只把「`Rim Intensity` 真的大于 1」的边缘光写进来(见 Manifest.cs)——
     // 曜星光那两颗球写着强度 1 + 绿色 `Rim LightColor`,而实机里它们是橙的和紫的。
     if material.flags.y > 0.5 {
-        glow += (matcap_light(n)
-            + material.rim_color.rgb * pow(facing, material.extra.x) * material.star.z)
+        // **加上去的几层光是 `max` 合的,不是相加。** 汇编里连着两条:
+        // `max r2.yzw, matcap*MatCapColor, spec*SpecColor` 再 `max r2.xyz, 上一步, rim`。
+        // 相加会让高光与边缘光在轮廓处叠成一圈白边;取 max 则是「哪层亮听哪层」。
+        glow += max(matcap_light(n),
+                    material.rim_color.rgb * pow(facing, material.extra.x) * material.star.z)
             * GLASS_GAIN
             + interior_star(in.interior_pos, n);
         alpha = clamp(material.star.w, 0.0, 1.0);
-        // **玻璃不吃两段明暗。** 它的明暗来自反射(MatCap + 边缘光),不是漫反射;
-        // 而那两颗球是**开口薄壳**(129 顶点、边界 30 条边),自转时露出来的面一直在换,
-        // 硬分成亮/暗两段就让整颗球在 0.72 与 1.0 之间来回跳 —— 那就是「转起来在闪」。
+        // **玻璃不吃两段明暗**:它的明暗来自反射(MatCap + 边缘光)而不是漫反射。
         lambert = 1.0;
     }
     let body = albedo * lambert * mix(1.0, material.params.y, line);

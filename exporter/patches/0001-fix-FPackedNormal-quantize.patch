@@ -1,0 +1,28 @@
+diff --git a/CUE4Parse/UE4/Objects/RenderCore/FPackedNormal.cs b/CUE4Parse/UE4/Objects/RenderCore/FPackedNormal.cs
+index f66a52db..067162e3 100644
+--- a/CUE4Parse/UE4/Objects/RenderCore/FPackedNormal.cs
++++ b/CUE4Parse/UE4/Objects/RenderCore/FPackedNormal.cs
+@@ -27,14 +27,20 @@ public FPackedNormal(uint data)
+             Data = data;
+         }
+ 
++        // 原实现少了两层括号:`vector.X + 1 * 127.5` 是 X+127.5(要的是 (X+1)*127.5),
++        // 而 C# 里 `+` 比 `<<` 紧,`a + b << 8 + c << 16` 会被解析成 `((a+b) << (8+c)) << 16`。
++        // 于是三个分量被搅成一个数,X/Y/Z 取出来彼此相等 —— 高精度切线基(FPackedRGBA16N)
++        // 正是经这里降到 8 位的,法线与切线因此变成同一个向量。
++        private static uint Quantize(float v) => (uint) Math.Clamp((int) ((v + 1f) * 127.5f), 0, 255);
++
+         public FPackedNormal(FVector vector)
+         {
+-            Data = (uint) ((int) (vector.X + 1 * 127.5) + (int) (vector.Y + 1 * 127.5) << 8 + (int) (vector.Z + 1 * 127.5) << 16);
++            Data = Quantize(vector.X) | Quantize(vector.Y) << 8 | Quantize(vector.Z) << 16;
+         }
+ 
+-        public FPackedNormal(FVector4 vector)// is this broken?
++        public FPackedNormal(FVector4 vector)
+         {
+-            Data = (uint) ((int) (vector.X + 1 * 127.5) + (int) (vector.Y + 1 * 127.5) << 8 + (int) (vector.Z + 1 * 127.5) << 16 + (int) (vector.W + 1 * 127.5) << 24);
++            Data = Quantize(vector.X) | Quantize(vector.Y) << 8 | Quantize(vector.Z) << 16 | Quantize(vector.W) << 24;
+         }
+ 
+         public void SetW(float value)

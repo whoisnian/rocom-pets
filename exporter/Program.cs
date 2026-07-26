@@ -12,7 +12,9 @@ using CUE4Parse.FileProvider;
 using CUE4Parse.FileProvider.Vfs;
 using CUE4Parse.UE4.Assets.Exports.Animation;
 using CUE4Parse.UE4.Assets.Exports.SkeletalMesh;
+using CUE4Parse.UE4.Objects.Core.Math;
 using CUE4Parse.UE4.Objects.Core.Misc;
+using CUE4Parse.UE4.Objects.RenderCore;
 using CUE4Parse.UE4.Versions;
 using CUE4Parse_Conversion.Textures;
 using System.Text;
@@ -95,6 +97,20 @@ for (var i = 0; i < args.Length; i++)
 if (species.Count == 0 && !all && probeAsset is null)
 {
     Console.Error.WriteLine($"缺 --species(或 --all)\n{usage}");
+    return 1;
+}
+
+// **上游必须先打补丁**,见 patches/0001-fix-FPackedNormal-quantize.patch。
+// 未打补丁时法线会被静默写成切线(整只宠物的光照/matcap/边缘光全错,而模型看着仍然正常),
+// 所以在这儿硬拦一道:导出坏包比导出失败更糟。
+if (!PackedNormalRoundTrips())
+{
+    Console.Error.WriteLine("""
+        CUE4Parse 的 FPackedNormal(FVector) 构造函数是坏的(上游 bug),法线会被写成切线。
+        先给 CUE4Parse 克隆打补丁:
+          git -C "$CUE4PARSE_DIR" apply <本仓库>/exporter/patches/0001-fix-FPackedNormal-quantize.patch
+        细节见 docs/design.md §1「法线」那几行。
+        """);
     return 1;
 }
 
@@ -512,6 +528,20 @@ FormReport ExportForm(
 
     var bounds = mesh.ImportedBounds;
     return new FormReport(form, written, textures, materials, glb.Length, bounds.BoxExtent.Z * 2f, warnings);
+}
+
+/// 上游的 `FPackedNormal(FVector)` 是否能把向量原样存取回来。
+///
+/// 坏掉的版本少了括号、又踩了 C# 里 `+` 比 `<<` 紧的优先级,三个分量会被搅成一个数;
+/// 高精度切线基(`FPackedRGBA16N`)正是经它降到 8 位的,于是**法线与切线变成同一个向量**。
+/// 拿一个不对称的向量试:三个分量都不同、且能区分 X/Y/Z 顺序错位。
+static bool PackedNormalRoundTrips()
+{
+    var packed = new FPackedNormal(new FVector(0.25f, -0.5f, 0.75f));
+    // 8 位量化的步长是 1/127.5,留两步余量
+    return Math.Abs(packed.X - 0.25f) < 0.02f
+        && Math.Abs(packed.Y - -0.5f) < 0.02f
+        && Math.Abs(packed.Z - 0.75f) < 0.02f;
 }
 
 // "World_Idle" → "idle";"Common_Sleep_Loop" → "sleeploop";逻辑名 "SleepLoop" → "sleeploop"

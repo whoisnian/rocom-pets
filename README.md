@@ -30,6 +30,7 @@ rocom-pets --pack 喵喵                                      # 按包名启动(
 rocom-pets --toggle-passthrough                            # 通知已在跑的实例(可绑快捷键)
 cargo run                                                  # 同上但用调试精灵(平台层验收模式)
 cargo run --release -- --render packs/喵喵 --bench 600      # 离屏渲宠物 + 测出帧耗时
+git -C "$CUE4PARSE_DIR" apply exporter/patches/*.patch      # 导出前必做:修上游把法线写成切线的 bug
 dotnet run --project exporter -- --species 3001 --out packs # 导一条进化链
 dotnet run --project exporter -- --all --skip-existing --out packs  # 全量导(可分批续跑)
 python tools/verify_glb.py packs/喵喵 --clips Idle,Walk     # 渲图验证
