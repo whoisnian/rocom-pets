@@ -44,6 +44,8 @@ struct MaterialParams {
     // 模型包围盒:最小角(xyz)与尺寸(w 存最长边),内部层要拿它把位置归一化
     bounds_min: vec4<f32>,
     bounds_size: vec4<f32>,
+    // 色带的 ID 遮罩:[区间下限, 区间上限, 有没有遮罩, -]
+    mask_id: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> camera: Camera;
@@ -60,6 +62,8 @@ struct MaterialParams {
 @group(1) @binding(5) var matcap_tex: texture_2d<f32>;
 // 玻璃内部那颗星的四角星场(`StarTex` = `T_EMeng003`);没有就是 1×1 白图
 @group(1) @binding(6) var interior_tex: texture_2d<f32>;
+// 色带的 ID 遮罩(`MaskTex`,ID 在 alpha 里);没有就是 1×1 白图
+@group(1) @binding(7) var mask_id_tex: texture_2d<f32>;
 
 struct VsIn {
     @location(0) pos: vec3<f32>,
@@ -197,11 +201,20 @@ fn flow_band(uv: vec2<f32>, albedo: vec3<f32>) -> vec3<f32> {
     if material.extra.w < 0.5 {
         return albedo;
     }
+    // **只在 ID 遮罩选中的地方卷。** `MaskTex` 的 alpha 是离散的材质 ID 台阶,材质给的
+    // `MaskID Min/Max` 划出该卷动的那一档:暮星辰环带是 0.72、额头与身体中央的黄装饰是 0.50,
+    // 阈值 0.6~0.8 只选中环带。不门控就是黄装饰跟着在黄绿之间来回变(实机里它们是固定黄)。
+    if material.mask_id.z > 0.5 {
+        let id = textureSample(mask_id_tex, base_sampler, uv).a;
+        if id < material.mask_id.x || id > material.mask_id.y {
+            return albedo;
+        }
+    }
     let scrolled = uv * material.flow.zw + vec2<f32>(material.flow.x, material.flow.y) * camera.time;
     let band = textureSample(noise_tex, base_sampler, scrolled).rgb;
-    // 色带整体偏亮(均值 ~0.7),直接乘会压暗固有色,所以按亮度归一化后再按强度混入
-    let normalized = band / max(max(band.r, max(band.g, band.b)), 0.001);
-    return mix(albedo, albedo * normalized, material.extra.y);
+    // **是混色不是相乘。** 色带图本身就是成品颜色(青↔粉竖条纹),而基色图里环带那条是纯粉;
+    // 相乘等于「粉 × 青」→ 出来是蓝,实机是真青。`FlowPower`(暮星辰 0.8)就是混色权重。
+    return mix(albedo, band, material.extra.y);
 }
 
 /// **玻璃内部那颗星。** 实机是这么做的(读 `MI_P_Object_Trans_MatCap` 的 pixel shader 汇编,

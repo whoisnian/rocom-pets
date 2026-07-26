@@ -127,8 +127,18 @@ public record MaterialInfo(
             ? FirstTexture("FlowTexture")
             : null;
 
-    /// 色带的混入强度(暮星辰环带 0.8)。
+    /// 色带的混入强度(暮星辰环带 0.8)—— 是**混色权重**,不是乘法强度。
     public float FlowPower => Scalar("FlowPower", 1f);
+
+    /// **色带的 ID 遮罩**:只在 `MaskTex` 的 **alpha** 落在 [`MaskID Min`, `MaskID Max`] 的地方生效。
+    ///
+    /// 实测暮星辰(阈值 0.6~0.8):那张 By_M 的 alpha 是**离散 ID 台阶**(0.0 / 0.27 / 0.50 /
+    /// 0.72 / 1.0),环带那片是 0.72(68.5% 落在区间内)、额头与身体中央的黄色装饰是 0.502
+    /// (0% 落在区间内)。不按这个门控,色带会连黄装饰一起卷,装饰就在黄绿之间来回变 ——
+    /// 而实机里那些装饰是固定黄色。
+    public string? MaskIdTexture => FlowTexture is null ? null : FirstTexture("MaskTex", "Mask");
+
+    public float[] MaskIdRange => [Scalar("MaskID Min", 0f), Scalar("MaskID Max", 1f)];
 
     /// **「假半透」族也是一层星点**:`..._FakeTrans*` 家族给 `NoiseTex`(黑底 + 粉白星点)
     /// + `NoiseTilingSpeed` + HDR 的 `Color02`,幽星光一族的身体看着半透、身上有星星靠它。
@@ -214,7 +224,13 @@ public record MaterialInfo(
     /// 而它的 shader 反汇编下来是**完全另一套**:223 行、4 张贴图、`N·L` + 遮罩 →
     /// 一维 `RampTex` 行查(采样 v 是常数 1/256),既没有折射也没有三向投影。
     /// 拿同一套画法套上去是错的 —— 按「父链里有」判会把它也算进来(踩过)。
-    public string? InteriorTexture =>
+    /// **暂时不导出:实机没有的「区域白闪」。** 采样是视线相关的,宠物一转,那个圆盘就在
+    /// 星场里扫过去 —— 扫到亮星就是一块白斑闪一下。起点(见上)已经查实,但深度标量的真实
+    /// 含义、三向投影的平铺、起点该怎么缩放这三个还是没解出来的 cb 槽位问题,凑不出稳定结果。
+    /// 把 `InteriorTextureWhenSolved` 改回 `InteriorTexture` 即可重新开启。
+    public string? InteriorTexture => null;
+
+    private string? InteriorTextureWhenSolved =>
         ParentChain.FirstOrDefault() == "MI_P_Object_Trans_MatCap"
             ? RootDefaults?.Textures.GetValueOrDefault("StarTex")
             : null;

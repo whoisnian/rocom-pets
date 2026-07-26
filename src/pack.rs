@@ -103,6 +103,10 @@ struct RawMaterial {
     #[serde(default = "one")]
     flow_power: f32,
     #[serde(default)]
+    mask_id_tex: Option<String>,
+    #[serde(default)]
+    mask_id_range: Option<[f32; 2]>,
+    #[serde(default)]
     interior_tex: Option<String>,
     #[serde(default)]
     interior_color: Option<[f32; 3]>,
@@ -167,6 +171,11 @@ pub struct Material {
     /// [u 速度, v 速度, u 平铺, v 平铺] + 混入强度。
     pub flow_uv: [f32; 4],
     pub flow_power: f32,
+    /// 色带的 **ID 遮罩**:只在 `mask_id_tex` 的 alpha 落在 `mask_id_range` 时才卷动。
+    /// 实测暮星辰那张 By_M 的 alpha 是离散 ID 台阶,环带是 0.72、额头与身体中央的黄装饰是 0.50,
+    /// 阈值 0.6~0.8 正好只选中环带。不门控的话黄装饰会跟着在黄绿之间来回变。
+    pub mask_id: Option<PathBuf>,
+    pub mask_id_range: [f32; 2],
     /// **玻璃内部那颗星**:四角星场贴图(`StarTex` = `T_EMeng003`),沿折射光线在物体空间
     /// march、三向投影采样、按时间卷动。读 shader 汇编得来,见 docs/design.md §1。
     pub interior: Option<PathBuf>,
@@ -367,6 +376,8 @@ impl Pack {
                                 flow: mat.flow_tex.map(|rel| dir.join(rel)),
                                 flow_uv: mat.flow.unwrap_or([0.0, 0.0, 1.0, 1.0]),
                                 flow_power: mat.flow_power,
+                                mask_id: mat.mask_id_tex.map(|rel| dir.join(rel)),
+                                mask_id_range: mat.mask_id_range.unwrap_or([0.0, 1.0]),
                                 interior: mat.interior_tex.map(|rel| dir.join(rel)),
                                 interior_color: mat.interior_color.unwrap_or([1.0; 3]),
                                 refraction: mat.refraction,

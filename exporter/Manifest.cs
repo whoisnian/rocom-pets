@@ -50,6 +50,9 @@ public record MaterialEntry(
     /// 卷动色带:渐变图 + 混入强度(暮星辰的环带靠它出青↔粉渐变)。
     string? FlowTexture,
     float FlowPower,
+    /// 色带的 ID 遮罩:`MaskTex` + alpha 的取值区间。
+    string? MaskIdTexture,
+    float[] MaskIdRange,
     /// 玻璃内部那颗星:四角星场贴图 + 着色 + 折射率 + march 深度。
     string? InteriorTexture,
     float[]? InteriorColor,
@@ -173,6 +176,11 @@ public static class Manifest
                         parts.Add($"flow_tex = {Quote(mat.FlowTexture)}");
                         parts.Add($"flow_power = {Num(mat.FlowPower)}");
                         parts.Add($"flow = [{string.Join(", ", mat.Flow.Select(Num))}]");
+                        if (mat.MaskIdTexture is not null)
+                        {
+                            parts.Add($"mask_id_tex = {Quote(mat.MaskIdTexture)}");
+                            parts.Add($"mask_id_range = [{Num(mat.MaskIdRange[0])}, {Num(mat.MaskIdRange[1])}]");
+                        }
                     }
                     if (mat.InteriorTexture is not null)
                     {

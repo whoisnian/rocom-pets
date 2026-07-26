@@ -476,6 +476,7 @@ FormReport ExportForm(
             info.MaskIsMatcap ? null : ExportEffectTexture(info.MatcapTexture), info.MatcapColor,
             info.RimColor, info.RimIntensity, info.RimPower, info.MainColor,
             ExportEffectTexture(info.FlowTexture), info.FlowPower,
+            ExportEffectTexture(info.MaskIdTexture), info.MaskIdRange,
             ExportEffectTexture(info.InteriorTexture), info.InteriorColor,
             info.Refraction, info.RefractDepth));
 

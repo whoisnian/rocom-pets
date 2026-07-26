@@ -74,6 +74,9 @@ pub struct Material {
     pub flow: Option<Image>,
     pub flow_uv: [f32; 4],
     pub flow_power: f32,
+    /// 色带的 ID 遮罩与取值区间(见 `pack::Material::mask_id`)。
+    pub mask_id: Option<Image>,
+    pub mask_id_range: [f32; 2],
     /// 玻璃内部那颗星:四角星场贴图 + 着色 + 折射率 + march 深度。
     pub interior: Option<Image>,
     pub interior_color: [f32; 3],
@@ -378,6 +381,8 @@ impl Model {
                     flow: spec.flow.as_deref().and_then(|p| load_texture(p, true)),
                     flow_uv: spec.flow_uv,
                     flow_power: spec.flow_power,
+                    mask_id: spec.mask_id.as_deref().and_then(|p| load_texture(p, true)),
+                    mask_id_range: spec.mask_id_range,
                     interior: spec.interior.as_deref().and_then(|p| load_texture(p, true)),
                     interior_color: spec.interior_color,
                     refraction: spec.refraction,

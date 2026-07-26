@@ -56,6 +56,8 @@ struct MaterialUniform {
     /// 模型包围盒:最小角 + 尺寸(w = 最长边)
     bounds_min: [f32; 4],
     bounds_size: [f32; 4],
+    /// 色带的 ID 遮罩:[区间下限, 区间上限, 有遮罩(0/1), -]
+    mask_id: [f32; 4],
 }
 
 /// 本体贴图 alpha 里那层线条遮罩的提亮倍数。游戏里那些纹路(水灵身上的竖条、
@@ -199,7 +201,17 @@ impl PetGpu {
                     },
                     count: None,
                 },
-                // 6 = 玻璃内部那颗星的四角星场
+                // 6 = 玻璃内部那颗星的四角星场;7 = 色带的 ID 遮罩
+                wgpu::BindGroupLayoutEntry {
+                    binding: 7,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
                 wgpu::BindGroupLayoutEntry {
                     binding: 6,
                     visibility: wgpu::ShaderStages::FRAGMENT,
@@ -290,8 +302,22 @@ impl PetGpu {
                 &material.name,
                 material.interior.as_ref().unwrap_or(&white),
             );
+            let mask_id_view = upload_texture(
+                device,
+                queue,
+                &material.name,
+                material.mask_id.as_ref().unwrap_or(&white),
+            );
             let has = |v: bool| if v { 1.0 } else { 0.0 };
             let rgb = |c: [f32; 3]| [c[0], c[1], c[2], 0.0];
+            let mask_id = |m: &super::model::Material| {
+                [
+                    m.mask_id_range[0],
+                    m.mask_id_range[1],
+                    has(m.mask_id.is_some()),
+                    0.0,
+                ]
+            };
             let interior = |m: &super::model::Material| {
                 [
                     m.refraction,
@@ -342,6 +368,7 @@ impl PetGpu {
                     interior_color: rgb(material.interior_color),
                     bounds_min: bmin,
                     bounds_size: bsize,
+                    mask_id: mask_id(material),
                 },
                 // 有基色的材质:params.x 说明 alpha 怎么解释(1=镂空遮罩,0=线条遮罩)
                 None => MaterialUniform {
@@ -391,6 +418,7 @@ impl PetGpu {
                     interior_color: rgb(material.interior_color),
                     bounds_min: bmin,
                     bounds_size: bsize,
+                    mask_id: mask_id(material),
                 },
             };
             let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -429,6 +457,10 @@ impl PetGpu {
                     wgpu::BindGroupEntry {
                         binding: 6,
                         resource: wgpu::BindingResource::TextureView(&interior_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 7,
+                        resource: wgpu::BindingResource::TextureView(&mask_id_view),
                     },
                 ],
             }));
