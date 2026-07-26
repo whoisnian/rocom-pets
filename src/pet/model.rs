@@ -40,7 +40,12 @@ pub struct Material {
     pub cutout: bool,
     /// alpha 里是否真的有线条信息(见 `alpha_has_detail`);否则提亮要关掉。
     pub line_detail: bool,
-    /// 半透:走特效通道(在不透明层之后画、不写深度),而不是主通道。
+    /// 材质标了 `BLEND_Translucent`:要叠 MatCap 高光、边缘光按混色算。
+    ///
+    /// **注意不等于「要混合」**:本作有一批材质标着 `BLEND_Translucent` 但不透明度就是 1
+    /// (幽星光那两个球),它们的输出与不透明完全一样,却因为不写深度而互相盖不住 ——
+    /// 两颗球绕着转、谁在前只由索引序决定,于是转身时前后关系突然对调,看着就是在闪。
+    /// 真正需要混合的判据是 `blended()`。
     pub translucent: bool,
     pub opacity: f32,
     /// 星点 / MatCap 两张附加贴图与它们的着色,以及边缘光。
@@ -51,9 +56,26 @@ pub struct Material {
     pub matcap_color: [f32; 3],
     pub rim_color: [f32; 3],
     pub rim_intensity: f32,
+    pub rim_power: f32,
     pub main_color: [f32; 3],
+    /// 卷动色带:渐变图 + [u速度, v速度, u平铺, v平铺] + 混入强度。
+    pub flow: Option<Image>,
+    pub flow_uv: [f32; 4],
+    pub flow_power: f32,
+    /// 「假半透」族的内部星光;与 `flow` 互斥。
+    pub inner: Option<Image>,
+    pub inner_color: [f32; 3],
     /// 特效层的画法(火焰/水壳/光晕)。`None` = 普通不透明材质,走主通道。
     pub effect: Option<EffectMaterial>,
+}
+
+impl Material {
+    /// 这一片是否真的需要混合(→ 在不透明层之后画、不写深度)。纯特效层永远要;
+    /// 有基色的只在不透明度真的小于 1 时才要 —— 标着半透但不透明度是 1 的当不透明画,
+    /// 输出一模一样却不会闪(见 `translucent`)。全量 47 个「半透 + 有基色」里只有 7 个需要。
+    pub fn blended(&self) -> bool {
+        self.effect.is_some() || (self.translucent && self.opacity < 1.0)
+    }
 }
 
 /// 特效层要用的东西:主色 + 卷动 + 遮罩/噪声贴图。参数解释见 `pack::Effect`。
@@ -328,7 +350,13 @@ impl Model {
                     matcap_color: spec.matcap_color,
                     rim_color: spec.rim_color,
                     rim_intensity: spec.rim_intensity,
+                    rim_power: spec.rim_power,
                     main_color: spec.main_color,
+                    flow: spec.flow.as_deref().and_then(|p| load_texture(p, true)),
+                    flow_uv: spec.flow_uv,
+                    flow_power: spec.flow_power,
+                    inner: spec.inner.as_deref().and_then(|p| load_texture(p, true)),
+                    inner_color: spec.inner_color,
                     effect,
                 });
                 materials.len() - 1

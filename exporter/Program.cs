@@ -470,7 +470,9 @@ FormReport ExportForm(
             info.IsTranslucent,
             ExportEffectTexture(info.StarTexture), info.StarTiling, info.StarColor,
             info.MaskIsMatcap ? null : ExportEffectTexture(info.MatcapTexture), info.MatcapColor,
-            info.RimColor, info.RimIntensity, info.MainColor));
+            info.RimColor, info.RimIntensity, info.RimPower, info.MainColor,
+            ExportEffectTexture(info.FlowTexture), info.FlowPower,
+            ExportEffectTexture(info.InnerTexture), info.InnerColor, info.InnerFlow));
 
         string? ExportEffectTexture(string? objectPath)
         {

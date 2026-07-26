@@ -89,6 +89,40 @@ public record MaterialInfo(
         Scalar("Flow_U_Tiling", 1f), Scalar("Flow_V_Tiling", 1f),
     ];
 
+    /// **卷动色带**:一张渐变图沿 UV 滚过表面,给固有色叠上流动的颜色。
+    /// 暮星辰的环带就是它——`MI_P_Object_XingGuang_UVFlow_Morph` 给 `FlowTexture`
+    /// = `T_..._Fx_D`(青↔粉竖条纹渐变)+ `Flow_U_Speed` = 0.25,于是青粉渐变绕着环跑;
+    /// 基色贴图里环带那一条是**纯粉的**,渐变完全来自这张图。
+    ///
+    /// 判据取「美术真给了流速」:`FlowTexture` 槽几乎人人都挂着,但只有 UVFlow 族在用。
+    public string? FlowTexture =>
+        Scalar("Flow_U_Speed") != 0f || Scalar("Flow_V_Speed") != 0f
+            ? FirstTexture("FlowTexture")
+            : null;
+
+    /// 色带的混入强度(暮星辰环带 0.8)。
+    public float FlowPower => Scalar("FlowPower", 1f);
+
+    /// **「假半透」族的内部星光**:身体看着半透、内里飘着星星。做法是拿 `NoiseTex`
+    /// (黑底 + 粉白星点)× HDR 的 `Color02`(幽星光 = (15,15,15)、暮星辰 = (14.8,11,15))
+    /// 按 `NoiseTilingSpeed` 卷动,叠在固有色上。
+    ///
+    /// 只认 `..._FakeTrans*` 父材质——全量只有 3 个材质用(幽星光一族的身体),
+    /// 按参数名放宽会误伤一堆把 `Color02` 当别的用的材质。
+    public bool IsFakeTrans =>
+        ParentChain.Any(p => p.Contains("FakeTrans", StringComparison.OrdinalIgnoreCase));
+
+    public string? InnerTexture => IsFakeTrans ? FirstTexture("NoiseTex", "Noise") : null;
+
+    public float[]? InnerColor => IsFakeTrans ? FirstVector("Color02") : null;
+
+    /// `NoiseTilingSpeed` 是 (平铺U, 平铺V, 速度U, 速度V);换成与 `Flow` 一致的
+    /// [速度U, 速度V, 平铺U, 平铺V] 布局,运行时两者共用同一组 uniform 字段。
+    public float[] InnerFlow =>
+        Vectors.TryGetValue("NoiseTilingSpeed", out var v) && v[0] > 0
+            ? [v[2], v[3], v[0], v[1]]
+            : [0f, 0f, 1f, 1f];
+
     /// 发光强度(火焰族有);没有就 1。
     public float Glow => Scalar("Glow Intensity", 1f);
 
@@ -124,6 +158,10 @@ public record MaterialInfo(
     public float[]? RimColor => FirstVector("Rim LightColor", "RimLightColor", "FresnelColor");
 
     public float RimIntensity => Scalar("Rim Intensity", Scalar("RimIntensity", 0f));
+
+    /// 边缘光的衰减次数:`pow(1 - N·V, RimPower)`。**小于 1 就不是「一圈边」而是整片泛色**——
+    /// 幽星光那两个球是 0.35,整颗都透着红,只写 RimColor 不写这个会画成一圈细红边。
+    public float RimPower => Scalar("Rim Power", Scalar("RimPower", 3f));
 
     private float Scalar(string name, float fallback = 0f) =>
         Scalars.TryGetValue(name, out var v) ? v : fallback;

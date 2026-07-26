@@ -41,11 +41,19 @@ public record MaterialEntry(
     /// MatCap 贴图 + 着色:玻璃/金属高光。
     string? MatcapTexture,
     float[]? MatcapColor,
-    /// 边缘光。
+    /// 边缘光。`RimPower` < 1 = 整片泛色而不是一圈细边。
     float[]? RimColor,
     float RimIntensity,
+    float RimPower,
     /// 半透材质的整体着色(`MainColor`)。
-    float[]? MainColor);
+    float[]? MainColor,
+    /// 卷动色带:渐变图 + 混入强度(暮星辰的环带靠它出青↔粉渐变)。
+    string? FlowTexture,
+    float FlowPower,
+    /// 「假半透」族的内部星光:星点图 + HDR 主色 + 卷动。与卷动色带互斥(共用一个贴图槽)。
+    string? InnerTexture,
+    float[]? InnerColor,
+    float[] InnerFlow);
 
 public record FormReport(
     Form Form,
@@ -153,27 +161,41 @@ public static class Manifest
                     {
                         parts.Add($"rim_color = [{Num(rc[0])}, {Num(rc[1])}, {Num(rc[2])}]");
                         parts.Add($"rim_intensity = {Num(mat.RimIntensity)}");
+                        parts.Add($"rim_power = {Num(mat.RimPower)}");
                     }
-                    // opacity 只写一次:纯特效层那一段也会写,重复键 TOML 直接解析失败
-                    if (mat.Translucent && mat.BaseColor is not null)
-                        parts.Add($"opacity = {Num(mat.Opacity)}");
+                    if (mat.FlowTexture is not null)
+                    {
+                        parts.Add($"flow_tex = {Quote(mat.FlowTexture)}");
+                        parts.Add($"flow_power = {Num(mat.FlowPower)}");
+                        parts.Add($"flow = [{string.Join(", ", mat.Flow.Select(Num))}]");
+                    }
+                    else if (mat.InnerTexture is not null && mat.InnerColor is { } ic)
+                    {
+                        parts.Add($"inner_tex = {Quote(mat.InnerTexture)}");
+                        parts.Add($"inner_color = [{Num(ic[0])}, {Num(ic[1])}, {Num(ic[2])}]");
+                        parts.Add($"flow = [{string.Join(", ", mat.InnerFlow.Select(Num))}]");
+                    }
+                    // 每个键只许出现一次:重复键 TOML 直接解析失败(opacity/flow 都踩过)
+                    parts.Add($"opacity = {Num(mat.Opacity)}");
                     if (mat.MainColor is { } mn && mat.Translucent)
                         parts.Add($"main_color = [{Num(mn[0])}, {Num(mn[1])}, {Num(mn[2])}]");
+                    // 父链对所有材质都记:它是「这一族该怎么画」的唯一线索
+                    // (如 `M_FX_Fire_Mat` = 火焰、`..._Trans_XingGuang_WPO` = 需要顶点位移的纱)
+                    parts.Add($"parents = [{string.Join(", ", mat.ParentChain.Select(Quote))}]");
                     if (mat.BaseColor is null)
                     {
                         // 特效层:主色 + 卷动 + 遮罩/噪声,运行时靠这些近似画出火焰/水壳/光晕
                         if (mat.Tint is { } t)
                             parts.Add($"tint = [{Num(t[0])}, {Num(t[1])}, {Num(t[2])}, {Num(t[3])}]");
-                        parts.Add($"opacity = {Num(mat.Opacity)}");
                         parts.Add($"glow = {Num(mat.Glow)}");
-                        parts.Add($"flow = [{string.Join(", ", mat.Flow.Select(Num))}]");
+                        if (mat.FlowTexture is null && mat.InnerTexture is null)
+                            parts.Add($"flow = [{string.Join(", ", mat.Flow.Select(Num))}]");
                         if (mat.MaskTexture is not null)
                         {
                             parts.Add($"mask_tex = {Quote(mat.MaskTexture)}");
                             if (mat.MaskIsMatcap) parts.Add("mask_matcap = true");
                         }
                         if (mat.NoiseTexture is not null) parts.Add($"noise_tex = {Quote(mat.NoiseTexture)}");
-                        parts.Add($"parents = [{string.Join(", ", mat.ParentChain.Select(Quote))}]");
                     }
                     sb.AppendLine($"  {ClipKey(mat.Name)} = {{ {string.Join(", ", parts)} }}");
                 }

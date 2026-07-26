@@ -20,9 +20,11 @@ struct MaterialParams {
     tint: vec4<f32>,
     // [u 速度, v 速度, u 平铺, v 平铺]
     flow: vec4<f32>,
-    // [不透明度, 发光强度, 是否加色, 有没有噪声贴图]
+    // 纯特效层:[不透明度, 发光强度, 是否加色, 有没有噪声贴图]
+    // 有基色的:  [alpha 是否镂空遮罩, 线条提亮倍数, -, -]
     params: vec4<f32>,
-    // [遮罩是否 matcap, 有基色, 有星点, 有 matcap]
+    // 纯特效层:[遮罩是否 matcap, -, 有星点, 有 matcap]
+    // 有基色的:  [-, 是否玻璃/纱(半透族), 有星点, 有 matcap]
     flags: vec4<f32>,
     // [星点 u 平铺, v 平铺, 边缘光强度, 不透明度]
     star: vec4<f32>,
@@ -33,6 +35,8 @@ struct MaterialParams {
     rim_color: vec4<f32>,
     // 半透材质的整体着色
     main_color: vec4<f32>,
+    // [边缘光衰减次数, 色带混入强度, 有没有内部星光, 有没有色带]
+    extra: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> camera: Camera;
@@ -40,7 +44,9 @@ struct MaterialParams {
 @group(0) @binding(1) var<storage, read> joints: array<mat4x4<f32>>;
 @group(1) @binding(0) var base_color: texture_2d<f32>;
 @group(1) @binding(1) var base_sampler: sampler;
-// 特效层的噪声贴图;普通材质这里是 1×1 白图
+// 第二张贴图,三种用途共用(一个材质只会是其中一种):
+// 纯特效层 = 噪声(火焰的流动);有基色的 = 卷动色带(暮星辰环带的渐变)或内部星光(幽星光的身体)。
+// 没有就是 1×1 白图
 @group(1) @binding(2) var noise_tex: texture_2d<f32>;
 @group(1) @binding(3) var<uniform> material: MaterialParams;
 // 星点(身上的细碎星光)与 MatCap(球面反射查找表);没有就是 1×1 白图
@@ -59,7 +65,8 @@ struct VsOut {
     @builtin(position) clip: vec4<f32>,
     @location(0) uv: vec2<f32>,
     @location(1) normal: vec3<f32>,
-    @location(2) view_dir: vec3<f32>,
+    // 裁剪空间的 xy(= NDC,正交投影下 w 恒为 1);星点层拿它当「屏幕上的位置」
+    @location(2) ndc: vec2<f32>,
 };
 
 // 线性混合蒙皮:权重和不为 1 的顶点(导出误差)按权重和归一化,否则会缩水
@@ -79,8 +86,7 @@ fn skin(input: VsIn) -> VsOut {
     out.clip = camera.view_proj * world;
     out.uv = input.uv;
     out.normal = normal;
-    // 正交投影下视线方向是常量,取 +Z(相机看向 -Z)
-    out.view_dir = vec3<f32>(0.0, 0.0, 1.0);
+    out.ndc = out.clip.xy;
     return out;
 }
 
@@ -99,10 +105,18 @@ fn vs_outline(input: VsIn) -> VsOut {
     out.clip = camera.view_proj * (world + vec4<f32>(normal * camera.outline_width, 0.0));
     out.uv = input.uv;
     out.normal = normal;
-    out.view_dir = vec3<f32>(0.0, 0.0, 1.0);
+    out.ndc = out.clip.xy;
     return out;
 }
 
+
+/// matcap 图里「算高光」的亮度门槛(见 `matcap_light`)。
+const SPEC_FLOOR: f32 = 0.35;
+/// 内部星光的叠加量:抵掉 `Color02` 那个 HDR 的 15。
+const INNER_GAIN: f32 = 0.06;
+/// 玻璃族高光的叠加量。游戏那边这项还乘着遮罩通道选出来的高光区,我们没有那张遮罩的语义,
+/// 只能整片叠,所以要压一档——满强度叠上去,幽星光那两颗球会泛成一团白。
+const GLASS_GAIN: f32 = 0.35;
 
 /// 相机的右/上向量。正交投影没有透视错切,`view_proj` 的行向量归一化后就是它们,
 /// 所以不必额外往 uniform 里塞。
@@ -112,30 +126,81 @@ fn camera_basis() -> mat2x3<f32> {
     return mat2x3<f32>(right, up);
 }
 
+/// 「这个面有多侧对着镜头」,0 = 正对、1 = 与视线平行(轮廓)。边缘光/菲涅尔都用它。
+///
+/// **视线方向必须从 `view_proj` 取,不能写死世界 +Z。** 相机是绕着宠物转的(yaw),
+/// 写死 +Z 时凡是背对世界 +Z 的面都会被判成「完全侧对」→ 平白吃一层 0.25 的白,
+/// 幽星光整只被冲淡成粉白就是这么来的。取第三行(深度行)归一化即得视线轴,
+/// 用 `abs` 所以不必关心它的正负号。
+fn facing_ratio(n: vec3<f32>) -> f32 {
+    let forward = normalize(vec3<f32>(camera.view_proj[0][2], camera.view_proj[1][2], camera.view_proj[2][2]));
+    return 1.0 - abs(dot(n, forward));
+}
+
 /// MatCap 的采样坐标:视空间法线映射到 [0,1](球面查找表的标准做法)。
 fn matcap_uv(n: vec3<f32>) -> vec2<f32> {
     let basis = camera_basis();
     return vec2<f32>(dot(n, basis[0]), -dot(n, basis[1])) * 0.5 + vec2<f32>(0.5, 0.5);
 }
 
-/// 身上的细碎星光。共享图 `Tex_PetGlassyStar_004` 一类,形状在 alpha 里,
-/// `StarStickTiling` 控制密度(暮星辰 = 4×4)。按视空间贴,于是转身时星点像浮在表面。
-fn star_light(n: vec3<f32>) -> vec3<f32> {
+/// 身上的细碎星光。`StarStickTiling` 控制密度(暮星辰 = 4×4)。
+///
+/// **「Stick」是贴在镜头上而不是贴在表面上。** 游戏里星点不随模型转动,像镜头前挂了一层
+/// 遮罩投到宠物身上。所以采样坐标取 **NDC**:平铺数就是「横跨模型几格」,密度不随宠物大小变。
+/// 取景用的正交视体是正方的(见 `orthographic_view`),所以格子天然不会被拉扁;
+/// 用视空间世界坐标则是「每世界单位几格」,大宠物身上会密到糊成一片。
+///
+/// **形状不在 alpha 里。** 共享图 `Tex_PetGlassyStar_004` 是张区域图集:红/橙/黄的随机
+/// 色块、每块中间画一颗浅蓝白的小星,**alpha 恒为 255**。拿 `rgb * a` 当强度等于把整张
+/// 橙色图糊到表面上 —— 暮星辰的裙子从饱和蓝被冲成彩虹糖就是这么来的。
+/// 星芒藏在**蓝减红**里:底色块红橙黄(R 高 B 低),星芒浅蓝白(B 高),相减只剩星芒。
+fn star_light(ndc: vec2<f32>) -> vec3<f32> {
     if material.flags.z < 0.5 {
         return vec3<f32>(0.0);
     }
-    let uv = matcap_uv(n) * material.star.xy;
+    let uv = vec2<f32>(ndc.x, -ndc.y) * 0.5 * material.star.xy;
     let star = textureSample(star_tex, base_sampler, uv);
-    return material.star_color.rgb * star.rgb * star.a;
+    let glyph = clamp(star.b - star.r, 0.0, 1.0);
+    return material.star_color.rgb * star.rgb * glyph;
+}
+
+/// 卷动色带:一张渐变图沿 UV 滚过表面,乘在固有色上。暮星辰的环带靠它出青↔粉渐变
+/// (`FlowTexture` = 青↔粉竖条纹 + `Flow_U_Speed` = 0.25;基色贴图里环带那一条是纯粉的)。
+fn flow_band(uv: vec2<f32>, albedo: vec3<f32>) -> vec3<f32> {
+    if material.extra.w < 0.5 {
+        return albedo;
+    }
+    let scrolled = uv * material.flow.zw + vec2<f32>(material.flow.x, material.flow.y) * camera.time;
+    let band = textureSample(noise_tex, base_sampler, scrolled).rgb;
+    // 色带整体偏亮(均值 ~0.7),直接乘会压暗固有色,所以按亮度归一化后再按强度混入
+    let normalized = band / max(max(band.r, max(band.g, band.b)), 0.001);
+    return mix(albedo, albedo * normalized, material.extra.y);
+}
+
+/// 「假半透」族的内部星光:黑底星点图 × HDR 主色(幽星光的身体 `Color02` = (15,15,15)),
+/// 按 `NoiseTilingSpeed` 卷动。游戏里幽星光一族的身体看着半透、内里飘着星星就是这层;
+/// HDR 那个 15 是配着别处的衰减用的,直接乘会糊成一片白,所以压到 `INNER_GAIN`。
+fn inner_sparkle(uv: vec2<f32>) -> vec3<f32> {
+    if material.extra.z < 0.5 {
+        return vec3<f32>(0.0);
+    }
+    let scrolled = uv * material.flow.zw + vec2<f32>(material.flow.x, material.flow.y) * camera.time;
+    let sparkle = textureSample(noise_tex, base_sampler, scrolled).rgb;
+    return material.tint.rgb * sparkle * INNER_GAIN;
 }
 
 /// MatCap 高光。`MatCapColor` 可能是 HDR(暮星辰那两个球是 (3,3,3)),所以直接相乘。
+///
+/// **只取亮的那部分。** matcap 图是整颗球的反射查找表(实测 matcap26/Matcap35 均值 0.2、
+/// 只有 8% 的像素亮过 0.5),暗区是球体自己的暗面——连暗区一起加等于给整片抬一层灰,
+/// 再乘上 HDR 的 MatCapColor 就把球冲成一团白。这里减掉底再归一化,留下的就是那几块高光。
 fn matcap_light(n: vec3<f32>) -> vec3<f32> {
     if material.flags.w < 0.5 {
         return vec3<f32>(0.0);
     }
     let m = textureSample(matcap_tex, base_sampler, matcap_uv(n));
-    return material.matcap_color.rgb * m.rgb * m.a;
+    let spec = max(m.rgb - vec3<f32>(SPEC_FLOOR), vec3<f32>(0.0)) / (1.0 - SPEC_FLOOR);
+    return material.matcap_color.rgb * spec;
 }
 
 @fragment
@@ -157,16 +222,33 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     // 两段明暗:亮部原色,暗部压到 0.72,过渡带 0.08 宽度避免锯齿
     let lit = smoothstep(-0.04, 0.04, ndl);
     let shade = mix(0.72, 1.0, lit);
+    let facing = facing_ratio(n);
     // 边缘光:让轮廓从桌面背景里浮出来,桌宠场景下比环境光更有用
-    let rim = pow(1.0 - max(dot(n, normalize(in.view_dir)), 0.0), 3.0) * 0.25;
+    let rim = pow(facing, 3.0) * 0.25;
 
-    // 纹路提亮:alpha 高的地方(线条)比底色亮一档。
-    // 星点只轻轻加一层;**不透明层不叠 MatCap**——游戏那边靠遮罩通道选择性反射,
+    // 固有色:卷动色带 → 整体着色 → 两段明暗 → 纹路提亮(alpha 高的地方比底色亮一档)
+    var albedo = flow_band(in.uv, tex.rgb * material.main_color.rgb);
+    // 加上去的光。星点只轻轻一层;**不透明层不叠 MatCap**——游戏那边靠遮罩通道选择性反射,
     // 无条件叠会把宠物冲白(试过,整只发白),而 toon 着色本身对着截图已经够像。
-    let color = tex.rgb * shade * mix(1.0, material.params.y, line)
-        + vec3<f32>(rim) + star_light(n) * 0.3;
-    // 输出预乘 alpha:透明表面合成要求(见 render.rs)
-    return vec4<f32>(color, 1.0);
+    var glow = vec3<f32>(rim) + star_light(in.ndc) * 0.3 + inner_sparkle(in.uv);
+    var alpha = 1.0;
+
+    // **玻璃 / 薄纱**(`MI_P_Object_Trans_*` 族:幽星光那两个球、暮星辰的裙子与球)。
+    // 只有这一族叠 MatCap 高光,并把固有色**往边缘光色上拉**。
+    //
+    // 边缘光是**混色不是加色**:材质给的是 `Rim LightColor`/`Rim DarkColor` 一对端点
+    // (加色用不着两个端点),而 `Rim Power` 小于 1 时它根本不是「一圈边」——幽星光那两个球
+    // 是 0.35,整颗都该是红的。当加色画,R 早就饱和到 1、再加只抬 G/B,球会从红泛成橙黄。
+    if material.flags.y > 0.5 {
+        let weight = pow(facing, material.extra.x) * min(material.star.z, 1.0);
+        albedo = mix(albedo, material.rim_color.rgb, weight);
+        glow += matcap_light(n) * GLASS_GAIN;
+        alpha = clamp(material.star.w, 0.0, 1.0);
+    }
+    let body = albedo * shade * mix(1.0, material.params.y, line);
+    // 输出预乘 alpha(见 render.rs)。**固有色乘 alpha、加上去的光不乘**:高光/星点/边缘光
+    // 是打在表面上的光,半透表面照样该有,乘进去会随着变透明一起消失。
+    return vec4<f32>(body * alpha + glow, alpha);
 }
 
 @fragment
@@ -180,7 +262,11 @@ fn fs_outline(in: VsOut) -> @location(0) vec4<f32> {
     return vec4<f32>(tex.rgb * 0.25, 1.0);
 }
 
-// 特效层(火焰 / 水壳 / 光晕)。**不是复刻游戏 shader,是够用的近似**:
+// 纯特效层(火焰 / 水壳 / 光晕):材质里没有 BaseTex/EyeTex,固有色是 shader 算的。
+// **有基色的半透材质不走这里**——暮星辰的裙子、那两个球都有基色贴图,和不透明本体共用
+// `fs_main`,只是多一个 alpha,少一次代码分叉。
+//
+// **不是复刻游戏 shader,是够用的近似**:
 // 主色 × 遮罩 × 卷动噪声,加色或半透二选一。参数全部来自游戏材质实例:
 // 火花 `M_FX_Fire_Mat` 给 Color01=(6,0.8,0)(R>1 的 HDR 橙,说明是加色)+ Mask/Noise + 流速;
 // 水蓝蓝 `M_Wat_ShuiLanLan_PP` 给 MainColor 浅蓝 + Opacity=0.8 + MatCap(当遮罩用)。
@@ -197,14 +283,8 @@ fn fs_effect(in: VsOut) -> @location(0) vec4<f32> {
 
     // 遮罩决定形状。**matcap 要按视空间法线采样**(它是球面反射查找表),
     // 拿网格 UV 采会糊成一块块的斑——水灵的水膜踩过这个坑。
-    // 相机基向量从 view_proj 里取:正交投影没有透视错切,行向量归一化后就是右/上。
     let n = normalize(in.normal);
-    var mask_uv = in.uv;
-    if material.flags.x > 0.5 {
-        let right = normalize(vec3<f32>(camera.view_proj[0][0], camera.view_proj[1][0], camera.view_proj[2][0]));
-        let up = normalize(vec3<f32>(camera.view_proj[0][1], camera.view_proj[1][1], camera.view_proj[2][1]));
-        mask_uv = vec2<f32>(dot(n, right), -dot(n, up)) * 0.5 + vec2<f32>(0.5, 0.5);
-    }
+    let mask_uv = select(in.uv, matcap_uv(n), material.flags.x > 0.5);
     let mask = textureSample(base_color, base_sampler, mask_uv);
     var flow_amount = 1.0;
     if has_noise {
@@ -213,22 +293,8 @@ fn fs_effect(in: VsOut) -> @location(0) vec4<f32> {
     }
 
     // 边缘处更亮/更实:水壳的菲涅尔感与火焰的边缘都靠这个
-    let facing = 1.0 - abs(dot(n, normalize(in.view_dir)));
+    let facing = facing_ratio(n);
     let rim = mix(0.35, 1.0, facing);
-
-    // **有基色的半透材质**走另一条:暮星辰的裙子与那两个球都是 `BLEND_Translucent`,
-    // 固有色来自贴图而不是 tint。当不透明画就是死板的实心块(球会变成纯色圆片)。
-    if material.flags.y > 0.5 {
-        let ndl = dot(n, normalize(camera.light_dir));
-        let shade = mix(0.72, 1.0, smoothstep(-0.04, 0.04, ndl));
-        let base = mask;   // 这里 base_color 绑的就是基色贴图
-        // 边缘更实、中间更透:玻璃与薄纱都是这个观感
-        let a = clamp(mix(material.star.w, 1.0, facing * facing), 0.0, 1.0);
-        let rim_glow = material.rim_color.rgb * pow(facing, 3.0) * material.star.z;
-        let lit = base.rgb * material.main_color.rgb * shade * mix(1.0, material.star_color.a, base.a)
-            + star_light(n) * 0.45 + matcap_light(n) * 0.35 + rim_glow;
-        return vec4<f32>(lit * a, a);
-    }
 
     let strength = mask.a * flow_amount * rim;
     let color = material.tint.rgb * glow * strength;

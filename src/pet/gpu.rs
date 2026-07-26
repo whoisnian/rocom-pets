@@ -29,9 +29,11 @@ struct CameraUniform {
 struct MaterialUniform {
     tint: [f32; 4],
     flow: [f32; 4],
-    /// [opacity, glow, additive(0/1), 是否有噪声贴图(0/1)]
+    /// 纯特效层 [opacity, glow, additive(0/1), 有噪声贴图(0/1)]
+    /// 有基色的 [alpha 是镂空遮罩(0/1), 线条提亮倍数, -, -]
     params: [f32; 4],
-    /// [遮罩是否 matcap(0/1), 有基色(0/1), 有星点(0/1), 有 matcap(0/1)]
+    /// 纯特效层 [遮罩是否 matcap(0/1), -, 有星点(0/1), 有 matcap(0/1)]
+    /// 有基色的 [-, 是玻璃/纱(0/1), 有星点(0/1), 有 matcap(0/1)]
     flags: [f32; 4],
     /// [星点 u 平铺, v 平铺, 边缘光强度, 不透明度]
     star: [f32; 4],
@@ -39,10 +41,14 @@ struct MaterialUniform {
     star_color: [f32; 4],
     /// MatCap 着色(rgb,可能是 HDR)+ 备用
     matcap_color: [f32; 4],
-    /// 半透材质的整体着色
-    main_color: [f32; 4],
+    // ⚠ 字段顺序必须和 pet.wgsl 的 `MaterialParams` 逐个对齐:uniform 是按偏移读的,
+    // 顺序错了不会报错,只会静默取到旁边那个字段的值(rim/main 曾经就是这么对调的)。
     /// 边缘光颜色
     rim_color: [f32; 4],
+    /// 半透材质的整体着色
+    main_color: [f32; 4],
+    /// [边缘光衰减次数, 色带混入强度, 有内部星光(0/1), 有色带(0/1)]
+    extra: [f32; 4],
 }
 
 /// 本体贴图 alpha 里那层线条遮罩的提亮倍数。游戏里那些纹路(水灵身上的竖条、
@@ -61,9 +67,12 @@ pub struct PetGpu {
     pipeline: wgpu::RenderPipeline,
     outline_pipeline: wgpu::RenderPipeline,
     effect_pipeline: wgpu::RenderPipeline,
-    /// (首索引, 数量, 材质序号);按「是不是特效层」分成两批,特效层要最后画。
+    glass_pipeline: wgpu::RenderPipeline,
+    /// (首索引, 数量, 材质序号)。分三批,后两批要在不透明层之后画:
+    /// `draws` 不透明、`glass_draws` 有基色的半透(玻璃/纱)、`effect_draws` 纯特效层。
     draws: Vec<(u32, u32, usize)>,
     effect_draws: Vec<(u32, u32, usize)>,
+    glass_draws: Vec<(u32, u32, usize)>,
 }
 
 impl PetGpu {
@@ -229,12 +238,13 @@ impl PetGpu {
                 (None, None) => &white,
             };
             let main_view = upload_texture(device, queue, &material.name, main);
-            let noise = material
-                .effect
-                .as_ref()
-                .and_then(|e| e.noise.as_ref())
-                .unwrap_or(&white);
-            let noise_view = upload_texture(device, queue, &material.name, noise);
+            // 第二张贴图三种用途共用一个 binding(一个材质只会是其中一种):特效层是噪声
+            // (火焰的流动)、有基色的是卷动色带(暮星辰环带的渐变)或内部星光(幽星光的身体)
+            let second = match &material.effect {
+                Some(effect) => effect.noise.as_ref(),
+                None => material.flow.as_ref().or(material.inner.as_ref()),
+            };
+            let noise_view = upload_texture(device, queue, &material.name, second.unwrap_or(&white));
             let star_view = upload_texture(
                 device,
                 queue,
@@ -248,6 +258,15 @@ impl PetGpu {
                 material.matcap.as_ref().unwrap_or(&white),
             );
             let has = |v: bool| if v { 1.0 } else { 0.0 };
+            let rgb = |c: [f32; 3]| [c[0], c[1], c[2], 0.0];
+            let extra = |m: &super::model::Material| {
+                [
+                    m.rim_power,
+                    m.flow_power,
+                    has(m.inner.is_some()),
+                    has(m.flow.is_some()),
+                ]
+            };
             let uniform = match &material.effect {
                 Some(effect) => MaterialUniform {
                     tint: effect.tint,
@@ -260,6 +279,7 @@ impl PetGpu {
                     ],
                     flags: [
                         has(effect.mask_matcap),
+                        // 纯特效层没有基色,不走玻璃分支
                         0.0,
                         has(material.star.is_some()),
                         has(material.matcap.is_some()),
@@ -276,29 +296,16 @@ impl PetGpu {
                         material.star_color[2],
                         LINE_BOOST,
                     ],
-                    matcap_color: [
-                        material.matcap_color[0],
-                        material.matcap_color[1],
-                        material.matcap_color[2],
-                        0.0,
-                    ],
-                    rim_color: [
-                        material.rim_color[0],
-                        material.rim_color[1],
-                        material.rim_color[2],
-                        0.0,
-                    ],
-                    main_color: [
-                        material.main_color[0],
-                        material.main_color[1],
-                        material.main_color[2],
-                        0.0,
-                    ],
+                    matcap_color: rgb(material.matcap_color),
+                    rim_color: rgb(material.rim_color),
+                    main_color: rgb(material.main_color),
+                    extra: extra(material),
                 },
                 // 有基色的材质:params.x 说明 alpha 怎么解释(1=镂空遮罩,0=线条遮罩)
                 None => MaterialUniform {
-                    tint: [1.0; 4],
-                    flow: [0.0, 0.0, 1.0, 1.0],
+                    // 有基色的材质不用 tint 当固有色,这里借给内部星光的 HDR 主色
+                    tint: rgb(material.inner_color),
+                    flow: material.flow_uv,
                     params: [
                         has(material.cutout),
                         // alpha 恒定的贴图没有线条可提,提亮必须是空操作(1.0),
@@ -311,9 +318,11 @@ impl PetGpu {
                         0.0,
                         0.0,
                     ],
+                    // flags.y = 1 表示「玻璃/纱」:fs_main 据此加 MatCap 高光与材质边缘光,
+                    // 普通不透明宠物无条件叠这两样会整只发白
                     flags: [
                         0.0,
-                        1.0,
+                        has(material.translucent),
                         has(material.star.is_some()),
                         has(material.matcap.is_some()),
                     ],
@@ -333,24 +342,10 @@ impl PetGpu {
                             1.0
                         },
                     ],
-                    matcap_color: [
-                        material.matcap_color[0],
-                        material.matcap_color[1],
-                        material.matcap_color[2],
-                        0.0,
-                    ],
-                    rim_color: [
-                        material.rim_color[0],
-                        material.rim_color[1],
-                        material.rim_color[2],
-                        0.0,
-                    ],
-                    main_color: [
-                        material.main_color[0],
-                        material.main_color[1],
-                        material.main_color[2],
-                        0.0,
-                    ],
+                    matcap_color: rgb(material.matcap_color),
+                    rim_color: rgb(material.rim_color),
+                    main_color: rgb(material.main_color),
+                    extra: extra(material),
                 },
             };
             let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -479,22 +474,38 @@ impl PetGpu {
             Some(wgpu::Face::Front),
             true,
         );
-        // 特效层:**不剔面**(火焰/水壳是薄壳,正反两面都要看得见)、不写深度。
-        // 混合沿用预乘 alpha —— shader 输出 alpha=0 就等价于加色(dst + rgb),
-        // 输出 alpha=不透明度就是普通半透,一条管线覆盖火焰与水壳两种。
-        let effect_pipeline = make_pipeline("pet-effect", "vs_main", "fs_effect", None, false);
+        // 混合通道:只测深度不写(半透层之间不该互相挡),**剔背面**——不剔的话闭合壳
+        // 正反两面都参与混合,转身时可见组合不断变化 → 看着在闪。薄片状的火焰/水膜
+        // 少画一面无所谓。混合沿用预乘 alpha:输出 alpha=0 就是加色(dst + rgb),
+        // 输出 alpha=不透明度就是普通半透,一条管线覆盖两种。
+        let effect_pipeline = make_pipeline(
+            "pet-effect",
+            "vs_main",
+            "fs_effect",
+            Some(wgpu::Face::Back),
+            false,
+        );
+        // 有基色的半透(暮星辰那两个球)和不透明本体是同一个片元函数,只是走混合通道
+        let glass_pipeline = make_pipeline(
+            "pet-glass",
+            "vs_main",
+            "fs_main",
+            Some(wgpu::Face::Back),
+            false,
+        );
 
-        // 特效层最后画:它们要叠在本体之上
-        // 半透的一律进特效通道:纯特效层(没有基色)和「有基色但 BLEND_Translucent」的
-        // (暮星辰的裙子与那两个球)都在里面
-        let (effect_draws, draws): (Vec<_>, Vec<_>) = model
+        // 需要混合的最后画(叠在本体之上)。判据是 `blended()` 而不是 `translucent`:
+        // 标着 BLEND_Translucent 但不透明度就是 1 的(幽星光那两个球)输出和不透明一样,
+        // 放进混合通道只会因为不写深度而互相盖不住 —— 两颗球绕着转就闪。
+        let (blended, draws): (Vec<_>, Vec<_>) = model
             .primitives
             .iter()
             .map(|p| (p.first_index, p.index_count, p.material))
-            .partition(|&(_, _, m)| {
-                model.materials[m].effect.is_some() || model.materials[m].translucent
-            });
-
+            .partition(|&(_, _, m)| model.materials[m].blended());
+        // 混合通道里再分两种片元函数:有基色的走 fs_main,纯特效层走 fs_effect
+        let (glass_draws, effect_draws): (Vec<_>, Vec<_>) = blended
+            .into_iter()
+            .partition(|&(_, _, m)| model.materials[m].effect.is_none());
         Ok(Self {
             vertices,
             indices,
@@ -506,8 +517,10 @@ impl PetGpu {
             pipeline,
             outline_pipeline,
             effect_pipeline,
+            glass_pipeline,
             draws,
             effect_draws,
+            glass_draws,
         })
     }
 
@@ -555,10 +568,16 @@ impl PetGpu {
                 pass.draw_indexed(first..first + count, 0, 0..1);
             }
         }
-        // 特效层放最后:本体的深度已经写好,这里只测不写,叠在上面
-        if !self.effect_draws.is_empty() {
-            pass.set_pipeline(&self.effect_pipeline);
-            for &(first, count, material) in &self.effect_draws {
+        // 混合层放最后:本体的深度已经写好,这里只测不写,叠在上面
+        for (pipeline, batch) in [
+            (&self.glass_pipeline, &self.glass_draws),
+            (&self.effect_pipeline, &self.effect_draws),
+        ] {
+            if batch.is_empty() {
+                continue;
+            }
+            pass.set_pipeline(pipeline);
+            for &(first, count, material) in batch {
                 pass.set_bind_group(1, &self.material_binds[material], &[]);
                 pass.draw_indexed(first..first + count, 0, 0..1);
             }
