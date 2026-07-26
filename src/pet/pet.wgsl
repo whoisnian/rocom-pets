@@ -105,13 +105,18 @@ fn skin(input: VsIn) -> VsOut {
     out.normal = normal;
     out.ndc = out.clip.xy;
     out.interior_pos = input.interior_pos;
-    // 物体空间:法线就是未蒙皮的顶点法线;视线用蒙皮矩阵的逆转过来。
-    // 刚体骨骼(旋转 + 平移、无缩放)下 `inverse(mat3(m)) == transpose(mat3(m))`,
-    // 那两颗球正是各自挂在一根骨头上刚体自转的,所以这个等价变换是准的。
-    let fwd = normalize(vec3<f32>(camera.view_proj[0][2], camera.view_proj[1][2], camera.view_proj[2][2]));
-    let r = mat3x3<f32>(m[0].xyz, m[1].xyz, m[2].xyz);
+    // **物体空间**:法线取**未蒙皮**的顶点法线(它是烘死在网格里的,不随动画变),
+    // 视线取模型空间的那份。
+    //
+    // 视线**不要**再用骨骼矩阵的逆转一次 —— 汇编里用的是 `cb2[6..8]`,那是 `Primitive`
+    // 即**组件**的 world→local,不是逐骨骼的。我们的宠物没有额外的模型变换
+    // (yaw 烘在 `view_proj` 里、模型在原点),所以模型空间 == 世界空间,直接用世界视线。
+    //
+    // 这两条合起来才是「星画在球上、跟着球刚体转」:烘死的法线让每个顶点的折射方向恒定,
+    // 于是采样位置钉在表面上;球一转,图案跟着转。用**蒙皮后**的世界法线则相反 ——
+    // 球面的世界法线分布本身是旋转不变的,图案会钉在屏幕上不动(那就是「像屏幕投影」)。
     out.local_normal = normalize(input.normal);
-    out.local_view = normalize(vec3<f32>(dot(r[0], fwd), dot(r[1], fwd), dot(r[2], fwd)));
+    out.local_view = normalize(vec3<f32>(camera.view_proj[0][2], camera.view_proj[1][2], camera.view_proj[2][2]));
     return out;
 }
 
