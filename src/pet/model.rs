@@ -23,6 +23,18 @@ pub struct Vertex {
     pub uv: [f32; 2],
     pub joints: [u16; 4],
     pub weights: [f32; 4],
+    /// 玻璃内部层的采样起点 `(UV1.x, UV1.y, UV2.x)`。
+    ///
+    /// **这三个分量是从 shader 里查出来的,不是挑的**:反汇编 `MI_P_Object_Trans_MatCap` 的
+    /// 片元着色器,内部层的起点是 `r4.xy = v2.zw; r4.z = v3.x`;再解 DXBC 的 `ISGN` 签名段,
+    /// `v2` = TEXCOORD0、`v3` = TEXCOORD1,而 UE 把材质的 UV 两两打包进插值器
+    /// (TEXCOORD0 = UV0.xy + UV1.xy,TEXCOORD1 = UV2.xy + UV3.xy)—— 于是就是这三个。
+    ///
+    /// 实测幽星光那两颗球 UV1 恒为 0、UV2.x 每颗球一个区间,所以起点几乎是**每颗球一个常量**,
+    /// 空间变化全来自「折射方向 × 深度」。这正好解释实机为什么每颗球都稳定居中一颗星、
+    /// 而且两颗球各是星和圆点(起点不同 → 落在星场的不同格)。
+    /// 之前我拿模型空间位置当起点,画出来就是「一颗被拉伸的星贴在表面」。
+    pub interior_pos: [f32; 3],
 }
 
 /// 一段网格:对应一个材质槽(宠物一般 2–3 个:本体/眼/嘴)。
@@ -66,7 +78,6 @@ pub struct Material {
     pub interior: Option<Image>,
     pub interior_color: [f32; 3],
     pub refraction: f32,
-    pub refract_depth: f32,
     /// 特效层的画法(火焰/水壳/光晕)。`None` = 普通不透明材质,走主通道。
     pub effect: Option<EffectMaterial>,
 }
@@ -281,6 +292,15 @@ impl Model {
                 .read_tex_coords(0)
                 .map(|it| it.into_f32().collect())
                 .unwrap_or_else(|| vec![[0.0, 0.0]; positions.len()]);
+            // UV1 / UV2:玻璃内部层的采样起点(见 `Vertex::interior_pos`)
+            let uv1: Vec<[f32; 2]> = reader
+                .read_tex_coords(1)
+                .map(|it| it.into_f32().collect())
+                .unwrap_or_else(|| vec![[0.0, 0.0]; positions.len()]);
+            let uv2: Vec<[f32; 2]> = reader
+                .read_tex_coords(2)
+                .map(|it| it.into_f32().collect())
+                .unwrap_or_else(|| vec![[0.0, 0.0]; positions.len()]);
             let joint_ids: Vec<[u16; 4]> = reader
                 .read_joints(0)
                 .context("缺 JOINTS_0")?
@@ -300,6 +320,7 @@ impl Model {
                     uv: uvs[i],
                     joints: joint_ids[i],
                     weights: weights[i],
+                    interior_pos: [uv1[i][0], uv1[i][1], uv2[i][0]],
                 });
             }
             let first_index = indices.len() as u32;
@@ -360,7 +381,6 @@ impl Model {
                     interior: spec.interior.as_deref().and_then(|p| load_texture(p, true)),
                     interior_color: spec.interior_color,
                     refraction: spec.refraction,
-                    refract_depth: spec.refract_depth,
                     effect,
                 });
                 materials.len() - 1

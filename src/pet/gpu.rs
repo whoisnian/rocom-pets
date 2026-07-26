@@ -297,7 +297,7 @@ impl PetGpu {
                     m.refraction,
                     // 实机的 march 深度是 100 配着别处的归一化用的,这里按包围盒归一化后
                     // 再缩到一个可用的量级(0.35 是对着实机截图挑的)
-                    if m.interior.is_some() { 0.7 } else { 0.0 },
+                    if m.interior.is_some() { 0.4 } else { 0.0 },
                     0.0,
                     has(m.interior.is_some()),
                 ]
@@ -472,6 +472,12 @@ impl PetGpu {
                     offset: 40,
                     shader_location: 4,
                     format: wgpu::VertexFormat::Float32x4,
+                },
+                // 玻璃内部层的采样起点 (UV1.x, UV1.y, UV2.x),见 model.rs 的 `interior_pos`
+                wgpu::VertexAttribute {
+                    offset: 56,
+                    shader_location: 5,
+                    format: wgpu::VertexFormat::Float32x3,
                 },
             ],
         };

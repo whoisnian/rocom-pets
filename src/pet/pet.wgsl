@@ -67,6 +67,8 @@ struct VsIn {
     @location(2) uv: vec2<f32>,
     @location(3) joint_ids: vec4<u32>,
     @location(4) weights: vec4<f32>,
+    // 玻璃内部层的采样起点 (UV1.x, UV1.y, UV2.x),见 model.rs 的 `interior_pos`
+    @location(5) interior_pos: vec3<f32>,
 };
 
 struct VsOut {
@@ -75,8 +77,8 @@ struct VsOut {
     @location(1) normal: vec3<f32>,
     // 裁剪空间的 xy(= NDC,正交投影下 w 恒为 1);星点层拿它当「屏幕上的位置」
     @location(2) ndc: vec2<f32>,
-    // 蒙皮后的模型空间位置;玻璃内部那层要拿它沿折射光线 march
-    @location(3) world: vec3<f32>,
+    // 玻璃内部层的采样起点(直接透传顶点属性)
+    @location(3) interior_pos: vec3<f32>,
 };
 
 // 线性混合蒙皮:权重和不为 1 的顶点(导出误差)按权重和归一化,否则会缩水
@@ -97,7 +99,7 @@ fn skin(input: VsIn) -> VsOut {
     out.uv = input.uv;
     out.normal = normal;
     out.ndc = out.clip.xy;
-    out.world = world.xyz;
+    out.interior_pos = input.interior_pos;
     return out;
 }
 
@@ -117,17 +119,23 @@ fn vs_outline(input: VsIn) -> VsOut {
     out.uv = input.uv;
     out.normal = normal;
     out.ndc = out.clip.xy;
-    out.world = world.xyz;
+    out.interior_pos = input.interior_pos;
     return out;
 }
 
 
+/// 星点遮罩的额外平铺倍率(见 `star_light`)。
+const STAR_TILE_SCALE: f32 = 3.0;
 /// matcap 图里「算高光」的亮度门槛(见 `matcap_light`)。
 const SPEC_FLOOR: f32 = 0.35;
 /// 内部星层的卷动速度与叠加量。速度实机来自一个 cb 向量参数(槽位还没对上名字),
 /// 亮度那边 `StarColor` 是 HDR 的 (0.33, 0.67, 2),直接乘会过曝。
 const INTERIOR_SPEED: f32 = 0.03;
 const INTERIOR_GAIN: f32 = 1.6;
+/// 内部星场的平铺。**必须远大于 1**:位置是按整只宠物的包围盒归一化的,而那两颗球的直径
+/// 只有包围盒最长边的 0.2 上下 —— 平铺 1 时一整颗球只摊到星场的一个格子上,
+/// 出来就是「一颗被拉伸的星贴在表面」而不是「球里有颗星」。
+const INTERIOR_TILING: f32 = 1.0;
 /// 玻璃族高光的叠加量。游戏那边这项还乘着遮罩通道选出来的高光区,我们没有那张遮罩的语义,
 /// 只能整片叠,所以要压一档——满强度叠上去,幽星光那两颗球会泛成一团白。
 const GLASS_GAIN: f32 = 0.35;
@@ -174,7 +182,10 @@ fn star_light(ndc: vec2<f32>) -> vec3<f32> {
     if material.flags.z < 0.5 {
         return vec3<f32>(0.0);
     }
-    let uv = vec2<f32>(ndc.x, -ndc.y) * 0.5 * material.star.xy;
+    // `ndc * 0.5` = 横跨画布一格,再乘材质给的平铺数。**还要再乘一个倍率**:
+    // 光按 `StarStickTiling`(2.5~4)算出来是「整只宠物上 2~4 格」,星点比实机大一倍以上,
+    // 看着像「一张图拉伸后投上去」;实机更像原图小尺寸密铺。倍率对着截图挑的。
+    let uv = vec2<f32>(ndc.x, -ndc.y) * 0.5 * material.star.xy * STAR_TILE_SCALE;
     let star = textureSample(star_tex, base_sampler, uv);
     let glyph = min(star.r, min(star.g, star.b));
     return material.star_color.rgb * star.rgb * glyph;
@@ -205,7 +216,7 @@ fn flow_band(uv: vec2<f32>, albedo: vec3<f32>) -> vec3<f32> {
 /// 高度做的两色渐变当固有色;这里只取「折射 + 三向投影星场 + 时间」这条主干。
 /// 卷动速度实机是个 cb 里的向量参数,而 cb 槽位与参数名的对应还没解出来(§1),
 /// 所以先用一个定值。
-fn interior_star(world: vec3<f32>, n: vec3<f32>) -> vec3<f32> {
+fn interior_star(start: vec3<f32>, n: vec3<f32>) -> vec3<f32> {
     if material.interior.w < 0.5 {
         return vec3<f32>(0.0);
     }
@@ -219,9 +230,8 @@ fn interior_star(world: vec3<f32>, n: vec3<f32>) -> vec3<f32> {
     }
     let dir = eta * forward - (eta * cosi + sqrt(k)) * n;
 
-    // 模型空间位置归一化到包围盒,再沿折射线走一段。深度按最长边缩放,免得大小宠物差太多
-    let local = (world - material.bounds_min.xyz) / max(material.bounds_size.w, 0.001);
-    let p = local + dir * material.interior.y;
+    // 起点是顶点里带的 (UV1.xy, UV2.x),沿折射线走一段
+    let p = (start + dir * material.interior.y) * INTERIOR_TILING;
     // 三向投影:权重取 |法线| 的高次,归一化
     let w = pow(abs(n), vec3<f32>(8.0));
     let wn = w / max(w.x + w.y + w.z, 0.001);
@@ -287,7 +297,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         glow += (matcap_light(n)
             + material.rim_color.rgb * pow(facing, material.extra.x) * material.star.z)
             * GLASS_GAIN
-            + interior_star(in.world, n);
+            + interior_star(in.interior_pos, n);
         alpha = clamp(material.star.w, 0.0, 1.0);
         // **玻璃不吃两段明暗。** 它的明暗来自反射(MatCap + 边缘光),不是漫反射;
         // 而那两颗球是**开口薄壳**(129 顶点、边界 30 条边),自转时露出来的面一直在换,

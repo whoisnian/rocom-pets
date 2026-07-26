@@ -202,10 +202,22 @@ public record MaterialInfo(
     /// 读 shader 汇编读出来的(见 docs/design.md §1):`refract()` 的教科书实现 + triplanar
     /// + `View` 的时间项 —— 这就是实机里「球内有颗星、自己在动、和球自转无关」的来源。
     ///
-    /// 只给**玻璃族**用(静态开关 `是否使用MatCap` 开着的那 17 个),它们是那种玻璃珠观感。
     /// 贴图取自根材质默认值:没有任何实例覆盖 `StarTex`,顺父链是看不见它的。
+    ///
+    /// **采样起点是 `(UV1.x, UV1.y, UV2.x)`,从 shader 里查出来的**:片元着色器里那句
+    /// `r4.xy = v2.zw; r4.z = v3.x`,配 DXBC `ISGN` 签名段(`v2` = TEXCOORD0、`v3` = TEXCOORD1)
+    /// 与 UE 的 UV 打包规则(TEXCOORD0 = UV0.xy + UV1.xy、TEXCOORD1 = UV2.xy + UV3.xy)。
+    /// 顶点侧见 model.rs 的 `Vertex::interior_pos`。
+    ///
+    /// **判据是「直接父就是 `MI_P_Object_Trans_MatCap`」,不能用「父链里有」。**
+    /// 暮星辰那两颗球的直接父是 `..._Trans_XingGuang_Fresnel`(它自己的父才是 Trans_MatCap),
+    /// 而它的 shader 反汇编下来是**完全另一套**:223 行、4 张贴图、`N·L` + 遮罩 →
+    /// 一维 `RampTex` 行查(采样 v 是常数 1/256),既没有折射也没有三向投影。
+    /// 拿同一套画法套上去是错的 —— 按「父链里有」判会把它也算进来(踩过)。
     public string? InteriorTexture =>
-        Switch("是否使用MatCap") ? RootDefaults?.Textures.GetValueOrDefault("StarTex") : null;
+        ParentChain.FirstOrDefault() == "MI_P_Object_Trans_MatCap"
+            ? RootDefaults?.Textures.GetValueOrDefault("StarTex")
+            : null;
 
     /// 内部星光的着色(根默认 `StarColor` = (0.33, 0.67, 2) —— 偏蓝的 HDR)。
     public float[]? InteriorColor =>
