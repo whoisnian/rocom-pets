@@ -103,25 +103,14 @@ public record MaterialInfo(
     /// 色带的混入强度(暮星辰环带 0.8)。
     public float FlowPower => Scalar("FlowPower", 1f);
 
-    /// **「假半透」族的内部星光**:身体看着半透、内里飘着星星。做法是拿 `NoiseTex`
-    /// (黑底 + 粉白星点)× HDR 的 `Color02`(幽星光 = (15,15,15)、暮星辰 = (14.8,11,15))
-    /// 按 `NoiseTilingSpeed` 卷动,叠在固有色上。
+    /// **「假半透」族也是一层星点**:`..._FakeTrans*` 家族给 `NoiseTex`(黑底 + 粉白星点)
+    /// + `NoiseTilingSpeed` + HDR 的 `Color02`,幽星光一族的身体看着半透、身上有星星靠它。
     ///
-    /// 只认 `..._FakeTrans*` 父材质——全量只有 3 个材质用(幽星光一族的身体),
-    /// 按参数名放宽会误伤一堆把 `Color02` 当别的用的材质。
+    /// 实机里这层**不流动**、也和别处的星点看着是同一份遮罩,所以运行时和 `StarStickTex`
+    /// 走同一条路(按屏幕位置贴的一层遮罩),只是贴图与着色换成这一族自己的。
+    /// 全量只有 3 个材质是这一族(幽星光的身体)。
     public bool IsFakeTrans =>
         ParentChain.Any(p => p.Contains("FakeTrans", StringComparison.OrdinalIgnoreCase));
-
-    public string? InnerTexture => IsFakeTrans ? FirstTexture("NoiseTex", "Noise") : null;
-
-    public float[]? InnerColor => IsFakeTrans ? FirstVector("Color02") : null;
-
-    /// `NoiseTilingSpeed` 是 (平铺U, 平铺V, 速度U, 速度V);换成与 `Flow` 一致的
-    /// [速度U, 速度V, 平铺U, 平铺V] 布局,运行时两者共用同一组 uniform 字段。
-    public float[] InnerFlow =>
-        Vectors.TryGetValue("NoiseTilingSpeed", out var v) && v[0] > 0
-            ? [v[2], v[3], v[0], v[1]]
-            : [0f, 0f, 1f, 1f];
 
     /// 发光强度(火焰族有);没有就 1。
     public float Glow => Scalar("Glow Intensity", 1f);
@@ -137,13 +126,33 @@ public record MaterialInfo(
     /// 与遮罩通道决定要不要叠,那套我们复刻不了。判据取「美术是否显式设了 `StarStickTiling`」:
     /// 设了(暮星辰的裙子 = 4×4)才当启用。一开始无条件叠,结果整只宠物被星点冲白。
     public string? StarTexture =>
-        Vectors.ContainsKey("StarStickTiling") ? FirstTexture("StarStickTex", "ShinyStarTex", "StarTex") : null;
+        Vectors.ContainsKey("StarStickTiling") ? FirstTexture("StarStickTex", "ShinyStarTex", "StarTex")
+        : IsFakeTrans ? FirstTexture("NoiseTex", "Noise")
+        : null;
 
-    /// 星点平铺;`StarStickTiling` 是 vec4,前两位是 uv 平铺(暮星辰 = (4,4))。
+    /// 星点平铺(前两位是 uv 平铺):`StarStickTiling` 是 vec4(暮星辰的裙子 = (4,4)),
+    /// 「假半透」族则记在 `NoiseTilingSpeed` 里(幽星光的身体 = (2.5,2.5,…))。
     public float[] StarTiling =>
-        Vectors.TryGetValue("StarStickTiling", out var v) && v[0] > 0 ? [v[0], v[1]] : [1f, 1f];
+        Vectors.TryGetValue("StarStickTiling", out var v) && v[0] > 0 ? [v[0], v[1]]
+        : IsFakeTrans && Vectors.TryGetValue("NoiseTilingSpeed", out var n) && n[0] > 0 ? [n[0], n[1]]
+        : [1f, 1f];
 
-    public float[]? StarColor => FirstVector("StarColor", "StarStickColor");
+    /// 平铺数是不是美术在 `StarStickTiling` 里明写的(而不是从「假半透」族的噪声参数推的)。
+    public bool HasExplicitStarTiling => Vectors.ContainsKey("StarStickTiling");
+
+    /// 星点着色。「假半透」族用 `Color02`,但那是**配着别处的衰减用的 HDR**
+    /// (幽星光 = (15,15,15)、暮星辰 = (14.8,11,15)),直接乘会糊成一片白;
+    /// 只取它的色相(按最大通道归一化),亮度交给运行时那一档固定系数。
+    public float[]? StarColor
+    {
+        get
+        {
+            if (FirstVector("StarColor", "StarStickColor") is { } c) return c;
+            if (!IsFakeTrans || FirstVector("Color02") is not { } hdr) return null;
+            var peak = MathF.Max(hdr[0], MathF.Max(hdr[1], hdr[2]));
+            return peak > 0 ? [hdr[0] / peak, hdr[1] / peak, hdr[2] / peak, 1f] : null;
+        }
+    }
 
     /// MatCap:球面反射查找表。暮星辰那两个球的玻璃感就是它 + `MatCapColor=(3,3,3)` 的 HDR 白。
     ///

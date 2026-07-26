@@ -49,11 +49,7 @@ public record MaterialEntry(
     float[]? MainColor,
     /// 卷动色带:渐变图 + 混入强度(暮星辰的环带靠它出青↔粉渐变)。
     string? FlowTexture,
-    float FlowPower,
-    /// 「假半透」族的内部星光:星点图 + HDR 主色 + 卷动。与卷动色带互斥(共用一个贴图槽)。
-    string? InnerTexture,
-    float[]? InnerColor,
-    float[] InnerFlow);
+    float FlowPower);
 
 public record FormReport(
     Form Form,
@@ -169,12 +165,6 @@ public static class Manifest
                         parts.Add($"flow_power = {Num(mat.FlowPower)}");
                         parts.Add($"flow = [{string.Join(", ", mat.Flow.Select(Num))}]");
                     }
-                    else if (mat.InnerTexture is not null && mat.InnerColor is { } ic)
-                    {
-                        parts.Add($"inner_tex = {Quote(mat.InnerTexture)}");
-                        parts.Add($"inner_color = [{Num(ic[0])}, {Num(ic[1])}, {Num(ic[2])}]");
-                        parts.Add($"flow = [{string.Join(", ", mat.InnerFlow.Select(Num))}]");
-                    }
                     // 每个键只许出现一次:重复键 TOML 直接解析失败(opacity/flow 都踩过)
                     parts.Add($"opacity = {Num(mat.Opacity)}");
                     if (mat.MainColor is { } mn && mat.Translucent)
@@ -188,7 +178,7 @@ public static class Manifest
                         if (mat.Tint is { } t)
                             parts.Add($"tint = [{Num(t[0])}, {Num(t[1])}, {Num(t[2])}, {Num(t[3])}]");
                         parts.Add($"glow = {Num(mat.Glow)}");
-                        if (mat.FlowTexture is null && mat.InnerTexture is null)
+                        if (mat.FlowTexture is null)
                             parts.Add($"flow = [{string.Join(", ", mat.Flow.Select(Num))}]");
                         if (mat.MaskTexture is not null)
                         {

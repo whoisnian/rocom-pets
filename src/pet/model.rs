@@ -62,9 +62,6 @@ pub struct Material {
     pub flow: Option<Image>,
     pub flow_uv: [f32; 4],
     pub flow_power: f32,
-    /// 「假半透」族的内部星光;与 `flow` 互斥。
-    pub inner: Option<Image>,
-    pub inner_color: [f32; 3],
     /// 特效层的画法(火焰/水壳/光晕)。`None` = 普通不透明材质,走主通道。
     pub effect: Option<EffectMaterial>,
 }
@@ -355,8 +352,6 @@ impl Model {
                     flow: spec.flow.as_deref().and_then(|p| load_texture(p, true)),
                     flow_uv: spec.flow_uv,
                     flow_power: spec.flow_power,
-                    inner: spec.inner.as_deref().and_then(|p| load_texture(p, true)),
-                    inner_color: spec.inner_color,
                     effect,
                 });
                 materials.len() - 1
@@ -424,6 +419,22 @@ impl Model {
             );
         }
 
+        // 自转的玻璃小件要压成平色(见 `flatten_spinning_parts`)。放在动画解析之后:
+        // 判据要看骨骼在动作里到底转了多少。
+        let spinning = spinning_joints(&skeleton, &clips);
+        for prim in &primitives {
+            if !materials[prim.material].translucent {
+                continue;
+            }
+            let range = prim.first_index as usize..(prim.first_index + prim.index_count) as usize;
+            flatten_spinning_parts(
+                &mut vertices,
+                &indices[range],
+                materials[prim.material].base_color.as_ref(),
+                &spinning,
+            );
+        }
+
         let bounds = bind_pose_bounds(&vertices, &skeleton);
         let motion_bounds = animated_bounds(&vertices, &skeleton, &clips, bounds);
         Ok(Self {
@@ -481,6 +492,157 @@ fn alpha_has_detail(image: &Image) -> bool {
     let high = image.rgba.chunks_exact(4).filter(|p| p[3] > 128).count();
     let share = high as f32 / total as f32;
     (0.02..0.90).contains(&share)
+}
+
+/// 哪些关节在动作里**沿一个方向转圈**(而不是来回摆)。
+///
+/// 判据是**净转动量**:把相邻两帧的相对旋转写成「轴 × 角」向量累加起来。一直朝一个方向转的
+/// 会越加越大(幽星光那两颗球一个 Idle 净转 700° 以上),来回摆的正负相消、加不起来。
+/// 不能用「转角绝对值累计」——翅膀扇十几个动作也能累到几千度,实测圣羽翼王会误判 71 件。
+fn spinning_joints(skeleton: &Skeleton, clips: &[Clip]) -> std::collections::HashSet<u16> {
+    /// 一整圈:低于这个的都算摆动。
+    const SPIN_DEGREES: f32 = 360.0;
+    let mut net: HashMap<usize, f32> = HashMap::new();
+    for clip in clips {
+        for channel in &clip.channels {
+            if channel.property != Property::Rotation {
+                continue;
+            }
+            let winding: Vec3 = channel
+                .values
+                .windows(2)
+                .map(|w| {
+                    let (from, to) = (Quat::from_array(w[0]), Quat::from_array(w[1]));
+                    // q 与 -q 是同一朝向:先对齐符号,否则相对旋转会莫名多出半圈
+                    let to = if from.dot(to) < 0.0 { -to } else { to };
+                    let (axis, angle) = (to * from.inverse()).to_axis_angle();
+                    axis * angle
+                })
+                .sum();
+            let slot = net.entry(channel.node).or_insert(0.0);
+            *slot = slot.max(winding.length().to_degrees());
+        }
+    }
+    skeleton
+        .joints
+        .iter()
+        .enumerate()
+        .filter(|(_, node)| net.get(node).copied().unwrap_or(0.0) >= SPIN_DEGREES)
+        .map(|(joint, _)| joint as u16)
+        .collect()
+}
+
+/// 把「自转的玻璃小件」的 UV 钉成一点,于是整件一片平色。
+///
+/// **这是为了治那种「转起来在闪」。** 玻璃族里有一批小球是单骨骼刚体、还在动作里自转
+/// (幽星光那两颗球一个 Idle 转两圈),而它们在基色图集里的 UV 落脚处横跨好几块**不相干**的
+/// 色块 —— 实测幽星光球 A 那一片里有橙 (255,123,60)、奶油 (255,248,172)、粉 (222,125,201)、
+/// 黄 (255,255,63):不是给球画的图,是刚好压在图集的几块拼缝上。逐像素采样再让它自转,
+/// 亮度就在 101↔158 之间来回跳(实测幅度 57/255),而实机里这两颗球是一色的。
+///
+/// 判据要窄,三条都得满足:**材质是玻璃族** + **整件的顶点全压在同一根骨骼上**(= 刚体,
+/// 自转时形体不变)+ **那根骨骼真的在动作里转满一圈以上**。少了最后一条会误伤一堆
+/// 摆动的刚性小件(实测圣羽翼王的羽毛有 71 件、一窝蜂 8 件),它们的贴图是美术真画的。
+/// 钉到哪个 UV:取「采出来的颜色最接近本件平均色」的那个顶点,比取包围盒中心更代表整件。
+fn flatten_spinning_parts(
+    vertices: &mut [Vertex],
+    indices: &[u32],
+    base_color: Option<&Image>,
+    spinning: &std::collections::HashSet<u16>,
+) {
+    let Some(image) = base_color else { return };
+    if image.width == 0 || image.height == 0 || spinning.is_empty() {
+        return;
+    }
+    for part in connected_parts(indices) {
+        // 刚体判据:全件同一根主骨骼,且主骨骼权重接近 1
+        let joint_of = |v: usize| {
+            let w = vertices[v].weights;
+            let (best, weight) = (0..4).fold((0u16, 0.0), |acc, k| {
+                if w[k] > acc.1 {
+                    (vertices[v].joints[k], w[k])
+                } else {
+                    acc
+                }
+            });
+            (weight > 0.99).then_some(best)
+        };
+        let Some(joint) = joint_of(part[0]) else {
+            continue;
+        };
+        if !spinning.contains(&joint) || part.iter().any(|&v| joint_of(v) != Some(joint)) {
+            continue;
+        }
+
+        let sample = |v: usize| {
+            let uv = vertices[v].uv;
+            // UE 的贴图是 wrap,UV 常落在 [0,1] 之外(见采样器那边的注释)
+            let x = (uv[0].rem_euclid(1.0) * image.width as f32) as usize % image.width as usize;
+            let y = (uv[1].rem_euclid(1.0) * image.height as f32) as usize % image.height as usize;
+            let i = (y * image.width as usize + x) * 4;
+            [
+                image.rgba[i] as f32,
+                image.rgba[i + 1] as f32,
+                image.rgba[i + 2] as f32,
+            ]
+        };
+        let colors: Vec<[f32; 3]> = part.iter().map(|&v| sample(v)).collect();
+        let sum = colors
+            .iter()
+            .fold([0.0; 3], |a, c| [a[0] + c[0], a[1] + c[1], a[2] + c[2]]);
+        let n = colors.len() as f32;
+        let mean = [sum[0] / n, sum[1] / n, sum[2] / n];
+        let pick = colors
+            .iter()
+            .enumerate()
+            .min_by(|(_, a), (_, b)| {
+                let d = |c: &[f32; 3]| (0..3).map(|k| (c[k] - mean[k]).powi(2)).sum::<f32>();
+                d(a).total_cmp(&d(b))
+            })
+            .map(|(i, _)| part[i]);
+        if let Some(pick) = pick {
+            let uv = vertices[pick].uv;
+            for &v in &part {
+                vertices[v].uv = uv;
+            }
+        }
+    }
+}
+
+/// 按「三角形共享顶点」把一片图元拆成互不相连的小件。
+fn connected_parts(indices: &[u32]) -> Vec<Vec<usize>> {
+    let mut parent: HashMap<u32, u32> = HashMap::new();
+    fn find(parent: &mut HashMap<u32, u32>, mut x: u32) -> u32 {
+        while let Some(&p) = parent.get(&x) {
+            if p == x {
+                break;
+            }
+            let grand = *parent.get(&p).unwrap_or(&p);
+            parent.insert(x, grand);
+            x = grand;
+        }
+        x
+    }
+    for &i in indices {
+        parent.entry(i).or_insert(i);
+    }
+    for tri in indices.chunks_exact(3) {
+        for &(a, b) in &[(tri[0], tri[1]), (tri[1], tri[2])] {
+            let (ra, rb) = (find(&mut parent, a), find(&mut parent, b));
+            if ra != rb {
+                parent.insert(ra, rb);
+            }
+        }
+    }
+    let mut groups: HashMap<u32, Vec<usize>> = HashMap::new();
+    let mut seen = std::collections::HashSet::new();
+    for &i in indices {
+        if seen.insert(i) {
+            let root = find(&mut parent, i);
+            groups.entry(root).or_default().push(i as usize);
+        }
+    }
+    groups.into_values().collect()
 }
 
 /// 父节点一定排在子节点之前的遍历序。

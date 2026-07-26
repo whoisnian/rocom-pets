@@ -47,7 +47,7 @@ struct MaterialUniform {
     rim_color: [f32; 4],
     /// 半透材质的整体着色
     main_color: [f32; 4],
-    /// [边缘光衰减次数, 色带混入强度, 有内部星光(0/1), 有色带(0/1)]
+    /// [边缘光衰减次数, 色带混入强度, -, 有色带(0/1)]
     extra: [f32; 4],
 }
 
@@ -238,11 +238,11 @@ impl PetGpu {
                 (None, None) => &white,
             };
             let main_view = upload_texture(device, queue, &material.name, main);
-            // 第二张贴图三种用途共用一个 binding(一个材质只会是其中一种):特效层是噪声
-            // (火焰的流动)、有基色的是卷动色带(暮星辰环带的渐变)或内部星光(幽星光的身体)
+            // 第二张贴图两种用途共用一个 binding(一个材质只会是其中一种):
+            // 特效层是噪声(火焰的流动),有基色的是卷动色带(暮星辰环带的渐变)
             let second = match &material.effect {
                 Some(effect) => effect.noise.as_ref(),
-                None => material.flow.as_ref().or(material.inner.as_ref()),
+                None => material.flow.as_ref(),
             };
             let noise_view = upload_texture(device, queue, &material.name, second.unwrap_or(&white));
             let star_view = upload_texture(
@@ -260,12 +260,7 @@ impl PetGpu {
             let has = |v: bool| if v { 1.0 } else { 0.0 };
             let rgb = |c: [f32; 3]| [c[0], c[1], c[2], 0.0];
             let extra = |m: &super::model::Material| {
-                [
-                    m.rim_power,
-                    m.flow_power,
-                    has(m.inner.is_some()),
-                    has(m.flow.is_some()),
-                ]
+                [m.rim_power, m.flow_power, 0.0, has(m.flow.is_some())]
             };
             let uniform = match &material.effect {
                 Some(effect) => MaterialUniform {
@@ -303,8 +298,7 @@ impl PetGpu {
                 },
                 // 有基色的材质:params.x 说明 alpha 怎么解释(1=镂空遮罩,0=线条遮罩)
                 None => MaterialUniform {
-                    // 有基色的材质不用 tint 当固有色,这里借给内部星光的 HDR 主色
-                    tint: rgb(material.inner_color),
+                    tint: [1.0; 4],
                     flow: material.flow_uv,
                     params: [
                         has(material.cutout),

@@ -102,10 +102,6 @@ struct RawMaterial {
     flow_tex: Option<String>,
     #[serde(default = "one")]
     flow_power: f32,
-    #[serde(default)]
-    inner_tex: Option<String>,
-    #[serde(default)]
-    inner_color: Option<[f32; 3]>,
 }
 
 #[derive(Deserialize)]
@@ -165,10 +161,6 @@ pub struct Material {
     /// [u 速度, v 速度, u 平铺, v 平铺] + 混入强度。
     pub flow_uv: [f32; 4],
     pub flow_power: f32,
-    /// 「假半透」族的内部星光:星点图 × HDR 主色,按 `flow_uv` 卷动。
-    /// **与 `flow` 互斥**(共用运行时的第二张贴图槽);全量只有幽星光一族 3 个材质用。
-    pub inner: Option<PathBuf>,
-    pub inner_color: [f32; 3],
 }
 
 /// 特效层(火焰/水壳/光晕)的画法参数,全部来自游戏材质。
@@ -359,8 +351,6 @@ impl Pack {
                                 flow: mat.flow_tex.map(|rel| dir.join(rel)),
                                 flow_uv: mat.flow.unwrap_or([0.0, 0.0, 1.0, 1.0]),
                                 flow_power: mat.flow_power,
-                                inner: mat.inner_tex.map(|rel| dir.join(rel)),
-                                inner_color: mat.inner_color.unwrap_or([1.0; 3]),
                             },
                         )
                     })

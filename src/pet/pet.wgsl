@@ -35,7 +35,7 @@ struct MaterialParams {
     rim_color: vec4<f32>,
     // 半透材质的整体着色
     main_color: vec4<f32>,
-    // [边缘光衰减次数, 色带混入强度, 有没有内部星光, 有没有色带]
+    // [边缘光衰减次数, 色带混入强度, -, 有没有色带]
     extra: vec4<f32>,
 };
 
@@ -44,9 +44,8 @@ struct MaterialParams {
 @group(0) @binding(1) var<storage, read> joints: array<mat4x4<f32>>;
 @group(1) @binding(0) var base_color: texture_2d<f32>;
 @group(1) @binding(1) var base_sampler: sampler;
-// 第二张贴图,三种用途共用(一个材质只会是其中一种):
-// 纯特效层 = 噪声(火焰的流动);有基色的 = 卷动色带(暮星辰环带的渐变)或内部星光(幽星光的身体)。
-// 没有就是 1×1 白图
+// 第二张贴图,两种用途共用(一个材质只会是其中一种):
+// 纯特效层 = 噪声(火焰的流动);有基色的 = 卷动色带(暮星辰环带的渐变)。没有就是 1×1 白图
 @group(1) @binding(2) var noise_tex: texture_2d<f32>;
 @group(1) @binding(3) var<uniform> material: MaterialParams;
 // 星点(身上的细碎星光)与 MatCap(球面反射查找表);没有就是 1×1 白图
@@ -112,8 +111,6 @@ fn vs_outline(input: VsIn) -> VsOut {
 
 /// matcap 图里「算高光」的亮度门槛(见 `matcap_light`)。
 const SPEC_FLOOR: f32 = 0.35;
-/// 内部星光的叠加量:抵掉 `Color02` 那个 HDR 的 15。
-const INNER_GAIN: f32 = 0.06;
 /// 玻璃族高光的叠加量。游戏那边这项还乘着遮罩通道选出来的高光区,我们没有那张遮罩的语义,
 /// 只能整片叠,所以要压一档——满强度叠上去,幽星光那两颗球会泛成一团白。
 const GLASS_GAIN: f32 = 0.35;
@@ -153,14 +150,17 @@ fn matcap_uv(n: vec3<f32>) -> vec2<f32> {
 /// **形状不在 alpha 里。** 共享图 `Tex_PetGlassyStar_004` 是张区域图集:红/橙/黄的随机
 /// 色块、每块中间画一颗浅蓝白的小星,**alpha 恒为 255**。拿 `rgb * a` 当强度等于把整张
 /// 橙色图糊到表面上 —— 暮星辰的裙子从饱和蓝被冲成彩虹糖就是这么来的。
-/// 星芒藏在**蓝减红**里:底色块红橙黄(R 高 B 低),星芒浅蓝白(B 高),相减只剩星芒。
+/// 星芒藏在 **min(r,g,b)** 里:两种星点图的底都是**饱和**的(`Tex_PetGlassyStar_004` 是
+/// 红橙黄色块、「假半透」族那张是纯黑),至少一个通道贴近 0;而星芒是浅色/白的,三通道都高。
+/// 取最小通道于是同时吃下两族,还不碰底。按 `rgb * a` 算过一版,等于把整张橙图糊到表面——
+/// 暮星辰的裙子从饱和蓝被冲成彩虹糖就是那么来的。
 fn star_light(ndc: vec2<f32>) -> vec3<f32> {
     if material.flags.z < 0.5 {
         return vec3<f32>(0.0);
     }
     let uv = vec2<f32>(ndc.x, -ndc.y) * 0.5 * material.star.xy;
     let star = textureSample(star_tex, base_sampler, uv);
-    let glyph = clamp(star.b - star.r, 0.0, 1.0);
+    let glyph = min(star.r, min(star.g, star.b));
     return material.star_color.rgb * star.rgb * glyph;
 }
 
@@ -175,18 +175,6 @@ fn flow_band(uv: vec2<f32>, albedo: vec3<f32>) -> vec3<f32> {
     // 色带整体偏亮(均值 ~0.7),直接乘会压暗固有色,所以按亮度归一化后再按强度混入
     let normalized = band / max(max(band.r, max(band.g, band.b)), 0.001);
     return mix(albedo, albedo * normalized, material.extra.y);
-}
-
-/// 「假半透」族的内部星光:黑底星点图 × HDR 主色(幽星光的身体 `Color02` = (15,15,15)),
-/// 按 `NoiseTilingSpeed` 卷动。游戏里幽星光一族的身体看着半透、内里飘着星星就是这层;
-/// HDR 那个 15 是配着别处的衰减用的,直接乘会糊成一片白,所以压到 `INNER_GAIN`。
-fn inner_sparkle(uv: vec2<f32>) -> vec3<f32> {
-    if material.extra.z < 0.5 {
-        return vec3<f32>(0.0);
-    }
-    let scrolled = uv * material.flow.zw + vec2<f32>(material.flow.x, material.flow.y) * camera.time;
-    let sparkle = textureSample(noise_tex, base_sampler, scrolled).rgb;
-    return material.tint.rgb * sparkle * INNER_GAIN;
 }
 
 /// MatCap 高光。`MatCapColor` 可能是 HDR(暮星辰那两个球是 (3,3,3)),所以直接相乘。
@@ -228,9 +216,10 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
 
     // 固有色:卷动色带 → 整体着色 → 两段明暗 → 纹路提亮(alpha 高的地方比底色亮一档)
     var albedo = flow_band(in.uv, tex.rgb * material.main_color.rgb);
+    var lambert = shade;
     // 加上去的光。星点只轻轻一层;**不透明层不叠 MatCap**——游戏那边靠遮罩通道选择性反射,
     // 无条件叠会把宠物冲白(试过,整只发白),而 toon 着色本身对着截图已经够像。
-    var glow = vec3<f32>(rim) + star_light(in.ndc) * 0.3 + inner_sparkle(in.uv);
+    var glow = vec3<f32>(rim) + star_light(in.ndc) * 0.3;
     var alpha = 1.0;
 
     // **玻璃 / 薄纱**(`MI_P_Object_Trans_*` 族:幽星光那两个球、暮星辰的裙子与球)。
@@ -244,8 +233,12 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         albedo = mix(albedo, material.rim_color.rgb, weight);
         glow += matcap_light(n) * GLASS_GAIN;
         alpha = clamp(material.star.w, 0.0, 1.0);
+        // **玻璃不吃两段明暗。** 它的明暗来自反射(MatCap + 边缘光),不是漫反射;
+        // 而那两颗球是**开口薄壳**(129 顶点、边界 30 条边),自转时露出来的面一直在换,
+        // 硬分成亮/暗两段就让整颗球在 0.72 与 1.0 之间来回跳 —— 那就是「转起来在闪」。
+        lambert = 1.0;
     }
-    let body = albedo * shade * mix(1.0, material.params.y, line);
+    let body = albedo * lambert * mix(1.0, material.params.y, line);
     // 输出预乘 alpha(见 render.rs)。**固有色乘 alpha、加上去的光不乘**:高光/星点/边缘光
     // 是打在表面上的光,半透表面照样该有,乘进去会随着变透明一起消失。
     return vec4<f32>(body * alpha + glow, alpha);

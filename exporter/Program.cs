@@ -440,6 +440,9 @@ FormReport ExportForm(
             $"{form.Asset} 的材质资产在 pak 里全部缺失(疑似未实装的宠物)");
 
     var materials = new List<MaterialEntry>();
+    // 星点平铺:优先用美术在 `StarStickTiling` 里明写的那个,没有才用从「假半透」族推出来的
+    float[]? explicitStarTiling = null;
+    float[]? derivedStarTiling = null;
     foreach (var (name, info) in resolved)
     {
         // 个别槽悬空:不写进材质表,运行时会跳过那一片(总比拿别的贴图硬凑好)
@@ -471,8 +474,13 @@ FormReport ExportForm(
             ExportEffectTexture(info.StarTexture), info.StarTiling, info.StarColor,
             info.MaskIsMatcap ? null : ExportEffectTexture(info.MatcapTexture), info.MatcapColor,
             info.RimColor, info.RimIntensity, info.RimPower, info.MainColor,
-            ExportEffectTexture(info.FlowTexture), info.FlowPower,
-            ExportEffectTexture(info.InnerTexture), info.InnerColor, info.InnerFlow));
+            ExportEffectTexture(info.FlowTexture), info.FlowPower));
+
+        if (info.StarTexture is not null)
+        {
+            if (info.HasExplicitStarTiling) explicitStarTiling ??= info.StarTiling;
+            else derivedStarTiling ??= info.StarTiling;
+        }
 
         string? ExportEffectTexture(string? objectPath)
         {
@@ -481,6 +489,15 @@ FormReport ExportForm(
             return file is null ? null : $"forms/{form.Asset}/tex/{file}";
         }
     }
+
+    // **一个形态只有一份星点遮罩。** 实机里那层星点看着是挂在镜头前的同一张遮罩,
+    // 而各材质自己写的平铺数不一样(暮星辰:裙子 4、身体 2.5),照各自的画就成了
+    // 两种密度叠在一只宠物上。统一取「显式写了 StarStickTiling 的那个」,没有才退而用别的。
+    var starTiling = explicitStarTiling ?? derivedStarTiling;
+    if (starTiling is not null)
+        for (var i = 0; i < materials.Count; i++)
+            if (materials[i].StarTexture is not null)
+                materials[i] = materials[i] with { StarTiling = starTiling };
 
     var bounds = mesh.ImportedBounds;
     return new FormReport(form, written, textures, materials, glb.Length, bounds.BoxExtent.Z * 2f, warnings);
