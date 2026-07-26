@@ -18,6 +18,7 @@
 
 using CUE4Parse.FileProvider;
 using CUE4Parse.FileProvider.Vfs;
+using CUE4Parse.UE4.Assets.Exports;
 using CUE4Parse.UE4.Assets.Exports.Material;
 using CUE4Parse.UE4.Assets.Exports.Texture;
 using CUE4Parse.UE4.Assets.Objects;
@@ -25,6 +26,8 @@ using CUE4Parse.UE4.Objects.Core.Misc;
 using CUE4Parse.UE4.Objects.Core.Math;
 using CUE4Parse.UE4.Objects.Engine;
 using CUE4Parse.UE4.Objects.UObject;
+using CUE4Parse.Utils;
+using System.Text;
 
 namespace RocomPets.Export;
 
@@ -39,8 +42,9 @@ public record RootDefaults(
 
 public static class RootMaterial
 {
-    /// GUID → 参数名。由 `--probe-material ALL` 全量扫实例生成(exporter/data/param-guids.tsv),
-    /// 因为根材质那边名字被剥了、只能靠 GUID 反查。
+    /// GUID → 参数名(**旧路子,已被哈希法取代,留作交叉校验**)。
+    /// 由 `--probe-material ALL` 全量扫实例生成(exporter/data/param-guids.tsv)。
+    /// 局限:只能命名「至少被某个实例覆盖过」的参数 —— M_P_Object_Trans 的 43 个向量里只有 16 个。
     private static readonly Lazy<Dictionary<string, string>> GuidNames = new(() =>
     {
         var map = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
@@ -54,6 +58,45 @@ public static class RootMaterial
         }
         return map;
     });
+
+    /// **参数名哈希**:`CachedExpressionData` 里名字被剥成了 `NameHashes`,但包的名字表是全的 ——
+    /// 把名字表里每个名字哈希一遍反查即可,不再受 GUID 桥的覆盖率限制。
+    ///
+    /// 算法是实测反推出来的:`CityHash64WithSeed(名字的大写 ASCII, 0)`。
+    /// 用 8 组已知 (名字, 哈希) 对暴力搜出来的,再在 M_P_Object_Trans 上验证:
+    /// 205 个参数里 **204 个**反查出名字(99.5%)。哈希**跨材质稳定**
+    /// (M_P_Object_Trans 与 M_P_Object 共享 195/205),所以是内容哈希、可移植。
+    ///
+    /// 注意 `CityHash64WithSeed(x, 0)` 与 `CityHash64(x)` **不是一回事**(CityHash 里是两条码路),
+    /// 而且大小写必须转大写 —— 这两点错任何一个都全不中。
+    ///
+    /// 反推完才发现 CUE4Parse 自己就有同一份实现(`HashedNamesProvider.TryAdd`),连
+    /// `Name_N` 后缀那条分支都在(FName 的 Number:`seed = index + 1`)—— 这里照它写。
+    private static ulong NameHash(string name)
+    {
+        var cut = name.LastIndexOf('_');
+        if (cut > 0 && int.TryParse(name.AsSpan(cut + 1), out var index) && index >= 0
+            && (index != 0 || name.Length - cut == 2) && name[cut + 1] != '0')
+        {
+            return CityHash.CityHash64WithSeed(
+                Encoding.UTF8.GetBytes(name[..cut].ToUpperInvariant()), (ulong) (index + 1));
+        }
+        return CityHash.CityHash64WithSeed(Encoding.UTF8.GetBytes(name.ToUpperInvariant()), 0);
+    }
+
+    /// 用包的名字表反查 `NameHashes`:名字表里每个名字哈希一遍,建 哈希 → 名字。
+    private static Dictionary<ulong, string> HashedNames(UObject root)
+    {
+        var map = new Dictionary<ulong, string>();
+        if (root.Owner is not { } pkg) return map;
+        foreach (var entry in pkg.NameMap)
+        {
+            var s = entry.Name;
+            if (string.IsNullOrEmpty(s)) continue;
+            map.TryAdd(NameHash(s), s);
+        }
+        return map;
+    }
 
     private static readonly Dictionary<string, RootDefaults> Cache = new(StringComparer.OrdinalIgnoreCase);
 
@@ -99,13 +142,22 @@ public static class RootMaterial
         var vectors = new Dictionary<string, float[]>(StringComparer.OrdinalIgnoreCase);
         var scalars = new Dictionary<string, float>(StringComparer.OrdinalIgnoreCase);
 
+        // 名字优先走**哈希反查**(覆盖全),对不上再退回 GUID 桥(只覆盖被实例覆盖过的)。
+        var hashed = HashedNames(root);
         void Fill<T>(int group, IReadOnlyList<T> values, Action<string, T> add)
         {
             if (group >= entries.Length || entries[group] is null) return;
-            var guids = entries[group]!.GetOrDefault<FGuid[]>("ExpressionGuids", []);
-            for (var i = 0; i < guids.Length && i < values.Count; i++)
-                if (GuidNames.Value.TryGetValue(guids[i].ToString(), out var name))
-                    add(name, values[i]);
+            var e = entries[group]!;
+            var hashes = e.GetOrDefault<ulong[]>("NameHashes", []);
+            var guids = e.GetOrDefault<FGuid[]>("ExpressionGuids", []);
+            for (var i = 0; i < values.Count; i++)
+            {
+                string? name = null;
+                if (i < hashes.Length) hashed.TryGetValue(hashes[i], out name);
+                if (name is null && i < guids.Length)
+                    GuidNames.Value.TryGetValue(guids[i].ToString(), out name);
+                if (name is not null) add(name, values[i]);
+            }
         }
 
         Fill(0, cached.GetOrDefault<float[]>("ScalarValues", []), (n, v) => scalars.TryAdd(n, v));

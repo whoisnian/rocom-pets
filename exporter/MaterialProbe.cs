@@ -14,6 +14,7 @@ using CUE4Parse.UE4.Assets.Exports.Material;
 using CUE4Parse.UE4.Assets.Exports.SkeletalMesh;
 using CUE4Parse.UE4.Assets.Objects;
 using CUE4Parse.UE4.Assets.Objects.Properties;
+using CUE4Parse.UE4.Objects.Core.Math;
 
 namespace RocomPets.Export;
 
@@ -252,6 +253,11 @@ public static class MaterialProbe
         if (asset.Contains('/'))
         {
             var obj = provider.LoadPackageObject(asset);
+            if (Environment.GetEnvironmentVariable("PROBE_HASHES") is not null)
+            {
+                DumpParameterHashes(obj);
+                return;
+            }
             Console.WriteLine($"=== {obj.Name}({obj.ExportType})的原始属性树");
             DumpProperties(obj, "  ");
             return;
@@ -421,5 +427,45 @@ public static class MaterialProbe
         if (s is null) return "(null)";
         s = s.Replace('\n', ' ');
         return s.Length > 110 ? s[..110] + "…" : s;
+    }
+
+    /// 打印根材质 `CachedExpressionData` 里每组参数的 `(下标, NameHash, 默认值)`。
+    ///
+    /// **为什么要 NameHash**:cooked 包把参数名剥成了哈希(`ParameterInfos` 是空壳)。
+    /// 但包的名字表里名字是全的 —— 把名字逐个哈希去对,就能把整组参数命名,
+    /// 不再受 GUID 桥覆盖率的限制(GUID 桥只能命名「至少被某个实例覆盖过」的参数)。
+    /// 值必须从这里打(C# 侧是完整浮点):属性树的 hex 转储是 8 位有损的,
+    /// `StarColor` 的 (0.33, 0.67, **2.0**) 根本存不下。
+    private static void DumpParameterHashes(UObject root)
+    {
+        var cached = root.GetOrDefault<FStructFallback>("CachedExpressionData")
+            ?.GetOrDefault<FStructFallback>("Parameters");
+        if (cached is null)
+        {
+            Console.Error.WriteLine("没有 CachedExpressionData.Parameters");
+            return;
+        }
+        var entries = cached.Properties
+            .Where(p => p.Name.Text == "RuntimeEntries")
+            .OrderBy(p => p.ArrayIndex)
+            .Select(p => p.Tag?.GetValue(typeof(FStructFallback)) as FStructFallback)
+            .ToArray();
+        var scalars = cached.GetOrDefault<float[]>("ScalarValues", []);
+        var vectors = cached.GetOrDefault<FLinearColor[]>("VectorValues", []);
+        Console.WriteLine($"=== {root.Name} 的参数哈希(组 0=标量 1=向量 2=贴图)");
+        for (var g = 0; g < entries.Length; g++)
+        {
+            if (entries[g] is not { } e) continue;
+            var hashes = e.GetOrDefault<ulong[]>("NameHashes", []);
+            Console.WriteLine($"--- 组 {g}:{hashes.Length} 条");
+            for (var i = 0; i < hashes.Length; i++)
+            {
+                var val = g == 0 && i < scalars.Length ? $"{scalars[i]:0.####}"
+                    : g == 1 && i < vectors.Length
+                        ? $"({vectors[i].R:0.####}, {vectors[i].G:0.####}, {vectors[i].B:0.####}, {vectors[i].A:0.####})"
+                        : "";
+                Console.WriteLine($"  [{i,3}] {hashes[i],22} {val}");
+            }
+        }
     }
 }

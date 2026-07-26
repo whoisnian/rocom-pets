@@ -148,9 +148,13 @@ const STAR_TILE_SCALE: f32 = 3.0;
 /// 球内星点的整体强度。汇编里这项是 `cb5[62].z`(未解出名字);根材质有个语义对得上的
 /// `StarIntensity` = 1,所以取 1。
 const INTERIOR_GAIN: f32 = 1.0;
-/// 星场的平铺标量(汇编里的 `cb5[61].y`,未解出名字)。根材质有个语义对得上的
-/// `StarTiling` = 0.4 —— 值越小采样范围越窄、星点看着越大。
+/// 星场的平铺标量(汇编里的 `cb5[61].y`)。根材质默认 `StarTiling` = 0.4 ——
+/// 值越小采样范围越窄、星点看着越大。**名字现在是查实的**:根材质 `CachedExpressionData`
+/// 的 `NameHashes` 可以用 `CityHash64WithSeed(名字大写, 0)` 反查(见 RootDefaults.cs),
+/// 139 个标量默认值全部有名字,不再靠语义猜。
 const STAR_FIELD_TILING: f32 = 0.4;
+/// 三向投影权重的次数:根材质 `StarTriPlannarBlendInt` = 2。
+const STAR_TRIPLANAR_BLEND: f32 = 2.0;
 /// 玻璃族 MatCap 高光的叠加量。游戏那边这项还乘着遮罩通道选出来的高光区,我们没有那张遮罩的
 /// 语义,只能整片叠,所以要压一档——满强度叠上去,幽星光那两颗球会泛成一团白。
 const GLASS_MATCAP_GAIN: f32 = 0.35;
@@ -276,8 +280,10 @@ fn interior_star(start: vec3<f32>, n: vec3<f32>, forward: vec3<f32>) -> f32 {
     // 取 1 时星点比实机小得多(用户实测「太小」)。
     let p = (start + dir * march) * (STAR_FIELD_TILING / max(half_extent, 0.0001));
 
-    // 三向投影:权重取 |法线| 的高次,归一化
-    let w = pow(abs(n), vec3<f32>(8.0));
+    // 三向投影:权重取 |法线| 的高次,归一化。次数用根材质里那个**有名字**的
+    // `StarTriPlannarBlendInt` = 2(汇编里对应 `pow(|v3.yzw|, cb5[63].y)` 再归一化)。
+    // 原来写死 8 是猜的 —— 8 让权重过于偏向单一轴,三个面几乎不混。
+    let w = pow(abs(n), vec3<f32>(STAR_TRIPLANAR_BLEND));
     let wn = w / max(w.x + w.y + w.z, 0.001);
     let s = textureSample(interior_tex, base_sampler, p.yz) * wn.x
         + textureSample(interior_tex, base_sampler, p.xz) * wn.y
