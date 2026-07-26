@@ -440,9 +440,10 @@ FormReport ExportForm(
             $"{form.Asset} 的材质资产在 pak 里全部缺失(疑似未实装的宠物)");
 
     var materials = new List<MaterialEntry>();
-    // 星点平铺:优先用美术在 `StarStickTiling` 里明写的那个,没有才用从「假半透」族推出来的
-    float[]? explicitStarTiling = null;
-    float[]? derivedStarTiling = null;
+    // 这个形态的星点遮罩(见下面统一那一段):优先用「假半透」族给的那张,它是宠物自己的
+    // 星点图(幽星光一族 = `T_Ill_XingGuang1_001_Fx_D`);没有才退用共享的 `StarStickTex`。
+    (string Tex, float[] Tiling, float[]? Color)? starLayer = null;
+    var starFromFakeTrans = false;
     foreach (var (name, info) in resolved)
     {
         // 个别槽悬空:不写进材质表,运行时会跳过那一片(总比拿别的贴图硬凑好)
@@ -476,10 +477,11 @@ FormReport ExportForm(
             info.RimColor, info.RimIntensity, info.RimPower, info.MainColor,
             ExportEffectTexture(info.FlowTexture), info.FlowPower));
 
-        if (info.StarTexture is not null)
+        if (info.StarTexture is not null && ExportEffectTexture(info.StarTexture) is { } starTex
+            && (starLayer is null || (info.IsFakeTrans && !starFromFakeTrans)))
         {
-            if (info.HasExplicitStarTiling) explicitStarTiling ??= info.StarTiling;
-            else derivedStarTiling ??= info.StarTiling;
+            starLayer = (starTex, info.StarTiling, info.StarColor);
+            starFromFakeTrans = info.IsFakeTrans;
         }
 
         string? ExportEffectTexture(string? objectPath)
@@ -490,14 +492,20 @@ FormReport ExportForm(
         }
     }
 
-    // **一个形态只有一份星点遮罩。** 实机里那层星点看着是挂在镜头前的同一张遮罩,
-    // 而各材质自己写的平铺数不一样(暮星辰:裙子 4、身体 2.5),照各自的画就成了
-    // 两种密度叠在一只宠物上。统一取「显式写了 StarStickTiling 的那个」,没有才退而用别的。
-    var starTiling = explicitStarTiling ?? derivedStarTiling;
-    if (starTiling is not null)
+    // **一个形态只有一份星点遮罩,而且盖在整只宠物上。** 实机里那层星点是挂在镜头前的
+    // 一张遮罩投到宠物身上(见 docs/design.md §1),不是各材质各画一份:
+    // 各材质自己写的贴图与平铺数并不一致(暮星辰:裙子是共享的 `Tex_PetGlassyStar_004` 4×4、
+    // 身体是自己的 `Fx_D` 1.8×1.8),照各自的画就成了两种星点两种密度叠在一只宠物上。
+    // 那两颗球身上的星星也是这么来的 —— 球的基色在图集里是**一片平色圆盘**,
+    // 星形完全来自这层遮罩(所以幽星光一颗球是星、另一颗是圆点:各自压在遮罩的不同格上)。
+    if (starLayer is { } star)
         for (var i = 0; i < materials.Count; i++)
-            if (materials[i].StarTexture is not null)
-                materials[i] = materials[i] with { StarTiling = starTiling };
+            materials[i] = materials[i] with
+            {
+                StarTexture = star.Tex,
+                StarTiling = star.Tiling,
+                StarColor = star.Color,
+            };
 
     var bounds = mesh.ImportedBounds;
     return new FormReport(form, written, textures, materials, glb.Length, bounds.BoxExtent.Z * 2f, warnings);

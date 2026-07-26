@@ -153,7 +153,11 @@ public static class Manifest
                         if (mat.MatcapColor is { } mc)
                             parts.Add($"matcap_color = [{Num(mc[0])}, {Num(mc[1])}, {Num(mc[2])}]");
                     }
-                    if (mat.RimIntensity > 0 && mat.RimColor is { } rc)
+                    // **只认 `Rim Intensity` 大于 1 的。** 这一族的强度普遍写着 1,那更像是
+                    // 「没动过的默认值」而不是「开了边缘光」:曜星光那两颗球写着强度 1 + 绿色
+                    // `Rim LightColor`,实机里它们是橙的和紫的,照着画怎么都不对。
+                    // 全量 946 个带边缘光的材质里只有 3 个强度大于 1(暮星辰的裙子 = 3,青色边)。
+                    if (mat.RimIntensity > 1 && mat.RimColor is { } rc)
                     {
                         parts.Add($"rim_color = [{Num(rc[0])}, {Num(rc[1])}, {Num(rc[2])}]");
                         parts.Add($"rim_intensity = {Num(mat.RimIntensity)}");
