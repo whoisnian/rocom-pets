@@ -57,7 +57,10 @@ public record MaterialEntry(
     string? InteriorTexture,
     float[]? InteriorColor,
     float Refraction,
-    float RefractDepth);
+    float RefractDepth,
+    /// 球内那颗星的闪烁:速度与次数(见 MaterialInfo.FlickerSpeed)。
+    float FlickerSpeed,
+    float FlickerPower);
 
 public record FormReport(
     Form Form,
@@ -189,6 +192,7 @@ public static class Manifest
                             parts.Add($"interior_color = [{Num(ic[0])}, {Num(ic[1])}, {Num(ic[2])}]");
                         parts.Add($"refraction = {Num(mat.Refraction)}");
                         parts.Add($"refract_depth = {Num(mat.RefractDepth)}");
+                        parts.Add($"flicker = [{Num(mat.FlickerSpeed)}, {Num(mat.FlickerPower)}]");
                     }
                     // 每个键只许出现一次:重复键 TOML 直接解析失败(opacity/flow 都踩过)
                     parts.Add($"opacity = {Num(mat.Opacity)}");

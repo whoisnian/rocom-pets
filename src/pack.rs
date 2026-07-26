@@ -108,11 +108,15 @@ struct RawMaterial {
     #[serde(default)]
     mask_id_range: Option<[f32; 2]>,
     #[serde(default)]
+    flicker: Option<[f32; 2]>,
+    #[serde(default)]
     interior_tex: Option<String>,
     #[serde(default)]
     interior_color: Option<[f32; 3]>,
     #[serde(default = "one")]
     refraction: f32,
+    #[serde(default)]
+    refract_depth: f32,
 }
 
 #[derive(Deserialize)]
@@ -183,11 +187,13 @@ pub struct Material {
     pub interior: Option<PathBuf>,
     pub interior_color: [f32; 3],
     /// 折射率(材质里的 `GlobalRefraction` = 1.3)。
-    ///
-    /// manifest 里还有个 `refract_depth`(= `GlobalDepth` = 100),**这里故意不读**:
-    /// 实机那个 100 是配着它自己那套归一化用的,我们按包围盒最长边缩放,深度是对着截图
-    /// 手挑的(见 gpu.rs)。留在 manifest 里是当材质记录,别当成运行时参数。
     pub refraction: f32,
+    /// march 深度(`GlobalDepth` = 100)。**量纲是从汇编定出来的**:
+    /// `marchDist = |半包围盒| × 0.01 × GlobalDepth` —— 代 100 进去正好等于 `|半包围盒|`。
+    /// 以前这里故意不读、在 gpu.rs 里写死 0.4「对着截图挑的」,现在按汇编算。
+    pub refract_depth: f32,
+    /// 球内那颗星的闪烁:[速度, 次数](`FlickerSpeed`/`FlickerPower`)。
+    pub flicker: [f32; 2],
 }
 
 /// 特效层(火焰/水壳/光晕)的画法参数,全部来自游戏材质。
@@ -383,6 +389,8 @@ impl Pack {
                                 interior: mat.interior_tex.map(|rel| dir.join(rel)),
                                 interior_color: mat.interior_color.unwrap_or([1.0; 3]),
                                 refraction: mat.refraction,
+                                refract_depth: mat.refract_depth,
+                                flicker: mat.flicker.unwrap_or([0.3, 5.0]),
                             },
                         )
                     })

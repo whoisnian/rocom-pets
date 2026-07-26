@@ -494,7 +494,7 @@ FormReport ExportForm(
             ExportEffectTexture(info.FlowTexture), info.FlowPower,
             ExportEffectTexture(info.MaskIdTexture), info.MaskIdRange,
             ExportEffectTexture(info.InteriorTexture), info.InteriorColor,
-            info.Refraction, info.RefractDepth));
+            info.Refraction, info.RefractDepth, info.FlickerSpeed, info.FlickerPower));
 
         if (info.StarTexture is not null && ExportEffectTexture(info.StarTexture) is { } starTex
             && (starLayer is null || (info.IsFakeTrans && !starFromFakeTrans)))

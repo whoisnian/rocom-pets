@@ -47,9 +47,9 @@ struct MaterialUniform {
     rim_color: [f32; 4],
     /// [边缘光衰减次数, 色带混入强度, -, 有色带(0/1)]
     extra: [f32; 4],
-    /// 玻璃内部那层:[折射率, march 深度, -, 有内部层(0/1)]
+    /// 玻璃内部那层:[折射率, GlobalDepth, 闪烁速度, 有内部层(0/1)]
     interior: [f32; 4],
-    /// 内部星光着色(rgb,HDR)
+    /// 内部星光着色(rgb,HDR)+ 闪烁次数(a)
     interior_color: [f32; 4],
     /// 模型包围盒:最小角 + 尺寸(w = 最长边)
     bounds_min: [f32; 4],
@@ -319,10 +319,12 @@ impl PetGpu {
             let interior = |m: &super::model::Material| {
                 [
                     m.refraction,
-                    // 实机的 march 深度是 100 配着别处的归一化用的,这里按包围盒归一化后
-                    // 再缩到一个可用的量级(0.35 是对着实机截图挑的)
-                    if m.interior.is_some() { 0.4 } else { 0.0 },
-                    0.0,
+                    // **march 深度按汇编算,不再手挑。** 汇编里是
+                    // `marchDist = |半包围盒| × 0.01 × GlobalDepth`,这里传 GlobalDepth(=100),
+                    // 那个 0.01 与包围盒的部分在 shader 里做(它才有包围盒)。
+                    m.refract_depth,
+                    // 闪烁速度(`FlickerSpeed`);次数走 interior_color.a
+                    m.flicker[0],
                     has(m.interior.is_some()),
                 ]
             };
@@ -362,7 +364,12 @@ impl PetGpu {
                     rim_color: rgb(material.rim_color),
                     extra: extra(material),
                     interior: interior(material),
-                    interior_color: rgb(material.interior_color),
+                    interior_color: [
+                        material.interior_color[0],
+                        material.interior_color[1],
+                        material.interior_color[2],
+                        material.flicker[1],
+                    ],
                     bounds_min: bmin,
                     bounds_size: bsize,
                     mask_id: mask_id(material),
@@ -412,7 +419,12 @@ impl PetGpu {
                     rim_color: rgb(material.rim_color),
                     extra: extra(material),
                     interior: interior(material),
-                    interior_color: rgb(material.interior_color),
+                    interior_color: [
+                        material.interior_color[0],
+                        material.interior_color[1],
+                        material.interior_color[2],
+                        material.flicker[1],
+                    ],
                     bounds_min: bmin,
                     bounds_size: bsize,
                     mask_id: mask_id(material),

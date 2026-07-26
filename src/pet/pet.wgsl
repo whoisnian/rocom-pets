@@ -35,9 +35,9 @@ struct MaterialParams {
     rim_color: vec4<f32>,
     // [边缘光衰减次数, 色带混入强度, -, 有没有色带]
     extra: vec4<f32>,
-    // 玻璃内部那层:[折射率, march 深度, -, 有没有内部层]
+    // 玻璃内部那层:[折射率, GlobalDepth, 闪烁速度, 有没有内部层]
     interior: vec4<f32>,
-    // 内部星光的着色(rgb,HDR)
+    // 内部星光的着色(rgb,HDR)+ 闪烁次数(a)
     interior_color: vec4<f32>,
     // 模型包围盒:最小角(xyz)与尺寸(w 存最长边),内部层要拿它把位置归一化
     bounds_min: vec4<f32>,
@@ -128,14 +128,9 @@ fn vs_outline(input: VsIn) -> VsOut {
 
 /// 星点遮罩的额外平铺倍率(见 `star_light`)。
 const STAR_TILE_SCALE: f32 = 3.0;
-/// 内部星层的卷动速度与叠加量。速度实机来自一个 cb 向量参数(槽位还没对上名字),
-/// 亮度那边 `StarColor` 是 HDR 的 (0.33, 0.67, 2),直接乘会过曝。
-const INTERIOR_SPEED: f32 = 0.03;
-const INTERIOR_GAIN: f32 = 1.6;
-/// 内部星场的平铺。**必须远大于 1**:位置是按整只宠物的包围盒归一化的,而那两颗球的直径
-/// 只有包围盒最长边的 0.2 上下 —— 平铺 1 时一整颗球只摊到星场的一个格子上,
-/// 出来就是「一颗被拉伸的星贴在表面」而不是「球里有颗星」。
-const INTERIOR_TILING: f32 = 1.0;
+/// 球内星点的整体强度。汇编里这项是 `cb5[62].z`(未解出名字);根材质有个语义对得上的
+/// `StarIntensity` = 1,所以取 1。
+const INTERIOR_GAIN: f32 = 1.0;
 /// 玻璃族 MatCap 高光的叠加量。游戏那边这项还乘着遮罩通道选出来的高光区,我们没有那张遮罩的
 /// 语义,只能整片叠,所以要压一档——满强度叠上去,幽星光那两颗球会泛成一团白。
 const GLASS_MATCAP_GAIN: f32 = 0.35;
@@ -227,13 +222,16 @@ fn flow_band(uv: vec2<f32>, albedo: vec3<f32>) -> vec3<f32> {
 /// 于是球看着像「里面飘着一颗星」,而且那颗星**自己在动、与球的自转无关** —— 正是实机观感。
 /// 这一层只给玻璃族(静态开关 `是否使用MatCap` 开着的那 17 个材质)。
 ///
-/// **是近似不是复刻**:游戏那边还有第二张三向投影贴图、两段 `pow` 相位曲线、以及一个按
-/// 高度做的两色渐变当固有色;这里只取「折射 + 三向投影星场 + 时间」这条主干。
+/// **返回强度(标量),不带颜色。** 汇编里星场的采样结果是个标量,颜色是另外几个 cb 槽
+/// 给的(`星点底色 + 强度 × 星点亮色`,再与按高度 lerp 的那对颜色混)。分开才对得上。
+///
+/// **是近似不是复刻**:游戏那边还有第二张三向投影贴图、两段 `pow` 相位曲线、以及那对按
+/// 高度做的渐变色;这里只取「折射 + 三向投影星场 + 时间」这条主干。
 /// 卷动速度实机是个 cb 里的向量参数,而 cb 槽位与参数名的对应还没解出来(§1),
 /// 所以先用一个定值。
-fn interior_star(start: vec3<f32>, n: vec3<f32>) -> vec3<f32> {
+fn interior_star(start: vec3<f32>, n: vec3<f32>) -> f32 {
     if material.interior.w < 0.5 {
-        return vec3<f32>(0.0);
+        return 0.0;
     }
     let forward = normalize(vec3<f32>(camera.view_proj[0][2], camera.view_proj[1][2], camera.view_proj[2][2]));
     // refract():WGSL 没有内建,照 Snell 写。eta 取 1/折射率(空气 → 介质)
@@ -241,20 +239,39 @@ fn interior_star(start: vec3<f32>, n: vec3<f32>) -> vec3<f32> {
     let cosi = dot(n, forward);
     let k = 1.0 - eta * eta * (1.0 - cosi * cosi);
     if k < 0.0 {
-        return vec3<f32>(0.0);   // 全内反射
+        return 0.0;   // 全内反射
     }
     let dir = eta * forward - (eta * cosi + sqrt(k)) * n;
 
-    // 起点是顶点里带的 (UV1.xy, UV2.x),沿折射线走一段
-    let p = (start + dir * material.interior.y) * INTERIOR_TILING;
+    // **march 距离与平铺照汇编算,不再手挑。** 汇编(fx1/34529.asm 63..78):
+    //   halfExtent = 0.5 * |包围盒尺寸|
+    //   marchDist  = halfExtent * 0.01 * GlobalDepth        ← 代 100 进去正好 = halfExtent
+    //   tiling     = <一个 cb 标量> / halfExtent            ← 那个标量取 1(中性),名字未解出
+    //   p = (start + 折射方向 * marchDist) * tiling
+    // 于是 p = start/halfExtent + 折射方向 —— 折射方向是单位向量,所以每颗球看到的是
+    // 星场里以某点为心、约一格大小的一块,这正是「每颗球稳定居中一颗星」的机制。
+    let half_extent = 0.5 * length(material.bounds_size.xyz);
+    let march = half_extent * 0.01 * material.interior.y;
+    let p = (start + dir * march) / max(half_extent, 0.0001);
+
     // 三向投影:权重取 |法线| 的高次,归一化
     let w = pow(abs(n), vec3<f32>(8.0));
     let wn = w / max(w.x + w.y + w.z, 0.001);
-    let drift = camera.time * INTERIOR_SPEED;
-    let a = textureSample(interior_tex, base_sampler, p.yz + drift).a * wn.x
-        + textureSample(interior_tex, base_sampler, p.xz + drift).a * wn.y
-        + textureSample(interior_tex, base_sampler, p.xy + drift).a * wn.z;
-    return material.interior_color.rgb * a * INTERIOR_GAIN;
+    let s = textureSample(interior_tex, base_sampler, p.yz) * wn.x
+        + textureSample(interior_tex, base_sampler, p.xz) * wn.y
+        + textureSample(interior_tex, base_sampler, p.xy) * wn.z;
+
+    // **星点不是在移动、是在闪。** 汇编(同上 89..106):
+    //   phase = frac(FlickerSpeed * 时间 + 星场.G)      ← 每颗星的相位来自 G 通道
+    //   闪    = -1.2 * |sin(2π * phase)|^FlickerPower   ← 注意是**减**
+    //   形状  = pow(星场.B, q)                          ← q 是未解出的 cb 标量,取 1
+    //   强度  = saturate((形状 + 闪) * 星场.A * 强度)
+    // 通道语义与贴图实测一致(T_EMeng003:G 均 0.328 且分散 = 相位;B 87% 为零 + 稀疏亮核
+    // = 形状;A 是星形遮罩)。所以星是一明一暗地闪,而不是整片飘 —— 原来那版按时间卷动 UV
+    // 是**猜的**,那会让星在球里滑动。
+    let phase = fract(material.interior.z * camera.time + s.g);
+    let twinkle = -1.2 * pow(abs(sin(phase * 6.28318548)), material.interior_color.w);
+    return saturate((s.b + twinkle) * s.a * INTERIOR_GAIN);
 }
 
 /// MatCap 高光。`MatCapColor` 可能是 HDR(暮星辰那两个球是 (3,3,3)),所以直接相乘。
@@ -317,7 +334,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     // (26,26,124),暗了三倍。另外静态开关 `GlassySwitch` 全库一个没开,而 `MainColor`
     // 属于那条 glassy 通路 —— 两边都指向「这一乘是多余的」。
     // 纯特效层的主色仍走 `tint`(那些材质压根没有基色贴图),不受影响。
-    let albedo = flow_band(in.uv, tex.rgb);
+    var albedo = flow_band(in.uv, tex.rgb);
     // 加上去的光。星点只轻轻一层;**不透明层不叠 MatCap**——游戏那边靠遮罩通道选择性反射,
     // 无条件叠会把宠物冲白(试过,整只发白),而 toon 着色本身对着截图已经够像。
     //
@@ -343,8 +360,15 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         // 相加会让高光与边缘光在轮廓处叠成一圈白边;取 max 则是「哪层亮听哪层」。
         glow += max(matcap_light(n) * GLASS_MATCAP_GAIN,
                     material.rim_color.rgb * pow(facing, material.extra.x) * material.star.z
-                        * GLASS_RIM_GAIN)
-            + interior_star(in.interior_pos, n);
+                        * GLASS_RIM_GAIN);
+        // **球内那颗星是「混进固有色」,不是加在上面。** 汇编最后一步是
+        // `out = lerp(基色 × 明暗色, 发光层色, 混合系数)`(fx1/34529.asm ⑥,见 design.md §1),
+        // 而发光层色 = `星点底色 + 星点强度 × 星点亮色`,再与「按物体空间高度 lerp 的那对颜色」混。
+        // 我们只拿到其中的 `StarColor`(根默认 (0.33,0.67,2) 的 HDR 蓝),底色那两对与混合
+        // 系数都是还没解出名字的 cb 槽位,所以这里退化成「按星点强度往 StarColor 混」——
+        // 结构照汇编(lerp 而不是相加),缺的那几项当成中性。
+        albedo = mix(albedo, material.interior_color.rgb,
+                     saturate(interior_star(in.interior_pos, n)));
         // 玻璃族自身的整体不透明度;`alpha_is_opacity` 的材质已经从基色 alpha 拿到了,别覆盖
         if !alpha_is_opacity {
             alpha = clamp(material.star.w, 0.0, 1.0);

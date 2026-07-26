@@ -231,13 +231,9 @@ public record MaterialInfo(
     /// 而它的 shader 反汇编下来是**完全另一套**:223 行、4 张贴图、`N·L` + 遮罩 →
     /// 一维 `RampTex` 行查(采样 v 是常数 1/256),既没有折射也没有三向投影。
     /// 拿同一套画法套上去是错的 —— 按「父链里有」判会把它也算进来(踩过)。
-    /// **暂时不导出:实机没有的「区域白闪」。** 采样是视线相关的,宠物一转,那个圆盘就在
-    /// 星场里扫过去 —— 扫到亮星就是一块白斑闪一下。起点(见上)已经查实,但深度标量的真实
-    /// 含义、三向投影的平铺、起点该怎么缩放这三个还是没解出来的 cb 槽位问题,凑不出稳定结果。
-    /// 把 `InteriorTextureWhenSolved` 改回 `InteriorTexture` 即可重新开启。
-    public string? InteriorTexture => null;
-
-    private string? InteriorTextureWhenSolved =>
+    /// ~~曾因「区域白闪」关掉过~~ **已重新开启**:那个白闪的根因是上游把切线写进了 NORMAL
+    /// (见 docs/design.md 法线那条),不是这一层的问题 —— 法线修好后它就稳了。
+    public string? InteriorTexture =>
         ParentChain.FirstOrDefault() == "MI_P_Object_Trans_MatCap"
             ? RootDefaults?.Textures.GetValueOrDefault("StarTex")
             : null;
@@ -246,10 +242,28 @@ public record MaterialInfo(
     public float[]? InteriorColor =>
         FirstVector("StarColor") ?? RootDefaults?.Vectors.GetValueOrDefault("StarColor");
 
-    /// 折射率与 march 深度。这两个每个宠物材质都写着(1.3 / 100),之前一直没用上。
+    /// 折射率与 march 深度。这两个每个宠物材质都写着(1.3 / 100)。
+    ///
+    /// **`GlobalDepth` 的量纲是从汇编定出来的**:`marchDist = |半包围盒| × 0.01 × GlobalDepth`,
+    /// 代 100 进去正好等于 `|半包围盒|` —— 那个 0.01 的配合是这个槽位就是 `GlobalDepth` 的强证据。
     public float Refraction => Scalar("GlobalRefraction", 1f);
 
     public float RefractDepth => Scalar("GlobalDepth", 0f);
+
+    /// **球内那颗星的闪烁**:汇编里是 `pow(星场.B, q) - 1.2 × |sin(2π × frac(速度×时间 + 星场.G))|^p`,
+    /// 再乘星场的 A(星形遮罩)。也就是说**星点不是在移动、是在一明一暗地闪**,
+    /// 而每颗星的相位来自贴图的 G 通道(实测 T_EMeng003 的 G 均值 0.328、取值分散,正合此用)。
+    ///
+    /// 速度与次数取根材质里**语义对得上的命名默认值**:`FlickerSpeed` = 0.3、`FlickerPower` = 5。
+    /// 这是语义匹配,不是靠 cb 槽位证实的(槽位↔参数名还没打通,见 docs/design.md)。
+    public float FlickerSpeed => RootScalar("FlickerSpeed", 0.3f);
+
+    public float FlickerPower => RootScalar("FlickerPower", 5f);
+
+    private float RootScalar(string name, float fallback) =>
+        Scalars.TryGetValue(name, out var v) ? v
+        : RootDefaults?.Scalars.TryGetValue(name, out var r) == true ? r
+        : fallback;
 
     /// 边缘光的衰减次数:`pow(1 - N·V, RimPower)`。**小于 1 就不是「一圈边」而是整片泛色**——
     /// 幽星光那两个球是 0.35,整颗都透着红,只写 RimColor 不写这个会画成一圈细红边。

@@ -82,6 +82,9 @@ pub struct Material {
     pub interior: Option<Image>,
     pub interior_color: [f32; 3],
     pub refraction: f32,
+    /// march 深度(`GlobalDepth`)与闪烁 [速度, 次数];量纲见 `pack::Material`。
+    pub refract_depth: f32,
+    pub flicker: [f32; 2],
     /// 特效层的画法(火焰/水壳/光晕)。`None` = 普通不透明材质,走主通道。
     pub effect: Option<EffectMaterial>,
 }
@@ -389,6 +392,8 @@ impl Model {
                     interior: spec.interior.as_deref().and_then(|p| load_texture(p, true)),
                     interior_color: spec.interior_color,
                     refraction: spec.refraction,
+                    refract_depth: spec.refract_depth,
+                    flicker: spec.flicker,
                     effect,
                 });
                 materials.len() - 1
