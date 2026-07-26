@@ -302,6 +302,16 @@ public static class MaterialProbe
                 Console.WriteLine($"    col {param,-20} = ({c[0]:0.###}, {c[1]:0.###}, {c[2]:0.###}, {c[3]:0.###})");
             foreach (var (param, v) in info.Scalars.OrderBy(kv => kv.Key))
                 Console.WriteLine($"    num {param,-20} = {v:0.####}");
+            // 根材质的默认值:实例与中间层都没覆盖的那些参数(顺父链看不到,见 RootDefaults.cs)
+            if (info.RootDefaults is { } rd)
+            {
+                foreach (var (param, tex) in rd.Textures.OrderBy(kv => kv.Key))
+                    if (!info.Textures.ContainsKey(param))
+                        Console.WriteLine($"    根tex {param,-18} → {tex}");
+                foreach (var (param, c) in rd.Vectors.OrderBy(kv => kv.Key))
+                    if (!info.Vectors.ContainsKey(param))
+                        Console.WriteLine($"    根col {param,-18} = ({c[0]:0.###}, {c[1]:0.###}, {c[2]:0.###}, {c[3]:0.###})");
+            }
         }
         foreach (var w in warnings) Console.WriteLine($"  [warn] {w}");
 

@@ -49,7 +49,12 @@ public record MaterialEntry(
     float[]? MainColor,
     /// 卷动色带:渐变图 + 混入强度(暮星辰的环带靠它出青↔粉渐变)。
     string? FlowTexture,
-    float FlowPower);
+    float FlowPower,
+    /// 玻璃内部那颗星:四角星场贴图 + 着色 + 折射率 + march 深度。
+    string? InteriorTexture,
+    float[]? InteriorColor,
+    float Refraction,
+    float RefractDepth);
 
 public record FormReport(
     Form Form,
@@ -168,6 +173,14 @@ public static class Manifest
                         parts.Add($"flow_tex = {Quote(mat.FlowTexture)}");
                         parts.Add($"flow_power = {Num(mat.FlowPower)}");
                         parts.Add($"flow = [{string.Join(", ", mat.Flow.Select(Num))}]");
+                    }
+                    if (mat.InteriorTexture is not null)
+                    {
+                        parts.Add($"interior_tex = {Quote(mat.InteriorTexture)}");
+                        if (mat.InteriorColor is { } ic)
+                            parts.Add($"interior_color = [{Num(ic[0])}, {Num(ic[1])}, {Num(ic[2])}]");
+                        parts.Add($"refraction = {Num(mat.Refraction)}");
+                        parts.Add($"refract_depth = {Num(mat.RefractDepth)}");
                     }
                     // 每个键只许出现一次:重复键 TOML 直接解析失败(opacity/flow 都踩过)
                     parts.Add($"opacity = {Num(mat.Opacity)}");

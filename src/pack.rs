@@ -102,6 +102,14 @@ struct RawMaterial {
     flow_tex: Option<String>,
     #[serde(default = "one")]
     flow_power: f32,
+    #[serde(default)]
+    interior_tex: Option<String>,
+    #[serde(default)]
+    interior_color: Option<[f32; 3]>,
+    #[serde(default = "one")]
+    refraction: f32,
+    #[serde(default)]
+    refract_depth: f32,
 }
 
 #[derive(Deserialize)]
@@ -161,6 +169,13 @@ pub struct Material {
     /// [u 速度, v 速度, u 平铺, v 平铺] + 混入强度。
     pub flow_uv: [f32; 4],
     pub flow_power: f32,
+    /// **玻璃内部那颗星**:四角星场贴图(`StarTex` = `T_EMeng003`),沿折射光线在物体空间
+    /// march、三向投影采样、按时间卷动。读 shader 汇编得来,见 docs/design.md §1。
+    pub interior: Option<PathBuf>,
+    pub interior_color: [f32; 3],
+    /// 折射率与 march 深度(材质里的 `GlobalRefraction` = 1.3、`GlobalDepth` = 100)。
+    pub refraction: f32,
+    pub refract_depth: f32,
 }
 
 /// 特效层(火焰/水壳/光晕)的画法参数,全部来自游戏材质。
@@ -351,6 +366,10 @@ impl Pack {
                                 flow: mat.flow_tex.map(|rel| dir.join(rel)),
                                 flow_uv: mat.flow.unwrap_or([0.0, 0.0, 1.0, 1.0]),
                                 flow_power: mat.flow_power,
+                                interior: mat.interior_tex.map(|rel| dir.join(rel)),
+                                interior_color: mat.interior_color.unwrap_or([1.0; 3]),
+                                refraction: mat.refraction,
+                                refract_depth: mat.refract_depth,
                             },
                         )
                     })

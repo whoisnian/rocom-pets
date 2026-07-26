@@ -62,6 +62,11 @@ pub struct Material {
     pub flow: Option<Image>,
     pub flow_uv: [f32; 4],
     pub flow_power: f32,
+    /// 玻璃内部那颗星:四角星场贴图 + 着色 + 折射率 + march 深度。
+    pub interior: Option<Image>,
+    pub interior_color: [f32; 3],
+    pub refraction: f32,
+    pub refract_depth: f32,
     /// 特效层的画法(火焰/水壳/光晕)。`None` = 普通不透明材质,走主通道。
     pub effect: Option<EffectMaterial>,
 }
@@ -352,6 +357,10 @@ impl Model {
                     flow: spec.flow.as_deref().and_then(|p| load_texture(p, true)),
                     flow_uv: spec.flow_uv,
                     flow_power: spec.flow_power,
+                    interior: spec.interior.as_deref().and_then(|p| load_texture(p, true)),
+                    interior_color: spec.interior_color,
+                    refraction: spec.refraction,
+                    refract_depth: spec.refract_depth,
                     effect,
                 });
                 materials.len() - 1

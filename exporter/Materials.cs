@@ -51,6 +51,10 @@ public record MaterialInfo(
     float OpacityMaskClipValue,
     /// 父链上所有材质的名字,由近及远;排查用。
     List<string> ParentChain,
+    /// **根材质的参数默认值**(参数名 → 值)。顺父链走不到根,所以只在根上给了默认、
+    /// 没有任何实例覆盖过的参数,只能从这儿拿(见 RootDefaults.cs)。
+    /// **刻意与上面几张表分开**:现有判据看的是「美术显式设了没有」,混进根默认会整片翻转。
+    RootDefaults? RootDefaults = null,
     /// 材质资产是不是真的读到了。`false` = 网格引用的材质包在 pak 里根本不存在(悬空引用),
     /// 参数全空,导出器会退回按贴图命名约定给基色,见 Program.cs。
     bool Resolved = true)
@@ -193,6 +197,25 @@ public record MaterialInfo(
 
     public float RimIntensity => Scalar("Rim Intensity", Scalar("RimIntensity", 0f));
 
+    /// **玻璃内部那颗星**:`StarTex`(根默认 = `T_EMeng003`,一张四角星场、alpha 是干净的
+    /// 稀疏星形遮罩)沿**折射光线**在物体空间 march、按三向投影采样,坐标再叠时间卷动。
+    /// 读 shader 汇编读出来的(见 docs/design.md §1):`refract()` 的教科书实现 + triplanar
+    /// + `View` 的时间项 —— 这就是实机里「球内有颗星、自己在动、和球自转无关」的来源。
+    ///
+    /// 只给**玻璃族**用(静态开关 `是否使用MatCap` 开着的那 17 个),它们是那种玻璃珠观感。
+    /// 贴图取自根材质默认值:没有任何实例覆盖 `StarTex`,顺父链是看不见它的。
+    public string? InteriorTexture =>
+        Switch("是否使用MatCap") ? RootDefaults?.Textures.GetValueOrDefault("StarTex") : null;
+
+    /// 内部星光的着色(根默认 `StarColor` = (0.33, 0.67, 2) —— 偏蓝的 HDR)。
+    public float[]? InteriorColor =>
+        FirstVector("StarColor") ?? RootDefaults?.Vectors.GetValueOrDefault("StarColor");
+
+    /// 折射率与 march 深度。这两个每个宠物材质都写着(1.3 / 100),之前一直没用上。
+    public float Refraction => Scalar("GlobalRefraction", 1f);
+
+    public float RefractDepth => Scalar("GlobalDepth", 0f);
+
     /// 边缘光的衰减次数:`pow(1 - N·V, RimPower)`。**小于 1 就不是「一圈边」而是整片泛色**——
     /// 幽星光那两个球是 0.35,整颗都透着红,只写 RimColor 不写这个会画成一圈细红边。
     public float RimPower => Scalar("Rim Power", Scalar("RimPower", 3f));
@@ -242,7 +265,8 @@ public static class Materials
                 // 喵呜的文件是 `MI_Gra_MiaoMiao2_001_By`、对象名是 `…Miaomiao2…`,魔力猫正好反过来。
                 // glb 里的材质名取的是对象名,键不一致运行时就查不到 → 整只宠物一片都画不出来。
                 var key = material.Name;
-                if (!string.IsNullOrEmpty(key)) result[key] = Resolve(key, material);
+                if (!string.IsNullOrEmpty(key))
+                    result[key] = Resolve(key, material) with { RootDefaults = RootMaterial.Of(material) };
             }
             catch (Exception e)
             {

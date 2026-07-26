@@ -49,6 +49,13 @@ struct MaterialUniform {
     main_color: [f32; 4],
     /// [边缘光衰减次数, 色带混入强度, -, 有色带(0/1)]
     extra: [f32; 4],
+    /// 玻璃内部那层:[折射率, march 深度, -, 有内部层(0/1)]
+    interior: [f32; 4],
+    /// 内部星光着色(rgb,HDR)
+    interior_color: [f32; 4],
+    /// 模型包围盒:最小角 + 尺寸(w = 最长边)
+    bounds_min: [f32; 4],
+    bounds_size: [f32; 4],
 }
 
 /// 本体贴图 alpha 里那层线条遮罩的提亮倍数。游戏里那些纹路(水灵身上的竖条、
@@ -192,6 +199,17 @@ impl PetGpu {
                     },
                     count: None,
                 },
+                // 6 = 玻璃内部那颗星的四角星场
+                wgpu::BindGroupLayoutEntry {
+                    binding: 6,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
             ],
         });
 
@@ -229,6 +247,15 @@ impl PetGpu {
             height: 1,
             rgba: vec![255, 255, 255, 255],
         };
+        // 内部星层要把模型空间位置归一化到包围盒
+        let bmin = [model.bounds.0.x, model.bounds.0.y, model.bounds.0.z, 0.0];
+        let extent = model.bounds.1 - model.bounds.0;
+        let bsize = [
+            extent.x,
+            extent.y,
+            extent.z,
+            extent.x.max(extent.y).max(extent.z),
+        ];
         let mut material_binds = Vec::new();
         for material in &model.materials {
             // 主贴图:普通材质是基色;特效层是遮罩(形状来源),缺了就用白图 = 常量 1
@@ -257,8 +284,24 @@ impl PetGpu {
                 &material.name,
                 material.matcap.as_ref().unwrap_or(&white),
             );
+            let interior_view = upload_texture(
+                device,
+                queue,
+                &material.name,
+                material.interior.as_ref().unwrap_or(&white),
+            );
             let has = |v: bool| if v { 1.0 } else { 0.0 };
             let rgb = |c: [f32; 3]| [c[0], c[1], c[2], 0.0];
+            let interior = |m: &super::model::Material| {
+                [
+                    m.refraction,
+                    // 实机的 march 深度是 100 配着别处的归一化用的,这里按包围盒归一化后
+                    // 再缩到一个可用的量级(0.35 是对着实机截图挑的)
+                    if m.interior.is_some() { 0.7 } else { 0.0 },
+                    0.0,
+                    has(m.interior.is_some()),
+                ]
+            };
             let extra = |m: &super::model::Material| {
                 [m.rim_power, m.flow_power, 0.0, has(m.flow.is_some())]
             };
@@ -295,6 +338,10 @@ impl PetGpu {
                     rim_color: rgb(material.rim_color),
                     main_color: rgb(material.main_color),
                     extra: extra(material),
+                    interior: interior(material),
+                    interior_color: rgb(material.interior_color),
+                    bounds_min: bmin,
+                    bounds_size: bsize,
                 },
                 // 有基色的材质:params.x 说明 alpha 怎么解释(1=镂空遮罩,0=线条遮罩)
                 None => MaterialUniform {
@@ -340,6 +387,10 @@ impl PetGpu {
                     rim_color: rgb(material.rim_color),
                     main_color: rgb(material.main_color),
                     extra: extra(material),
+                    interior: interior(material),
+                    interior_color: rgb(material.interior_color),
+                    bounds_min: bmin,
+                    bounds_size: bsize,
                 },
             };
             let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -374,6 +425,10 @@ impl PetGpu {
                     wgpu::BindGroupEntry {
                         binding: 5,
                         resource: wgpu::BindingResource::TextureView(&matcap_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 6,
+                        resource: wgpu::BindingResource::TextureView(&interior_view),
                     },
                 ],
             }));

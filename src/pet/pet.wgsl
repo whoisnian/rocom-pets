@@ -37,6 +37,13 @@ struct MaterialParams {
     main_color: vec4<f32>,
     // [边缘光衰减次数, 色带混入强度, -, 有没有色带]
     extra: vec4<f32>,
+    // 玻璃内部那层:[折射率, march 深度, -, 有没有内部层]
+    interior: vec4<f32>,
+    // 内部星光的着色(rgb,HDR)
+    interior_color: vec4<f32>,
+    // 模型包围盒:最小角(xyz)与尺寸(w 存最长边),内部层要拿它把位置归一化
+    bounds_min: vec4<f32>,
+    bounds_size: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> camera: Camera;
@@ -51,6 +58,8 @@ struct MaterialParams {
 // 星点(身上的细碎星光)与 MatCap(球面反射查找表);没有就是 1×1 白图
 @group(1) @binding(4) var star_tex: texture_2d<f32>;
 @group(1) @binding(5) var matcap_tex: texture_2d<f32>;
+// 玻璃内部那颗星的四角星场(`StarTex` = `T_EMeng003`);没有就是 1×1 白图
+@group(1) @binding(6) var interior_tex: texture_2d<f32>;
 
 struct VsIn {
     @location(0) pos: vec3<f32>,
@@ -66,6 +75,8 @@ struct VsOut {
     @location(1) normal: vec3<f32>,
     // 裁剪空间的 xy(= NDC,正交投影下 w 恒为 1);星点层拿它当「屏幕上的位置」
     @location(2) ndc: vec2<f32>,
+    // 蒙皮后的模型空间位置;玻璃内部那层要拿它沿折射光线 march
+    @location(3) world: vec3<f32>,
 };
 
 // 线性混合蒙皮:权重和不为 1 的顶点(导出误差)按权重和归一化,否则会缩水
@@ -86,6 +97,7 @@ fn skin(input: VsIn) -> VsOut {
     out.uv = input.uv;
     out.normal = normal;
     out.ndc = out.clip.xy;
+    out.world = world.xyz;
     return out;
 }
 
@@ -105,12 +117,17 @@ fn vs_outline(input: VsIn) -> VsOut {
     out.uv = input.uv;
     out.normal = normal;
     out.ndc = out.clip.xy;
+    out.world = world.xyz;
     return out;
 }
 
 
 /// matcap 图里「算高光」的亮度门槛(见 `matcap_light`)。
 const SPEC_FLOOR: f32 = 0.35;
+/// 内部星层的卷动速度与叠加量。速度实机来自一个 cb 向量参数(槽位还没对上名字),
+/// 亮度那边 `StarColor` 是 HDR 的 (0.33, 0.67, 2),直接乘会过曝。
+const INTERIOR_SPEED: f32 = 0.03;
+const INTERIOR_GAIN: f32 = 1.6;
 /// 玻璃族高光的叠加量。游戏那边这项还乘着遮罩通道选出来的高光区,我们没有那张遮罩的语义,
 /// 只能整片叠,所以要压一档——满强度叠上去,幽星光那两颗球会泛成一团白。
 const GLASS_GAIN: f32 = 0.35;
@@ -176,6 +193,45 @@ fn flow_band(uv: vec2<f32>, albedo: vec3<f32>) -> vec3<f32> {
     return mix(albedo, albedo * normalized, material.extra.y);
 }
 
+/// **玻璃内部那颗星。** 实机是这么做的(读 `MI_P_Object_Trans_MatCap` 的 pixel shader 汇编,
+/// 见 docs/design.md §1):把视线按 `GlobalRefraction`(=1.3)折射进物体内部,沿折射光线
+/// march 一段(`GlobalDepth`),在**模型空间**按三向投影采 `StarTex`(= `T_EMeng003`,
+/// 一张四角星场、alpha 是干净的稀疏星形遮罩),采样坐标再叠上时间卷动。
+///
+/// 于是球看着像「里面飘着一颗星」,而且那颗星**自己在动、与球的自转无关** —— 正是实机观感。
+/// 这一层只给玻璃族(静态开关 `是否使用MatCap` 开着的那 17 个材质)。
+///
+/// **是近似不是复刻**:游戏那边还有第二张三向投影贴图、两段 `pow` 相位曲线、以及一个按
+/// 高度做的两色渐变当固有色;这里只取「折射 + 三向投影星场 + 时间」这条主干。
+/// 卷动速度实机是个 cb 里的向量参数,而 cb 槽位与参数名的对应还没解出来(§1),
+/// 所以先用一个定值。
+fn interior_star(world: vec3<f32>, n: vec3<f32>) -> vec3<f32> {
+    if material.interior.w < 0.5 {
+        return vec3<f32>(0.0);
+    }
+    let forward = normalize(vec3<f32>(camera.view_proj[0][2], camera.view_proj[1][2], camera.view_proj[2][2]));
+    // refract():WGSL 没有内建,照 Snell 写。eta 取 1/折射率(空气 → 介质)
+    let eta = 1.0 / max(material.interior.x, 0.001);
+    let cosi = dot(n, forward);
+    let k = 1.0 - eta * eta * (1.0 - cosi * cosi);
+    if k < 0.0 {
+        return vec3<f32>(0.0);   // 全内反射
+    }
+    let dir = eta * forward - (eta * cosi + sqrt(k)) * n;
+
+    // 模型空间位置归一化到包围盒,再沿折射线走一段。深度按最长边缩放,免得大小宠物差太多
+    let local = (world - material.bounds_min.xyz) / max(material.bounds_size.w, 0.001);
+    let p = local + dir * material.interior.y;
+    // 三向投影:权重取 |法线| 的高次,归一化
+    let w = pow(abs(n), vec3<f32>(8.0));
+    let wn = w / max(w.x + w.y + w.z, 0.001);
+    let drift = camera.time * INTERIOR_SPEED;
+    let a = textureSample(interior_tex, base_sampler, p.yz + drift).a * wn.x
+        + textureSample(interior_tex, base_sampler, p.xz + drift).a * wn.y
+        + textureSample(interior_tex, base_sampler, p.xy + drift).a * wn.z;
+    return material.interior_color.rgb * a * INTERIOR_GAIN;
+}
+
 /// MatCap 高光。`MatCapColor` 可能是 HDR(暮星辰那两个球是 (3,3,3)),所以直接相乘。
 ///
 /// **只取亮的那部分。** matcap 图是整颗球的反射查找表(实测 matcap26/Matcap35 均值 0.2、
@@ -230,7 +286,8 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     if material.flags.y > 0.5 {
         glow += (matcap_light(n)
             + material.rim_color.rgb * pow(facing, material.extra.x) * material.star.z)
-            * GLASS_GAIN;
+            * GLASS_GAIN
+            + interior_star(in.world, n);
         alpha = clamp(material.star.w, 0.0, 1.0);
         // **玻璃不吃两段明暗。** 它的明暗来自反射(MatCap + 边缘光),不是漫反射;
         // 而那两颗球是**开口薄壳**(129 顶点、边界 30 条边),自转时露出来的面一直在换,

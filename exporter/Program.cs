@@ -475,7 +475,9 @@ FormReport ExportForm(
             ExportEffectTexture(info.StarTexture), info.StarTiling, info.StarColor,
             info.MaskIsMatcap ? null : ExportEffectTexture(info.MatcapTexture), info.MatcapColor,
             info.RimColor, info.RimIntensity, info.RimPower, info.MainColor,
-            ExportEffectTexture(info.FlowTexture), info.FlowPower));
+            ExportEffectTexture(info.FlowTexture), info.FlowPower,
+            ExportEffectTexture(info.InteriorTexture), info.InteriorColor,
+            info.Refraction, info.RefractDepth));
 
         if (info.StarTexture is not null && ExportEffectTexture(info.StarTexture) is { } starTex
             && (starLayer is null || (info.IsFakeTrans && !starFromFakeTrans)))
