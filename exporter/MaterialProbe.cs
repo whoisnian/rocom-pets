@@ -65,6 +65,9 @@ public static class MaterialProbe
         var switchOff = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
         var switchSample = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         var switchWho = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
+        // GUID → 参数名。全量收一遍,用来给根材质 CachedExpressionData 里那些
+        // 「名字被剥掉、只剩哈希」的默认值配名字(见 Materials.cs 的 ParameterGuids)
+        var guidNames = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
 
         foreach (var asset in assets)
         {
@@ -106,6 +109,8 @@ public static class MaterialProbe
                     foreach (var sc in info.Scalars.Keys) acc.Scalars.Add(sc);
                 }
 
+                foreach (var (pname, guid) in info.ParameterGuids) guidNames.TryAdd(guid, pname);
+
                 foreach (var (sw, on) in info.Switches)
                 {
                     if (on)
@@ -129,6 +134,9 @@ public static class MaterialProbe
         Console.WriteLine("\n=== 根材质分布");
         foreach (var (k, v) in parentCount.OrderByDescending(kv => kv.Value))
             Console.WriteLine($"  {v,6}  {k}   贴图参数: {string.Join(", ", paramsByParent[k].OrderBy(x => x))}");
+        Console.WriteLine($"\n=== GUID → 参数名({guidNames.Count} 条;拿去给根材质的默认值配名字)");
+        foreach (var (g, n) in guidNames.OrderBy(kv => kv.Value, StringComparer.OrdinalIgnoreCase))
+            Console.WriteLine($"  {g}\t{n}");
         Console.WriteLine("\n=== 静态开关(「这个特性到底开没开」的明写答案)");
         foreach (var sw in switchOn.Keys.Concat(switchOff.Keys).Distinct(StringComparer.OrdinalIgnoreCase)
                      .OrderByDescending(s => switchOn.GetValueOrDefault(s)))
@@ -236,6 +244,16 @@ public static class MaterialProbe
         if (asset.StartsWith("ALL:", StringComparison.OrdinalIgnoreCase))
         {
             Survey(provider, int.Parse(asset[4..]));
+            return;
+        }
+        // 带 `/` 的当**对象路径**直接加载 —— 用来看**根材质**(`UMaterial`,如 M_P_Object_Trans)。
+        // 顺父链合并到根就停了(根不是 UMaterialInstance),所以只写在根上的参数默认值
+        // 平时是看不见的;而 cooked 包里 `CachedExpressionData` 存着有序的参数名与默认值。
+        if (asset.Contains('/'))
+        {
+            var obj = provider.LoadPackageObject(asset);
+            Console.WriteLine($"=== {obj.Name}({obj.ExportType})的原始属性树");
+            DumpProperties(obj, "  ");
             return;
         }
         const string petsRoot = "NRC/Content/ArtRes/AnimSequence/Pets";
@@ -351,7 +369,10 @@ public static class MaterialProbe
                 break;
             case ArrayProperty { Value: { } array }:
                 Console.WriteLine($"{indent}{name} [{array.Properties.Count}]:");
-                for (var i = 0; i < array.Properties.Count && i < 32; i++)
+                // 数组默认截到 32 项:根材质的 CachedExpressionData 有 149 个标量参数,
+                // 想看全设 PROBE_ALL=1
+                var cap = Environment.GetEnvironmentVariable("PROBE_ALL") is null ? 32 : int.MaxValue;
+                for (var i = 0; i < array.Properties.Count && i < cap; i++)
                 {
                     Console.WriteLine($"{indent}  [{i}]");
                     DumpTag("", array.Properties[i], indent + "    ", depth + 1);

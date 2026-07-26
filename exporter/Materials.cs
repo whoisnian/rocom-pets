@@ -20,6 +20,7 @@ using CUE4Parse.UE4.Assets.Exports.Material;
 using CUE4Parse.UE4.Assets.Exports.SkeletalMesh;
 using CUE4Parse.UE4.Assets.Exports.Texture;
 using CUE4Parse.UE4.Assets.Objects;
+using CUE4Parse.UE4.Objects.Core.Misc;
 using CUE4Parse.UE4.Objects.UObject;
 
 namespace RocomPets.Export;
@@ -33,6 +34,15 @@ public record MaterialInfo(
     Dictionary<string, float[]> Vectors,
     /// 参数名 → 标量。强度/流速/菲涅尔次数一类。
     Dictionary<string, float> Scalars,
+    /// 参数名 → 该参数的 `ExpressionGUID`。**这是通往根材质默认值的桥**:根材质
+    /// (`UMaterial`)的 `CachedExpressionData` 里参数**名字被剥了、只剩哈希**,但有一份
+    /// 与值数组同序的 `ExpressionGuids`;而实例这边每条参数都同时带名字和 GUID。
+    /// 两边按 GUID 一对,就能给根材质那 149 个标量 / 43 个向量 / 13 张贴图的默认值配上名字。
+    ///
+    /// 为什么非要读根默认值:顺父链只能合并到根**之前**(根不是 `UMaterialInstance`),
+    /// 所以只在根上给了默认、实例没覆盖的参数,平时完全看不见 —— 而那两颗球的固有色
+    /// 恰恰就在那儿(根默认里有 F94728 红橙、FFC635 琥珀、64358B 紫、FF1BE7 品红)。
+    Dictionary<string, string> ParameterGuids,
     /// **静态开关**:参数名 → 开/关。这是「这个特性到底开没开」的**明写答案**,
     /// 名字多半是中文(`是否使用MatCap`、`开启黑魔法效果`、`使用顶点色`)。
     /// 在拿到它之前只能靠「美术有没有显式写某个参数」间接推断,那是猜。
@@ -224,7 +234,7 @@ public static class Materials
                     // 如小浣蛋的 `MI_Dem_XiaoHuanDan1_001_By`)。仍然登记一条空的,
                     // 让导出器能按名字去凑基色贴图,免得整只宠物画不出来。
                     warnings.Add($"材质 {slot.Name} 在 pak 里没有资产(悬空引用),退回按贴图名接基色");
-                    result[slot.Name.Text] = new MaterialInfo(slot.Name.Text, [], [], [], [],
+                    result[slot.Name.Text] = new MaterialInfo(slot.Name.Text, [], [], [], [], [],
                         EBlendMode.BLEND_Opaque, DefaultMaskClip, [], Resolved: false);
                     continue;
                 }
@@ -240,6 +250,12 @@ public static class Materials
             }
         }
         return result;
+    }
+
+    /// 全零 GUID 是「没记」(材质层参数就是这样),不收。
+    private static void Remember(Dictionary<string, string> into, string? name, FGuid guid)
+    {
+        if (!string.IsNullOrEmpty(name) && guid != default) into.TryAdd(name, guid.ToString());
     }
 
     /// 顺父链合并参数。**从最远的祖先开始写**,近的覆盖远的,于是子实例的覆盖最终生效。
@@ -261,6 +277,7 @@ public static class Materials
         var vectors = new Dictionary<string, float[]>(StringComparer.OrdinalIgnoreCase);
         var scalars = new Dictionary<string, float>(StringComparer.OrdinalIgnoreCase);
         var switches = new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
+        var guids = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         var blend = EBlendMode.BLEND_Opaque;
         var maskClip = DefaultMaskClip;
         // chain 是「自己 → 父 → 祖父」,倒着遍历 = 从祖先到自己
@@ -273,16 +290,21 @@ public static class Materials
                 var path = texture?.GetPathName();
                 if (!string.IsNullOrEmpty(param.Name) && !string.IsNullOrEmpty(path))
                     textures[param.Name] = path;
+                Remember(guids, param.Name, param.ExpressionGUID);
             }
             foreach (var param in mi.GetOrDefault<FVectorParameterValue[]>("VectorParameterValues", []))
             {
                 var c = param.ParameterValue;
                 if (!string.IsNullOrEmpty(param.Name) && c is not null)
                     vectors[param.Name] = [c.Value.R, c.Value.G, c.Value.B, c.Value.A];
+                Remember(guids, param.Name, param.ExpressionGUID);
             }
             foreach (var param in mi.GetOrDefault<FScalarParameterValue[]>("ScalarParameterValues", []))
+            {
                 if (!string.IsNullOrEmpty(param.Name))
                     scalars[param.Name] = param.ParameterValue;
+                Remember(guids, param.Name, param.ExpressionGUID);
+            }
             // 静态开关。**`bOverride` 一律是 false 而 `Value` 却各不相同**(实测幽星光一族
             // 100 条里没有一条 bOverride=true,但 `是否使用MatCap` 是 true、`GlassySwitch` 是
             // false),说明本作存的是**合并后的有效值**而不是「我覆盖了什么」——
@@ -304,6 +326,6 @@ public static class Materials
                 if (overrides.OpacityMaskClipValue > 0) maskClip = overrides.OpacityMaskClipValue;
             }
         }
-        return new MaterialInfo(name, textures, vectors, scalars, switches, blend, maskClip, parents);
+        return new MaterialInfo(name, textures, vectors, scalars, guids, switches, blend, maskClip, parents);
     }
 }
