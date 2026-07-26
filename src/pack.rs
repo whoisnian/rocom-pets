@@ -86,6 +86,8 @@ struct RawMaterial {
     star_tiling: Option<[f32; 2]>,
     #[serde(default)]
     star_color: Option<[f32; 3]>,
+    #[serde(default = "one")]
+    stick_intensity: f32,
     #[serde(default)]
     matcap_tex: Option<String>,
     #[serde(default)]
@@ -162,6 +164,8 @@ pub struct Material {
     pub star: Option<PathBuf>,
     pub star_tiling: [f32; 2],
     pub star_color: [f32; 3],
+    /// 星点层的强度(根材质 `Stick_Intensity` = 1.5)。运行时原来写死 0.3,那是手挑的。
+    pub stick_intensity: f32,
     /// 球面反射查找表:玻璃/金属高光。
     pub matcap: Option<PathBuf>,
     pub matcap_color: [f32; 3],
@@ -375,6 +379,7 @@ impl Pack {
                                 star: mat.star_tex.map(|rel| dir.join(rel)),
                                 star_tiling: mat.star_tiling.unwrap_or([1.0, 1.0]),
                                 star_color: mat.star_color.unwrap_or([1.0; 3]),
+                                stick_intensity: mat.stick_intensity,
                                 matcap: mat.matcap_tex.map(|rel| dir.join(rel)),
                                 matcap_color: mat.matcap_color.unwrap_or([1.0; 3]),
                                 rim_color: mat.rim_color.unwrap_or([1.0; 3]),

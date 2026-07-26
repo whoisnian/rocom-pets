@@ -64,6 +64,8 @@ pub struct Material {
     pub star: Option<Image>,
     pub star_tiling: [f32; 2],
     pub star_color: [f32; 3],
+    /// 星点层强度(`Stick_Intensity`)。
+    pub stick_intensity: f32,
     pub matcap: Option<Image>,
     pub matcap_color: [f32; 3],
     pub rim_color: [f32; 3],
@@ -378,6 +380,7 @@ impl Model {
                     star: spec.star.as_deref().and_then(|p| load_texture(p, true)),
                     star_tiling: spec.star_tiling,
                     star_color: spec.star_color,
+                    stick_intensity: spec.stick_intensity,
                     matcap: spec.matcap.as_deref().and_then(|p| load_texture(p, true)),
                     matcap_color: spec.matcap_color,
                     rim_color: spec.rim_color,

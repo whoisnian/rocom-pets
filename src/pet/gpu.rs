@@ -37,7 +37,7 @@ struct MaterialUniform {
     flags: [f32; 4],
     /// [星点 u 平铺, v 平铺, 边缘光强度, 不透明度]
     star: [f32; 4],
-    /// 星点着色(rgb)+ 线条提亮(a)
+    /// 星点着色(rgb)+ **星点层强度**(a,`Stick_Intensity`)
     star_color: [f32; 4],
     /// MatCap 着色(rgb,可能是 HDR)+ 备用
     matcap_color: [f32; 4],
@@ -358,7 +358,7 @@ impl PetGpu {
                         material.star_color[0],
                         material.star_color[1],
                         material.star_color[2],
-                        LINE_BOOST,
+                        material.stick_intensity,
                     ],
                     matcap_color: rgb(material.matcap_color),
                     rim_color: rgb(material.rim_color),
@@ -409,11 +409,7 @@ impl PetGpu {
                         material.star_color[0],
                         material.star_color[1],
                         material.star_color[2],
-                        if material.line_detail {
-                            LINE_BOOST
-                        } else {
-                            1.0
-                        },
+                        material.stick_intensity,
                     ],
                     matcap_color: rgb(material.matcap_color),
                     rim_color: rgb(material.rim_color),

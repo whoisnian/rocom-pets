@@ -34,10 +34,11 @@ public record MaterialEntry(
     bool MaskIsMatcap,
     /// 以下对**所有**材质都有意义(有基色的也一样)。
     bool Translucent,
-    /// 星点贴图 + 平铺 + 着色:身上那些细碎星光。
+    /// 星点贴图 + 平铺 + 着色 + 强度:身上那些细碎星光。
     string? StarTexture,
     float[] StarTiling,
     float[]? StarColor,
+    float StickIntensity,
     /// MatCap 贴图 + 着色:玻璃/金属高光。
     string? MatcapTexture,
     float[]? MatcapColor,
@@ -155,6 +156,7 @@ public static class Manifest
                     {
                         parts.Add($"star_tex = {Quote(mat.StarTexture)}");
                         parts.Add($"star_tiling = [{Num(mat.StarTiling[0])}, {Num(mat.StarTiling[1])}]");
+                        parts.Add($"stick_intensity = {Num(mat.StickIntensity)}");
                         if (mat.StarColor is { } sc)
                             parts.Add($"star_color = [{Num(sc[0])}, {Num(sc[1])}, {Num(sc[2])}]");
                     }

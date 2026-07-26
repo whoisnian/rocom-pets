@@ -184,6 +184,17 @@ public record MaterialInfo(
     /// 平铺数是不是美术在 `StarStickTiling` 里明写的(而不是从「假半透」族的噪声参数推的)。
     public bool HasExplicitStarTiling => Vectors.ContainsKey("StarStickTiling");
 
+    /// 星点层的强度。**根材质里叫 `Stick_Intensity`(默认 1.5)** —— 运行时原来写死 0.3,
+    /// 那是手挑的。名字现在查实了(参数名哈希,见 RootDefaults.cs)。
+    ///
+    /// 顺带一条**查实后决定「不改」**的:那 4 个 `StickRandomColor01..04`
+    /// (红橙/品红/蓝/金黄)不是给 shader 用来重新上色的 —— 共享星点图
+    /// `Tex_PetGlassyStar_004` 里的颜色块本来就是红/橙/黄(R≈0.94、B≈0.06),
+    /// 其中两种正好等于 `StickRandomColor01`(0.946,0.064,0.021)与
+    /// `04`(0.925,0.742,0.027),而 `02`(品红)`03`(蓝)在贴图里根本不出现。
+    /// 所以颜色是烘在贴图里的,运行时「用贴图 rgb」是对的,别去按那 4 个色重上。
+    public float StickIntensity => RootScalar("Stick_Intensity", 1.5f);
+
     /// 星点着色。「假半透」族用 `Color02`,但那是**配着别处的衰减用的 HDR**
     /// (幽星光 = (15,15,15)、暮星辰 = (14.8,11,15)),直接乘会糊成一片白;
     /// 只取它的色相(按最大通道归一化),亮度交给运行时那一档固定系数。

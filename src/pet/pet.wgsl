@@ -28,7 +28,7 @@ struct MaterialParams {
     flags: vec4<f32>,
     // [星点 u 平铺, v 平铺, 边缘光强度, 不透明度]
     star: vec4<f32>,
-    // 星点着色(rgb)+ 线条提亮(a)
+    // 星点着色(rgb)+ **星点层强度**(a,根材质 `Stick_Intensity` = 1.5)
     star_color: vec4<f32>,
     // MatCap 着色(rgb,可能是 HDR)
     matcap_color: vec4<f32>,
@@ -143,8 +143,23 @@ fn vs_outline(input: VsIn) -> VsOut {
 }
 
 
-/// 星点遮罩的额外平铺倍率(见 `star_light`)。
-const STAR_TILE_SCALE: f32 = 3.0;
+/// 星点遮罩的平铺倍率。**现在是 1.0 —— 也就是这个手挑的倍率没了**,平铺纯粹来自材质的
+/// `StarStickTiling`(幽星光 2.5、暮星辰 4)。
+///
+/// 原来写 3.0,理由是「星点比实机大一倍以上」。那个判断是错的:放大对照实机截图看,
+/// 实机是**少而大**的四角星(整只身上三四颗),我原来是**多而小**(十几二十颗)——
+/// 方向正好反了,3.0 让它更密更小。
+const STAR_TILE_SCALE: f32 = 1.0;
+/// 星点层的整体标定系数;与材质的 `Stick_Intensity`(根默认 1.5)相乘 ⇒ 净 0.9。
+///
+/// **`Stick_Intensity` 直接代进来会过强**,但原因不是强度 —— 是密度。放大对照实机才看清:
+/// 实机少而大、我原来多而小,所以先把平铺改对(见 `STAR_TILE_SCALE`),强度才有意义。
+/// `Stick_Intensity` 现在留作**材质间的相对权重**(全库 82 个材质都是 1.5,暂时不改变什么)。
+///
+/// **试过一个无效的指标,记下来免得再用**:拿「身体区域去掉 8×8 块均值后的高频 std」
+/// 比我的渲图与实机截图 —— 那个数**由锯齿主导**(我们没有抗锯齿、还有描边,
+/// 实机截图是抗锯齿+缩放过的),星点层开关前后比值只从 2.77 变到 2.73,分辨不出东西。
+const STICK_GAIN: f32 = 0.6;
 /// 球内星点的整体强度。汇编里这项是 `cb5[62].z`(未解出名字);根材质有个语义对得上的
 /// `StarIntensity` = 1,所以取 1。
 const INTERIOR_GAIN: f32 = 1.0;
@@ -213,7 +228,8 @@ fn star_light(ndc: vec2<f32>) -> vec3<f32> {
     let uv = vec2<f32>(ndc.x, -ndc.y) * 0.5 * material.star.xy * STAR_TILE_SCALE;
     let star = textureSample(star_tex, base_sampler, uv);
     let glyph = min(star.r, min(star.g, star.b));
-    return material.star_color.rgb * star.rgb * glyph;
+    // 强度用根材质里**有名字**的 `Stick_Intensity`(默认 1.5),不再是外面那个手挑的 0.3。
+    return material.star_color.rgb * star.rgb * glyph * material.star_color.w;
 }
 
 /// 卷动色带:一张渐变图沿 UV 滚过表面,乘在固有色上。暮星辰的环带靠它出青↔粉渐变
@@ -370,7 +386,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     // **玻璃族不加**:它有材质自己的边缘光(`RimColor`/`RimIntensity`/`RimPower`),
     // 两层叠起来轮廓会糊成一圈白 —— 暮星辰的裙子就是这么被冲成淡青的。
     let generic_rim = select(rim, 0.0, material.flags.y > 0.5);
-    var glow = vec3<f32>(generic_rim) + star_light(in.ndc) * 0.3;
+    var glow = vec3<f32>(generic_rim) + star_light(in.ndc) * STICK_GAIN;
     // **不透明度**:`alpha_is_opacity` 的材质取基色 alpha,并照汇编做那个重映射
     // (`add r1.z, a, -0.04` → `mul_sat r1.z, r1.z, 1.1111`,即把 0.04..0.94 拉到 0..1)。
     // 暮星辰裙子那块 UV 的 alpha 中位 0.537 → 0.55,与从实机截图水印衰减反推的 0.50 对得上。
