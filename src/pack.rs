@@ -162,9 +162,11 @@ pub struct Material {
     pub opacity: f32,
     /// 身上那些细碎星光。
     pub star: Option<PathBuf>,
+    /// 星点层的 uv 平铺。来自材质的**标量** `StarStickTiling`(汇编里那一乘是单个标量,
+    /// u/v 同一个数);这个名字在材质图里同名还有一个向量参数,别读错(见 Materials.cs)。
     pub star_tiling: [f32; 2],
     pub star_color: [f32; 3],
-    /// 星点层的强度(根材质 `Stick_Intensity` = 1.5)。运行时原来写死 0.3,那是手挑的。
+    /// 星点层的强度(根材质 `Stick_Intensity` = 1.5)。
     pub stick_intensity: f32,
     /// 球面反射查找表:玻璃/金属高光。
     pub matcap: Option<PathBuf>,

@@ -150,9 +150,12 @@ public record MaterialInfo(
     /// **「假半透」族也是一层星点**:`..._FakeTrans*` 家族给 `NoiseTex`(黑底 + 粉白星点)
     /// + `NoiseTilingSpeed` + HDR 的 `Color02`,幽星光一族的身体看着半透、身上有星星靠它。
     ///
-    /// 实机里这层**不流动**、也和别处的星点看着是同一份遮罩,所以运行时和 `StarStickTex`
-    /// 走同一条路(按屏幕位置贴的一层遮罩),只是贴图与着色换成这一族自己的。
-    /// 全量只有 3 个材质是这一族(幽星光的身体)。
+    /// 实机里这层**不流动**,运行时和 `StarStickTex` 走同一条路,只是贴图与着色换成这一族
+    /// 自己的。全量只有 3 个材质是这一族(幽星光的身体)。
+    ///
+    /// **注意两族的公式其实不一样**(反汇编查实的,见 pet.wgsl `star_light`):`StarStickTex`
+    /// 那张是彩色星形色块图集,这一族的 `NoiseTex` 是纯黑底、r/g/b 分别是阈值/相位/幅度。
+    /// 运行时把两层并成一份时公式也并成了一套,那是已知的简化 —— 不是「同一份遮罩」。
     public bool IsFakeTrans =>
         ParentChain.Any(p => p.Contains("FakeTrans", StringComparison.OrdinalIgnoreCase));
 
@@ -169,6 +172,11 @@ public record MaterialInfo(
     /// **几乎每个宠物材质都挂着这张图,但绝大多数并没有真的启用它**——游戏靠静态开关
     /// 与遮罩通道决定要不要叠,那套我们复刻不了。判据取「美术是否显式设了 `StarStickTiling`」:
     /// 设了(暮星辰的裙子 = 4×4)才当启用。一开始无条件叠,结果整只宠物被星点冲白。
+    ///
+    /// **这个门是启发式,不是查实的**:真正决定要不要画的是静态开关 + 遮罩通道。它是照
+    /// 「全量只有 10 / 16 个形态真的启用星点 / matcap」这个观察定的,别当成读出来的语义。
+    /// 这里**故意只查向量**那份 `StarStickTiling`:平铺该读标量(见 `StarTiling`),但把标量
+    /// 也算进这个门会让更多材质新启用这一层 —— 那是未经验证的行为改动,没做。
     public string? StarTexture =>
         Vectors.ContainsKey("StarStickTiling") ? FirstTexture("StarStickTex", "ShinyStarTex", "StarTex")
         : IsFakeTrans ? FirstTexture("NoiseTex", "Noise")
@@ -190,10 +198,6 @@ public record MaterialInfo(
         : RootDefaults?.Scalars.TryGetValue("StarStickTiling", out var r) == true && r > 0 ? [r, r]
         : IsFakeTrans && Vectors.TryGetValue("NoiseTilingSpeed", out var n) && n[0] > 0 ? [n[0], n[1]]
         : [1f, 1f];
-
-    /// 平铺数是不是美术在 `StarStickTiling` 里明写的(而不是从「假半透」族的噪声参数推的)。
-    public bool HasExplicitStarTiling =>
-        Scalars.ContainsKey("StarStickTiling") || Vectors.ContainsKey("StarStickTiling");
 
     /// 星点层的强度。**根材质里叫 `Stick_Intensity`(默认 1.5)** —— 运行时原来写死 0.3,
     /// 那是手挑的。名字现在查实了(参数名哈希,见 RootDefaults.cs)。
