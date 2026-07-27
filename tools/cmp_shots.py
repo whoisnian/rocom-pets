@@ -70,7 +70,7 @@ def ours(path: Path, down=4, erode=2):
 def palette(px, k=6, bins=8):
     """粗量化取前 k 个主色 → [(按亮度归一化的色, 占比)]。
 
-    归一化是为了把整体明暗差(实机有场景雾)从色度比较里剔掉。
+    归一化是为了把整体明暗差(实机有场景雾)从色度比较里剔掉;分母有下限,见下面。
     """
     q = (px // (256 // bins)).astype(int)
     key = q[:, 0] * bins * bins + q[:, 1] * bins + q[:, 2]
@@ -78,7 +78,9 @@ def palette(px, k=6, bins=8):
     out = []
     for i in np.argsort(-c)[:k]:
         col = px[key == u[i]].mean(0)
-        out.append((col / max(col.mean(), 1e-6), c[i] / len(px)))
+        # **分母要有下限**:直接除以自身均值时,近黑色会被归一化成一个**噪声方向**。
+        # (注:这不是下面那条「指标骗人」的原因 —— 加下限后波波拉的数字没变。)
+        out.append((col / max(col.mean(), 16.0), c[i] / len(px)))
     return out
 
 
@@ -125,11 +127,12 @@ def main() -> None:
                      (np.median(A[ring].mean(1)) / np.median(la))
                      / (np.median(a[gring].mean(1)) / np.median(lb)),
                      iqr(la) / iqr(lb), asset,
-                     float(np.abs(ma / ma.mean() - mb / mb.mean()).sum())))
+                     (A[inner].mean(1) < 26).mean(), (a[gin].mean(1) < 26).mean()))
     rows.sort(key=lambda r: -r[2])
-    print(f'{"形态":12} {"亮度比":>7} {"调色板":>7} {"描边比":>7} {"对比比":>7} {"中位色偏":>8}  asset')
+    print(f'{"形态":12} {"亮度比":>7} {"调色板":>7} {"描边比":>7} {"对比比":>7} {"很暗(我们/实机)":>16}  asset')
     for r in rows:
-        print(f"{r[0]:12} {r[1]:7.2f} {r[2]:7.3f} {r[3]:7.2f} {r[4]:7.2f} {r[6]:8.3f}  {r[5]}")
+        print(f"{r[0]:12} {r[1]:7.2f} {r[2]:7.3f} {r[3]:7.2f} {r[4]:7.2f} "
+              f"{r[6]:8.3f}/{r[7]:<7.3f}  {r[5]}")
     if rows:
         med = lambda i: np.median([r[i] for r in rows])
         print(f"\n中位: 亮度 {med(1):.2f}  调色板 {med(2):.3f}  描边 {med(3):.2f}  对比 {med(4):.2f}")

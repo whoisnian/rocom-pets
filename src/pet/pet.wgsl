@@ -324,9 +324,19 @@ fn flow_band(uv: vec2<f32>, albedo: vec3<f32>) -> vec3<f32> {
     }
     let scrolled = uv * material.flow.zw + vec2<f32>(material.flow.x, material.flow.y) * camera.time;
     let band = textureSample(noise_tex, base_sampler, scrolled).rgb;
+    // **色带是黑的地方不混。** `FlowTexture` 这个槽位装的东西并不统一:暮星辰给的是一张
+    // 青↔粉的**渐变色带**(`_Fx_D`),而水蓝蓝给的是一张 85% 全黑的**遮罩**(`_Fx_M`)——
+    // 后者配上 `FlowPower = 1`,`mix(固有色, 色带, 1)` 直接把整只身体换成了黑,
+    // 水蓝蓝/波波拉的触手就是这么黑掉的(实测暗像素占不透明区 14.5%、alpha 全是 1)。
+    //
+    // 汇编里那条链**从不替换固有色**:`MI_P_Object_UVFlow_*` 的流动贴图一路喂的是
+    // 法线扰动与双层 UV 合成(`cb6[73]` 平铺 / `[74]` 偏移 / `[75]` 速度,两次采样再
+    // `r4*(r7-1)`),不是拿来当颜色混的。完整复刻是另一件事(已记入待办),
+    // 这里先只堵住「变黑」这一条 —— 它在任何读法下都是错的。
+    let band_lit = max(band.r, max(band.g, band.b));
     // **是混色不是相乘。** 色带图本身就是成品颜色(青↔粉竖条纹),而基色图里环带那条是纯粉;
     // 相乘等于「粉 × 青」→ 出来是蓝,实机是真青。`FlowPower`(暮星辰 0.8)就是混色权重。
-    return mix(albedo, band, material.extra.y);
+    return mix(albedo, band, material.extra.y * step(0.05, band_lit));
 }
 
 /// **玻璃内部那颗星。** 实机是这么做的(读 `MI_P_Object_Trans_MatCap` 的 pixel shader 汇编,
