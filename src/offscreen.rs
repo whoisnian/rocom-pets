@@ -130,6 +130,21 @@ pub fn render(request: &Request) -> Result<()> {
     let outline_width = (model.bounds.1 - model.bounds.0).length() * 0.004;
 
     let mut tiles: Vec<(String, Vec<u8>)> = Vec::new();
+    // **零动画的形态渲绑定姿势。** 全库 819 个形态里有 64 个一段动作都没有 ——
+    // 那不是导出漏了:解包里这些资产**根本没有 `Animation/` 目录**(实测
+    // `Wat_ShuiLanLanBo_001` 只有 SKM + ABP + 材质,而同族的 `Wat_ShuiLanLan3_001` 有 62 段),
+    // 游戏里它们多半是静态物件。
+    //
+    // 绑定姿势下 `世界变换 × 逆绑定矩阵 = I`,所以直接传单位阵就是绑定姿势,不必造一个
+    // 空的 `Player`。这样至少能看见它们;运行时要不要当桌宠是另一回事(不能动)。
+    if model.clips.is_empty() {
+        let identity = vec![glam::Mat4::IDENTITY; model.skeleton.joints.len()];
+        pet.update(&queue, view_proj, light_dir, outline_width, request.time, &identity);
+        let pixels = draw_and_read(
+            &device, &queue, &pet, &color, &color_view, &depth_view, &readback, size, padded_row,
+        )?;
+        tiles.push(("BindPose".into(), pixels));
+    }
     for name in &request.clips {
         let Some(index) = model.clip(name) else {
             log::warn!("跳过 {name}:glb 里没有这段动作");
