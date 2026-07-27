@@ -765,13 +765,14 @@ fn animated_bounds(
         return (min, max);
     }
     let bind_longest = (bind.1 - bind.0).max_element().max(1e-4);
-    let bind_center = (bind.0 + bind.1) * 0.5;
     let limit = bind_longest * MAX_POSE_GROWTH;
     let drift_limit = (bind.1.y - bind.0.y).max(1e-4) * MAX_POSE_CENTER_DRIFT;
     let mut pose = Pose::bind(skeleton);
     let mut matrices = Vec::new();
     let root_bind = skeleton.bind[skeleton.root_joint].translation;
-    let mut rejected = 0usize;
+
+    // 先把每个姿势的盒子都量出来,**筛选放到第二遍**(见下面为什么不能拿绑定盒当基准)
+    let mut sampled: Vec<(Vec3, Vec3)> = Vec::new();
     for clip in clips {
         for step in 0..BOUNDS_SAMPLES {
             let time = clip.duration * step as f32 / (BOUNDS_SAMPLES - 1).max(1) as f32;
@@ -783,7 +784,6 @@ fn animated_bounds(
             local.translation.x = root_bind.x;
             local.translation.z = root_bind.z;
             pose.joint_matrices(skeleton, &mut matrices);
-            // 先单独量这个姿势,坏姿势整帧丢掉,不让它污染并集
             let mut pose_min = Vec3::splat(f32::INFINITY);
             let mut pose_max = Vec3::splat(f32::NEG_INFINITY);
             for v in vertices {
@@ -798,30 +798,53 @@ fn animated_bounds(
                 pose_min = pose_min.min(p);
                 pose_max = pose_max.max(p);
             }
-            let drift = ((pose_min + pose_max) * 0.5 - bind_center)
-                .abs()
-                .max_element();
-            if (pose_max - pose_min).max_element() > limit || drift > drift_limit {
-                log::trace!(
-                    "  丢掉 {} @{:.2}s:形体 {:.2}x、中心偏移 {:.2}(身高的 {:.0}%)",
-                    clip.name,
-                    time,
-                    (pose_max - pose_min).max_element() / bind_longest,
-                    drift,
-                    drift / (bind.1.y - bind.0.y).max(1e-4) * 100.0
-                );
-                rejected += 1;
-                continue;
+            if pose_min.x.is_finite() {
+                sampled.push((pose_min, pose_max));
             }
-            min = min.min(pose_min);
-            max = max.max(pose_max);
         }
     }
+    if sampled.is_empty() {
+        return (min, max);
+    }
+
+    // **基准取「各姿势中心的中位数」,不是绑定盒中心。**
+    //
+    // 原来拿绑定盒中心当基准,对**浮游**宠物是灾难:叮叮卯的绑定盒只有 13.8 cm 高,而所有
+    // 动作都把它悬到 y ≈ 0.78 m —— 偏移 0.7 m 远超 `drift_limit`(= 绑定盒高 × 1.0),
+    // 于是**每一帧都被丢掉**,`motion_bounds` 退回绑定盒,相机框住原点附近的一小块,
+    // 整只渲不出来(全库 4 个资产 / 6 个包栽在这儿,渲出来是全透明的空图)。
+    //
+    // 换成中位数后:整体一致的偏移不再被当成异常(中位数就是那个偏移),而个别跑飞的姿势
+    // (Run/Walk 的 root 位移没被剥干净时,能差出几米)照样被剔掉 —— 守卫的本意保住了。
+    let mut cx: Vec<f32> = sampled.iter().map(|(a, b)| (a.x + b.x) * 0.5).collect();
+    let mut cy: Vec<f32> = sampled.iter().map(|(a, b)| (a.y + b.y) * 0.5).collect();
+    let mut cz: Vec<f32> = sampled.iter().map(|(a, b)| (a.z + b.z) * 0.5).collect();
+    for v in [&mut cx, &mut cy, &mut cz] {
+        v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    }
+    let mid = sampled.len() / 2;
+    let base = Vec3::new(cx[mid], cy[mid], cz[mid]);
+
+    let mut rejected = 0usize;
+    let mut accepted = 0usize;
+    for (pose_min, pose_max) in &sampled {
+        let drift = ((*pose_min + *pose_max) * 0.5 - base).abs().max_element();
+        if (*pose_max - *pose_min).max_element() > limit || drift > drift_limit {
+            rejected += 1;
+            continue;
+        }
+        accepted += 1;
+        min = min.min(*pose_min);
+        max = max.max(*pose_max);
+    }
     if rejected > 0 {
-        log::debug!(
-            "取景包围盒:丢掉 {rejected}/{} 个姿势(形体超 {MAX_POSE_GROWTH} 倍或整只挪走)",
-            clips.len() * BOUNDS_SAMPLES
-        );
+        log::debug!("取景包围盒:丢掉 {rejected}/{} 个姿势", sampled.len());
+    }
+    if accepted == 0 {
+        // 仍然全否只可能是「每个姿势都比绑定盒大 2.5 倍以上」,那时绑定盒本身不可信,
+        // 退回中位姿势那一帧,至少框得住。
+        log::warn!("取景包围盒:{rejected} 个姿势全被丢掉,退回中位姿势");
+        return sampled[mid];
     }
     log::debug!(
         "取景包围盒 = 绑定盒的 {:.2} 倍",
