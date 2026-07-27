@@ -771,9 +771,11 @@ fn animated_bounds(
     let mut matrices = Vec::new();
     let root_bind = skeleton.bind[skeleton.root_joint].translation;
 
-    // 先把每个姿势的盒子都量出来,**筛选放到第二遍**(见下面为什么不能拿绑定盒当基准)
+    // 先把每个姿势的盒子都量出来,**筛选放到第二遍**(见下面为什么不能拿绑定盒当基准)。
+    // `clip_of` 记这一帧属于哪段动作 —— 基准要**按段**取中位数,见下面。
     let mut sampled: Vec<(Vec3, Vec3)> = Vec::new();
-    for clip in clips {
+    let mut clip_of: Vec<usize> = Vec::new();
+    for (ci, clip) in clips.iter().enumerate() {
         for step in 0..BOUNDS_SAMPLES {
             let time = clip.duration * step as f32 / (BOUNDS_SAMPLES - 1).max(1) as f32;
             pose.sample(skeleton, clip, time);
@@ -800,6 +802,7 @@ fn animated_bounds(
             }
             if pose_min.x.is_finite() {
                 sampled.push((pose_min, pose_max));
+                clip_of.push(ci);
             }
         }
     }
@@ -807,28 +810,45 @@ fn animated_bounds(
         return (min, max);
     }
 
-    // **基准取「各姿势中心的中位数」,不是绑定盒中心。**
+    // **基准按「每段动作各自的姿势中心中位数」取,不是绑定盒中心、也不是全局中位数。**
     //
-    // 原来拿绑定盒中心当基准,对**浮游**宠物是灾难:叮叮卯的绑定盒只有 13.8 cm 高,而所有
-    // 动作都把它悬到 y ≈ 0.78 m —— 偏移 0.7 m 远超 `drift_limit`(= 绑定盒高 × 1.0),
-    // 于是**每一帧都被丢掉**,`motion_bounds` 退回绑定盒,相机框住原点附近的一小块,
-    // 整只渲不出来(全库 4 个资产 / 6 个包栽在这儿,渲出来是全透明的空图)。
-    //
-    // 换成中位数后:整体一致的偏移不再被当成异常(中位数就是那个偏移),而个别跑飞的姿势
-    // (Run/Walk 的 root 位移没被剥干净时,能差出几米)照样被剔掉 —— 守卫的本意保住了。
-    let mut cx: Vec<f32> = sampled.iter().map(|(a, b)| (a.x + b.x) * 0.5).collect();
-    let mut cy: Vec<f32> = sampled.iter().map(|(a, b)| (a.y + b.y) * 0.5).collect();
-    let mut cz: Vec<f32> = sampled.iter().map(|(a, b)| (a.z + b.z) * 0.5).collect();
-    for v in [&mut cx, &mut cy, &mut cz] {
-        v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    // ① 拿**绑定盒中心**当基准,对**浮游**宠物是灾难:叮叮卯的绑定盒只有 13.8 cm 高,而所有
+    //    动作都把它悬到 y ≈ 0.78 m —— 偏移远超 `drift_limit`(= 绑定盒高 × 1.0),
+    //    于是**每一帧都被丢掉**,`motion_bounds` 退回绑定盒,相机框住原点附近,整只渲不出来。
+    // ② 换成**全局**中位数仍不够:某一整段动作整体偏在别处(叮叮卯二阶的 Idle 就是),
+    //    那一段会被整段丢掉,而运行时照样会播它 —— 盒子不覆盖它,渲出来还是空的。
+    //    **守卫绝不能丢掉运行时真会显示的姿势。**
+    // ③ 所以按**段内**中位数:整段一致的偏移不算异常(段内中位数就是那个偏移),
+    //    只剔掉段内的离群帧(root 位移没剥干净时,尾部能差出几米)。
+    let median3 = |idx: &[usize]| -> Vec3 {
+        let mut c: [Vec<f32>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+        for &i in idx {
+            let m = (sampled[i].0 + sampled[i].1) * 0.5;
+            c[0].push(m.x);
+            c[1].push(m.y);
+            c[2].push(m.z);
+        }
+        for v in c.iter_mut() {
+            v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        }
+        let k = idx.len() / 2;
+        Vec3::new(c[0][k], c[1][k], c[2][k])
+    };
+    let mut per_clip: Vec<Vec<usize>> = vec![Vec::new(); clips.len()];
+    for (i, &ci) in clip_of.iter().enumerate() {
+        per_clip[ci].push(i);
     }
-    let mid = sampled.len() / 2;
-    let base = Vec3::new(cx[mid], cy[mid], cz[mid]);
+    let base_of: Vec<Vec3> = per_clip
+        .iter()
+        .map(|idx| if idx.is_empty() { Vec3::ZERO } else { median3(idx) })
+        .collect();
 
     let mut rejected = 0usize;
     let mut accepted = 0usize;
-    for (pose_min, pose_max) in &sampled {
-        let drift = ((*pose_min + *pose_max) * 0.5 - base).abs().max_element();
+    for (i, (pose_min, pose_max)) in sampled.iter().enumerate() {
+        let drift = ((*pose_min + *pose_max) * 0.5 - base_of[clip_of[i]])
+            .abs()
+            .max_element();
         if (*pose_max - *pose_min).max_element() > limit || drift > drift_limit {
             rejected += 1;
             continue;
@@ -843,12 +863,22 @@ fn animated_bounds(
     if accepted == 0 {
         // 仍然全否只可能是「每个姿势都比绑定盒大 2.5 倍以上」,那时绑定盒本身不可信,
         // 退回中位姿势那一帧,至少框得住。
-        log::warn!("取景包围盒:{rejected} 个姿势全被丢掉,退回中位姿势");
-        return sampled[mid];
+        log::warn!("取景包围盒:{rejected} 个姿势全被丢掉,退回全部姿势的并集");
+        let mut m0 = Vec3::splat(f32::INFINITY);
+        let mut m1 = Vec3::splat(f32::NEG_INFINITY);
+        for (a, b) in &sampled {
+            m0 = m0.min(*a);
+            m1 = m1.max(*b);
+        }
+        return (m0, m1);
     }
     log::debug!(
-        "取景包围盒 = 绑定盒的 {:.2} 倍",
-        (max - min).max_element() / bind_longest
+        "取景包围盒 = 绑定盒的 {:.2} 倍;绑定 {:?}..{:?} 取景 {:?}..{:?}",
+        (max - min).max_element() / bind_longest,
+        bind.0,
+        bind.1,
+        min,
+        max
     );
     (min, max)
 }
