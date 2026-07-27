@@ -14,9 +14,12 @@
 2. **同名形态散在几十个包里、asset 还不一样**(鸭吉吉 6 个变体、岚鸟 4 个),随便挑会挑到
    异地/配色变体 —— 挑错了色偏能差 30 倍(鸭吉吉 `Ar_003` 0.200 vs `_001` **0.025**)。
    规则:优先不带 `Ar`、后缀数字最小的 asset。
-3. **整只轮廓上的「中位颜色」不可比**:两边取景不同(红绒十字那张裁掉了腿、白身占主导),
-   中位色能差一大截 —— 那是构图差异不是颜色错。所以这里同时给**形状相对**的量
-   (描边环 ÷ 主体、`p75−p25` ÷ 中位),那两个才稳。
+3. **整只轮廓上的「中位颜色」不可比**:两边取景不同(红绒十字那张裁掉了腿、雪影娃娃那张
+   是特写),中位色能差一大截 —— 那是构图差异不是颜色错。**所以主指标用「调色板距离」**:
+   两边各取主色再做加权最近邻匹配,构图只改各色的占比、不改调色板成员。实测三只被构图
+   带偏的立刻归位:红绒十字 1.666 → **0.236**、雪影娃娃 0.743 → **0.098**、
+   暮星辰 0.650 → **0.085**。中位色偏仍然打印,但只当参考。
+   形状相对的量(描边环 ÷ 主体、`p75−p25` ÷ 中位)同样不受构图影响。
 
 另外:**有些宠物有异色形态**(`MutationColorSwitch` + `RedChannel`/`GreenChannel`/`BlueChannel`
 + `MaskTex` 分区),我们没实现;拿截图当参考前要先确认那张不是异色版。
@@ -64,6 +67,28 @@ def ours(path: Path, down=4, erode=2):
     return a[..., :3], inner, m & ~inner
 
 
+def palette(px, k=6, bins=8):
+    """粗量化取前 k 个主色 → [(按亮度归一化的色, 占比)]。
+
+    归一化是为了把整体明暗差(实机有场景雾)从色度比较里剔掉。
+    """
+    q = (px // (256 // bins)).astype(int)
+    key = q[:, 0] * bins * bins + q[:, 1] * bins + q[:, 2]
+    u, c = np.unique(key, return_counts=True)
+    out = []
+    for i in np.argsort(-c)[:k]:
+        col = px[key == u[i]].mean(0)
+        out.append((col / max(col.mean(), 1e-6), c[i] / len(px)))
+    return out
+
+
+def palette_dist(pa, pb):
+    """加权最近邻的对称距离 —— 对构图稳健(见模块头第 3 条)。"""
+    def one(x, y):
+        return sum(w * min(float(np.abs(c - c2).sum()) for c2, _ in y) for c, w in x)
+    return 0.5 * (one(pa, pb) + one(pb, pa))
+
+
 def main() -> None:
     out = Path(os.environ.get("CMP_OUT", "/tmp/cmp_shots"))
     out.mkdir(parents=True, exist_ok=True)
@@ -96,18 +121,20 @@ def main() -> None:
         la, lb = A[inner].mean(1), a[gin].mean(1)
         iqr = lambda x: (np.percentile(x, 75) - np.percentile(x, 25)) / np.median(x)
         rows.append((name, ma.mean() / mb.mean(),
-                     float(np.abs(ma / ma.mean() - mb / mb.mean()).sum()),
+                     palette_dist(palette(A[inner]), palette(a[gin])),
                      (np.median(A[ring].mean(1)) / np.median(la))
                      / (np.median(a[gring].mean(1)) / np.median(lb)),
-                     iqr(la) / iqr(lb), asset))
+                     iqr(la) / iqr(lb), asset,
+                     float(np.abs(ma / ma.mean() - mb / mb.mean()).sum())))
     rows.sort(key=lambda r: -r[2])
-    print(f'{"形态":12} {"亮度比":>7} {"色偏":>6} {"描边比":>7} {"对比比":>7}  asset')
+    print(f'{"形态":12} {"亮度比":>7} {"调色板":>7} {"描边比":>7} {"对比比":>7} {"中位色偏":>8}  asset')
     for r in rows:
-        print(f"{r[0]:12} {r[1]:7.2f} {r[2]:6.3f} {r[3]:7.2f} {r[4]:7.2f}  {r[5]}")
+        print(f"{r[0]:12} {r[1]:7.2f} {r[2]:7.3f} {r[3]:7.2f} {r[4]:7.2f} {r[6]:8.3f}  {r[5]}")
     if rows:
         med = lambda i: np.median([r[i] for r in rows])
-        print(f"\n中位: 亮度 {med(1):.2f}  色偏 {med(2):.3f}  描边 {med(3):.2f}  对比 {med(4):.2f}")
-        print("目标都是 1.00(色偏是 0.00)。亮度中位偏低是**实机的场景雾**,不要去追,见 docs/design.md §1.1")
+        print(f"\n中位: 亮度 {med(1):.2f}  调色板 {med(2):.3f}  描边 {med(3):.2f}  对比 {med(4):.2f}")
+        print("比值类目标都是 1.00,调色板距离目标 0.00。"
+              "亮度中位偏低是**实机的场景雾**,不要去追,见 docs/design.md §1.1")
 
 
 main()
