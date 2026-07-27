@@ -460,6 +460,9 @@ FormReport ExportForm(
     // 星点图(幽星光一族 = `T_Ill_XingGuang1_001_Fx_D`);没有才退用共享的 `StarStickTex`。
     (string Tex, float[] Tiling, float[]? Color)? starLayer = null;
     var starFromFakeTrans = false;
+    // 平铺数单独挑一份:见下面统一那一段末尾的说明 —— 贴图跟着「假半透」那份走,
+    // 平铺数则跟着**实例里显式覆盖过**的那份走(两者不一定在同一个材质上)。
+    float[]? explicitTiling = null;
     foreach (var (name, info) in resolved)
     {
         // 个别槽悬空:不写进材质表,运行时会跳过那一片(总比拿别的贴图硬凑好)
@@ -502,6 +505,11 @@ FormReport ExportForm(
             starLayer = (starTex, info.StarTiling, info.StarColor);
             starFromFakeTrans = info.IsFakeTrans;
         }
+        // 实例上**显式覆盖过**的 `StarStickTiling`(不是继承来的根默认 4)优先。
+        // 曜星光就是这种情形:5.3 写在 `_By` 上,而星点贴图来自 `_Fx`(假半透那份),
+        // 只按贴图那一份挑会把 5.3 丢掉、退回根默认 4。
+        if (info.Scalars.ContainsKey("StarStickTiling") || info.Vectors.ContainsKey("StarStickTiling"))
+            explicitTiling ??= info.StarTiling;
 
         string? ExportEffectTexture(string? objectPath)
         {
@@ -511,20 +519,27 @@ FormReport ExportForm(
         }
     }
 
-    // **一个形态只有一份星点遮罩,而且盖在整只宠物上。** 实机里那层星点是挂在镜头前的
-    // 一张遮罩投到宠物身上(见 docs/design.md §1),不是各材质各画一份:
-    // 各材质自己写的贴图与平铺数并不一致(暮星辰:裙子是共享的 `Tex_PetGlassyStar_004` 4×4、
-    // 身体是自己的 `Fx_D` 1.8×1.8),照各自的画就成了两种星点两种密度叠在一只宠物上。
-    // 那两颗球身上的星星也是这么来的 —— 球的基色在图集里是**一片平色圆盘**,
-    // 星形完全来自这层遮罩(所以幽星光一颗球是星、另一颗是圆点:各自压在遮罩的不同格上)。
+    // **一个形态只有一份星点遮罩,而且盖在整只宠物上。** 各材质自己写的贴图与平铺数并不一致
+    // (暮星辰:裙子是共享的 `Tex_PetGlassyStar_004`、身体是自己的 `Fx_D`),照各自的画就成了
+    // 两种星点两种密度叠在一只宠物上。那两颗球身上的星星也是这层 —— 球的基色在图集里是
+    // **一片平色圆盘**,星形完全来自这层(所以幽星光一颗球是星、另一颗是圆点)。
+    //
+    // 这是我们的简化:游戏那边**每个材质各有一份**(各自的 cb),靠静态开关与遮罩通道决定
+    // 要不要画。真按每材质走要先解出那些开关,现在还做不到。
+    //
+    // 贴图与颜色跟「假半透」那份走(它是宠物自己的星点图);**平铺数单独挑**,跟着实例里
+    // 显式覆盖过的那份走 —— 两者不一定在同一个材质上(见上面 `explicitTiling`)。
     if (starLayer is { } star)
+    {
+        var tiling = explicitTiling ?? star.Tiling;
         for (var i = 0; i < materials.Count; i++)
             materials[i] = materials[i] with
             {
                 StarTexture = star.Tex,
-                StarTiling = star.Tiling,
+                StarTiling = tiling,
                 StarColor = star.Color,
             };
+    }
 
     var bounds = mesh.ImportedBounds;
     return new FormReport(form, written, textures, materials, glb.Length, bounds.BoxExtent.Z * 2f, warnings);

@@ -77,13 +77,11 @@ struct VsOut {
     @builtin(position) clip: vec4<f32>,
     @location(0) uv: vec2<f32>,
     @location(1) normal: vec3<f32>,
-    // 裁剪空间的 xy(= NDC,正交投影下 w 恒为 1);星点层拿它当「屏幕上的位置」
-    @location(2) ndc: vec2<f32>,
     // 玻璃内部层的采样起点(直接透传顶点属性)
-    @location(3) interior_pos: vec3<f32>,
+    @location(2) interior_pos: vec3<f32>,
     // **物体空间**的法线与视线:玻璃内部层的折射必须在这个空间里算(见 `interior_star`)
-    @location(4) local_normal: vec3<f32>,
-    @location(5) local_view: vec3<f32>,
+    @location(3) local_normal: vec3<f32>,
+    @location(4) local_view: vec3<f32>,
 };
 
 // 线性混合蒙皮:权重和不为 1 的顶点(导出误差)按权重和归一化,否则会缩水
@@ -103,7 +101,6 @@ fn skin(input: VsIn) -> VsOut {
     out.clip = camera.view_proj * world;
     out.uv = input.uv;
     out.normal = normal;
-    out.ndc = out.clip.xy;
     out.interior_pos = input.interior_pos;
     // **物体空间**:法线取**未蒙皮**的顶点法线(它是烘死在网格里的,不随动画变),
     // 视线取模型空间的那份。
@@ -135,7 +132,6 @@ fn vs_outline(input: VsIn) -> VsOut {
     out.clip = camera.view_proj * (world + vec4<f32>(normal * camera.outline_width, 0.0));
     out.uv = input.uv;
     out.normal = normal;
-    out.ndc = out.clip.xy;
     out.interior_pos = input.interior_pos;
     out.local_normal = normalize(input.normal);
     out.local_view = vec3<f32>(0.0, 0.0, 1.0);
@@ -143,26 +139,31 @@ fn vs_outline(input: VsIn) -> VsOut {
 }
 
 
-/// 星点遮罩的额外平铺倍率。**对着实机截图挑的**:光按材质给的 `StarStickTiling` /
-/// `NoiseTilingSpeed`(2.5 或 1.8)算出来星点太大太稀。
+/// 星点层的额外平铺倍率。**这个手挑的倍率已经撤掉了(=1)**,平铺纯粹来自材质。
 ///
-/// **改过一次 1.0 又改回来**,记下原因免得再犯:当时的依据是「实机是少而大的四角星」,
-/// 而那个观察来自**两张放大倍率不同的裁图**(我拿 420px 渲图的 28% 去比 1440px 截图的 60%)。
-/// 把两边的宠物高度归一化后同框再比,实机是**多而小、很淡**的 —— 用户目视也确认
-/// 幽星光/曜星光/暮星辰三只的星点大小与间距差不多。所以密度这边 3.0 是对的。
+/// 原来是 3.0,理由是「材质给的 2.5/1.8 算出来星点偏大一倍」。真正的原因不是倍率,是
+/// **导出器读错了参数**:汇编里星点的采样是 `mul rX.zw, v2.xxxy, cb6[130].w` —— 网格 UV0
+/// 乘**一个标量**,而 `StarStickTiling` 在材质图里**同名存在标量与向量两份**,导出器只查了
+/// 向量表,于是幽星光一族全掉进 `NoiseTilingSpeed` 兜底拿到 1.8/2.5。改成标量优先后三只是
+/// **4 / 5.3 / 4**,而 5.3 × 1.0 ≈ 1.8 × 3.0 —— 这个倍率一直就是在替它。
+///
+/// **中途还改过一次 1.0 又改回 3.0 再撤掉**,那次的依据(「实机是少而大的四角星」)是错的:
+/// 它来自**两张放大倍率不同的裁图**(420px 渲图裁 28% 去比 1440px 截图裁 60%)。
 ///
 /// 教训:观感比对**必须先把两边的宠物在屏幕上的尺寸对齐**,否则裁图尺度会直接翻转结论。
-const STAR_TILE_SCALE: f32 = 3.0;
-/// 星点层的整体标定系数;与材质的 `Stick_Intensity`(根默认 1.5)相乘 ⇒ 净 0.3。
-///
-/// **`Stick_Intensity` 直接代进来会过强**,但原因不是强度 —— 是密度。放大对照实机才看清:
-/// 实机少而大、我原来多而小,所以先把平铺改对(见 `STAR_TILE_SCALE`),强度才有意义。
-/// `Stick_Intensity` 现在留作**材质间的相对权重**(全库 82 个材质都是 1.5,暂时不改变什么)。
+/// 按 bbox 高度归一也不够 —— 实机那张的 bbox 含环绕的粉环,同比例裁框还是落偏。
+/// 最后用的是**按躯干宽度归一**(宽度剖面的 97 分位),裁框以最宽那一行为中心,与放大倍率无关。
+const STAR_TILE_SCALE: f32 = 1.0;
+/// 星点层的整体标定系数;折的是汇编里的 `cb6[131].x`(名字未解),再与材质的
+/// `Stick_Intensity`(根默认 1.5)相乘 ⇒ 净 0.3。
 ///
 /// **试过一个无效的指标,记下来免得再用**:拿「身体区域去掉 8×8 块均值后的高频 std」
 /// 比我的渲图与实机截图 —— 那个数**由锯齿主导**(我们没有抗锯齿、还有描边,
 /// 实机截图是抗锯齿+缩放过的),星点层开关前后比值只从 2.77 变到 2.73,分辨不出东西。
 const STICK_GAIN: f32 = 0.2;
+/// 星点闪烁的相位速度。汇编里是 `frac(View 时间 × 0.25)` —— **0.25 是硬写在材质图里的
+/// 字面量**(和它并列的 `frac(时间 × 0.0056)` 喂另一层),不是可覆盖的参数,所以照抄。
+const STAR_PHASE_SPEED: f32 = 0.25;
 /// 球内星点的整体强度。汇编里这项是 `cb5[62].z`(未解出名字);根材质有个语义对得上的
 /// `StarIntensity` = 1,所以取 1。
 const INTERIOR_GAIN: f32 = 1.0;
@@ -208,30 +209,59 @@ fn matcap_uv(n: vec3<f32>) -> vec2<f32> {
     return vec2<f32>(dot(n, basis[0]), -dot(n, basis[1])) * 0.5 + vec2<f32>(0.5, 0.5);
 }
 
-/// 星点遮罩。**一只宠物只有一份,盖在整只身上**(导出器统一好了,见 Program.cs):
-/// 游戏里它像挂在镜头前的一层遮罩投到宠物身上,不随模型转动。那两颗球身上的星星也是它——
-/// 球的基色在图集里是一片平色圆盘,星形完全来自这层(所以幽星光一颗球是星、另一颗是圆点)。
+/// 星点层。**一只宠物只有一份,盖在整只身上**(导出器统一好了,见 Program.cs):
+/// 那两颗球身上的星星也是它 —— 球的基色在图集里是一片平色圆盘,星形完全来自这层
+/// (所以幽星光一颗球是星、另一颗是圆点)。
 ///
-/// 采样坐标取 **NDC**:平铺数就是「横跨模型几格」,密度不随宠物大小变。取景用的正交视体
-/// 是正方的(见 `orthographic_view`),格子天然不会被拉扁;用视空间世界坐标则是
-/// 「每世界单位几格」,大宠物身上会密到糊成一片。
+/// **这里是照反汇编原样搬的**,来源:`MI_P_Object_XingGuang_FakeTrans01` 的世界 base pass
+/// (shader 27803,7 个 uniform buffer ⇒ 材质 cb 是 cb6),第 375~403 行:
 ///
-/// **形状不在 alpha 里,在 min(r,g,b) 里。** 两种星点图的底都是**饱和**的
-/// (共享图 `Tex_PetGlassyStar_004` 是红橙黄色块 + 每块中间一颗浅蓝白小星、**alpha 恒为 255**;
-/// 「假半透」族那张是纯黑底 + 粉白星点),至少一个通道贴近 0;而星芒是浅色/白的、三通道都高。
-/// 取最小通道于是同时吃下两族、还不碰底。按 `rgb * a` 算过一版,等于把整张橙图糊到表面——
-/// 暮星辰的裙子从饱和蓝被冲成彩虹糖就是那么来的。
-fn star_light(ndc: vec2<f32>) -> vec3<f32> {
+/// ```text
+/// r12.w = frac(cb0[153].z * 0.25)                  ← View 时间 × 硬写的 0.25(4 秒一周)
+/// θ     = r12.w * 2π
+/// k     = 1.1 * lerp(|sin θ|, |cos θ|, tex.g)
+/// uv    = v2.xy * cb6[130].w                       ← v2 = **网格 UV0**
+/// x     = saturate((tex.b * (k - tex.r) - 0.01) * 25)
+/// m     = x²(3 - 2x)                               ← smoothstep,×25 造出很硬很细的边
+/// c     = 4 段渐变 cb68 →(t=⅓) cb67 →(⅔) cb70 →(1) cb72,t = saturate(k)
+/// 出    = lerp(底色, cb6[131].x * m * c, saturate(m + cb6[131].y))
+/// ```
+///
+/// 读这段有个坑:`sample` 写的是 `r11.xyz`,**把上面 `sincos` 存进 r11.x 的 sin 覆盖掉了**,
+/// 所以后面 `add r3.z, -r11.x, r3.z` 减的是 `tex.r` 而不是 sin。
+///
+/// 由此贴图三通道的分工是 **r = 每颗星的阈值、g = 相位混合、b = 幅度**,星形完全烘在贴图里
+/// (实测那张 512² 图:三通道基本共位、都是连续的 0..1、alpha 恒 1 未用)。
+///
+/// **两条旧结论就此推翻**(都在 design.md 里改掉了):
+/// ① 「采样坐标取 NDC、星点贴在镜头上不随模型转」—— 错。这个 shader 里 `v8`(SV_Position)
+///    只在 View 的抖动那条出现过,星点采的是网格 UV0,**是贴在表面上的**。
+/// ② 「形状在 min(r,g,b) 里、颜色取 tex.rgb」—— 那是 **StarStick** 那条路的做法
+///    (共享图 `Tex_PetGlassyStar_004` 确实是彩色星形色块),被错用到了「假半透」族这张
+///    纯黑底的噪声图上。两族是两套公式,导出器把两层并成一份时把公式也并错了。
+///
+/// 还缺的:那 4 个渐变色槽(cb6[67]/[68]/[70]/[72])没对上名字。材质里声明了
+/// `StickRandomColor01..04`,数量正好,但那 4 个是红/品红/蓝/黄的浓色,而实机星点是淡白粉、
+/// 和宠物 MI 上 HDR 的 `Color02`(曜星光 (10, 8.07, 9.04))才对得上 —— 更像「黑 → Color02」
+/// 那条亮度渐变。所以这里退化成 `star_color * saturate(k)`,不去编那 4 个色。
+/// `cb6[131].y`(混合系数的下限)当 0,`cb6[131].x` 折进 `star_color.w`(`Stick_Intensity`)。
+///
+/// **照汇编原样实现过一版,过曝到没法用,退回来了 —— 原因值得记住。**
+/// 那个遮罩 `m` 在 k=1 时覆盖贴图的 **29.6%**(k=0.4 时 10%),也就是说这一层压根不是
+/// 「细碎星点」,而是**一层脉动的大面积柔光**,靠那 4 段渐变色去着色才成立。缺了 4 个色槽
+/// 与 `cb6[131].x/.y` 两个强度标量,把公式照抄进来只会让整只糊成一片白(实测过)。
+/// 所以这一层**卡在 cb 名字上,不是标定能救的**。
+///
+/// 眼下留着这套经验着色:`glyph = min(r,g,b)` + 相加。它是**碰巧**能看
+/// (这张图 g 通道最小、均值 0.028,取最小通道就筛出了稀疏亮点),但它是对着实机截图标过的。
+/// 从汇编搬过来的只有一条**与名字无关**的修正:采样坐标从 NDC 换成**网格 UV0**。
+fn star_light(uv0: vec2<f32>) -> vec3<f32> {
     if material.flags.z < 0.5 {
         return vec3<f32>(0.0);
     }
-    // `ndc * 0.5` = 横跨画布一格,再乘材质给的平铺数。**还要再乘一个倍率**:
-    // 光按 `StarStickTiling`(2.5~4)算出来是「整只宠物上 2~4 格」,星点比实机大一倍以上,
-    // 看着像「一张图拉伸后投上去」;实机更像原图小尺寸密铺。倍率对着截图挑的。
-    let uv = vec2<f32>(ndc.x, -ndc.y) * 0.5 * material.star.xy * STAR_TILE_SCALE;
+    let uv = uv0 * material.star.xy * STAR_TILE_SCALE;
     let star = textureSample(star_tex, base_sampler, uv);
     let glyph = min(star.r, min(star.g, star.b));
-    // 强度用根材质里**有名字**的 `Stick_Intensity`(默认 1.5),不再是外面那个手挑的 0.3。
     return material.star_color.rgb * star.rgb * glyph * material.star_color.w;
 }
 
@@ -389,7 +419,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     // **玻璃族不加**:它有材质自己的边缘光(`RimColor`/`RimIntensity`/`RimPower`),
     // 两层叠起来轮廓会糊成一圈白 —— 暮星辰的裙子就是这么被冲成淡青的。
     let generic_rim = select(rim, 0.0, material.flags.y > 0.5);
-    var glow = vec3<f32>(generic_rim) + star_light(in.ndc) * STICK_GAIN;
+    var glow = vec3<f32>(generic_rim) + star_light(in.uv) * STICK_GAIN;
     // **不透明度**:`alpha_is_opacity` 的材质取基色 alpha,并照汇编做那个重映射
     // (`add r1.z, a, -0.04` → `mul_sat r1.z, r1.z, 1.1111`,即把 0.04..0.94 拉到 0..1)。
     // 暮星辰裙子那块 UV 的 alpha 中位 0.537 → 0.55,与从实机截图水印衰减反推的 0.50 对得上。

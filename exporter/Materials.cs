@@ -174,15 +174,26 @@ public record MaterialInfo(
         : IsFakeTrans ? FirstTexture("NoiseTex", "Noise")
         : null;
 
-    /// 星点平铺(前两位是 uv 平铺):`StarStickTiling` 是 vec4(暮星辰的裙子 = (4,4)),
-    /// 「假半透」族则记在 `NoiseTilingSpeed` 里(幽星光的身体 = (2.5,2.5,…))。
+    /// 星点平铺(前两位是 uv 平铺)。
+    ///
+    /// **`StarStickTiling` 在材质图里同名存在标量与向量两份**,根默认是**标量** 4。汇编里星点
+    /// 的采样是 `mul rX.zw, v2.xxxy, cb6[130].w` —— 网格 UV0 乘**一个标量**,u/v 同一个数,
+    /// 所以标量那份才是它,向量那份是同名的另一个参数。
+    ///
+    /// 原来只查向量表,于是幽星光一族(标量覆盖 5.3 / 向量 (4,4) / 无覆盖)全掉进
+    /// `NoiseTilingSpeed` 兜底,拿到 1.8/2.5 —— 偏小一半，运行时靠一个手挑的 ×3 补回来。
+    /// 现在按标量优先,三只得到 4 / 5.3 / 4(与用户目视「三只星点大小间距差不多」一致),
+    /// 运行时那个 ×3 也就撤掉了。
     public float[] StarTiling =>
-        Vectors.TryGetValue("StarStickTiling", out var v) && v[0] > 0 ? [v[0], v[1]]
+        Scalars.TryGetValue("StarStickTiling", out var s) && s > 0 ? [s, s]
+        : Vectors.TryGetValue("StarStickTiling", out var v) && v[0] > 0 ? [v[0], v[1]]
+        : RootDefaults?.Scalars.TryGetValue("StarStickTiling", out var r) == true && r > 0 ? [r, r]
         : IsFakeTrans && Vectors.TryGetValue("NoiseTilingSpeed", out var n) && n[0] > 0 ? [n[0], n[1]]
         : [1f, 1f];
 
     /// 平铺数是不是美术在 `StarStickTiling` 里明写的(而不是从「假半透」族的噪声参数推的)。
-    public bool HasExplicitStarTiling => Vectors.ContainsKey("StarStickTiling");
+    public bool HasExplicitStarTiling =>
+        Scalars.ContainsKey("StarStickTiling") || Vectors.ContainsKey("StarStickTiling");
 
     /// 星点层的强度。**根材质里叫 `Stick_Intensity`(默认 1.5)** —— 运行时原来写死 0.3,
     /// 那是手挑的。名字现在查实了(参数名哈希,见 RootDefaults.cs)。
