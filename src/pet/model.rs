@@ -760,9 +760,8 @@ fn animated_bounds(
     clips: &[Clip],
     bind: (Vec3, Vec3),
 ) -> (Vec3, Vec3) {
-    let (mut min, mut max) = bind;
     if vertices.is_empty() {
-        return (min, max);
+        return bind;
     }
     let bind_longest = (bind.1 - bind.0).max_element().max(1e-4);
     let limit = bind_longest * MAX_POSE_GROWTH;
@@ -807,7 +806,7 @@ fn animated_bounds(
         }
     }
     if sampled.is_empty() {
-        return (min, max);
+        return bind;    // 零动画形态:渲的就是绑定姿势
     }
 
     // **基准按「每段动作各自的姿势中心中位数」取,不是绑定盒中心、也不是全局中位数。**
@@ -843,6 +842,11 @@ fn animated_bounds(
         .map(|idx| if idx.is_empty() { Vec3::ZERO } else { median3(idx) })
         .collect();
 
+    // **取景盒不拿绑定盒当种子。** 运行时显示的永远是某个动作的姿势,绑定姿势只在
+    // 「零动画形态」那条路上出现(那时 `sampled` 为空,下面直接返回 `bind`)。
+    // 而绑定盒可能是坏的:`Dem_JingJiLong2_001` 的绑定盒 y ∈ [−28.4, 3.2](31.6 米高,
+    // 离群顶点),拿它当种子会把取景撑到 31 米,宠物缩成一个点 —— 渲出来就是空图。
+    let (mut min, mut max) = (Vec3::splat(f32::INFINITY), Vec3::splat(f32::NEG_INFINITY));
     let mut rejected = 0usize;
     let mut accepted = 0usize;
     for (i, (pose_min, pose_max)) in sampled.iter().enumerate() {
