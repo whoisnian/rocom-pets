@@ -335,9 +335,17 @@ public record MaterialInfo(
             ? RootDefaults?.Textures.GetValueOrDefault("StarTex")
             : null;
 
-    /// 内部星光的着色(根默认 `StarColor` = (0.33, 0.67, 2) —— 偏蓝的 HDR)。
+    /// 内部星光的着色:**`CrossStarColor`**(根默认 (0.5, 0.1, 0.8) 紫)。
+    ///
+    /// **原来取的是 `StarColor`(0.33, 0.67, 2) —— 错的。** 汇编里球内星层那一步是
+    /// `lerp(底, cb5[41], 星点强度)`,而 `cb5[41]` 在 `MI_Ill_XingGuang1_001_Fx1` 块 10 里
+    /// 解出来是 `CrossStarColor`;`StarColor` 根本不在这条链上。
+    /// 早先一版把 `cb5[36]` 读成 `StarColor` 并据此说「运行时用 StarColor 是对的」——
+    /// 那是解析 bug 造成的**槽位名整体错位一格**(见 rocom-capture 的 `uniexpr.param_pair`),
+    /// 修完 `cb5[36]` 是 `BlackMagicRimColor`。全库没有实例覆盖过 `CrossStarColor`。
     public float[]? InteriorColor =>
-        FirstVector("StarColor") ?? RootDefaults?.Vectors.GetValueOrDefault("StarColor");
+        FirstVector("CrossStarColor") ?? RootDefaults?.Vectors.GetValueOrDefault("CrossStarColor")
+        ?? FirstVector("StarColor") ?? RootDefaults?.Vectors.GetValueOrDefault("StarColor");
 
     /// 折射率与 march 深度。这两个每个宠物材质都写着(1.3 / 100)。
     ///

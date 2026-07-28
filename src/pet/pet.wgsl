@@ -6,7 +6,7 @@
 // **MatCap / StarStick / 玻璃内部层这几层后来是照反汇编做的**(见 docs/shader.md),
 // 不再是「不追」。但**基础 toon 那几个数仍然是猜的**,而且是在上游法线 bug 修好**之前**
 // 调出来的、之后没复核过 —— 逐个标在下面各自的定义处:
-//   `mix(0.72, 1.0, lit)` 的 0.72、`smoothstep(-0.04, 0.04, ndl)` 的阈值与过渡宽度、
+//   `mix(0.72, 1.0, lit)` 的 0.72(已换成汇编的 0.5/1.5)、
 //   `rim = pow(facing, 3.0) * 0.25`、`gpu.rs` 的 `LINE_BOOST = 1.55`。
 
 struct Camera {
@@ -147,13 +147,17 @@ fn vs_outline(input: VsIn) -> VsOut {
 }
 
 
-/// 星贴层的四段渐变色。**读出来的**:`StickRandomColor02 → 03 → 04 → 00FX_BaseColor`,
-/// 每段 ⅓ 宽,定名过程见 `stick_layer` 的注释。全库没有实例覆盖过这三个 `StickRandomColor`,
-/// 所以写成常量;`00FX_BaseColor` 有 2 处实例覆盖,但那两处不是宠物身上开着这层的材质。
-const STICK_RAMP_0: vec3<f32> = vec3<f32>(0.9601, 0.1603, 0.9074);
-const STICK_RAMP_1: vec3<f32> = vec3<f32>(0.0489, 0.1545, 0.9774);
-const STICK_RAMP_2: vec3<f32> = vec3<f32>(0.9253, 0.7416, 0.0273);
-const STICK_RAMP_3: vec3<f32> = vec3<f32>(1.0, 1.0, 1.0);
+/// 星贴层的四段渐变色:**`StickRandomColor01 → 02 → 03 → 04`**,每段 ⅓ 宽。
+/// 全库没有实例覆盖过它们,所以写成常量。
+///
+/// **这里一度记成「02 → 03 → 04 → 白,01 不在渐变里」,那是解析 bug 的假象** ——
+/// 冻结块里的向量参数数组被截断了两条(见 rocom-capture 的 `uniexpr.param_pair`
+/// 与「短串前进步长」那两处修复),于是每个槽位的名字都**错位一格**。
+/// 修完重解,四个槽正好是 01/02/03/04,比原来那个「三个浓色 + 白」自洽得多。
+const STICK_RAMP_0: vec3<f32> = vec3<f32>(0.9462, 0.0636, 0.0214);
+const STICK_RAMP_1: vec3<f32> = vec3<f32>(0.9601, 0.1603, 0.9074);
+const STICK_RAMP_2: vec3<f32> = vec3<f32>(0.0489, 0.1545, 0.9774);
+const STICK_RAMP_3: vec3<f32> = vec3<f32>(0.9253, 0.7416, 0.0273);
 /// 星贴层的强度与混合下限:汇编 `cb6[96].w` = `Stick_Intensity` = 1.5、
 /// `cb6[97].x` = `GlassyMainColorOpacity` = 0。两个都没有实例覆盖过。
 ///
@@ -168,20 +172,14 @@ const STICK_BLEND_FLOOR: f32 = 0.0;
 /// 星点闪烁的相位速度。汇编里是 `frac(View 时间 × 0.25)` —— **0.25 是硬写在材质图里的
 /// 字面量**(和它并列的 `frac(时间 × 0.0056)` 喂另一层),不是可覆盖的参数,所以照抄。
 const STAR_PHASE_SPEED: f32 = 0.25;
-/// 球内星点的整体强度:汇编 `mul_sat r0.y, r0.y, cb5[62].z`,而 **`cb5[62].z` 解出来是
-/// `FragmentsColor.w`,值 0** —— 也就是说 **shader 里的球内星层被乘成了零,实机根本不画它**。
+/// 球内星点的整体强度:汇编 `mul_sat r0.y, r0.y, cb5[62].z`,而 `cb5[62].z` 是
+/// **`CrossStarColor.w` = 1.0**。
 ///
-/// 原来这里取 1.0,依据是「根材质有个语义对得上的 `StarIntensity` = 1」——猜错了参数。
-/// `FragmentsColor` 全库没有实例覆盖过,根默认 (9, 0, 5, 0),所以这一层对**每只**宠物都是关的。
-///
-/// 这正好和早先那条**观察**对上:实机球里那颗金星是**平涂、硬边、带白描边**的,
-/// 那是附加特效精灵(骨骼网格里没有),不是 shader 的球内星层 —— 当时只能从观感上判断,
-/// 现在汇编把它钉死了。整段 `interior_star` 保留(公式是读出来的、以后别的宠物可能用得上),
-/// 但强度按读出来的 0 走。
-///
-/// 编译器折不掉这一乘是因为它是**uniform**不是编译期常量,所以整段 march + 三次采样照样在
-/// 字节码里 —— 「代码存在」不等于「这一层可见」,这是这套逆向里很容易踩的一条。
-const INTERIOR_GAIN: f32 = 0.0;
+/// **这里一度写成 0(「实机不画这一层」),那是解析 bug 的假象** —— 参数数组被截断,
+/// 槽位名整体错位一格,把 `CrossStarColor.w` 读成了 `FragmentsColor.w`(= 0)。
+/// 修完重解是 1.0,这一层**是画的**。
+/// (更早还按语义猜成 `StarIntensity` = 1 —— 值碰巧对,理由是错的。)
+const INTERIOR_GAIN: f32 = 1.0;
 /// 球内星场的采样平铺:汇编 `cb5[61].y`,**名字读出来是 `StarUVScale` = 3.0**。
 ///
 /// 原来这里写 0.4,理由是「根材质有个语义对得上的 `StarTiling` = 0.4」—— **猜错了参数**:
@@ -280,6 +278,32 @@ const SHOULDER_WHITE: f32 = 1.5;
 /// 引擎真实的解码方式,不是拟合出来的数;而变差的那两项**本来就补不回来** ——
 /// 抬曝光能把亮度拉到 0.98(曝光 0.70),但全库过曝会从 3 暴涨到 **98**:
 /// 游戏在 HDR 里有余量、削顶很少,我们的贴图是 LDR,抬曝光只会削顶。
+/// 明暗过渡的上下界。**读出来的**:汇编里这一步是
+/// `smoothstep(BlackMagicSoftMin, BlackMagicSoftMax, (N·L + 1) / 2)`
+/// (`MI_Ill_XingGuang1_001_Fx1` 块 10 的 `cb5[59].x` / `cb5[58].w`,值 0.50 / 0.52,
+/// 全库零覆盖),换算到 `N·L` 空间就是 `smoothstep(2×0.50 − 1, 2×0.52 − 1)` = **(0.00, 0.04)**。
+///
+/// 原来写的是 `(-0.04, 0.04)` —— 宽一倍且偏低,是当初扫参数扫出来的。
+const SHADE_TERM_LO: f32 = 0.0;
+const SHADE_TERM_HI: f32 = 0.04;
+/// 特效层边缘系数的下限(`rim = mix(下限, 1, facing)`)。**当年在显示空间对着截图标的。**
+///
+/// **把 `fs_effect` 搬进线性的尝试到此为止,记下别再走**:三种编码 × 四档下限全测过,
+/// 按受影响的两只(波波拉 + 水灵,它们才有特效层;中位对这两只不敏感)看 ——
+///
+/// | 版本 | 波波拉 | 水灵 | 合计 |
+/// |---|---|---|---|
+/// | **现状(显示空间)** | 0.337 | **0.097** | **0.434** |
+/// | 线性 + 下限 0.35 | 0.315 | 0.145 | 0.460 |
+/// | 线性 + 下限 0.6 | 0.311 | 0.224 | 0.535 |
+/// | 线性 + 下限 0.8 | 0.369 | 0.271 | 0.640 |
+/// | 线性 + 下限 1.0 | 0.361 | **抠图不可比** | — |
+///
+/// 每一档都更差,下限 1.0 时水灵的颜色甚至跑到贴近背景、触发了抠图丢块检测。
+/// ⇒ 这层的显示空间标定是**自洽**的,只调「编码 + 这一个下限」搬不过去。
+/// 真要做还得动 `glow`(来自 `Glow Intensity`,而它的根默认其实是 **0** —— 导出器兜底成 1,
+/// 说明这一项对特效层根本不是 `Glow Intensity`)与 alpha 的耦合方式。
+const EFFECT_RIM_FLOOR: f32 = 0.35;
 const DECODE_GAMMA: f32 = 2.2;
 const EXPOSURE: f32 = 0.4816;
 /// 环境 / 间接光。实机由 mobile base pass 的天光那批 View 常量给,离线读不出来,所以标定
@@ -380,9 +404,20 @@ fn stick_layer(uv0: vec2<f32>) -> StickLayer {
     let ks = saturate(k);
     // 4 段渐变,每段 ⅓ 宽。第三段汇编用的是 `max(3k-2, 0)` 不是 saturate ——
     // k ≤ 1 时两者等价,照抄以免以后 k 的上界改了还对
-    var c = mix(STICK_RAMP_0, STICK_RAMP_1, min(ks * 3.0, 1.0));
-    c = mix(c, STICK_RAMP_2, saturate(ks * 3.0 - 1.0));
-    c = mix(c, STICK_RAMP_3, max(ks * 3.0 - 2.0, 0.0));
+    // **两族的着色不一样,不能共用四段渐变。** `StickRandomColor01..04` 属于
+    // `StarStickTex` 那一族;而幽星光一族走的是**「假半透」**族(`NoiseTex` + `Color02`),
+    // 它的颜色就是 `Color02` —— 导出器早就把它归一化后写成 `star_color` 了
+    // (曜星光 `Color02` = (10, 8.07, 9.04) ⇒ `star_color` = (1, 0.807, 0.904))。
+    //
+    // **踩过**:我按汇编把渐变读出来之后,不分族地套到所有材质上,而退步的三只
+    // (幽星光 0.086→0.115、曜星光 0.078→0.129、暮星辰 0.082→0.094)**正好全是假半透族**。
+    // 「公式读对了」不等于「这条公式属于这个材质」—— 先确认材质属于哪一族。
+    var c = material.star_color.rgb;
+    if material.params.w < 0.5 {
+        c = mix(STICK_RAMP_0, STICK_RAMP_1, min(ks * 3.0, 1.0));
+        c = mix(c, STICK_RAMP_2, saturate(ks * 3.0 - 1.0));
+        c = mix(c, STICK_RAMP_3, max(ks * 3.0 - 2.0, 0.0));
+    }
     // 遮罩:`× 25` 造出很硬很细的边。**减的是 tex.r 不是 sin θ** ——
     // 汇编里 sample 的目标寄存器把 sincos 的结果覆盖掉了,踩过一次
     let x = saturate((tex.b * (k - tex.r) - 0.01) * 25.0);
@@ -552,7 +587,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     // 白能让三个通道**同时**吻合 (1.0,0.773,0.948) vs 实机 (1.0,0.773,0.949) —— 而汇编尾部
     // 正好有 `mad r0.xyz, r0, v5.w, v5.xyz`(**高度雾的 inscatter**,加性)。也就是说参考截图里
     // 那层淡白是**场景的雾**,桌宠不该有,所以圆顶颜色存在一个不可消的偏差,别去追。
-    let lit = smoothstep(-0.04, 0.04, ndl);
+    let lit = smoothstep(SHADE_TERM_LO, SHADE_TERM_HI, ndl);
     // **直接光项照汇编:暗 0.5 / 亮 1.5**(见上面 ② 那段),再加一层环境光。
     //
     // **环境那一项是必须的,不是补丁。** 汇编那对只乘在**直接光**上,而实机的 mobile base pass
@@ -759,9 +794,11 @@ fn fs_effect(in: VsOut) -> @location(0) vec4<f32> {
 
     // 边缘处更亮/更实:水壳的菲涅尔感与火焰的边缘都靠这个
     let facing = facing_ratio(n);
-    let rim = mix(0.35, 1.0, facing);
+    let rim = mix(EFFECT_RIM_FLOOR, 1.0, facing);
 
     let strength = mask.a * flow_amount * rim;
+    // **这一层至今整个留在显示空间**(主通道早就搬进线性了)。搬过来试过三种编码 ×
+    // 四档 `EFFECT_RIM_FLOOR`,**每一档都比现状差** —— 见下面常量的注释。
     let color = material.tint.rgb * glow * strength;
     if additive {
         // 加色:alpha=0,只往目标上加光

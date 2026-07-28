@@ -39,6 +39,10 @@ public record MaterialEntry(
     float[] StarTiling,
     float[]? StarColor,
     float StickIntensity,
+    /// 星点层来自**「假半透」族**(`NoiseTex` + `Color02`),而不是 `StarStickTex` 那一族。
+    /// 两族的着色不一样:前者用 `Color02`(即 `StarColor` 这一项),后者用
+    /// `StickRandomColor01..04` 四段渐变。见 pet.wgsl 的 `stick_layer`。
+    bool StarFakeTrans,
     /// MatCap 贴图 + 着色:玻璃/金属高光。
     string? MatcapTexture,
     float[]? MatcapColor,
@@ -169,6 +173,7 @@ public static class Manifest
                         parts.Add($"star_tex = {Quote(mat.StarTexture)}");
                         parts.Add($"star_tiling = [{Num(mat.StarTiling[0])}, {Num(mat.StarTiling[1])}]");
                         parts.Add($"stick_intensity = {Num(mat.StickIntensity)}");
+                        if (mat.StarFakeTrans) parts.Add("star_fake_trans = true");
                         if (mat.StarColor is { } sc)
                             parts.Add($"star_color = [{Num(sc[0])}, {Num(sc[1])}, {Num(sc[2])}]");
                     }

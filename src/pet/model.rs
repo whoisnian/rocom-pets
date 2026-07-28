@@ -63,6 +63,8 @@ pub struct Material {
     /// 星点 / MatCap 两张附加贴图与它们的着色,以及边缘光。
     pub star: Option<Image>,
     pub star_tiling: [f32; 2],
+    /// 星点层来自「假半透」族:着色用 `star_color`(= `Color02`),不是四段渐变
+    pub star_fake_trans: bool,
     pub star_color: [f32; 3],
     /// 星点层强度(`Stick_Intensity`)。
     pub stick_intensity: f32,
@@ -382,6 +384,7 @@ impl Model {
                     // 星点/matcap 的 alpha 原样保留:形状全在 alpha 里
                     star: spec.star.as_deref().and_then(|p| load_texture(p, true)),
                     star_tiling: spec.star_tiling,
+                    star_fake_trans: spec.star_fake_trans,
                     star_color: spec.star_color,
                     stick_intensity: spec.stick_intensity,
                     matcap: spec.matcap.as_deref().and_then(|p| load_texture(p, true)),

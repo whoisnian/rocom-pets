@@ -497,6 +497,7 @@ FormReport ExportForm(
             info.Tint, info.Opacity, info.Glow, info.Flow, maskFile, noiseFile, info.MaskIsMatcap,
             info.IsTranslucent,
             ExportEffectTexture(info.StarTexture), info.StarTiling, info.StarColor, info.StickIntensity,
+            info.IsFakeTrans,
             info.MaskIsMatcap ? null : ExportEffectTexture(info.MatcapTexture), info.MatcapColor,
             info.RimColor, info.RimIntensity, info.EmissiveColor, info.EmissiveIntensity,
             info.RimPower, info.AlphaIsOpacity,
@@ -556,6 +557,10 @@ FormReport ExportForm(
                 StarTexture = star.Tex,
                 StarTiling = tiling,
                 StarColor = star.Color,
+                // **`StarFakeTrans` 不在这里统一** —— 它是**按材质**的:
+                // 汇编里带四段渐变的三条 shader(23766 / 27803 / 34270,V=116)全部来自
+                // `_By`(`MI_P_Object` 那一族),而 `_Fx`(`FakeTrans`)的 shader 一条都没有。
+                // 两族公式不同,所以这个标记必须跟着材质自己的父链走。
             };
         }
     }

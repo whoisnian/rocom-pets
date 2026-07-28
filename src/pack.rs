@@ -82,6 +82,9 @@ struct RawMaterial {
     translucent: bool,
     #[serde(default)]
     star_tex: Option<String>,
+    /// 星点层来自「假半透」族(`NoiseTex` + `Color02`),着色走 `star_color` 而不是四段渐变
+    #[serde(default)]
+    star_fake_trans: bool,
     #[serde(default)]
     star_tiling: Option<[f32; 2]>,
     #[serde(default)]
@@ -169,6 +172,8 @@ pub struct Material {
     /// 星点层的 uv 平铺。来自材质的**标量** `StarStickTiling`(汇编里那一乘是单个标量,
     /// u/v 同一个数);这个名字在材质图里同名还有一个向量参数,别读错(见 Materials.cs)。
     pub star_tiling: [f32; 2],
+    /// 星点层来自「假半透」族:着色用 `star_color`(= `Color02`),不是四段渐变
+    pub star_fake_trans: bool,
     pub star_color: [f32; 3],
     /// 星点层的强度(根材质 `Stick_Intensity` = 1.5)。
     pub stick_intensity: f32,
@@ -387,6 +392,7 @@ impl Pack {
                                 translucent: mat.translucent,
                                 opacity: mat.opacity,
                                 star: mat.star_tex.map(|rel| dir.join(rel)),
+                                star_fake_trans: mat.star_fake_trans,
                                 star_tiling: mat.star_tiling.unwrap_or([1.0, 1.0]),
                                 star_color: mat.star_color.unwrap_or([1.0; 3]),
                                 stick_intensity: mat.stick_intensity,
