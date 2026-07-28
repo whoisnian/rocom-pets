@@ -42,7 +42,7 @@
 | **alpha 的含义分两种,由基色参数名决定**:`EyeTex`(眼/嘴)的贴图是**带透明背景的表情图集**,alpha 是真遮罩;`BaseTex`(本体)的 alpha 是美术塞的遮罩通道(813 张 `_By_D` 里 160 张通过率 <95%、60 张 <5%) | 导出器把这个区分写进 manifest 的 `mask_alpha`:载入时本体贴图的 alpha 刷成 255、表情图集原样保留,shader 里一个统一的 alpha 测试就够。阈值用材质给的 `OpacityMaskClipValue`,全量实测都是 0.3333 |
 | **材质名在「资产文件名」与「对象名」之间大小写会漂,方向还不一致**:喵呜的文件是 `MI_Gra_MiaoMiao2_001_By`、对象名是 `…Miaomiao2…`,魔力猫正好反过来 | glb 里的材质名取的是**对象名**,所以 manifest 的键也要用对象名,运行时查表再统一小写。两头对不上的表现是**整只宠物一片都画不出来**,而且报错是 wgpu 深处一句 `buffer slice can not be empty`——现在载入时加了空网格守卫,直接说清楚 |
 | **材质要从网格的 `Materials` 数组拿,不能去列 `<资产>/Mat/` 目录**:小浣蛋的 `Mat/` 里只有描边材质,本体材质不在那儿;还有资产把材质放在 `Yise/Mat/`(异色变体)。网格声明的槽是权威来源 | 改按网格取后,13 个「材质表为空」的形态全部有解 |
-| **shader 反编译那条链的操作细节不在这儿**:取 shader / 认归属 / 反汇编 / 对语义的四步流水线、archive 的二进制布局、踩过的坑,全在 rocom-capture 的 [docs/shader.md](https://github.com/whoisnian/rocom-capture/blob/master/docs/shader.md) | 这张表只记**结论**(读出来的公式与判据),工具和格式那边归 rocom-capture(它管解包) |
+| **shader 反编译那条链的操作细节不在这儿**:取 shader / 认归属 / 反汇编 / 对语义的四步流水线、archive 的二进制布局、踩过的坑,全在 [docs/shader.md](shader.md);安卓 GLSL 那条在 [docs/android-glsl.md](android-glsl.md) | 这张表只记**结论**(读出来的公式与判据),工具与格式在那两份里 |
 | **公式的离线来源是 shader library,而且它就在包里**:解包数据来自 **Windows 客户端**,所以 `NRC/Content/ShaderArchive-NRC-PCD3D_ES31.ushaderbytecode`(229MB)里是 D3D 的 DXBC —— 5715 个 shader map、72407 条 shader(pixel 52453 / vertex 19936),裸 LZ4 压,已能全部解出(rocom-capture 的 `scripts/shaderdump.py`) | cooked 包里材质图被剥掉了(editor-only),只剩参数值与静态开关;而编译产物里公式是全的、**静态开关也已在编译期定死** = 「这个材质实际跑的是什么」。这是不碰设备、不碰反作弊就能拿到 ground truth 的路子 |
 | **shader 反过来认不出材质,但绕过去了**:archive 里没有任何材质名(搜 `M_P_Object`/`XingGuang` 零命中);`.stable.upipelinecache` 里也只有哈希;DXBC 的反射段 `RDEF` 被剥了,只剩 `ISGN`/`OSGN`/`SHEX` | 归属靠**反向比对**:把材质导成原始字节(rocom-capture 的 `unpack.sh --raw`,因为哈希在 CUE4Parse 不解的 cooked resource 段里),再拿 archive 的 5715 条 `ShaderMapHashes` 逐条 memmem 那个 `.uexp`。实测幽星光 `Fx1`(那两颗球)命中 24 个 shader map、`By` 18 个、眼睛 1 个,材质之间基本不重叠 |
 | **反汇编本机就能做,不用 Windows**:wine 自带的 `d3dcompiler_47.dll` 就导出 `D3DDisassemble`(wine 11 由 vkd3d-shader 实现),编译宿主用 wine 自己的 `winegcc` | 工具是 rocom-capture 的 `scripts/dxbcdis.c`,抽查 31 条全部成功。所以**不需要抓帧**:安卓要 root、iOS 要越狱、Windows 要赌 ACE,而这条完全离线、零封号风险 |
@@ -156,7 +156,7 @@ NORMAL 的那个 bug)**之前**的,标定基础就已经不成立 —— 当时�
 **注意这条测量有个混淆项**:两边取景的 yaw 不同,采到的 UV 不完全是同一块。所以它是线索,不是结论。
 
 **已更正一条**:原来记的「实机那两端是**颜色对**而不是灰度系数(暗部会偏色)」**是错的**。
-重解冻结块查实(见 rocom-capture/scripts/uniexpr.py 的「cb 布局」):那两个槽装的是
+重解冻结块查实(见 scripts/uniexpr.py 的「cb 布局」):那两个槽装的是
 `Parameter(下标)`,而下标落在**标量**参数段 —— 一个标量广播成 float4。所以
 `mix(暗, 亮, lit)` 这个**灰度结构本身是对的**。
 
@@ -218,7 +218,7 @@ p95 13~17(只在过渡带,正是 gamma 正确化该带来的)。
 
 **曾经排除过一条路**:「按值锚定参数名」对这一项走不通(父/根材质里这对在别的块是中性占位,
 两个 paramId 29 与 46 落在字母序段的断点两侧,夹不住)。**这条已经不重要了** ——
-名字现在可以直接读出来(`rocom-capture/scripts/matparams.py`),不用按值反推。
+名字现在可以直接读出来(`scripts/matparams.py`),不用按值反推。
 
 **用 17 只有实机截图的宠物做了一次全覆盖对照**(2026-07-28),结论和过程都值得记:
 
@@ -516,7 +516,7 @@ alpha 置顶窗口 + 命中穿透。现成引擎恰好都在这两点撞墙：
 - 卡通着色：base color + ramp 光照 + 描边(法线外扩或屏幕空间)。**目标是「像」不是「同」**——
   游戏是自研 shader，含 RampTex/MatCap/描边/StarStick/Fragments 等几十个参数。
   **这条已经部分推进**:材质实例参数能完整读(§1),MatCap / StarStick / 玻璃内部层后来是照
-  反编译出的公式做的(rocom-capture/docs/shader.md);仍然是「像」而不是「同」的是基础 toon
+  反编译出的公式做的(docs/shader.md);仍然是「像」而不是「同」的是基础 toon
   那几个数(见 §1「还是猜的」那一节)。
 - 提交策略(全屏透明层的合成开销主要靠这些压掉)：
   - 无动画/交互时不提交帧；
@@ -915,8 +915,8 @@ N 只宠物的性能与内存实测、Windows 安装包 / Linux AppImage。
 | ~~**特效通道(`fs_effect`)还整个留在显示空间 —— 但单改编码会更差**~~ | 主通道早就搬进「线性 + `sqrt(色 × 曝光)` 编码」了,`fs_effect` 至今直接返回裸 `tint`。量化上很像是这儿的问题:实机波波拉内部是 (11, **209**, **251**),而 `sqrt(MainColor)` = (108, **210**, **242**) —— G/B 几乎逐位对上。**但两个候选都试了、都更差**:`sqrt(tint)` 让水灵 0.097 → **0.168**、`sqrt(tint × 曝光)` → **0.145**(波波拉 0.337 → 0.345 / 0.316)。原因是特效层那几个系数(`glow`、`rim = mix(0.35, 1.0, facing)`、`strength`)当年都是**在显示空间对着截图标的** —— 和主通道当初一样,搬进线性是**打包活**:编码 + 重标一起做,单改一行只会打破自洽 | 中:要做就整包做,别单改编码 |
 | **波波拉与火神的色差:两只都开着 `OpenCustomDepth`,依赖一条我们没有的通道** | 全库只有 **11 个材质**开了这个静态开关,正好是**水系与火系两族**(`Fir_JiZai3` / `Fir_XiaoHuoMiao1,2,3,Bo` / `Wat_DiMo2` / `Wat_ShuiLanLan1,2,3,3_011,Bo`),而 15 只对照里最大的两个色差项 —— 波波拉 0.337、火神 0.090 —— **都在这张表里**,都是那个 `_Fx`/`_Fx1` 材质。另外那片外壳是 `MSM_Unlit` + 半透 0.5,而运行时 `fs_effect` 把 matcap **只用来算 alpha**、颜色恒等于 `tint`;`MSM_Unlit` 材质里 `MatCapColor × matcap` 是**加进自发光**的(会提亮),这与「实机比壳与基色 0.5 混合更亮」对得上 | 中:**先弄清自定义深度那条通道在做什么**,比逐参数追更值得。改 matcap 那条要先拿到 composition(4 个块里都没有 `MainColor`) |
 | ~~**水体层:参数已经通到宠物包,但合成方式还没读对**~~ **推翻:那三层实机一层都不画** | 汇编第 114~117 行 `r4 × (1 − r2.y)`,而 `r2.y` 在两个分支下都是 1(`OpenBlackMagicByIDMask` 全库零覆盖)⇒ `Color1`/caustics/菲涅尔三层全部归零。这是同一个坑第三次(球内星层 `FragmentsColor.w`=0、玻璃菲涅尔 `FresnelIntensity`=0)。**读出公式后必须再查链上每个乘法因子是不是 0** | 已解决:不要实现 | 导出器写出 `water_color1`(a = 增益 `Emitter Intensity`)/ `water_color2` / `water_main`(a = 混合系数)/ `water_caustics` / `water_shape`,caustics 贴图走 `noise_tex` 槽;值与属性 JSON 逐字对上。**运行时那层实现过一次、失败了并已撤回**:整层替换 → 调色板 0.337 崩到 0.631,加在着色结果上 → 0.618(水灵 0.097 → 0.335 / 0.403),渲图一片平色。根因是我只读了 shader 35663 的 50~150 行,`r4` 不是最终颜色 —— 基色与两段明暗在后面重新进来 | 中:**先把 35663 的 150~676 行读完**,参数侧不用再动 |
-| ~~**水体预设整条链已读全,可以照着实现了**~~ 前半段成立、后半段太乐观 | 见 rocom-capture/docs/shader.md「水体预设」:`mask × Color1 × Emitter Intensity` + `caustics × Color2 × maskVariant` + 菲涅尔层,末尾 `lerp(…, Main Color, Main Color.w)`。配对是块 15(V=83)↔ shader 35663(`dcl cb5[106]`,`83+23+1=107`),解出的参数集与那个材质自己覆盖的一整套逐个对上。**已顺手修掉一处 misattribution**:`Emitter Intensity` 在这个预设里是 `Color1` 层的增益,不是自发光 —— 导出器不再给水体族输出自发光层 | 小~中:纯实现活(要新的 caustics 贴图槽 + 6 个参数),不再需要逆向 |
-| **波波拉那 0.337 不是自发光,是水体预设没实现** | 做过决定性检验:**关掉自发光,波波拉一动不动仍是 0.337**(而火神从 0.090 恶化到 0.178)—— 所以「这两只离群 = 自发光」的因果**只对火神成立**。波波拉的水体材质(父 `MI_P_Object_Water_NoMetal`)覆盖的是 `Color1`/`Color2`/`Main Color`/`CausticsInt`/`FlowDistort`/`FresnelInt`/`FresnelPower`,是一整套 caustics + 菲涅尔的水体层,我们完全没画 | 中:**卡在「那个材质没有自己的内联 shader map」**,见 rocom-capture/docs/shader.md。中途我按错配的块推出「实机偏青来自 `RedChannel`」并改了导出器 —— **那是错的,已整体撤回** |
+| ~~**水体预设整条链已读全,可以照着实现了**~~ 前半段成立、后半段太乐观 | 见 docs/shader.md「水体预设」:`mask × Color1 × Emitter Intensity` + `caustics × Color2 × maskVariant` + 菲涅尔层,末尾 `lerp(…, Main Color, Main Color.w)`。配对是块 15(V=83)↔ shader 35663(`dcl cb5[106]`,`83+23+1=107`),解出的参数集与那个材质自己覆盖的一整套逐个对上。**已顺手修掉一处 misattribution**:`Emitter Intensity` 在这个预设里是 `Color1` 层的增益,不是自发光 —— 导出器不再给水体族输出自发光层 | 小~中:纯实现活(要新的 caustics 贴图槽 + 6 个参数),不再需要逆向 |
+| **波波拉那 0.337 不是自发光,是水体预设没实现** | 做过决定性检验:**关掉自发光,波波拉一动不动仍是 0.337**(而火神从 0.090 恶化到 0.178)—— 所以「这两只离群 = 自发光」的因果**只对火神成立**。波波拉的水体材质(父 `MI_P_Object_Water_NoMetal`)覆盖的是 `Color1`/`Color2`/`Main Color`/`CausticsInt`/`FlowDistort`/`FresnelInt`/`FresnelPower`,是一整套 caustics + 菲涅尔的水体层,我们完全没画 | 中:**卡在「那个材质没有自己的内联 shader map」**,见 docs/shader.md。中途我按错配的块推出「实机偏青来自 `RedChannel`」并改了导出器 —— **那是错的,已整体撤回** |
 | ~~**球内星光的颜色多半用错了**~~ **推翻了,不用改** | 「四对颜色槽全是标量广播」来自一次**错误的块配对**。正确配对(34529 → `Fx1` 块 10,`54+15+1 = 70` 精确相等)下 `cb5[36]` 就是 `StarColor`。**更重要的是:这一层整体被 `FragmentsColor.w` = 0 乘掉了** —— 实机不画它,实机球里那颗金星是附加特效精灵。见 §1.1 | 已解决 |
 | 还卡着的具体条目 | **两段明暗、星点层那 4 个渐变色槽都已解决**。剩下的:球内星点的颜色(现在代的是根默认 `StarColor`)、球体固有色色相偏一档、水体那一族的色相 —— 这些现在**都是「去把槽位定位到名字」的执行活**,不再卡在方法上 | 小~中,逐条做 |
 | 玻璃球缺一块**大面积白色高光** | 实机每颗球有一大块明确的白高光(见截图),我们的 matcap 只按单通道 × `MatCapColor` × 0.35 叠了一层很淡的 | 小:matcap 那条链路已按汇编改对(单通道 + `max` 合),缺的是它在实机里还乘着一个遮罩通道选出的高光区 —— 那张遮罩的语义还没查 |

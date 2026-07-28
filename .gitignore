@@ -16,3 +16,6 @@ obj/
 
 # Python 缓存
 __pycache__/
+# winegcc 的编译产物(dxbcdis.c 一条命令就能重建,见 docs/shader.md)
+dxbcdis.exe
+dxbcdis.exe.so

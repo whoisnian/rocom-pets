@@ -18,6 +18,12 @@ GNOME 等不实现 wlr-layer-shell 的合成器不在支持范围，也不做 X1
 - 导出器(`exporter/`)：C# + CUE4Parse，从自己的游戏 pak 生成宠物包;
   一条进化链一个包(glb 含全部动作 + 贴图 + manifest.toml)，见 [docs/spike-s3.md](docs/spike-s3.md)。
 - 验证工具(`tools/verify_glb.py`)：按 glTF 规范自采样 + 蒙皮 + 光栅化，渲图肉眼核对动画正确性。
+- shader 逆向(`scripts/`)：cooked 包里材质图被剥了、只剩参数值与静态开关,而编译产物里公式是全的、
+  静态开关也已定死。这批脚本把公式从 shader library 里读出来 ——
+  Windows 端走 DXBC(`shaderdump.py` 取码、`dxbcdis.c` 反汇编、`dxbcsig.py` 对语义、
+  `matshader.py` 认归属、`uniexpr.py` + `matparams.py` 把 cb 槽位对回参数名),
+  安卓端走 GLSL 源码(`glsldump.py`,好读得多)。
+  流水线与结论见 [docs/shader.md](docs/shader.md) 与 [docs/android-glsl.md](docs/android-glsl.md)。
 
 配置在 `~/.config/rocom-pets/config.toml`(首次运行生成带注释模板);托盘菜单可切穿透、
 召回、退出;全局热键走 XDG GlobalShortcuts portal(KDE 会弹窗确认),或把 KDE 自定义快捷键
@@ -34,6 +40,7 @@ git -C "$CUE4PARSE_DIR" apply exporter/patches/*.patch      # 导出前必做:�
 dotnet run --project exporter -- --species 3001 --out packs # 导一条进化链
 dotnet run --project exporter -- --all --skip-existing --out packs  # 全量导(可分批续跑)
 python tools/verify_glb.py packs/喵喵 --clips Idle,Walk     # 渲图验证
+uv run --with lz4 python scripts/glsldump.py <安卓 shader 库> --index   # shader 逆向(见 docs/shader.md)
 ```
 
 资产提取链路在 [rocom-capture](../rocom-capture) 里验证；叫声提取管线复用 rocom-petvo。
