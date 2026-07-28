@@ -105,6 +105,8 @@ struct RawMaterial {
     emissive_intensity: f32,
     #[serde(default = "three")]
     rim_power: f32,
+    #[serde(default)]
+    noise_uv: Option<[f32; 4]>,
     /// 基色 alpha 是不透明度(而不是纹路遮罩)——静态开关 `Opacity or OpacityMask` 开着的那批
     #[serde(default)]
     alpha_opacity: bool,
@@ -188,6 +190,8 @@ pub struct Material {
     pub emissive_intensity: f32,
     /// 边缘光的衰减次数。**小于 1 = 整片泛色**(幽星光的球 0.35),不是一圈细边。
     pub rim_power: f32,
+    /// 假半透族星点层:[速度X, 速度Y, 强度, 是否用 UV0]。见 pet.wgsl 的 stick_layer。
+    pub noise_uv: [f32; 4],
     /// **基色贴图的 alpha 是不透明度**(不是纹路遮罩)。判据是静态开关 `Opacity or OpacityMask`,
     /// 开着的 11 个材质:蜜蜂/小甲虫的翅膀、果冻、暮星辰的裙子……
     pub alpha_opacity: bool,
@@ -403,6 +407,7 @@ impl Pack {
                                 emissive: mat.emissive.unwrap_or([0.0; 3]),
                                 emissive_intensity: mat.emissive_intensity,
                                 rim_power: mat.rim_power,
+                                noise_uv: mat.noise_uv.unwrap_or([0.0, 0.0, 1.0, 1.0]),
                                 alpha_opacity: mat.alpha_opacity,
                                 flow: mat.flow_tex.map(|rel| dir.join(rel)),
                                 flow_uv: mat.flow.unwrap_or([0.0, 0.0, 1.0, 1.0]),

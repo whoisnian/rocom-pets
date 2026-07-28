@@ -77,7 +77,9 @@ public record MaterialEntry(
     float RefractDepth,
     /// 球内那颗星的闪烁:速度与次数(见 MaterialInfo.FlickerSpeed)。
     float FlickerSpeed,
-    float FlickerPower);
+    float FlickerPower,
+    /// 假半透族星点层的 [速度X, 速度Y, 强度, 是否用UV0]。见 Materials.cs 的 NoiseUv。
+    float[] NoiseUv);
 
 public record FormReport(
     Form Form,
@@ -174,6 +176,11 @@ public static class Manifest
                         parts.Add($"star_tiling = [{Num(mat.StarTiling[0])}, {Num(mat.StarTiling[1])}]");
                         parts.Add($"stick_intensity = {Num(mat.StickIntensity)}");
                         if (mat.StarFakeTrans) parts.Add("star_fake_trans = true");
+                        // **不能只在 `StarFakeTrans` 时写。** 那个标记只有 `_Fx` 有,而身体是
+                        // `_By` 画的 —— 只发给 `_Fx` 的话 `_By` 退回兜底值 [0,0,1,1],
+                        // 于是仍走 UV0、强度 1.0:星点贴在身上、而且浓三十倍(踩过)。
+                        // 星点层本来就是跨材质统一的,这套参数跟着一起发。
+                        parts.Add($"noise_uv = [{string.Join(", ", mat.NoiseUv.Select(Num))}]");
                         if (mat.StarColor is { } sc)
                             parts.Add($"star_color = [{Num(sc[0])}, {Num(sc[1])}, {Num(sc[2])}]");
                     }

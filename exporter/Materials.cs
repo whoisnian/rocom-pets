@@ -289,9 +289,15 @@ public record MaterialInfo(
         get
         {
             if (FirstVector("StarColor", "StarStickColor") is { } c) return c;
+            // **HDR 量级要保留,不能归一化。** 原来除掉了峰值(曜星光 `Color02` =
+            // (10, 8.07, 9.04) ⇒ (1, 0.807, 0.904)),那是因为当时运行时的强度写死 1.5、
+            // 不除会糊白。现在强度是**读出来的** `Mat_NoiseIntensity` = 0.05,
+            // 而它本就是配着原始 HDR 值用的:
+            //     实机 (10, 8.07, 9.04) × 0.05 = (0.50, 0.40, 0.45)
+            //     归一化后          × 0.05 = (0.05, 0.04, 0.045)   ← 暗十倍
+            // 用户实测「幽星光身上的星点不明显」就是这十倍。
             if (!IsFakeTrans || FirstVector("Color02") is not { } hdr) return null;
-            var peak = MathF.Max(hdr[0], MathF.Max(hdr[1], hdr[2]));
-            return peak > 0 ? [hdr[0] / peak, hdr[1] / peak, hdr[2] / peak, 1f] : null;
+            return [hdr[0], hdr[1], hdr[2], 1f];
         }
     }
 
@@ -373,6 +379,23 @@ public record MaterialInfo(
     /// 边缘光的衰减次数:`pow(1 - N·V, RimPower)`。**小于 1 就不是「一圈边」而是整片泛色**——
     /// 幽星光那两个球是 0.35,整颗都透着红,只写 RimColor 不写这个会画成一圈细红边。
     public float RimPower => Scalar("Rim Power", Scalar("RimPower", 3f));
+
+    /// **假半透族那层星点不走网格 UV0。** 材质图里有个明写的开关 `UseNoiseUV0`,根默认 **0**;
+    /// 配套 `Mat_NoiseTilingX/Y = 5 / 2.5`、`Mat_NoiseSpeedX/Y = 0.1 / -0.1`、
+    /// `Mat_NoiseIntensity = 0.05`。四条实机观察逐条对上:很淡、像蒙在镜头前、
+    /// 拖动旋转时星点不随着转、略微上浮(`SpeedY` 为负 ⇒ 采样坐标下移 ⇒ 图案上浮)。
+    ///
+    /// **必须用 `RootScalar` 取。** 这几个参数全库没有任何实例覆盖过,只存在于根默认里,
+    /// 而 `Scalar()` **不查根默认**(那是刻意的,见 `RootDefaults` 那条注释)。
+    /// 踩过两次:两轮都拿到兜底值 `[0,0,1,1]`,还一度误判成"解包数据里没有"。
+    public float[] NoiseUv =>
+    [
+        RootScalar("Mat_NoiseSpeedX", 0f), RootScalar("Mat_NoiseSpeedY", 0f),
+        RootScalar("Mat_NoiseIntensity", 1f), RootScalar("UseNoiseUV0", 1f),
+    ];
+
+    /// 同上那套里的平铺;0 = 这个材质没有这套参数。
+    public float[] NoiseTiling => [RootScalar("Mat_NoiseTilingX", 0f), RootScalar("Mat_NoiseTilingY", 0f)];
 
     private float Scalar(string name, float fallback = 0f) =>
         Scalars.TryGetValue(name, out var v) ? v : fallback;

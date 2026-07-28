@@ -458,7 +458,7 @@ FormReport ExportForm(
     var materials = new List<MaterialEntry>();
     // 这个形态的星点遮罩(见下面统一那一段):优先用「假半透」族给的那张,它是宠物自己的
     // 星点图(幽星光一族 = `T_Ill_XingGuang1_001_Fx_D`);没有才退用共享的 `StarStickTex`。
-    (string Tex, float[] Tiling, float[]? Color)? starLayer = null;
+    (string Tex, float[] Tiling, float[]? Color, float[] NoiseUv)? starLayer = null;
     var starFromFakeTrans = false;
     // 平铺数单独挑一份:见下面统一那一段末尾的说明 —— 贴图跟着「假半透」那份走,
     // 平铺数则跟着**实例里显式覆盖过**的那份走(两者不一定在同一个材质上)。
@@ -506,12 +506,16 @@ FormReport ExportForm(
             info.WaterColor1, info.WaterColor2, info.WaterMain,
             info.WaterCaustics, info.WaterShape,
             ExportEffectTexture(info.InteriorTexture), info.InteriorColor,
-            info.Refraction, info.RefractDepth, info.FlickerSpeed, info.FlickerPower));
+            info.Refraction, info.RefractDepth, info.FlickerSpeed, info.FlickerPower,
+            info.NoiseUv));
 
         if (info.StarTexture is not null && ExportEffectTexture(info.StarTexture) is { } starTex
             && (starLayer is null || (info.IsFakeTrans && !starFromFakeTrans)))
         {
-            starLayer = (starTex, info.StarTiling, info.StarColor);
+            // 假半透族的平铺该用 `Mat_NoiseTilingX/Y`(5 / 2.5),不是 `StarStickTiling`(4)。
+            var tile = info.IsFakeTrans && info.NoiseTiling[0] > 0f && info.NoiseTiling[1] > 0f
+                ? info.NoiseTiling : info.StarTiling;
+            starLayer = (starTex, tile, info.StarColor, info.NoiseUv);
             starFromFakeTrans = info.IsFakeTrans;
         }
         // 实例上**显式覆盖过**的 `StarStickTiling`(不是继承来的根默认 4)优先。
@@ -557,6 +561,10 @@ FormReport ExportForm(
                 StarTexture = star.Tex,
                 StarTiling = tiling,
                 StarColor = star.Color,
+                // 坐标系/滚动/浓度跟着星点层一起统一发,否则 `_By` 拿不到(见 Manifest.cs)。
+                // **但只在星点层来自假半透族时发** —— 这套参数是那一族的,
+                // 另一族走 `StarStickTex` + 自己的公式,误套过去会让全库过曝 5 → 11(踩过)。
+                NoiseUv = starFromFakeTrans ? star.NoiseUv : [0f, 0f, 1f, 1f],
                 // **`StarFakeTrans` 不在这里统一** —— 它是**按材质**的:
                 // 汇编里带四段渐变的三条 shader(23766 / 27803 / 34270,V=116)全部来自
                 // `_By`(`MI_P_Object` 那一族),而 `_Fx`(`FakeTrans`)的 shader 一条都没有。

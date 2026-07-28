@@ -76,6 +76,8 @@ pub struct Material {
     pub emissive: [f32; 3],
     pub emissive_intensity: f32,
     pub rim_power: f32,
+    /// 假半透族星点层:[速度X, 速度Y, 强度, 是否用 UV0]。
+    pub noise_uv: [f32; 4],
     /// 基色 alpha 是不透明度(见 `pack::Material::alpha_opacity`)。
     pub alpha_opacity: bool,
     /// 卷动色带:渐变图 + [u速度, v速度, u平铺, v平铺] + 混入强度。
@@ -394,6 +396,7 @@ impl Model {
                     emissive: spec.emissive,
                     emissive_intensity: spec.emissive_intensity,
                     rim_power: spec.rim_power,
+                    noise_uv: spec.noise_uv,
                     alpha_opacity: spec.alpha_opacity,
                     flow: spec.flow.as_deref().and_then(|p| load_texture(p, true)),
                     flow_uv: spec.flow_uv,

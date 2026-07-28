@@ -58,6 +58,8 @@ struct MaterialUniform {
     bounds_size: [f32; 4],
     /// 色带的 ID 遮罩:[区间下限, 区间上限, 有遮罩(0/1), -]
     mask_id: [f32; 4],
+    /// 假半透族星点层:[速度X, 速度Y, 强度, 是否用 UV0]
+    noise_uv: [f32; 4],
 }
 
 /// 本体贴图 alpha 里那层线条遮罩的**加性**强度。游戏里那些纹路(水灵身上的竖条、
@@ -402,6 +404,7 @@ impl PetGpu {
                     bounds_min: bmin,
                     bounds_size: bsize,
                     mask_id: mask_id(material),
+                    noise_uv: material.noise_uv,
                 },
                 // 有基色的材质:params.x/.z 说明 alpha 怎么解释
                 // (x=1 镂空遮罩、z=1 不透明度,都为 0 则是线条遮罩)
@@ -462,6 +465,7 @@ impl PetGpu {
                     bounds_min: bmin,
                     bounds_size: bsize,
                     mask_id: mask_id(material),
+                    noise_uv: material.noise_uv,
                 },
             };
             let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {

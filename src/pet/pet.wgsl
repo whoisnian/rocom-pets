@@ -52,6 +52,8 @@ struct MaterialParams {
     bounds_size: vec4<f32>,
     // 色带的 ID 遮罩:[区间下限, 区间上限, 有没有遮罩, -]
     mask_id: vec4<f32>,
+    /// 假半透族星点层:[速度X, 速度Y, 强度, 是否用 UV0]
+    noise_uv: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> camera: Camera;
@@ -90,6 +92,10 @@ struct VsOut {
     // **物体空间**的法线与视线:玻璃内部层的折射必须在这个空间里算(见 `interior_star`)
     @location(3) local_normal: vec3<f32>,
     @location(4) local_view: vec3<f32>,
+    /// **裁剪空间 NDC**。假半透族的星点层在这个空间里采 —— 材质图 `UseNoiseUV0 = 0`
+    /// 明写了"不走网格 UV0",实机观感正是"蒙在镜头前、拖动旋转时星点不随着转"。
+    /// 用 NDC 而非 `@builtin(position)`,是为了不依赖视口尺寸。
+    @location(5) ndc: vec2<f32>,
 };
 
 // 线性混合蒙皮:权重和不为 1 的顶点(导出误差)按权重和归一化,否则会缩水
@@ -107,6 +113,7 @@ fn skin(input: VsIn) -> VsOut {
 
     var out: VsOut;
     out.clip = camera.view_proj * world;
+    out.ndc = out.clip.xy / max(out.clip.w, 1e-6);
     out.uv = input.uv;
     out.normal = normal;
     out.interior_pos = input.interior_pos;
@@ -138,6 +145,7 @@ fn vs_outline(input: VsIn) -> VsOut {
     let world = m * vec4<f32>(input.pos, 1.0);
     var out: VsOut;
     out.clip = camera.view_proj * (world + vec4<f32>(normal * camera.outline_width, 0.0));
+    out.ndc = out.clip.xy / max(out.clip.w, 1e-6);
     out.uv = input.uv;
     out.normal = normal;
     out.interior_pos = input.interior_pos;
@@ -172,6 +180,12 @@ const STICK_BLEND_FLOOR: f32 = 0.0;
 /// 星点闪烁的相位速度。汇编里是 `frac(View 时间 × 0.25)` —— **0.25 是硬写在材质图里的
 /// 字面量**(和它并列的 `frac(时间 × 0.0056)` 喂另一层),不是可覆盖的参数,所以照抄。
 const STAR_PHASE_SPEED: f32 = 0.25;
+/// 见 `stick_layer` 里 `base_uv` 那段:离屏画布 ↔ 实机屏幕的尺度比。
+///
+/// **这条线上唯一一个标定值**,其余(坐标系/滚动速度/浓度/平铺)全部读自解包数据。
+/// 它取决于实机里宠物占屏幕多大 —— **越大越密**(屏幕上铺的格子越多)。
+/// 2.0 是对着实机截图目视定的;1.0 星点偏大、2.5 起就偏密。
+const SCREEN_REF: f32 = 2.0;
 /// 球内星点的整体强度:汇编 `mul_sat r0.y, r0.y, cb5[62].z`,而 `cb5[62].z` 是
 /// **`CrossStarColor.w` = 1.0**。
 ///
@@ -393,12 +407,23 @@ struct StickLayer {
     cover: f32,
 }
 
-fn stick_layer(uv0: vec2<f32>) -> StickLayer {
+fn stick_layer(uv0: vec2<f32>, ndc: vec2<f32>) -> StickLayer {
     if material.flags.z < 0.5 {
         return StickLayer(vec3<f32>(0.0), 0.0);
     }
     let theta = fract(camera.time * STAR_PHASE_SPEED) * 6.2831855;
-    let tex = textureSample(star_tex, base_sampler, uv0 * material.star.xy);
+    // **坐标系由 `UseNoiseUV0` 定。** 假半透族(幽星光一家)根默认是 0 ⇒ 走**相机空间**
+    // (这里用 NDC),再按 `Mat_NoiseSpeedX/Y` 随时间滚动。`SpeedY = -0.1` 为负 ⇒
+    // 采样坐标下移 ⇒ 图案**上浮**,与实机一致。
+    // **屏幕参考尺度。** 实机里宠物只占屏幕一小块,`Mat_NoiseTiling`(5 / 2.5)铺的是
+    // **整个屏幕**;而我们离屏渲染时宠物**填满画布**,同样的平铺落到宠物身上只剩一两次
+    // —— 星点偏大、滚动相对星点也偏快(用户实测两条)。乘一个参考尺度同时校正两者:
+    // 平铺变密 ⇒ 星点变小,而滚动是 UV 单位、相对格子就慢了同样的倍数。
+    // **这个数是标定的**,不是读出来的:它取决于实机截图里宠物占屏幕多大。
+    let base_uv = select((ndc * 0.5 + vec2<f32>(0.5)) * SCREEN_REF, uv0,
+                         material.noise_uv.w > 0.5);
+    let scroll = vec2<f32>(material.noise_uv.x, material.noise_uv.y) * camera.time;
+    let tex = textureSample(star_tex, base_sampler, base_uv * material.star.xy + scroll);
     // `k = 1.1 * lerp(|sin θ|, |cos θ|, tex.g)`,每颗星按 g 通道拿到自己的相位
     let k = 1.1 * mix(abs(sin(theta)), abs(cos(theta)), tex.g);
     let ks = saturate(k);
@@ -420,9 +445,25 @@ fn stick_layer(uv0: vec2<f32>) -> StickLayer {
     }
     // 遮罩:`× 25` 造出很硬很细的边。**减的是 tex.r 不是 sin θ** ——
     // 汇编里 sample 的目标寄存器把 sincos 的结果覆盖掉了,踩过一次
-    let x = saturate((tex.b * (k - tex.r) - 0.01) * 25.0);
-    let m = x * x * (3.0 - 2.0 * x);
-    return StickLayer(c * m * STICK_INTENSITY, saturate(m + STICK_BLEND_FLOOR));
+    // **形状固定,时间只调亮度。** 原来是 `saturate((tex.b*(k − tex.r) − 0.01)*25)` ——
+    // 一个随时间移动的阈值:`tex.r < k` 把亮的星芯排除在外、只留外圈辉光,几何上必然出
+    // **空心环**(实机报的"星点周围一圈光晕闪烁")。贴图本身就是成品星场,不该再去切。
+    // **遮罩要收到只剩星芯。** 颜色是 `c·m·gain`(幽星光 15 × 0.05 = 0.75·m),
+    // 而 cover 用裸 m —— 若把星芒外围那圈暗辉光(m ≈ 0.3)也算进 cover,
+    // 就会往身体上混一层比底色更暗的**灰**:星芯亮不起来、暗区反而发灰(用户实测)。
+    // 只保留 `c·m·gain` 能压过底色的那一段。
+    let m = smoothstep(0.5, 1.0, max(tex.r, max(tex.g, tex.b)));
+    // **强度用读出来的 `Mat_NoiseIntensity`(0.05),不是 `Stick_Intensity`(1.5)** —— 差三十倍。
+    let gain = material.noise_uv.z;
+    // **强度只进颜色,不进混合系数。** 汇编那条是
+    //     lerp(底, Stick_Intensity × m × c, saturate(m + GlassyMainColorOpacity))
+    // —— cover 用的是**裸的 m**。把 gain 也乘进 cover(0.05·m)会让这一层几乎不参与
+    // 混合,星点整个看不见(踩过)。
+    // **颜色取贴图自身。** `_Fx_D` 里那些星芒本来就是**品红 / 白 / 青**的成品色
+    // (实机看是"浅青粉"),用一个平的 `Color02` 白色会把这层色相抹平(用户实测)。
+    // `Color02` 只作为 HDR 增益。
+    let lit_c = select(c, tex.rgb * c, material.noise_uv.w < 0.5);
+    return StickLayer(lit_c * m * gain, saturate(m + STICK_BLEND_FLOOR));
 }
 
 /// 卷动色带:一张渐变图沿 UV 滚过表面,乘在固有色上。暮星辰的环带靠它出青↔粉渐变
@@ -709,8 +750,19 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     // 全库过曝 11 → 14,多出来的正好是开着这层的星光族三只。
     //
     // 渐变色是材质参数(本来就在线性空间),所以**不过 `DECODE_GAMMA`** —— 只有贴图要解码。
-    let stick = stick_layer(in.uv);
-    let body = mix(albedo * shade, stick.color, stick.cover);
+    let stick = stick_layer(in.uv, in.ndc);
+    // **假半透族那层是加光,不是 lerp 替换。** 上面那条 lerp 是 `StarStickTex` 那一族的
+    // (汇编查实);两族公式不同,合并成一套是已知的简化。这一族的星点色是
+    // `Color02 × Mat_NoiseIntensity`(幽星光 15 × 0.05 = 0.75),**比被照亮的身体还暗** ——
+    // 替上去就是一片深色麻点(用户实测「星点的黑灰色明显不对」)。加上去才是星芒。
+    // **判据要跟着坐标系走,不能用 `params.w`。** `star_fake_trans` 那个标记只有 `_Fx` 有,
+    // 而身体是 `_By` 画的 —— 按 `params.w` 判会让 `_By` 走 lerp 替换那一支,
+    // 拿一个比底色暗的星点色替上去 ⇒ **身上一片黑斑**(用户实测)。
+    // `noise_uv.w < 0.5` 表示"这个材质用相机空间的噪声坐标",与加光是同一族。
+    let fake_trans = material.noise_uv.w < 0.5;
+    let body = select(mix(albedo * shade, stick.color, stick.cover),
+                      albedo * shade, fake_trans);
+    let stick_add = select(vec3<f32>(0.0), stick.color, fake_trans);
     // **末尾统一编码到显示空间**:`sqrt(色 × 曝光)`,照汇编尾部那条
     // `movc o0.xyz, (曝光 < 1), sqrt(色 × 曝光), 色`。
     //
@@ -721,7 +773,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     //
     // 输出预乘 alpha(见 render.rs)。**固有色乘 alpha、加上去的光不乘**:高光/星点/边缘光
     // 是打在表面上的光,半透表面照样该有,乘进去会随着变透明一起消失。
-    var lin = max(body * alpha + glow, vec3<f32>(0.0)) * EXPOSURE;
+    var lin = max(body * alpha + glow + stick_add, vec3<f32>(0.0)) * EXPOSURE;
     // **软肩**:游戏那条链在 HDR 里算完再由曝光压回来,削顶发生在有余量的地方;
     // 我们的贴图是 LDR,硬削顶意味着「一提亮就大片糊白」——实测把亮度比从 0.83 提到 0.92
     // 需要 `AMBIENT` 1.0,而那时全库过曝从 1 涨到 34。
