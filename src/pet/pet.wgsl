@@ -38,6 +38,8 @@ struct MaterialParams {
     star_color: vec4<f32>,
     // MatCap 着色(rgb,可能是 HDR)
     matcap_color: vec4<f32>,
+    // 自发光:`Emitter Color`(rgb,线性)+ `Emitter Intensity`(a);a = 0 时整层不画
+    emissive: vec4<f32>,
     rim_color: vec4<f32>,
     // [边缘光衰减次数, 色带混入强度, -, 有没有色带]
     extra: vec4<f32>,
@@ -145,42 +147,57 @@ fn vs_outline(input: VsIn) -> VsOut {
 }
 
 
-/// 星点层的额外平铺倍率。**这个手挑的倍率已经撤掉了(=1)**,平铺纯粹来自材质。
+/// 星贴层的四段渐变色。**读出来的**:`StickRandomColor02 → 03 → 04 → 00FX_BaseColor`,
+/// 每段 ⅓ 宽,定名过程见 `stick_layer` 的注释。全库没有实例覆盖过这三个 `StickRandomColor`,
+/// 所以写成常量;`00FX_BaseColor` 有 2 处实例覆盖,但那两处不是宠物身上开着这层的材质。
+const STICK_RAMP_0: vec3<f32> = vec3<f32>(0.9601, 0.1603, 0.9074);
+const STICK_RAMP_1: vec3<f32> = vec3<f32>(0.0489, 0.1545, 0.9774);
+const STICK_RAMP_2: vec3<f32> = vec3<f32>(0.9253, 0.7416, 0.0273);
+const STICK_RAMP_3: vec3<f32> = vec3<f32>(1.0, 1.0, 1.0);
+/// 星贴层的强度与混合下限:汇编 `cb6[96].w` = `Stick_Intensity` = 1.5、
+/// `cb6[97].x` = `GlassyMainColorOpacity` = 0。两个都没有实例覆盖过。
 ///
-/// 原来是 3.0,理由是「材质给的 2.5/1.8 算出来星点偏大一倍」。真正的原因不是倍率,是
-/// **导出器读错了参数**:汇编里星点的采样是 `mul rX.zw, v2.xxxy, cb6[130].w` —— 网格 UV0
-/// 乘**一个标量**,而 `StarStickTiling` 在材质图里**同名存在标量与向量两份**,导出器只查了
-/// 向量表,于是幽星光一族全掉进 `NoiseTilingSpeed` 兜底拿到 1.8/2.5。改成标量优先后三只是
-/// **4 / 5.3 / 4**,而 5.3 × 1.0 ≈ 1.8 × 3.0 —— 这个倍率一直就是在替它。
+/// 这里换掉的是原先那个手挑的 `STICK_GAIN = 0.083`(由「旧 0.2² / EXPOSURE」折算而来)——
+/// 那是为「相加式叠一层白光」标的,而汇编里这层是 **lerp 替换固有色**,两者不可比。
 ///
-/// **中途还改过一次 1.0 又改回 3.0 再撤掉**,那次的依据(「实机是少而大的四角星」)是错的:
-/// 它来自**两张放大倍率不同的裁图**(420px 渲图裁 28% 去比 1440px 截图裁 60%)。
-///
-/// 教训:观感比对**必须先把两边的宠物在屏幕上的尺寸对齐**,否则裁图尺度会直接翻转结论。
-/// 按 bbox 高度归一也不够 —— 实机那张的 bbox 含环绕的粉环,同比例裁框还是落偏。
-/// 最后用的是**按躯干宽度归一**(宽度剖面的 97 分位),裁框以最宽那一行为中心,与放大倍率无关。
-const STAR_TILE_SCALE: f32 = 1.0;
-/// 星点层的整体标定系数;折的是汇编里的 `cb6[131].x`(名字未解),再与材质的
-/// `Stick_Intensity`(根默认 1.5)相乘 ⇒ 净 0.3。
-///
-/// **试过一个无效的指标,记下来免得再用**:拿「身体区域去掉 8×8 块均值后的高频 std」
-/// 比我的渲图与实机截图 —— 那个数**由锯齿主导**(我们没有抗锯齿、还有描边,
-/// 实机截图是抗锯齿+缩放过的),星点层开关前后比值只从 2.77 变到 2.73,分辨不出东西。
-///
-/// 搬进线性后按 `旧² / EXPOSURE` = 0.2² / 0.4816 ≈ 0.083 换算(保持观感等值)。
-const STICK_GAIN: f32 = 0.083;
+/// **另记一个试过的无效指标**:拿「身体区域去掉 8×8 块均值后的高频 std」比渲图与实机截图 ——
+/// 那个数**由锯齿主导**(我们没抗锯齿、还有描边,实机截图是抗锯齿+缩放过的),
+/// 星点层开关前后比值只从 2.77 变到 2.73,分辨不出东西。
+const STICK_INTENSITY: f32 = 1.5;
+const STICK_BLEND_FLOOR: f32 = 0.0;
 /// 星点闪烁的相位速度。汇编里是 `frac(View 时间 × 0.25)` —— **0.25 是硬写在材质图里的
 /// 字面量**(和它并列的 `frac(时间 × 0.0056)` 喂另一层),不是可覆盖的参数,所以照抄。
 const STAR_PHASE_SPEED: f32 = 0.25;
-/// 球内星点的整体强度。汇编里这项是 `cb5[62].z`(未解出名字);根材质有个语义对得上的
-/// `StarIntensity` = 1,所以取 1。
-const INTERIOR_GAIN: f32 = 1.0;
-/// 星场的平铺标量(汇编里的 `cb5[61].y`)。根材质默认 `StarTiling` = 0.4 ——
-/// 值越小采样范围越窄、星点看着越大。**名字现在是查实的**:根材质 `CachedExpressionData`
-/// 的 `NameHashes` 可以用 `CityHash64WithSeed(名字大写, 0)` 反查(见 RootDefaults.cs),
-/// 139 个标量默认值全部有名字,不再靠语义猜。
-const STAR_FIELD_TILING: f32 = 0.4;
-/// 三向投影权重的次数:根材质 `StarTriPlannarBlendInt` = 2。
+/// 球内星点的整体强度:汇编 `mul_sat r0.y, r0.y, cb5[62].z`,而 **`cb5[62].z` 解出来是
+/// `FragmentsColor.w`,值 0** —— 也就是说 **shader 里的球内星层被乘成了零,实机根本不画它**。
+///
+/// 原来这里取 1.0,依据是「根材质有个语义对得上的 `StarIntensity` = 1」——猜错了参数。
+/// `FragmentsColor` 全库没有实例覆盖过,根默认 (9, 0, 5, 0),所以这一层对**每只**宠物都是关的。
+///
+/// 这正好和早先那条**观察**对上:实机球里那颗金星是**平涂、硬边、带白描边**的,
+/// 那是附加特效精灵(骨骼网格里没有),不是 shader 的球内星层 —— 当时只能从观感上判断,
+/// 现在汇编把它钉死了。整段 `interior_star` 保留(公式是读出来的、以后别的宠物可能用得上),
+/// 但强度按读出来的 0 走。
+///
+/// 编译器折不掉这一乘是因为它是**uniform**不是编译期常量,所以整段 march + 三次采样照样在
+/// 字节码里 —— 「代码存在」不等于「这一层可见」,这是这套逆向里很容易踩的一条。
+const INTERIOR_GAIN: f32 = 0.0;
+/// 球内星场的采样平铺:汇编 `cb5[61].y`,**名字读出来是 `StarUVScale` = 3.0**。
+///
+/// 原来这里写 0.4,理由是「根材质有个语义对得上的 `StarTiling` = 0.4」—— **猜错了参数**:
+/// 两个都存在,而接在这个槽上的是 `StarUVScale`。差 7.5 倍。
+/// 定名靠把 shader 34529(`V=54`、`dcl cb5[70]`)配到 `MI_Ill_XingGuang1_001_Fx1` 的块 10
+/// (`54 + ⌈60/4⌉ + 1 = 70`,精确相等、12 个块里唯一),同块的 `FlickerSpeed` = 0.3、
+/// `FlickerPower` = 5、`MatCapColor` 与宠物包里的值逐字对上 —— 配对是可信的。
+/// 全库没有实例覆盖过它,所以写成常量。
+const INTERIOR_UV_SCALE: f32 = 3.0;
+/// march 距离的倍率:汇编 `marchDist = halfExtent × 0.01 × cb5[61].x`,而
+/// **`cb5[61].x` 的名字是 `StarColorDepth` = 15**,不是 `GlobalDepth`。
+///
+/// 原来代的是 `GlobalDepth` = 100,依据是「代 100 进去正好让 marchDist = halfExtent,
+/// 那个 0.01 的配合就是强证据」—— 那只是个自洽性论证,**名字读出来就否掉了**。
+/// 真值 15 ⇒ marchDist = 0.15 × halfExtent。同样全库零覆盖。
+const INTERIOR_DEPTH: f32 = 15.0;
 const STAR_TRIPLANAR_BLEND: f32 = 2.0;
 /// 玻璃族 MatCap 高光的叠加量。**已经撤成 1.0 —— 这一层不再有手挑参数。**
 ///
@@ -204,6 +221,36 @@ const GLASS_MATCAP_GAIN: f32 = 1.0;
 /// **那两条测量都是在显示空间做的**(量的是截图像素),搬进线性后要换算:
 /// `旧² / EXPOSURE` = 0.16² / 0.4816 ≈ 0.0532。换算保持观感等值,原来那两条测量的效力也保留。
 const GLASS_RIM_GAIN: f32 = 0.0532;
+/// 自发光那层的遮罩代理:0 = 平加、1 = 乘菲涅尔。汇编里那个遮罩是若干标量拼出的 ramp,
+/// **输入没追到**,所以两种都实现了、用 17 只实机对照挑。结果如实记(调色板距离):
+///
+/// | | 基线(没这层) | 平加 | **菲涅尔** |
+/// |---|---|---|---|
+/// | 火神(橙 0.5) | 0.162 | 0.244 | **0.113** |
+/// | 波波拉(蓝 0.3/0.4) | 0.329 | 0.339 | 0.338 |
+/// | 水灵 | 0.107 | 0.112 | 0.123 |
+///
+/// 取菲涅尔:自发光最强的火神好 30%,而且更接近汇编里 ramp 遮罩的形状。
+/// **波波拉没改善**,说明它的差距不在自发光,而在 `MI_P_Object_Water_NoMetal` 那套水体着色
+/// (我们完全没实现),已另记待办。
+const EMISSIVE_FRESNEL: f32 = 1.0;
+/// 输出前软肩的白点(extended Reinhard);<= 0 关闭,退回硬削顶。见 `fs_main` 末尾。
+///
+/// **它解开了一个卡了很久的死结。** 之前两次都撞到同一堵墙:想把亮度比从 0.83 拉到 1.0,
+/// 无论提 `EXPOSURE`(0.70)还是提 `AMBIENT`(1.0),全库过曝都会从 1 暴涨到 34~98 ——
+/// 因为我们的贴图是 LDR、削顶是硬的。而游戏那条链在 HDR 里算完再由曝光压回来,削顶发生在
+/// 有余量的地方。软肩就是在补这份余量:低值几乎不动,高值平滑压向白点。
+///
+/// 加上它之后 `AMBIENT` 才提得动(0.5765 → 1.5),17 只对照:
+///
+/// | | 亮度 | 调色板 | 描边 | 对比 | 全库过曝 |
+/// |---|---|---|---|---|---|
+/// | 无软肩 A=0.58 | 0.83 | 0.088 | 1.02 | 1.11 | 1 |
+/// | 无软肩 A=1.0 | 0.92 | 0.088 | 0.93 | 1.10 | **34** |
+/// | **W=1.5 A=1.5** | **0.91** | 0.090 | 0.98 | **0.97** | **1** |
+///
+/// 注意 **W = 1 是恒等**(extended Reinhard 在白点 1 时不压缩),别拿它当「开启」。
+const SHOULDER_WHITE: f32 = 1.5;
 
 /// **曝光**:整条固有色链路改到线性空间后唯一的自由标量。
 ///
@@ -237,7 +284,7 @@ const DECODE_GAMMA: f32 = 2.2;
 const EXPOSURE: f32 = 0.4816;
 /// 环境 / 间接光。实机由 mobile base pass 的天光那批 View 常量给,离线读不出来,所以标定
 /// (见 `fs_main` 里两段明暗那段的推导)。**它是这条链路上仅剩的一个自由标量。**
-const AMBIENT: f32 = 0.5765;
+const AMBIENT: f32 = 1.5;
 
 /// 相机的右/上向量。正交投影没有透视错切,`view_proj` 的行向量归一化后就是它们,
 /// 所以不必额外往 uniform 里塞。
@@ -293,34 +340,54 @@ fn matcap_uv(n: vec3<f32>) -> vec2<f32> {
 ///
 /// ---
 ///
-/// **下面这段代码不是上面那个公式。** 上面是 ground truth,下面是能跑的近似,差别如下:
+/// **这一层现在是照汇编实现的,四个渐变色是读出来的、不是猜的。** 定名的办法是把同一段代码
+/// 在 `MI_P_Object_Masked` 的 shader 27931 里配到冻结块 9,再经 uexp 里 shader map 自带的
+/// 名字表把 `paramId` 翻成名字(整条链见 rocom-capture 的 docs/shader.md「最后一步:名字」)。
+/// 槽位对应:
 ///
-/// | | 汇编 | 这里 |
+/// | 汇编 | 名字 | 值 |
 /// |---|---|---|
-/// | 采样坐标 | 网格 UV0 × 标量 | **同**(这条是与名字无关的修正,已改对) |
-/// | 遮罩 | `smoothstep(saturate((b·(k−r)−0.01)×25))` | `min(r,g,b)` ← **和汇编不是一回事** |
-/// | 颜色 | 4 段渐变 `c(t)` | `star_color`(材质的 `Color02` 归一化后) |
-/// | 叠加 | `lerp(底色, 强度·m·c, saturate(m+下限))` | 相加 |
+/// | `cb6[96].z` | `StarStickTiling` | 4(逐材质,走 `material.star.xy`) |
+/// | `cb6[96].w` | `Stick_Intensity` | 1.5 |
+/// | `cb6[97].x` | `GlassyMainColorOpacity` | 0 |
+/// | `cb6[38]` | `StickRandomColor02` | (0.960, 0.160, 0.907) 洋红 |
+/// | `cb6[37]` | `StickRandomColor03` | (0.049, 0.155, 0.977) 蓝 |
+/// | `cb6[40]` | `StickRandomColor04` | (0.925, 0.742, 0.027) 黄 |
+/// | `cb6[42]` | `00FX_BaseColor` | (1, 1, 1) 白 |
 ///
-/// **为什么不照抄:照抄过一版,整只糊成一片白。** 那个遮罩 `m` 在 k=1 时覆盖贴图的 **29.6%**
-/// (k=0.4 时 10%)—— 这一层压根不是「细碎星点」,而是**一层脉动的大面积柔光**,靠 4 段渐变色
-/// 着色才成立。缺了那 4 个色槽(`cb6[67]/[68]/[70]/[72]`)与 `cb6[131].x/.y` 两个强度标量的
-/// 名字,公式就落不了地。**这一层卡在 cb 名字上,不是标定能救的。**
+/// **`StickRandomColor01` 不在这条渐变里** —— 名字有 `01..04` 四个,用到的是 `02/03/04` + 白。
+/// 除 `StarStickTiling`(2 处)与 `00FX_BaseColor`(2 处)外,这些参数**全库没有任何实例覆盖过**
+/// (拿探针的 `--probe-material ALL` 那 395 条实例覆盖清单查的),所以写成常量是安全的。
 ///
-/// 那 4 个色**不要**去套 `StickRandomColor01..04`:数量正好对得上,但那 4 个是红/品红/蓝/黄的
-/// 浓色,而实机星点是淡白粉、和宠物 MI 上 HDR 的 `Color02`(曜星光 (10, 8.07, 9.04))才对得上
-/// —— 更像「黑 → Color02」那条亮度渐变。查过一次省掉一次错误改动,记在这儿。
-///
-/// 眼下这套 `min(r,g,b)` 是**碰巧**能看(这张图 g 通道最小、均值 0.028,取最小通道刚好筛出
-/// 稀疏亮点),而且是对着实机截图标过的,所以留着 —— 但它**是猜的**,别当成读出来的。
-fn star_light(uv0: vec2<f32>) -> vec3<f32> {
+/// **推翻的旧结论**:我曾写下「那 4 个色不要去套 `StickRandomColor01..04`,实机星点是淡白粉、
+/// 和 HDR 的 `Color02` 才对得上」。汇编说了它就是这四个浓色 —— 之前那个观察站不住,
+/// 因为浓色经 `× m`(m 多数时候很小)、HDR 曝光再 `sqrt` 编码之后本来就会往白里跑。
+/// 旧的 `min(r, g, b)` 近似同时废弃:它连遮罩形状都和汇编不是一回事。
+/// 星贴层的一次求值:`color` 已含 `Stick_Intensity`,`cover` 是 lerp 的混合系数。
+struct StickLayer {
+    color: vec3<f32>,
+    cover: f32,
+}
+
+fn stick_layer(uv0: vec2<f32>) -> StickLayer {
     if material.flags.z < 0.5 {
-        return vec3<f32>(0.0);
+        return StickLayer(vec3<f32>(0.0), 0.0);
     }
-    let uv = uv0 * material.star.xy * STAR_TILE_SCALE;
-    let star = textureSample(star_tex, base_sampler, uv);
-    let glyph = min(star.r, min(star.g, star.b));
-    return material.star_color.rgb * star.rgb * glyph * material.star_color.w;
+    let theta = fract(camera.time * STAR_PHASE_SPEED) * 6.2831855;
+    let tex = textureSample(star_tex, base_sampler, uv0 * material.star.xy);
+    // `k = 1.1 * lerp(|sin θ|, |cos θ|, tex.g)`,每颗星按 g 通道拿到自己的相位
+    let k = 1.1 * mix(abs(sin(theta)), abs(cos(theta)), tex.g);
+    let ks = saturate(k);
+    // 4 段渐变,每段 ⅓ 宽。第三段汇编用的是 `max(3k-2, 0)` 不是 saturate ——
+    // k ≤ 1 时两者等价,照抄以免以后 k 的上界改了还对
+    var c = mix(STICK_RAMP_0, STICK_RAMP_1, min(ks * 3.0, 1.0));
+    c = mix(c, STICK_RAMP_2, saturate(ks * 3.0 - 1.0));
+    c = mix(c, STICK_RAMP_3, max(ks * 3.0 - 2.0, 0.0));
+    // 遮罩:`× 25` 造出很硬很细的边。**减的是 tex.r 不是 sin θ** ——
+    // 汇编里 sample 的目标寄存器把 sincos 的结果覆盖掉了,踩过一次
+    let x = saturate((tex.b * (k - tex.r) - 0.01) * 25.0);
+    let m = x * x * (3.0 - 2.0 * x);
+    return StickLayer(c * m * STICK_INTENSITY, saturate(m + STICK_BLEND_FLOOR));
 }
 
 /// 卷动色带:一张渐变图沿 UV 滚过表面,乘在固有色上。暮星辰的环带靠它出青↔粉渐变
@@ -391,20 +458,20 @@ fn interior_star(start: vec3<f32>, n: vec3<f32>, forward: vec3<f32>) -> f32 {
     // 于是 p = start/halfExtent + 折射方向 —— 折射方向是单位向量,所以每颗球看到的是
     // 星场里以某点为心、约一格大小的一块,这正是「每颗球稳定居中一颗星」的机制。
     let half_extent = 0.5 * length(material.bounds_size.xyz);
-    let march = half_extent * 0.01 * material.interior.y;
-    // `tiling = <cb 标量> / halfExtent`。那个标量没解出名字,取根材质里语义对得上的
-    // `StarTiling` = 0.4:它把采样范围缩到 0.4 倍,于是星场被放大 2.5 倍 ——
-    // 取 1 时星点比实机小得多(用户实测「太小」)。
-    let p = (start + dir * march) * (STAR_FIELD_TILING / max(half_extent, 0.0001));
+    let march = half_extent * 0.01 * INTERIOR_DEPTH;
+    let p = (start + dir * march) * (INTERIOR_UV_SCALE / max(half_extent, 0.0001));
 
-    // 三向投影:权重取 |法线| 的高次,归一化。次数用根材质里那个**有名字**的
-    // `StarTriPlannarBlendInt` = 2(汇编里对应 `pow(|v3.yzw|, cb5[63].y)` 再归一化)。
-    // 原来写死 8 是猜的 —— 8 让权重过于偏向单一轴,三个面几乎不混。
-    let w = pow(abs(n), vec3<f32>(STAR_TRIPLANAR_BLEND));
-    let wn = w / max(w.x + w.y + w.z, 0.001);
-    let s = textureSample(interior_tex, base_sampler, p.yz) * wn.x
-        + textureSample(interior_tex, base_sampler, p.xz) * wn.y
-        + textureSample(interior_tex, base_sampler, p.xy) * wn.z;
+    // **三向投影不是「归一化权重加权和」,是两次嵌套 lerp。** 汇编(34529,83..88):
+    //   k    = saturate(|n| * (2*StarTriPlannarBlendInt + 1) - StarTriPlannarBlendInt)
+    //   s    = lerp(sample(p.xz), sample(p.yz), k.y)
+    //   s    = lerp(s,            sample(p.xy), k.w)
+    // 原来那版是 `pow(|n|, B)` 再归一化 —— 结构就不对(而且更早还写死次数 8,
+    // 那让权重几乎完全偏向单一轴)。
+    let blend = saturate(abs(n) * (2.0 * STAR_TRIPLANAR_BLEND + 1.0) - STAR_TRIPLANAR_BLEND);
+    let s0 = textureSample(interior_tex, base_sampler, p.xz);
+    let s1 = textureSample(interior_tex, base_sampler, p.yz);
+    let s2 = textureSample(interior_tex, base_sampler, p.xy);
+    let s = mix(mix(s0, s1, blend.y), s2, blend.z);
 
     // **星点不是在移动、是在闪。** 汇编(同上 89..106):
     //   phase = frac(FlickerSpeed * 时间 + 星场.G)      ← 每颗星的相位来自 G 通道
@@ -515,14 +582,36 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     // 卷动色带那张也是显示空间的成品颜色,所以在 `flow_band` 里混完再一起平方。
     var albedo = flow_band(in.uv, tex.rgb);
     albedo = pow(albedo, vec3<f32>(DECODE_GAMMA));
-    // 加上去的光。星点只轻轻一层;**不透明层不叠 MatCap**——游戏那边靠遮罩通道选择性反射,
+    // **线条遮罩是「往固有色里加一个颜色」,不是「乘一个亮度倍数」。** 查实于罗隐(阿米亚特)
+    // 的 body shader 51377 第 99~103 行:
+    //     r1.w = saturate((基色.a − 0.04) × 1.1111)     ← 和不透明度用的是同一个重映射
+    //     mad r6.xyz, cb6[7].xyzx, r1.w, r6.xyzx         ← 加上 cb6[7] × 那个遮罩
+    // 那一步的 `r6` 还是**固有色累加器**(两段明暗的乘法在更后面),所以要加在这里、
+    // 不能加在 `albedo * shade` 之后 —— 后者试过,对比比从 0.96 崩到 0.40。
+    //
+    // `cb6[7]` 那个颜色的名字还没解出来(这条 shader 的 V=112,全库没有材质带这个块),
+    // 先取中性白 × 一个标定强度;**形状按汇编改对了**,原来那个 `× mix(1, 1.55, alpha)` 是错的。
+    albedo += vec3<f32>(material.params.y) * saturate((line - 0.04) * 1.1111);
+    // 加上去的光。**不透明层不叠 MatCap**——游戏那边靠遮罩通道选择性反射,
     // 无条件叠会把宠物冲白(试过,整只发白),而 toon 着色本身对着截图已经够像。
     //
     // 那层白色 `rim` 是我们自己加的(汇编里没有,桌宠场景下让轮廓从背景里浮出来)。
     // **玻璃族不加**:它有材质自己的边缘光(`RimColor`/`RimIntensity`/`RimPower`),
     // 两层叠起来轮廓会糊成一圈白 —— 暮星辰的裙子就是这么被冲成淡青的。
     let generic_rim = select(rim, 0.0, material.flags.y > 0.5);
-    var glow = vec3<f32>(generic_rim) + star_light(in.uv) * STICK_GAIN;
+    var glow = vec3<f32>(generic_rim);
+    // **自发光**:材质的 `Emitter Color` × `Emitter Intensity`,线性空间里加性叠加。
+    // 根默认强度是 0(这一层默认关闭),所以只影响明确开启的宠物 —— 全库唯二是
+    // 波波拉(蓝 0.3/0.4)与火神(橙 0.5),而它们正好是 17 只实机对照里唯二的
+    // **非构图色差离群项**(调色板 0.329 / 0.162),关着的那些都在 0.02~0.11。
+    //
+    // 汇编里它是 `材质颜色 × 一个遮罩` 加进结果(水蓝蓝 body 的 shader 33729 第 553 行:
+    // `mad r5.xyz, cb6[94].xyzx, r2.y, r5.xyzx`,r5 随后 `add` 进颜色)。那个遮罩由若干
+    // 标量拼出的 ramp 给,**输入还没追到**;`EMISSIVE_FRESNEL` 选用哪种代理,见它的注释。
+    if material.emissive.w > 0.0 {
+        let mask = select(1.0, facing, EMISSIVE_FRESNEL > 0.5);
+        glow += material.emissive.rgb * material.emissive.w * mask;
+    }
     // **不透明度**:`alpha_is_opacity` 的材质取基色 alpha,并照汇编做那个重映射
     // (`add r1.z, a, -0.04` → `mul_sat r1.z, r1.z, 1.1111`,即把 0.04..0.94 拉到 0..1)。
     // 暮星辰裙子那块 UV 的 alpha 中位 0.537 → 0.55,与从实机截图水印衰减反推的 0.50 对得上。
@@ -567,7 +656,26 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         // 「开口薄壳自转时会在 0.72↔1.0 之间跳」—— 那个跳动是法线被写成切线造成的
         // (见 design.md 法线那条),法线修好后不复存在,所以这个特例撤掉。
     }
-    let body = albedo * shade * mix(1.0, material.params.y, line);
+    // **线条遮罩是「加一个颜色」,不是「乘一个亮度倍数」** —— 查实于罗隐(阿米亚特)的 body
+    // shader 51377 第 99~103 行:
+    //     r1.w = saturate((基色.a − 0.04) × 1.1111)      ← 和不透明度用的是同一个重映射
+    //     mad r6.xyz, cb6[7].xyzx, r1.w, r6.xyzx          ← 加上 cb6[7] × 那个遮罩
+    // 原来这里是 `× mix(1.0, LINE_BOOST, alpha)`(乘法),形状就不对。
+    // `cb6[7]` 那个颜色的名字还没解出来(这条 shader 的 V=112,全库没有材质带这个块),
+    // 所以先取中性白 × 一个标定强度 —— 但**形状按汇编改对了**。
+    // **星贴层是 lerp 替换已着色的颜色,不是加一层光、也不是染固有色。** 汇编:
+    //     mad r7.xyw, Stick_Intensity, r7.xyxw, -r0.xyxz    ← 强度 × (m × 渐变色) − 底
+    //     mad r0.xyz, r9.w, r7.xywx, r0.xyzx                ← 底 + 混合系数 × 上面那个差
+    // 合起来 `lerp(底, Stick_Intensity × m × c, saturate(m + GlassyMainColorOpacity))`。
+    //
+    // **位置很要紧**:那一步作用在 `r0`(效果累加器)上,而固有色累加器是 `r6` ——
+    // 两者到第 487 行才合并。所以渐变色**不该再乘 `shade`**。先放在 `albedo * shade`
+    // 之前试过:`shade` 最高 3.0(两段明暗 1.5 + AMBIENT 1.5),把浓色直接顶到过曝,
+    // 全库过曝 11 → 14,多出来的正好是开着这层的星光族三只。
+    //
+    // 渐变色是材质参数(本来就在线性空间),所以**不过 `DECODE_GAMMA`** —— 只有贴图要解码。
+    let stick = stick_layer(in.uv);
+    let body = mix(albedo * shade, stick.color, stick.cover);
     // **末尾统一编码到显示空间**:`sqrt(色 × 曝光)`,照汇编尾部那条
     // `movc o0.xyz, (曝光 < 1), sqrt(色 × 曝光), 色`。
     //
@@ -578,8 +686,17 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     //
     // 输出预乘 alpha(见 render.rs)。**固有色乘 alpha、加上去的光不乘**:高光/星点/边缘光
     // 是打在表面上的光,半透表面照样该有,乘进去会随着变透明一起消失。
-    let lin = max(body * alpha + glow, vec3<f32>(0.0));
-    return vec4<f32>(sqrt(lin * EXPOSURE), alpha);
+    var lin = max(body * alpha + glow, vec3<f32>(0.0)) * EXPOSURE;
+    // **软肩**:游戏那条链在 HDR 里算完再由曝光压回来,削顶发生在有余量的地方;
+    // 我们的贴图是 LDR,硬削顶意味着「一提亮就大片糊白」——实测把亮度比从 0.83 提到 0.92
+    // 需要 `AMBIENT` 1.0,而那时全库过曝从 1 涨到 34。
+    // 这里用 extended Reinhard(白点 `SHOULDER_WHITE`)近似那份余量:低值几乎不变,
+    // 高值平滑压向 1,于是能在不糊白的前提下把整体抬亮。`SHOULDER_WHITE <= 0` 关闭。
+    if SHOULDER_WHITE > 0.0 {
+        let w2 = SHOULDER_WHITE * SHOULDER_WHITE;
+        lin = lin * (1.0 + lin / w2) / (1.0 + lin);
+    }
+    return vec4<f32>(sqrt(lin), alpha);
 }
 
 @fragment
@@ -607,7 +724,7 @@ fn fs_outline(in: VsOut) -> @location(0) vec4<f32> {
     // **实机侧的抠图也踩过一次**:按「与角落背景色的距离」判,好几张截图里宠物很小、
     // 背景是带花纹的卡片,会把大片背景算成宠物(菊花梨的「色偏」因此虚高到 1.46,
     // 修正后只有 0.16)。判据要加两道:**取最大连通块**、面积占比 > 55% 视为抠图失败。
-    return vec4<f32>(tex.rgb * 0.70, 1.0);
+    return vec4<f32>(tex.rgb * 0.80, 1.0);
 }
 
 // 纯特效层(火焰 / 水壳 / 光晕):材质里没有 BaseTex/EyeTex,固有色是 shader 算的。

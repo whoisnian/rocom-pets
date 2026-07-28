@@ -311,6 +311,18 @@ public static class MaterialProbe
             // 根材质的默认值:实例与中间层都没覆盖的那些参数(顺父链看不到,见 RootDefaults.cs)
             if (info.RootDefaults is { } rd)
             {
+                // `PROBE_ROOT_ALL=1`:**不过滤**地把根材质的完整参数表打出来。
+                // 平时那几行会跳过「实例已覆盖」的参数(因为那时根默认不是实际值),
+                // 但要拿「这个图到底有哪些参数、按什么顺序」时,需要的恰恰是完整表 ——
+                // 补丁表里的 `paramId` 疑似就是这张表某种顺序下的下标(见
+                // rocom-capture/scripts/matparams.py)。
+                if (Environment.GetEnvironmentVariable("PROBE_ROOT_ALL") is not null)
+                {
+                    Console.WriteLine($"    全根表: 贴图 {rd.Textures.Count} 向量 {rd.Vectors.Count} 标量 {rd.Scalars.Count}");
+                    foreach (var (param, _) in rd.Textures) Console.WriteLine($"    ALLtex {param}");
+                    foreach (var (param, _) in rd.Vectors) Console.WriteLine($"    ALLcol {param}");
+                    foreach (var (param, _) in rd.Scalars) Console.WriteLine($"    ALLnum {param}");
+                }
                 foreach (var (param, tex) in rd.Textures.OrderBy(kv => kv.Key))
                     if (!info.Textures.ContainsKey(param))
                         Console.WriteLine($"    根tex {param,-18} → {tex}");

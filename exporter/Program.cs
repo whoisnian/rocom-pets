@@ -487,15 +487,23 @@ FormReport ExportForm(
             maskFile = ExportEffectTexture(info.MaskTexture);
             noiseFile = ExportEffectTexture(info.NoiseTexture);
         }
+        else if (info.WaterColor1 is not null)
+        {
+            // 水体预设的 caustics 也走 `noise_tex` 那个槽(它有基色,但没有色带,槽是空的)
+            noiseFile = ExportEffectTexture(info.NoiseTexture);
+        }
         materials.Add(new MaterialEntry(name, baseColor, info.IsFacePatch,
             info.OpacityMaskClipValue, info.BlendMode.ToString(), info.ParentChain,
             info.Tint, info.Opacity, info.Glow, info.Flow, maskFile, noiseFile, info.MaskIsMatcap,
             info.IsTranslucent,
             ExportEffectTexture(info.StarTexture), info.StarTiling, info.StarColor, info.StickIntensity,
             info.MaskIsMatcap ? null : ExportEffectTexture(info.MatcapTexture), info.MatcapColor,
-            info.RimColor, info.RimIntensity, info.RimPower, info.AlphaIsOpacity,
+            info.RimColor, info.RimIntensity, info.EmissiveColor, info.EmissiveIntensity,
+            info.RimPower, info.AlphaIsOpacity,
             ExportEffectTexture(info.FlowTexture), info.FlowPower,
             ExportEffectTexture(info.MaskIdTexture), info.MaskIdRange,
+            info.WaterColor1, info.WaterColor2, info.WaterMain,
+            info.WaterCaustics, info.WaterShape,
             ExportEffectTexture(info.InteriorTexture), info.InteriorColor,
             info.Refraction, info.RefractDepth, info.FlickerSpeed, info.FlickerPower));
 
@@ -529,16 +537,27 @@ FormReport ExportForm(
     //
     // 贴图与颜色跟「假半透」那份走(它是宠物自己的星点图);**平铺数单独挑**,跟着实例里
     // 显式覆盖过的那份走 —— 两者不一定在同一个材质上(见上面 `explicitTiling`)。
+    //
+    // **但不是所有材质都刷**:只刷「图里有这一层」的(`GraphHasStickLayer`,判据见那儿)。
+    // 眼睛与嘴走 `M_P_Eyes`,它的完整参数表里一个 `Star*`/`Stick*` 都没有 —— 原来连它们
+    // 一起刷,眼睛上也有一层脉动的星点。
     if (starLayer is { } star)
     {
         var tiling = explicitTiling ?? star.Tiling;
+        var hasLayer = resolved
+            .Where(kv => kv.Value.Resolved && kv.Value.GraphHasStickLayer)
+            .Select(kv => kv.Key)
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
         for (var i = 0; i < materials.Count; i++)
+        {
+            if (!hasLayer.Contains(materials[i].Name)) continue;
             materials[i] = materials[i] with
             {
                 StarTexture = star.Tex,
                 StarTiling = tiling,
                 StarColor = star.Color,
             };
+        }
     }
 
     var bounds = mesh.ImportedBounds;

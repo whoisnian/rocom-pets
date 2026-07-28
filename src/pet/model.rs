@@ -70,6 +70,9 @@ pub struct Material {
     pub matcap_color: [f32; 3],
     pub rim_color: [f32; 3],
     pub rim_intensity: f32,
+    /// 自发光色(线性)+ 强度;强度 0 = 不画。见 pack.rs。
+    pub emissive: [f32; 3],
+    pub emissive_intensity: f32,
     pub rim_power: f32,
     /// 基色 alpha 是不透明度(见 `pack::Material::alpha_opacity`)。
     pub alpha_opacity: bool,
@@ -385,6 +388,8 @@ impl Model {
                     matcap_color: spec.matcap_color,
                     rim_color: spec.rim_color,
                     rim_intensity: spec.rim_intensity,
+                    emissive: spec.emissive,
+                    emissive_intensity: spec.emissive_intensity,
                     rim_power: spec.rim_power,
                     alpha_opacity: spec.alpha_opacity,
                     flow: spec.flow.as_deref().and_then(|p| load_texture(p, true)),

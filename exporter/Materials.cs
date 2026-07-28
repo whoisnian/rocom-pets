@@ -162,6 +162,66 @@ public record MaterialInfo(
     /// 发光强度(火焰族有);没有就 1。
     public float Glow => Scalar("Glow Intensity", 1f);
 
+    /// 自发光:`Emitter Color` × `Emitter Intensity`。**根默认强度是 0**,也就是这一层
+    /// 默认关闭、要用的宠物自己开 —— 所以只对开了的那些生效,风险有界。
+    ///
+    /// 汇编里它是 `材质颜色 × 一个遮罩` 加进结果(水蓝蓝 body 的 shader 33729:
+    /// `mad r5.xyz, cb6[94].xyzx, r2.y, r5.xyzx`,r5 随后加进颜色);那个遮罩由若干标量
+    /// 拼出的 ramp 给,**输入还没追到**,运行时先用菲涅尔当代理(见 pet.wgsl)。
+    ///
+    /// 证据:全库唯二开着这一项的(波波拉 0.3/0.4 蓝、火神 0.5 橙)正好是 17 只实机对照里
+    /// **唯二的非构图色差离群项**(调色板 0.329 / 0.162),而关着的那些都在 0.02~0.11。
+    /// **水体预设里 `Emitter Intensity` 不是自发光强度,是 `Color1` 那层的增益。**
+    /// 查实于水蓝蓝 `_Fx`(父 `MI_P_Object_Water_NoMetal`)的 shader 35663 —— 配到该材质
+    /// 块 15(`V=83`、`dcl cb5[106]`、`83 + ⌈90/4⌉ + 1 = 107`),那一步是
+    /// `mad r4.xyz, r4.xyzx, cb5[83].x, r5.xyzx`,而 `cb5[83].x` 的名字就是 `Emitter Intensity`,
+    /// `r4` 是 `mask × Color1`。完整公式见 rocom-capture/docs/shader.md「水体预设」。
+    ///
+    /// 所以这一族不能输出自发光层 —— 原来当通用自发光加了「白 × 0.4 × 菲涅尔」。
+    /// **实测也支持**:关掉自发光后波波拉的调色板距离一动不动(0.337),
+    /// 而火神从 0.090 恶化到 0.178 —— 火神那边它确实是自发光,所以只排除水体。
+    /// (火神的图里也有 `Color1`/`Color2`/`FresnelInt`,可能是同一个共享图层,
+    /// 但它的 shader 还没读,没有证据前不动。)
+    public bool IsWater =>
+        ParentChain.Any(p => p.Contains("Water", StringComparison.OrdinalIgnoreCase));
+
+    public float EmissiveIntensity => IsWater ? 0f : Scalar("Emitter Intensity", 0f);
+
+    /// 水体预设(`ML_P_StylizedWater` 图层)。整条链是从 shader 35663 读出来的,
+    /// 公式见 rocom-capture/docs/shader.md「水体预设」;这里只把参数搬出来。
+    ///
+    /// `Color1` 的**增益就是 `Emitter Intensity`**(见上面),所以合成一个 rgb + a 传出去;
+    /// `Main Color` 的 **a 是末尾那步 lerp 的混合系数**(波波拉是 0 ⇒ 空操作)——
+    /// 这个「rgb 存颜色、a 存混合量」的套路在这套材质里反复出现,别只取 rgb。
+    public float[]? WaterColor1 => !IsWater ? null
+        : Vectors.TryGetValue("Color1", out var c)
+            ? [c[0], c[1], c[2], Scalar("Emitter Intensity", 0f)]
+            : null;
+
+    public float[]? WaterColor2 =>
+        !IsWater ? null : Vectors.TryGetValue("Color2", out var c) ? [c[0], c[1], c[2], 0f] : null;
+
+    /// `Main Color` 原样带 a(a = 混合系数)。
+    public float[]? WaterMain =>
+        !IsWater ? null : Vectors.TryGetValue("Main Color", out var c) ? c : null;
+
+    /// caustics 的 `[u 平铺, v 平铺, u 速度, v 速度]`。
+    public float[] WaterCaustics =>
+    [
+        Scalar("U_Tiling_Caustics", 1f), Scalar("V_Tiling_Caustics", 1f),
+        Scalar("U_Speed_Caustics", 0f), Scalar("V_Speed_Caustics", 0f),
+    ];
+
+    /// `[CausticsInt, FlowDistort, FresnelInt, FresnelPower]`。
+    public float[] WaterShape =>
+    [
+        Scalar("CausticsInt", 1f), Scalar("FlowDistort", 0f),
+        Scalar("FresnelInt", 1f), Scalar("FresnelPower", 1f),
+    ];
+
+    public float[]? EmissiveColor =>
+        EmissiveIntensity > 0f && Vectors.TryGetValue("Emitter Color", out var c) ? c : null;
+
     /// 是不是半透材质。**有基色的材质也可能是半透**——暮星辰的裙子(`Fx1`)与那两个球(`Fx2`)
     /// 都是 `MI_P_Object_Trans_*` 家族、`BLEND_Translucent`,当成不透明画就是死板的实心块。
     public bool IsTranslucent =>
@@ -181,6 +241,17 @@ public record MaterialInfo(
         Vectors.ContainsKey("StarStickTiling") ? FirstTexture("StarStickTex", "ShinyStarTex", "StarTex")
         : IsFakeTrans ? FirstTexture("NoiseTex", "Noise")
         : null;
+
+    /// **这个材质的图里到底有没有星贴层。** 判据是**读出来的**:参数名表(uexp 里 shader map
+    /// 自带那张,见 rocom-capture 的 `scripts/matparams.py`)就是「这个图实际用到哪些参数」,
+    /// 而眼睛/嘴走的 `M_P_Eyes` 整张表只有 42 条、**一个 `Star*`/`Stick*` 都没有** ——
+    /// 所以那两个槽压根不可能有这一层。
+    ///
+    /// 之所以要这道门:下面「一个形态只有一份星点遮罩」那段统一会把星点盖到**所有**材质上,
+    /// 连眼睛和嘴一起刷。星光族三只实测就是这样(包里 `_Es`/`_Mh` 也带着 `star_tex`)。
+    public bool GraphHasStickLayer =>
+        RootDefaults is { } rd
+        && (rd.Scalars.ContainsKey("Stick_Intensity") || rd.Scalars.ContainsKey("StarStickTiling"));
 
     /// 星点平铺(前两位是 uv 平铺)。
     ///

@@ -45,6 +45,9 @@ public record MaterialEntry(
     /// 边缘光。`RimPower` < 1 = 整片泛色而不是一圈细边。
     float[]? RimColor,
     float RimIntensity,
+    /// 自发光色(线性)与强度;强度为 0 时不写出。见 Materials.cs 的 EmissiveColor。
+    float[]? EmissiveColor,
+    float EmissiveIntensity,
     float RimPower,
     /// 基色贴图的 alpha 是不透明度(而不是纹路遮罩)。
     bool AlphaIsOpacity,
@@ -54,6 +57,15 @@ public record MaterialEntry(
     /// 色带的 ID 遮罩:`MaskTex` + alpha 的取值区间。
     string? MaskIdTexture,
     float[] MaskIdRange,
+    /// 水体预设(`ML_P_StylizedWater`):`Color1`(a = 增益 `Emitter Intensity`)、
+    /// `Color2`、`Main Color`(a = 末尾 lerp 的混合系数)、caustics 的平铺/速度、
+    /// `[CausticsInt, FlowDistort, FresnelInt, FresnelPower]`。公式见
+    /// rocom-capture/docs/shader.md「水体预设」。
+    float[]? WaterColor1,
+    float[]? WaterColor2,
+    float[]? WaterMain,
+    float[] WaterCaustics,
+    float[] WaterShape,
     /// 玻璃内部那颗星:四角星场贴图 + 着色 + 折射率 + march 深度。
     string? InteriorTexture,
     float[]? InteriorColor,
@@ -170,11 +182,30 @@ public static class Manifest
                     // 「没动过的默认值」而不是「开了边缘光」:曜星光那两颗球写着强度 1 + 绿色
                     // `Rim LightColor`,实机里它们是橙的和紫的,照着画怎么都不对。
                     // 全量 946 个带边缘光的材质里只有 3 个强度大于 1(暮星辰的裙子 = 3,青色边)。
+                    if (mat.EmissiveColor is { } ec)
+                    {
+                        parts.Add($"emissive = [{Num(ec[0])}, {Num(ec[1])}, {Num(ec[2])}]");
+                        parts.Add($"emissive_intensity = {Num(mat.EmissiveIntensity)}");
+                    }
                     if (mat.RimIntensity > 1 && mat.RimColor is { } rc)
                     {
                         parts.Add($"rim_color = [{Num(rc[0])}, {Num(rc[1])}, {Num(rc[2])}]");
                         parts.Add($"rim_intensity = {Num(mat.RimIntensity)}");
                         parts.Add($"rim_power = {Num(mat.RimPower)}");
+                    }
+                    if (mat.WaterColor1 is { } w1)
+                    {
+                        parts.Add($"water_color1 = [{string.Join(", ", w1.Select(Num))}]");
+                        if (mat.WaterColor2 is { } w2)
+                            parts.Add($"water_color2 = [{string.Join(", ", w2.Select(Num))}]");
+                        if (mat.WaterMain is { } wm)
+                            parts.Add($"water_main = [{string.Join(", ", wm.Select(Num))}]");
+                        parts.Add($"water_caustics = [{string.Join(", ", mat.WaterCaustics.Select(Num))}]");
+                        parts.Add($"water_shape = [{string.Join(", ", mat.WaterShape.Select(Num))}]");
+                        // caustics 走 `noise_tex` 那个槽(水体材质有基色,但没有色带,槽是空的)。
+                        // **这一行必须在这儿,不能靠下面「BaseColor is null」那支** —— 水体有基色。
+                        if (mat.NoiseTexture is not null)
+                            parts.Add($"noise_tex = {Quote(mat.NoiseTexture)}");
                     }
                     if (mat.FlowTexture is not null)
                     {

@@ -41,6 +41,8 @@ struct MaterialUniform {
     star_color: [f32; 4],
     /// MatCap 着色(rgb,可能是 HDR)+ 备用
     matcap_color: [f32; 4],
+    /// 自发光:`Emitter Color`(rgb,线性)+ `Emitter Intensity`(a)。a = 0 时整层不画。
+    emissive: [f32; 4],
     // ⚠ 字段顺序必须和 pet.wgsl 的 `MaterialParams` 逐个对齐:uniform 是按偏移读的,
     // 顺序错了不会报错,只会静默取到旁边那个字段的值(rim/main 曾经就是这么对调的)。
     /// 边缘光颜色
@@ -58,14 +60,19 @@ struct MaterialUniform {
     mask_id: [f32; 4],
 }
 
-/// 本体贴图 alpha 里那层线条遮罩的提亮倍数。游戏里那些纹路(水灵身上的竖条、
-/// 多数宠物的身体分块线)比底色亮一档,这里用乘法近似。
+/// 本体贴图 alpha 里那层线条遮罩的**加性**强度。游戏里那些纹路(水灵身上的竖条、
+/// 多数宠物的身体分块线)比底色亮一档。
 ///
-/// **这个数是猜的,而且标定基础已经不成立**:定于 `383182c` / `466326f`,当时是「按实机
-/// 截图对出来的」—— 但那时上游把切线写进了 NORMAL(修于 `1daa75e`),渲图整体偏白,
-/// 拿它去对截图得出的倍数并不可信。撤不掉(总得有个值),但不要当已验证的。
-/// 真解法还在汇编里没读:游戏那边这层不是「乘一个倍数」,得先认出它走的是哪条通路。
-const LINE_BOOST: f32 = 1.55;
+/// **形状已经按汇编改对了**(罗隐 body shader 51377 第 99~103 行):
+///     r1.w = saturate((基色.a − 0.04) × 1.1111)     ← 和不透明度用的是同一个重映射
+///     mad r6.xyz, cb6[7].xyzx, r1.w, r6.xyzx         ← 往**固有色**里加 cb6[7] × 那个遮罩
+/// 原来这里是 `× mix(1.0, 1.55, alpha)`(乘法、且用生 alpha),形状就不对 —— 那个 1.55
+/// 还是在上游法线 bug 修好前对着截图挑的。
+///
+/// **只剩强度是标定的**:`cb6[7]` 那个颜色的名字还没解出来(这条 shader 的 V=112,
+/// 全库没有材质带这个块),所以先取中性白 × 这个标量。17 只对照对它很不敏感
+/// (0.0~0.35 之间四项指标几乎不动),取中间值。
+const LINE_BOOST: f32 = 0.2;
 
 /// 一只宠物的 GPU 资源(网格与贴图按形态共享,实例状态另说)。
 pub struct PetGpu {
@@ -353,6 +360,7 @@ impl PetGpu {
                         has(material.star.is_some()),
                         has(material.matcap.is_some()),
                     ],
+                    emissive: [0.0, 0.0, 0.0, 0.0],   // 纯特效层不走这一层
                     star: [
                         material.star_tiling[0],
                         material.star_tiling[1],
@@ -386,12 +394,14 @@ impl PetGpu {
                     flow: material.flow_uv,
                     params: [
                         has(material.cutout),
-                        // alpha 恒定的贴图没有线条可提,提亮必须是空操作(1.0),
-                        // 否则整只宠物被均匀调亮
+                        // alpha 恒定的贴图没有线条可提,这一项必须是**加性的空操作 = 0**,
+                        // 否则整只宠物被均匀加亮。
+                        // **改成加性时踩过**:这儿原来写 1.0(乘法的恒等元),换成加性后就变成
+                        // 「加一整份白」——17 只对照的对比比从 0.96 崩到 0.23、亮度冲到 1.2。
                         if material.line_detail && !material.alpha_opacity {
                             LINE_BOOST
                         } else {
-                            1.0
+                            0.0
                         },
                         has(material.alpha_opacity),
                         0.0,
@@ -403,6 +413,12 @@ impl PetGpu {
                         has(material.translucent),
                         has(material.star.is_some()),
                         has(material.matcap.is_some()),
+                    ],
+                    emissive: [
+                        material.emissive[0],
+                        material.emissive[1],
+                        material.emissive[2],
+                        material.emissive_intensity,
                     ],
                     star: [
                         material.star_tiling[0],

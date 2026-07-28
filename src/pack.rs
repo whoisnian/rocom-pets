@@ -96,6 +96,10 @@ struct RawMaterial {
     rim_color: Option<[f32; 3]>,
     #[serde(default)]
     rim_intensity: f32,
+    #[serde(default)]
+    emissive: Option<[f32; 3]>,
+    #[serde(default)]
+    emissive_intensity: f32,
     #[serde(default = "three")]
     rim_power: f32,
     /// 基色 alpha 是不透明度(而不是纹路遮罩)——静态开关 `Opacity or OpacityMask` 开着的那批
@@ -173,6 +177,10 @@ pub struct Material {
     pub matcap_color: [f32; 3],
     pub rim_color: [f32; 3],
     pub rim_intensity: f32,
+    /// 自发光色(线性)与强度:材质的 `Emitter Color` × `Emitter Intensity`。
+    /// **根默认强度是 0**,只有明确开启的宠物才有(全库唯二:波波拉 蓝 0.3/0.4、火神 橙 0.5)。
+    pub emissive: [f32; 3],
+    pub emissive_intensity: f32,
     /// 边缘光的衰减次数。**小于 1 = 整片泛色**(幽星光的球 0.35),不是一圈细边。
     pub rim_power: f32,
     /// **基色贴图的 alpha 是不透明度**(不是纹路遮罩)。判据是静态开关 `Opacity or OpacityMask`,
@@ -386,6 +394,8 @@ impl Pack {
                                 matcap_color: mat.matcap_color.unwrap_or([1.0; 3]),
                                 rim_color: mat.rim_color.unwrap_or([1.0; 3]),
                                 rim_intensity: mat.rim_intensity,
+                                emissive: mat.emissive.unwrap_or([0.0; 3]),
+                                emissive_intensity: mat.emissive_intensity,
                                 rim_power: mat.rim_power,
                                 alpha_opacity: mat.alpha_opacity,
                                 flow: mat.flow_tex.map(|rel| dir.join(rel)),
