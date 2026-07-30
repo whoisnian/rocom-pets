@@ -524,124 +524,278 @@ impl Actor {
     }
 }
 
-pub struct Stage {
+/// 实体的稳定标识。**不是 `entities` 里的下标** —— 移除一只之后下标会滑动,
+/// 而托盘的「移除这只」与掩码回读都跨帧持有标识。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct EntityId(u64);
+
+/// 在场的一只:角色本体 + 它自己的位置与拖动状态。
+///
+/// **拖动状态必须挂在实体上而不是 `Stage` 上**:多只同时在场时,拎起来的是被点中的
+/// 那一只,其余照常待机。
+pub struct Entity {
+    id: EntityId,
     actor: Actor,
-    /// 表面尺寸(逻辑像素)。
-    size: (u32, u32),
     /// 角色左上角在表面内的位置。
     pos: (f32, f32),
     /// 角色局部坐标下的覆盖矩形,只在角色变了才重算。
     coverage: Vec<Rect>,
-    pointer: Option<(f64, f64)>,
     /// 按下时记下的「指针 - 角色左上角」偏移。
     drag_offset: Option<(f64, f64)>,
     /// 本次按下之后指针是否移动过(用来区分「点一下」与「拎起来拖」)。
     drag_moved: bool,
-    passthrough: bool,
 }
 
-impl Stage {
-    pub fn new(actor: Actor, size: (u32, u32)) -> Self {
+impl Entity {
+    fn new(id: EntityId, actor: Actor, size: (u32, u32)) -> Self {
         let coverage = actor.coverage();
-        let mut stage = Self {
+        let mut entity = Self {
+            id,
             actor,
-            size,
             pos: (0.0, 0.0),
             coverage,
-            pointer: None,
             drag_offset: None,
             drag_moved: false,
-            passthrough: false,
         };
-        stage.reset_position();
-        stage
+        entity.reset_position(size);
+        entity
     }
 
+    // 平台层还按「一只」渲染(Phase 5 第 2 步才改),这几个访问器先没人调。
+    // 和 pack.rs 里那批 manifest 字段同一处理:照契约留着,比等到要用时再补更省事。
+    #[allow(dead_code)]
+    pub fn id(&self) -> EntityId {
+        self.id
+    }
+
+    #[allow(dead_code)]
     pub fn actor(&self) -> &Actor {
         &self.actor
     }
 
-    /// 换角色(切形态):尺寸与轮廓都变了,重算覆盖区并重新落地。
-    pub fn replace_actor(&mut self, actor: Actor) {
-        self.actor = actor;
-        self.coverage = self.actor.coverage();
-        self.drag_offset = None;
-        self.drag_moved = false;
-        self.reset_position();
-    }
-
-    /// 只给测试用:直接改角色状态(比如把困倦顶到阈值,省去等几分钟)。
-    #[cfg(test)]
-    pub fn actor_mut_for_test(&mut self) -> &mut Actor {
-        &mut self.actor
-    }
-
-    /// 角色左上角位置(表面局部逻辑像素)。
-    pub fn actor_pos(&self) -> (f32, f32) {
+    #[allow(dead_code)]
+    pub fn pos(&self) -> (f32, f32) {
         self.pos
-    }
-
-    pub fn passthrough(&self) -> bool {
-        self.passthrough
     }
 
     pub fn is_dragging(&self) -> bool {
         self.drag_offset.is_some()
     }
 
+    /// 脚底在表面里的 y。**z 序就按它排**:脚底越靠下的越靠前(挡住后面的)。
+    fn foot_y(&self) -> f32 {
+        match &self.actor {
+            Actor::Pet(pet) => self.pos.1 + pet.foot_offset,
+            Actor::Sprite(sprite) => self.pos.1 + sprite.height as f32,
+        }
+    }
+
     /// 摆到初始位置:精灵居中(调试用),宠物站到屏幕底边中间。
-    pub fn reset_position(&mut self) {
+    fn reset_position(&mut self, size: (u32, u32)) {
         let (w, h) = self.actor.size();
-        self.pos.0 = (self.size.0 as f32 - w as f32) * 0.5;
+        self.pos.0 = (size.0 as f32 - w as f32) * 0.5;
         self.pos.1 = match self.actor {
-            Actor::Sprite(_) => (self.size.1 as f32 - h as f32) * 0.5,
-            Actor::Pet(_) => self.ground_y(),
+            Actor::Sprite(_) => (size.1 as f32 - h as f32) * 0.5,
+            Actor::Pet(_) => self.ground_y(size),
         };
-        self.clamp_to_surface();
+        self.clamp_to_surface(size);
     }
 
     /// 宠物站立时左上角该在的 y:让脚底落在屏幕底边上方 GROUND_MARGIN 处。
-    fn ground_y(&self) -> f32 {
+    fn ground_y(&self, size: (u32, u32)) -> f32 {
         let foot = match &self.actor {
             Actor::Pet(pet) => pet.foot_offset,
             Actor::Sprite(sprite) => sprite.height as f32,
         };
-        (self.size.1 as f32 - GROUND_MARGIN - foot).max(0.0)
+        (size.1 as f32 - GROUND_MARGIN - foot).max(0.0)
     }
 
-    fn clamp_to_surface(&mut self) {
+    fn clamp_to_surface(&mut self, size: (u32, u32)) {
         let (w, h) = self.actor.size();
-        let max_x = (self.size.0 as f32 - w as f32).max(0.0);
+        let max_x = (size.0 as f32 - w as f32).max(0.0);
         self.pos.0 = self.pos.0.clamp(0.0, max_x);
         match &self.actor {
             // 宠物的画布比它本身大(取景留了余量),按画布夹会把它顶离地面。
             // 真正该约束的是**脚底**留在屏幕内,画布超出边界让它被裁掉就好。
             Actor::Pet(pet) => {
                 let min_y = -(h as f32 - pet.foot_offset);
-                let max_y = self.size.1 as f32 - pet.foot_offset;
+                let max_y = size.1 as f32 - pet.foot_offset;
                 self.pos.1 = self.pos.1.clamp(min_y.min(max_y), max_y);
             }
             Actor::Sprite(_) => {
-                let max_y = (self.size.1 as f32 - h as f32).max(0.0);
+                let max_y = (size.1 as f32 - h as f32).max(0.0);
                 self.pos.1 = self.pos.1.clamp(0.0, max_y);
             }
         }
     }
 
+    /// 这只自己想要的推进频率。行走/拖动/反应中位置本身在变,不看姿势也得跑满;
+    /// 待机与睡觉交给姿势速度决定(睡着几乎不动 → 自动落到下限)。
+    fn tick_hz(&self) -> f32 {
+        match &self.actor {
+            Actor::Pet(pet) => {
+                let busy = self.drag_offset.is_some()
+                    || matches!(
+                        pet.activity,
+                        Activity::Walk { .. } | Activity::React { .. } | Activity::Dragged
+                    );
+                if busy {
+                    ACTIVE_HZ
+                } else {
+                    hz_for_motion(pet.player.motion())
+                }
+            }
+            Actor::Sprite(_) => ACTIVE_HZ,
+        }
+    }
+
+    /// 表面坐标是否落在这只的可见部分上。
+    fn hit_test(&self, x: f64, y: f64) -> bool {
+        let lx = (x - self.pos.0 as f64).floor() as i32;
+        let ly = (y - self.pos.1 as f64).floor() as i32;
+        self.actor.hit(lx, ly)
+    }
+
+    /// 这只在表面坐标下的输入矩形。
+    fn input_rects(&self) -> impl Iterator<Item = Rect> + '_ {
+        let (dx, dy) = (self.pos.0.round() as i32, self.pos.1.round() as i32);
+        self.coverage.iter().map(move |r| r.translated(dx, dy))
+    }
+}
+
+pub struct Stage {
+    /// 在场的实体。**顺序即绘制顺序**(靠后的画在上面);命中测试另按脚底 y 取最上面那只。
+    entities: Vec<Entity>,
+    next_id: u64,
+    /// 表面尺寸(逻辑像素)。
+    size: (u32, u32),
+    pointer: Option<(f64, f64)>,
+    passthrough: bool,
+}
+
+impl Stage {
+    pub fn new(actor: Actor, size: (u32, u32)) -> Self {
+        let mut stage = Self {
+            entities: Vec::new(),
+            next_id: 0,
+            size,
+            pointer: None,
+            passthrough: false,
+        };
+        stage.spawn(actor);
+        stage
+    }
+
+    /// 放一只上台,返回它的标识。
+    pub fn spawn(&mut self, actor: Actor) -> EntityId {
+        let id = EntityId(self.next_id);
+        self.next_id += 1;
+        self.entities.push(Entity::new(id, actor, self.size));
+        id
+    }
+
+    /// 撤掉一只。找不到就是 false(标识可能已经失效)。
+    #[allow(dead_code)] // 托盘的「移除这只」在 Phase 5 第 7 步接
+    pub fn despawn(&mut self, id: EntityId) -> bool {
+        let before = self.entities.len();
+        self.entities.retain(|e| e.id != id);
+        self.entities.len() != before
+    }
+
+    #[allow(dead_code)] // 平台层按实体渲染时用(Phase 5 第 2 步)
+    pub fn entities(&self) -> &[Entity] {
+        &self.entities
+    }
+
+    fn entity_mut(&mut self, id: EntityId) -> Option<&mut Entity> {
+        self.entities.iter_mut().find(|e| e.id == id)
+    }
+
+    /// 命中测试:**取最上面的那一只**。z 序按脚底 y(越靠下越靠前),
+    /// 脚底相同则取后加入的(绘制顺序里在上面)。
+    pub fn pick(&self, x: f64, y: f64) -> Option<EntityId> {
+        self.entities
+            .iter()
+            .filter(|e| e.hit_test(x, y))
+            .max_by(|a, b| {
+                a.foot_y()
+                    .total_cmp(&b.foot_y())
+                    .then(a.id.0.cmp(&b.id.0))
+            })
+            .map(|e| e.id)
+    }
+
+    // ── 单实体便利访问 ────────────────────────────────────────────
+    // 平台层目前仍按「一只」写(见 design.md §9 Phase 5 第 1 步),这几个先落到
+    // **第一只**上。等平台层改成按实体渲染后一并删掉。
+
+    /// 第一只(平台层过渡用)。台上至少有一只是 `Stage::new` 保证的。
+    fn primary(&self) -> &Entity {
+        &self.entities[0]
+    }
+
+    fn primary_mut(&mut self) -> &mut Entity {
+        &mut self.entities[0]
+    }
+
+    pub fn actor(&self) -> &Actor {
+        &self.primary().actor
+    }
+
+    /// 换角色(切形态):尺寸与轮廓都变了,重算覆盖区并重新落地。
+    pub fn replace_actor(&mut self, actor: Actor) {
+        let size = self.size;
+        let entity = self.primary_mut();
+        entity.actor = actor;
+        entity.coverage = entity.actor.coverage();
+        entity.drag_offset = None;
+        entity.drag_moved = false;
+        entity.reset_position(size);
+    }
+
+    /// 只给测试用:直接改角色状态(比如把困倦顶到阈值,省去等几分钟)。
+    #[cfg(test)]
+    pub fn actor_mut_for_test(&mut self) -> &mut Actor {
+        &mut self.primary_mut().actor
+    }
+
+    /// 角色左上角位置(表面局部逻辑像素)。
+    pub fn actor_pos(&self) -> (f32, f32) {
+        self.primary().pos
+    }
+
+    pub fn passthrough(&self) -> bool {
+        self.passthrough
+    }
+
+    /// 有没有哪一只正被拎着。
+    pub fn is_dragging(&self) -> bool {
+        self.entities.iter().any(Entity::is_dragging)
+    }
+
+    /// 所有实体重新落地(改屏幕尺寸/切形态之后)。
+    pub fn reset_position(&mut self) {
+        let size = self.size;
+        for entity in &mut self.entities {
+            entity.reset_position(size);
+        }
+    }
+
     /// 当前该交给合成器的输入区(表面局部坐标)。穿透时为空。
+    ///
+    /// **取各实体的并集**。这里不做去重/合并:合成器接受重叠矩形,而实体之间本来
+    /// 就很少叠在一起;真要压条目数,该压的是单只那 60~87 个格子。
     pub fn input_regions(&self) -> Vec<Rect> {
         if self.passthrough {
             return Vec::new();
         }
-        let (dx, dy) = (self.pos.0.round() as i32, self.pos.1.round() as i32);
-        self.coverage.iter().map(|r| r.translated(dx, dy)).collect()
+        self.entities.iter().flat_map(Entity::input_rects).collect()
     }
 
-    /// 表面坐标是否落在角色的可见部分上(比输入区更精确,用于自己内部的判定)。
+    /// 表面坐标是否落在**任何一只**的可见部分上(比输入区更精确,用于自己内部的判定)。
+    #[allow(dead_code)] // 内部判定现在都走 `pick`;这条留给平台层的命中查询
     pub fn hit_test(&self, x: f64, y: f64) -> bool {
-        let lx = (x - self.pos.0 as f64).floor() as i32;
-        let ly = (y - self.pos.1 as f64).floor() as i32;
-        self.actor.hit(lx, ly)
+        self.pick(x, y).is_some()
     }
 
     pub fn handle(&mut self, event: StageEvent) -> Reaction {
@@ -650,22 +804,27 @@ impl Stage {
                 if (width, height) == self.size {
                     return Reaction::NONE;
                 }
-                let grounded = matches!(self.actor, Actor::Pet(_));
                 self.size = (width, height);
-                if grounded {
-                    self.pos.1 = self.ground_y();
+                let size = self.size;
+                for entity in &mut self.entities {
+                    if matches!(entity.actor, Actor::Pet(_)) {
+                        entity.pos.1 = entity.ground_y(size);
+                    }
+                    entity.clamp_to_surface(size);
                 }
-                self.clamp_to_surface();
                 Reaction::BOTH
             }
             StageEvent::PointerMoved { x, y } => {
                 self.pointer = Some((x, y));
-                if let Some((ox, oy)) = self.drag_offset {
-                    let moved =
-                        ((x - ox) as f32 - self.pos.0).abs() + ((y - oy) as f32 - self.pos.1).abs();
+                // 正被拎着的那一只跟着指针走;其余照常
+                let size = self.size;
+                if let Some(entity) = self.entities.iter_mut().find(|e| e.is_dragging()) {
+                    let (ox, oy) = entity.drag_offset.expect("刚判过在拖");
+                    let moved = ((x - ox) as f32 - entity.pos.0).abs()
+                        + ((y - oy) as f32 - entity.pos.1).abs();
                     if moved > DRAG_THRESHOLD {
-                        self.drag_moved = true;
-                        if let Actor::Pet(pet) = &mut self.actor {
+                        entity.drag_moved = true;
+                        if let Actor::Pet(pet) = &mut entity.actor {
                             // 真被拎起来了才播害怕:轻点一下不该惊动它
                             if pet.activity != Activity::Dragged {
                                 let len = pet.clip_seconds(PetReaction::PickedUp);
@@ -674,8 +833,8 @@ impl Stage {
                             }
                         }
                     }
-                    self.pos = ((x - ox) as f32, (y - oy) as f32);
-                    self.clamp_to_surface();
+                    entity.pos = ((x - ox) as f32, (y - oy) as f32);
+                    entity.clamp_to_surface(size);
                     return Reaction::BOTH;
                 }
                 // 没在拖:看看是不是在头上来回蹭
@@ -683,12 +842,18 @@ impl Stage {
             }
             StageEvent::PointerPressed { x, y } => {
                 self.pointer = Some((x, y));
-                if self.passthrough || !self.hit_test(x, y) {
+                if self.passthrough {
                     return Reaction::NONE;
                 }
-                self.drag_offset = Some((x - self.pos.0 as f64, y - self.pos.1 as f64));
-                self.drag_moved = false;
-                if let Actor::Pet(pet) = &mut self.actor {
+                let Some(id) = self.pick(x, y) else {
+                    return Reaction::NONE;
+                };
+                let Some(entity) = self.entity_mut(id) else {
+                    return Reaction::NONE;
+                };
+                entity.drag_offset = Some((x - entity.pos.0 as f64, y - entity.pos.1 as f64));
+                entity.drag_moved = false;
+                if let Actor::Pet(pet) = &mut entity.actor {
                     // 睡着时被戳 → 醒过来(而不是原地受惊)
                     if pet.is_sleeping() {
                         pet.wake_up();
@@ -699,20 +864,24 @@ impl Stage {
             StageEvent::PointerReleased | StageEvent::PointerLeft => {
                 if event == StageEvent::PointerLeft {
                     self.pointer = None;
-                    // 指针走了:把瞥过去的身子转回正面
-                    if let Actor::Pet(pet) = &mut self.actor {
-                        if matches!(pet.activity, Activity::Idle { .. }) {
-                            pet.target_yaw = 0.0;
+                    // 指针走了:把瞥过去的身子转回正面(每一只都要)
+                    for entity in &mut self.entities {
+                        if let Actor::Pet(pet) = &mut entity.actor {
+                            if matches!(pet.activity, Activity::Idle { .. }) {
+                                pet.target_yaw = 0.0;
+                            }
+                            pet.petting.reset();
                         }
-                        pet.petting.reset();
                     }
                 }
-                if self.drag_offset.take().is_none() {
+                let size = self.size;
+                let Some(entity) = self.entities.iter_mut().find(|e| e.is_dragging()) else {
                     return Reaction::NONE;
-                }
-                let clicked = !self.drag_moved;
-                self.drag_moved = false;
-                if let Actor::Pet(pet) = &mut self.actor {
+                };
+                entity.drag_offset = None;
+                let clicked = !entity.drag_moved;
+                entity.drag_moved = false;
+                if let Actor::Pet(pet) = &mut entity.actor {
                     if clicked && !pet.is_sleeping() {
                         // 只是点了一下 → 受惊(正在醒来的那一下不算)
                         let len = pet.clip_seconds(PetReaction::Startled);
@@ -723,15 +892,16 @@ impl Stage {
                         pet.player.play(pet.clips.idle);
                     }
                 }
-                self.pos.1 = match self.actor {
-                    Actor::Pet(_) => self.ground_y(),
-                    Actor::Sprite(_) => self.pos.1,
-                };
+                if matches!(entity.actor, Actor::Pet(_)) {
+                    entity.pos.1 = entity.ground_y(size);
+                }
                 Reaction::BOTH
             }
             StageEvent::TogglePassthrough => {
                 self.passthrough = !self.passthrough;
-                self.drag_offset = None;
+                for entity in &mut self.entities {
+                    entity.drag_offset = None;
+                }
                 Reaction::BOTH
             }
         }
@@ -739,9 +909,10 @@ impl Stage {
 
     /// 装上新回读到的轮廓掩码(见 pet/mask.rs),顺带刷新输入区。
     pub fn set_pet_mask(&mut self, mask: Mask) -> Reaction {
-        if let Actor::Pet(pet) = &mut self.actor {
+        let entity = self.primary_mut();
+        if let Actor::Pet(pet) = &mut entity.actor {
             pet.mask = Some(mask);
-            self.coverage = self.actor.coverage();
+            entity.coverage = entity.actor.coverage();
             return Reaction {
                 redraw: false,
                 regions_dirty: true,
@@ -750,17 +921,30 @@ impl Stage {
         Reaction::NONE
     }
 
-    /// 指针在宠物头部区域移动:来回蹭够次数就算摸头。
+    /// 指针在宠物头部区域移动:来回蹭够次数就算摸头。**只喂给指针下面那一只**,
+    /// 其余的把蹭计数清零(指针已经不在它们身上了)。
     fn feed_petting(&mut self, x: f64, y: f64) -> Reaction {
-        if self.passthrough || !self.hit_test(x, y) {
-            if let Actor::Pet(pet) = &mut self.actor {
-                pet.petting.reset();
+        let picked = if self.passthrough {
+            None
+        } else {
+            self.pick(x, y)
+        };
+        for entity in &mut self.entities {
+            if Some(entity.id) != picked {
+                if let Actor::Pet(pet) = &mut entity.actor {
+                    pet.petting.reset();
+                }
             }
-            return Reaction::NONE;
         }
-        let local_y = (y - self.pos.1 as f64) as f32;
-        let center_x = self.pos.0 as f64 + self.actor.size().0 as f64 * 0.5;
-        let Actor::Pet(pet) = &mut self.actor else {
+        let Some(picked) = picked else {
+            return Reaction::NONE;
+        };
+        let Some(entity) = self.entity_mut(picked) else {
+            return Reaction::NONE;
+        };
+        let local_y = (y - entity.pos.1 as f64) as f32;
+        let center_x = entity.pos.0 as f64 + entity.actor.size().0 as f64 * 0.5;
+        let Actor::Pet(pet) = &mut entity.actor else {
             return Reaction::NONE;
         };
         // 指针在身上(不限头部)就侧一点身,像是在瞥它
@@ -785,51 +969,47 @@ impl Stage {
     }
 
     /// 下一次推进该隔多久。只有「正在播的动作几乎不动」时才降频(见 `hz_for_motion`)。
+    /// **取各实体里最快的那一个**:一只在走、其余在睡时,整台仍要按走的那只推进。
     pub fn tick_interval(&self) -> Duration {
-        let hz = match &self.actor {
-            Actor::Pet(pet) => {
-                // 行走/拖动/反应中位置本身在变,不看姿势也得跑满;
-                // 待机与睡觉交给姿势速度决定(睡着几乎不动 → 自动落到下限)
-                let busy = self.drag_offset.is_some()
-                    || matches!(
-                        pet.activity,
-                        Activity::Walk { .. } | Activity::React { .. } | Activity::Dragged
-                    );
-                if busy {
-                    ACTIVE_HZ
-                } else {
-                    hz_for_motion(pet.player.motion())
-                }
-            }
-            Actor::Sprite(_) => ACTIVE_HZ,
-        };
+        let hz = self
+            .entities
+            .iter()
+            .map(Entity::tick_hz)
+            .fold(f32::MIN, f32::max)
+            .max(hz_for_motion(0.0));
         Duration::from_secs_f32(1.0 / hz)
     }
 
     /// 推进时间:宠物的行为与动画。返回是否要重画/重设输入区。
     pub fn tick(&mut self, dt: f32) -> Reaction {
-        let before = match &self.actor {
-            Actor::Pet(pet) => Some(activity_label(&pet.activity)),
-            _ => None,
-        };
-        let reaction = self.tick_inner(dt);
-        if let (Some(before), Actor::Pet(pet)) = (before, &self.actor) {
-            if before != activity_label(&pet.activity) {
-                log::debug!(
-                    "宠物 → {}(困倦 {:.2} 无聊 {:.2})",
-                    activity_label(&pet.activity),
-                    pet.needs.sleepiness,
-                    pet.needs.boredom
-                );
+        let size = self.size;
+        let mut reaction = Reaction::NONE;
+        for index in 0..self.entities.len() {
+            let before = match &self.entities[index].actor {
+                Actor::Pet(pet) => Some(activity_label(&pet.activity)),
+                _ => None,
+            };
+            let one = Self::tick_entity(&mut self.entities[index], dt, size);
+            if let (Some(before), Actor::Pet(pet)) = (before, &self.entities[index].actor) {
+                if before != activity_label(&pet.activity) {
+                    log::debug!(
+                        "宠物 → {}(困倦 {:.2} 无聊 {:.2})",
+                        activity_label(&pet.activity),
+                        pet.needs.sleepiness,
+                        pet.needs.boredom
+                    );
+                }
             }
+            reaction.redraw |= one.redraw;
+            reaction.regions_dirty |= one.regions_dirty;
         }
         reaction
     }
 
-    fn tick_inner(&mut self, dt: f32) -> Reaction {
-        let surface_width = self.size.0 as f32;
-        let dragging = self.drag_offset.is_some();
-        let Actor::Pet(pet) = &mut self.actor else {
+    fn tick_entity(entity: &mut Entity, dt: f32, size: (u32, u32)) -> Reaction {
+        let surface_width = size.0 as f32;
+        let dragging = entity.drag_offset.is_some();
+        let Actor::Pet(pet) = &mut entity.actor else {
             return Reaction::NONE;
         };
 
@@ -862,21 +1042,21 @@ impl Stage {
                     } else {
                         // 待机结束:按需求挑下一件事
                         let max_x = (surface_width - pet.size.0 as f32).max(0.0);
-                        pet.choose_next(self.pos.0, max_x);
+                        pet.choose_next(entity.pos.0, max_x);
                     }
                 }
                 Activity::Walk { target_x } => {
-                    let delta = target_x - self.pos.0;
+                    let delta = target_x - entity.pos.0;
                     let step = pet.walk_speed * dt;
                     if delta.abs() <= step {
-                        self.pos.0 = target_x;
+                        entity.pos.0 = target_x;
                         pet.activity = Activity::Idle {
                             remaining: 1.5 + pet.rng.next_f32() * 3.0,
                         };
                         pet.target_yaw = 0.0;
                         pet.player.play(pet.clips.idle);
                     } else {
-                        self.pos.0 += step * delta.signum();
+                        entity.pos.0 += step * delta.signum();
                     }
                     moved = true;
                 }
@@ -892,7 +1072,7 @@ impl Stage {
         pet.player.update(&pet.model);
 
         if moved {
-            self.clamp_to_surface();
+            entity.clamp_to_surface(size);
         }
         // 动画一直在动,所以每 tick 都要重画;位置变了才需要重设输入区
         Reaction {
@@ -1012,6 +1192,70 @@ mod tests {
             let v = rng.next_f32();
             assert!((0.0..1.0).contains(&v), "越界: {v}");
         }
+    }
+}
+
+#[cfg(test)]
+mod entity_tests {
+    use super::*;
+
+    /// 两只精灵:第二只放在第一只右下方一点,重叠一块。
+    fn two_sprites() -> Stage {
+        let mut stage = Stage::new(Actor::Sprite(Sprite::test_pattern(64)), (800, 600));
+        stage.spawn(Actor::Sprite(Sprite::test_pattern(64)));
+        stage
+    }
+
+    #[test]
+    fn spawn_and_despawn_track_by_id() {
+        let mut stage = two_sprites();
+        assert_eq!(stage.entities().len(), 2);
+        let second = stage.entities()[1].id();
+        assert!(stage.despawn(second));
+        assert_eq!(stage.entities().len(), 1);
+        // 同一个标识不会再命中(下标滑动了也不会误伤别人)
+        assert!(!stage.despawn(second));
+    }
+
+    #[test]
+    fn input_regions_are_the_union() {
+        let mut stage = two_sprites();
+        // 两只错开:各自的圆心都必须在输入区里
+        stage.entities[1].pos = (100.0, 100.0);
+        let regions = stage.input_regions();
+        let first = stage.entities[0].pos;
+        let (fx, fy) = (first.0 as f64 + 32.0, first.1 as f64 + 32.0);
+        assert!(regions.iter().any(|r| r.contains(fx, fy)));
+        assert!(regions.iter().any(|r| r.contains(132.0, 132.0)));
+    }
+
+    #[test]
+    fn pick_takes_the_topmost() {
+        let mut stage = two_sprites();
+        // 完全重叠;第二只脚底更靠下 ⇒ 它在上面
+        stage.entities[0].pos = (100.0, 100.0);
+        stage.entities[1].pos = (100.0, 110.0);
+        let top = stage.entities[1].id();
+        assert_eq!(stage.pick(132.0, 142.0), Some(top));
+        // 把第一只挪到更下面,z 序随之翻转
+        stage.entities[0].pos = (100.0, 120.0);
+        let other = stage.entities[0].id();
+        assert_eq!(stage.pick(132.0, 152.0), Some(other));
+    }
+
+    #[test]
+    fn dragging_moves_only_the_picked_one() {
+        let mut stage = two_sprites();
+        stage.entities[0].pos = (100.0, 100.0);
+        stage.entities[1].pos = (400.0, 100.0);
+        let still = stage.entities[0].pos;
+        stage.handle(StageEvent::PointerPressed { x: 432.0, y: 132.0 });
+        stage.handle(StageEvent::PointerMoved { x: 482.0, y: 152.0 });
+        assert_eq!(stage.entities[1].pos, (450.0, 120.0));
+        assert_eq!(stage.entities[0].pos, still, "没被点中的那只不该动");
+        assert!(stage.is_dragging());
+        stage.handle(StageEvent::PointerReleased);
+        assert!(!stage.is_dragging());
     }
 }
 
