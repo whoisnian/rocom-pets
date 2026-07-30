@@ -56,6 +56,11 @@ const GROUND_MARGIN: f32 = 4.0;
 /// 按下后指针移动超过这么多逻辑像素才算拖动,否则算点击。
 const DRAG_THRESHOLD: f32 = 4.0;
 
+/// 放下之后的下落:重力与落地速度上限(逻辑像素)。
+/// 用屏幕尺度的常数而不是从宠物尺寸推:掉落手感该和宠物多大无关。
+const FALL_GRAVITY: f32 = 2600.0;
+const FALL_MAX_SPEED: f32 = 1600.0;
+
 /// 摸头判定:头部区域取包围盒上面这个比例。
 const HEAD_ZONE: f32 = 0.45;
 /// 在这段时间窗口内来回蹭够 REVERSALS 次就算「摸头」。
@@ -99,7 +104,9 @@ const FULL_RATE_MOTION: f32 = 1.0;
 fn activity_label(activity: &Activity) -> &'static str {
     match activity {
         Activity::Idle { .. } => "待机",
-        Activity::Walk { .. } => "行走",
+        Activity::Walk { running: false, .. } => "行走",
+        Activity::Walk { running: true, .. } => "奔跑",
+        Activity::Falling { .. } => "下落",
         Activity::Dragged => "被拎着",
         Activity::React { .. } => "反应",
         Activity::Sleeping(SleepPhase::Falling { .. }) => "入睡",
@@ -118,8 +125,10 @@ fn hz_for_motion(motion: f32) -> f32 {
 pub enum Activity {
     /// 站着待机,`remaining` 秒后换个地方走走。
     Idle { remaining: f32 },
-    /// 走向 `target_x`(左上角的目标 x)。
-    Walk { target_x: f32 },
+    /// 走向 `target_x`(左上角的目标 x)。`running` = 跑(远处才跑,见 `choose_next`)。
+    Walk { target_x: f32, running: bool },
+    /// 被放下之后往地面落。`speed` 是当前下落速度(px/s,受重力加速)。
+    Falling { speed: f32 },
     /// 被鼠标拎着。
     Dragged,
     /// 一次性反应/表情,播完 `remaining` 秒回到待机。
@@ -205,6 +214,9 @@ pub struct PetActor {
     pub activity: Activity,
     /// 走路速度(逻辑像素/秒)。
     pub walk_speed: f32,
+    /// 跑速(逻辑像素/秒)。**要钳制**:动画反推出来的值中位 417cm/s、最大 1125cm/s
+    /// (魔力猫那只 7.5m/s),照搬会让宠物瞬间横穿屏幕。见 wayland.rs 的 `run_speed_cm`。
+    pub run_speed: f32,
     /// 画布顶端到宠物脚底的距离(逻辑像素)。取景留了余量,脚底不在画布最下沿,
     /// 站地面时要按这个值对齐,否则宠物会悬空。
     pub foot_offset: f32,
@@ -269,6 +281,10 @@ impl Petting {
 struct Clips {
     idle: usize,
     walk: Option<usize>,
+    /// 跑。**不是每只都有**(全库 463/539 个包有),缺了就一律用走。
+    run: Option<usize>,
+    /// 落地。原来不在导出器白名单里,全库一个都没有;补上之后仍是部分形态才有。
+    jump_fall: Option<usize>,
     startled: Option<usize>,
     happy: Option<usize>,
     afraid: Option<usize>,
@@ -307,11 +323,22 @@ impl PetActor {
             let emote = !self.clips.emotes.is_empty() && self.rng.next_f32() < EMOTE_CHANCE;
             if !emote {
                 let target_x = self.rng.next_f32() * max_x;
-                let far_enough = (target_x - pos_x).abs() > self.size.0 as f32 * 0.25;
-                if let (Some(walk), true) = (self.clips.walk, far_enough) {
-                    self.activity = Activity::Walk { target_x };
+                let distance = (target_x - pos_x).abs();
+                let far_enough = distance > self.size.0 as f32 * 0.25;
+                // **远处才跑**:近距离用跑显得慌张,而且跑动画一两步就到、看着像抽搐。
+                //
+                // 阈值要按**可走范围**(`max_x`)取,这两条都踩过:
+                // ① 按宠物画布取(「三个身位」)—— 画布带着取景余量、比宠物本身大 1.64 倍,
+                //    水灵在 2560px 屏上画布就有 805px,三个身位 2415px 几乎整屏;
+                // ② 按屏幕宽取 —— 可走范围只有 `max_x`(屏宽减画布宽),站在中间时
+                //    最远也只能走 `max_x/2`,阈值取屏宽的三成五就已经够不着了。
+                // 实测这两版跑动作**一次都不会触发**。四成可走范围 ≈ 两成的目标点会起跑。
+                let running = distance > max_x * 0.4 && self.clips.run.is_some();
+                let clip = if running { self.clips.run } else { self.clips.walk };
+                if let (Some(clip), true) = (clip, far_enough) {
+                    self.activity = Activity::Walk { target_x, running };
                     self.target_yaw = camera_yaw(target_x > pos_x);
-                    self.player.play(walk);
+                    self.player.play(clip);
                     self.needs.boredom = 0.0;
                     return;
                 }
@@ -425,11 +452,14 @@ impl PetActor {
         size: (u32, u32),
         foot_offset: f32,
         walk_speed: f32,
+        run_speed: f32,
         seed: u64,
     ) -> Self {
         // Idle 一定要有:没有 Idle 的包等于没法待机,退化成用第 0 段动作
         let idle = model.clip("Idle").unwrap_or(0);
         let walk = model.clip("Walk");
+        let run = model.clip("Run");
+        let jump_fall = model.clip("JumpFall");
         // 反应动作:游戏里「摸头」在 INTERACTIONTREE_CONF 有对应动作键,但键→动作表的映射
         // 还没核实(见 design.md §5),所以先按语义挑:受惊 Shock、开心 Happy、害怕 Fear,
         // 缺哪个就退到 Alert / Show / Shock
@@ -453,12 +483,15 @@ impl PetActor {
             target_yaw: 0.0,
             activity: Activity::Idle { remaining: 2.0 },
             walk_speed,
+            run_speed,
             foot_offset,
             mask: None,
             needs: Needs::default(),
             clips: Clips {
                 idle,
                 walk,
+                run,
+                jump_fall,
                 startled,
                 happy,
                 afraid,
@@ -634,7 +667,10 @@ impl Entity {
                 let busy = self.drag_offset.is_some()
                     || matches!(
                         pet.activity,
-                        Activity::Walk { .. } | Activity::React { .. } | Activity::Dragged
+                        Activity::Walk { .. }
+                            | Activity::Falling { .. }
+                            | Activity::React { .. }
+                            | Activity::Dragged
                     );
                 if busy {
                     ACTIVE_HZ
@@ -898,13 +934,24 @@ impl Stage {
                         let len = pet.clip_seconds(PetReaction::Startled);
                         pet.react(PetReaction::Startled, len);
                     } else if !clicked {
-                        // 拎着放下 → 落回地面(下落动画等有 JumpFall 再说)
-                        pet.activity = Activity::Idle { remaining: 1.5 };
-                        pet.player.play(pet.clips.idle);
+                        // 拎着放下 → 往地面落。**不再瞬移**:原来是直接把 y 设成地面线,
+                        // 从半空松手会「啪」地闪下去。有 JumpFall 就播它,没有就用待机姿势落。
+                        pet.activity = Activity::Falling { speed: 0.0 };
+                        pet.player.play(pet.clips.jump_fall.unwrap_or(pet.clips.idle));
                     }
                 }
-                if matches!(entity.actor, Actor::Pet(_)) {
-                    entity.pos.1 = entity.ground_y(size);
+                // 已经在地面上(或者本来就不是宠物)就不用落
+                let ground = entity.ground_y(size);
+                let on_ground = entity.pos.1 >= ground;
+                match &mut entity.actor {
+                    Actor::Pet(pet) => {
+                        if matches!(pet.activity, Activity::Falling { .. }) && on_ground {
+                            pet.activity = Activity::Idle { remaining: 1.5 };
+                            pet.player.play(pet.clips.idle);
+                            entity.pos.1 = ground;
+                        }
+                    }
+                    Actor::Sprite(_) => entity.pos.1 = ground,
                 }
                 Reaction::BOTH
             }
@@ -1022,6 +1069,8 @@ impl Stage {
     fn tick_entity(entity: &mut Entity, dt: f32, size: (u32, u32)) -> Reaction {
         let surface_width = size.0 as f32;
         let dragging = entity.drag_offset.is_some();
+        // 地面线要在借出 `pet` 之前算好:它同时看 actor 与 size
+        let ground = entity.ground_y(size);
         let Actor::Pet(pet) = &mut entity.actor else {
             return Reaction::NONE;
         };
@@ -1035,6 +1084,19 @@ impl Stage {
                     // 刚被放下
                     pet.activity = Activity::Idle { remaining: 1.0 };
                     pet.player.play(pet.clips.idle);
+                }
+                Activity::Falling { speed } => {
+                    let speed = (speed + FALL_GRAVITY * dt).min(FALL_MAX_SPEED);
+                    let next = entity.pos.1 + speed * dt;
+                    if next >= ground {
+                        entity.pos.1 = ground;
+                        pet.activity = Activity::Idle { remaining: 1.0 };
+                        pet.player.play(pet.clips.idle);
+                    } else {
+                        entity.pos.1 = next;
+                        pet.activity = Activity::Falling { speed };
+                    }
+                    moved = true;
                 }
                 Activity::React { remaining } => {
                     let remaining = remaining - dt;
@@ -1058,9 +1120,14 @@ impl Stage {
                         pet.choose_next(entity.pos.0, max_x);
                     }
                 }
-                Activity::Walk { target_x } => {
+                Activity::Walk { target_x, running } => {
                     let delta = target_x - entity.pos.0;
-                    let step = pet.walk_speed * dt;
+                    let speed = if running {
+                        pet.run_speed
+                    } else {
+                        pet.walk_speed
+                    };
+                    let step = speed * dt;
                     if delta.abs() <= step {
                         entity.pos.0 = target_x;
                         pet.activity = Activity::Idle {
@@ -1261,7 +1328,7 @@ mod entity_tests {
         let model = Arc::new(Model::for_test(&["Idle", "Walk"]));
         assert_eq!(Arc::strong_count(&model), 1);
         let mut stage = Stage::new(
-            Actor::Pet(PetActor::new(Arc::clone(&model), (200, 200), 180.0, 100.0, 1)),
+            Actor::Pet(PetActor::new(Arc::clone(&model), (200, 200), 180.0, 100.0, 250.0, 1)),
             (1000, 600),
         );
         stage.spawn(Actor::Pet(PetActor::new(
@@ -1269,6 +1336,7 @@ mod entity_tests {
             (200, 200),
             180.0,
             100.0,
+            250.0,
             2,
         )));
         // 两只在场,加上这里持有的那份 = 3;网格/动画/贴图只有一份
@@ -1310,6 +1378,7 @@ mod pet_tests {
         let model = Model::for_test(&[
             "Idle",
             "Walk",
+            "Run",
             "Shock",
             "Happy",
             "Fear",
@@ -1317,7 +1386,7 @@ mod pet_tests {
             "SleepLoop",
             "SleepEnd",
         ]);
-        let actor = Actor::Pet(PetActor::new(Arc::new(model), (200, 200), 180.0, 100.0, 7));
+        let actor = Actor::Pet(PetActor::new(Arc::new(model), (200, 200), 180.0, 100.0, 250.0, 7));
         Stage::new(actor, (1000, 600))
     }
 
@@ -1373,10 +1442,54 @@ mod pet_tests {
         });
         assert_eq!(activity(&s), Activity::Dragged, "移动超过阈值算拎起来");
         assert!(s.is_dragging());
+        let lifted = s.actor_pos().1;
         s.handle(StageEvent::PointerReleased);
-        assert!(matches!(activity(&s), Activity::Idle { .. }));
-        // 松手落回地面
+        // **松手不再瞬移**:先进入下落,一路掉到地面线才回待机
+        assert!(
+            matches!(activity(&s), Activity::Falling { .. }),
+            "从半空松手该开始下落"
+        );
+        assert_eq!(s.actor_pos().1, lifted, "松手那一下不该跳位置");
+        let ground = 600.0 - GROUND_MARGIN - 180.0;
+        for _ in 0..120 {
+            s.tick(1.0 / 60.0);
+            if matches!(activity(&s), Activity::Idle { .. }) {
+                break;
+            }
+            assert!(s.actor_pos().1 <= ground, "不该穿过地面");
+        }
+        assert!(matches!(activity(&s), Activity::Idle { .. }), "该落地回待机");
         assert_eq!(s.actor_pos().1 + 180.0, 600.0 - GROUND_MARGIN);
+    }
+
+    #[test]
+    fn far_target_runs_and_near_target_walks() {
+        // 跑速比走速快,且只有远处才起跑
+        let mut s = pet_stage();
+        let max_x = 1000.0 - 200.0;
+        match s.actor_mut_for_test() {
+            Actor::Pet(pet) => {
+                pet.needs.boredom = 1.0;
+                // 近处:目标就在旁边 ⇒ 走(或原地),不该是跑
+                pet.choose_next(0.0, 10.0);
+                assert!(
+                    !matches!(pet.activity, Activity::Walk { running: true, .. }),
+                    "近距离不该起跑"
+                );
+                // 远处:反复挑几次,总会挑到超过三个身位的目标
+                let mut saw_run = false;
+                for _ in 0..40 {
+                    pet.needs.boredom = 1.0;
+                    pet.choose_next(0.0, max_x);
+                    if matches!(pet.activity, Activity::Walk { running: true, .. }) {
+                        saw_run = true;
+                        break;
+                    }
+                }
+                assert!(saw_run, "远处目标该起跑(测试模型带 Run)");
+            }
+            _ => panic!("该是宠物"),
+        }
     }
 
     #[test]
@@ -1457,7 +1570,7 @@ mod pet_tests {
                 break;
             }
         }
-        let Activity::Walk { target_x } = activity(&s) else {
+        let Activity::Walk { target_x, .. } = activity(&s) else {
             panic!("没走起来")
         };
         let going_right = target_x > s.actor_pos().0;
@@ -1503,12 +1616,13 @@ mod behaviour_tests {
         let model = Model::for_test(&[
             "Idle",
             "Walk",
+            "Run",
             "Shock",
             "SleepStart",
             "SleepLoop",
             "SleepEnd",
         ]);
-        let actor = Actor::Pet(PetActor::new(Arc::new(model), (200, 200), 180.0, 100.0, 99));
+        let actor = Actor::Pet(PetActor::new(Arc::new(model), (200, 200), 180.0, 100.0, 250.0, 99));
         Stage::new(actor, (1000, 600))
     }
 

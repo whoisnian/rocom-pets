@@ -531,6 +531,16 @@ impl App {
             .map(|c| c.speed_cm_s)
             .filter(|v| *v > 1.0)
             .unwrap_or(40.0);
+        // 跑速同理,但**必须钳制**:全库反推值中位 417cm/s、p90 563、最高 1125
+        // (魔力猫那只 7.5m/s),照搬会让宠物一瞬间横穿屏幕。按走速的倍数夹 ——
+        // 保留「这只跑起来相对更快」的个性,又不至于离谱。代价是极端值那几只脚会打滑,
+        // 比起「一眨眼跑没影」是划算的。
+        let run_speed_cm = form
+            .clip("Run")
+            .map(|c| c.speed_cm_s)
+            .filter(|v| *v > 1.0)
+            .unwrap_or(walk_speed_cm * 2.0)
+            .clamp(walk_speed_cm * 1.2, walk_speed_cm * 3.0);
         let seed = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos() as u64)
@@ -538,18 +548,20 @@ impl App {
             ^ (self.stages.len() as u64 * 0x9E3779B97F4A7C15);
 
         log::info!(
-            "  {} 屏幕高 {:.0}px(画布 {}px,脚底 {:.0}px),走速 {:.0}cm/s",
+            "  {} 屏幕高 {:.0}px(画布 {}px,脚底 {:.0}px),走速 {:.0}cm/s,跑速 {:.0}cm/s",
             form.name,
             height_px,
             side as u32,
             foot_offset,
-            walk_speed_cm
+            walk_speed_cm,
+            run_speed_cm
         );
         Ok(Actor::Pet(PetActor::new(
             model,
             (side as u32, side as u32),
             foot_offset,
             walk_speed_cm * self.px_per_cm,
+            run_speed_cm * self.px_per_cm,
             seed,
         )))
     }

@@ -50,6 +50,9 @@ string[] defaultClips =
 [
     "Idle", "Walk", "Run", "Happy", "Anger", "Sad", "Fear", "Shock", "Show", "Relax", "Alert",
     "SleepStart", "SleepLoop", "SleepEnd", "SleepStand", "CallOut",
+    // 拖放松手之后的落地(design.md §9 Phase 1 遗留)。ANIM_CONF 里有这个逻辑名,
+    // 但原来不在白名单里 ⇒ 全库 831 个形态一个都没导出来。
+    "JumpFall",
 ];
 
 var home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
