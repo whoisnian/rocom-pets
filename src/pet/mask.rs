@@ -117,6 +117,17 @@ impl MaskReadback {
 
     /// 提交一次「画布 → 缓冲」的拷贝并开始映射。
     /// 已有请求在飞、或距上次请求还不到 `MIN_INTERVAL` 就什么都不做。
+    /// 这一份现在该不该再要一次:没有在途的请求,且离上次够久了。
+    ///
+    /// 多实体时**一帧只回读一只**(见 wayland.rs 的轮转),轮到谁要先问这一句 ——
+    /// 否则轮到一个还在节流里的,这一帧的名额就白白浪费了。
+    pub fn is_due(&self) -> bool {
+        !self.pending
+            && self
+                .last_request
+                .is_none_or(|t| std::time::Instant::now() - t >= MIN_INTERVAL)
+    }
+
     pub fn request(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, canvas: &wgpu::Texture) {
         let now = std::time::Instant::now();
         if self.pending || self.last_request.is_some_and(|t| now - t < MIN_INTERVAL) {

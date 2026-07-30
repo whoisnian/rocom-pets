@@ -299,6 +299,9 @@ struct StageWindow {
     configured: bool,
     /// 上次推进动画的时刻,用来算 dt。
     last_tick: Option<Instant>,
+    /// 掩码回读的轮转游标:**一帧最多回读一只**。N 只同帧全回读会把 Phase 2 压下去的
+    /// 开销乘回来 —— 取景改按动作包围盒之后画布面积还涨了 1.64 倍,回读量按面积走。
+    readback_cursor: usize,
 }
 
 /// 一只宠物在某个 stage 上的渲染资源。
@@ -479,6 +482,7 @@ impl App {
             _fractional: fractional,
             configured: false,
             last_tick: None,
+            readback_cursor: 0,
         });
     }
 
@@ -818,14 +822,28 @@ impl App {
             surfaces
                 .canvas
                 .render(&gpu.device, &gpu.queue, &surfaces.gpu);
-            // 顺手要一份轮廓:拷贝很小(几十 KB)且是异步的,不阻塞出帧;
-            // 回读结果在后续 tick 里 poll(见 App::tick)
             surfaces
                 .readback
                 .resize(&gpu.device, surfaces.canvas.size());
-            surfaces
-                .readback
-                .request(&gpu.device, &gpu.queue, surfaces.canvas.texture());
+        }
+
+        // 轮廓回读:**一帧只要一只**,按游标轮转。拷贝本身很小(几十 KB)且异步,
+        // 但每只的画布都不小,N 只同帧全要会把出帧开销乘回来。
+        // 从游标处起找**第一个到点的**(还在 140ms 节流里的跳过),否则这一帧的名额白费。
+        // 回读结果在后续 tick 里 poll(见 App::tick)。
+        let count = stage.pets.len();
+        if count > 0 {
+            let start = stage.readback_cursor % count;
+            let chosen = (0..count)
+                .map(|step| (start + step) % count)
+                .find(|i| stage.pets[*i].readback.is_due());
+            stage.readback_cursor = (start + 1) % count;
+            if let Some(i) = chosen {
+                let surfaces = &mut stage.pets[i];
+                surfaces
+                    .readback
+                    .request(&gpu.device, &gpu.queue, surfaces.canvas.texture());
+            }
         }
 
         // 再把每只的画布按 z 序合成到 stage 上(靠后的画在上面)
