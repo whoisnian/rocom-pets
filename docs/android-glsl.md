@@ -8,6 +8,14 @@ HLSLcc 生成的 GLSL 源码文本** —— 公式直接能读。
 
 > 这份文档是**过程记录**,结论稳定后应择要并入 `docs/shader.md`,本文可删。
 
+> **⚠️ 2026-07-30 更正:§3 指纹配出来的 `#3119` 归属是错的,§4 起所有带槽位下标的结论作废。**
+> 用实机私有数据拿到宠物的安卓 cooked 材质后精确查哈希:`#3119` 属于 map 4734,
+> 而它是**共享父材质 `MI_P_Object_Masked`** 的 —— 全库 2764 个宠物材质、1237 个 map 零命中。
+> 幽星光自己那批 shader 的材质 uniform buffer 是 `pc5_m[39]`,不是 `#3119` 的 `pc6_m[69]`,
+> **缓冲编号和槽位数都不同**。详见 [android-device.md](android-device.md) §5。
+> 本文以下内容保留作过程记录:**「有哪些层」的结构性描述仍然成立**(幽星光自己的 shader 里
+> 三向投影与 `refract()` 都在),**「哪个槽位是什么」的每一条都要重做**。
+
 ## 1. 取包
 
 APK(2.0 GB)里 UE 的数据藏在 `assets/main.obb.png` —— 名字是 png,实为 **store 压缩的 zip**:
@@ -66,6 +74,11 @@ layout(location=0) out vec4 out_Target0;
 
 ## 3. 归属:SHA1 这条路在跨平台上是断的
 
+> **已被取代(2026-07-30)**:断的只是「Windows 材质 × 安卓 archive」。宠物的**安卓** cooked
+> 材质在手机的应用私有目录里,取到之后同平台哈希直接命中,不需要指纹。见
+> [android-device.md](android-device.md)。**下面这套结构指纹判据实测会把答案引到父材质上** ——
+> 它 feature 全开、双面、11 次采样,每一条判据都对得上,恰恰因为它是那个超集。
+
 `docs/shader.md` 的归属办法是拿材质 uexp 里的 shader map SHA1 去 archive 的哈希表里 memmem。
 跨平台**行不通**,实测:
 
@@ -96,6 +109,10 @@ v121 = mix(mix(texture(ps8,v114.xz),texture(ps8,v114.yz),v118.xxxx),texture(ps8,
 ## 4. 读出来的东西(这才是重点)
 
 以下全部来自 `#3119`,`pc6_m` = 材质参数块、`pc5_m` = MaterialCollection、`pc0_h` = View。
+
+> **⚠️ `#3119` 是父材质 `MI_P_Object_Masked` 的,不是任何一只宠物的**(见文首更正)。
+> 本节每一条**公式结构**可以继续参考,每一个 **`pc6_m[i]` 下标**都不要往宠物身上代 ——
+> 宠物那边材质 UB 是 `pc5_m[39]`,连缓冲编号都不一样。
 
 ### 4.1 底色贴图是"反色调映射"的 —— `DECODE_GAMMA = 2.2` 是个粗糙近似
 

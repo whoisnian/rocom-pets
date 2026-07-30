@@ -24,6 +24,9 @@ GNOME 等不实现 wlr-layer-shell 的合成器不在支持范围，也不做 X1
   `matshader.py` 认归属、`uniexpr.py` + `matparams.py` 把 cb 槽位对回参数名),
   安卓端走 GLSL 源码(`glsldump.py`,好读得多)。
   流水线与结论见 [docs/shader.md](docs/shader.md) 与 [docs/android-glsl.md](docs/android-glsl.md)。
+  安卓那条路原本卡在**归属**(APK 里有 shader 却没有宠物资产,只能靠结构指纹猜);
+  宠物资产在手机的**应用私有目录**里,`adb root` 取到之后归属变成精确哈希查表,
+  见 [docs/android-device.md](docs/android-device.md)。
 
 配置在 `~/.config/rocom-pets/config.toml`(首次运行生成带注释模板);托盘菜单可切穿透、
 召回、退出;全局热键走 XDG GlobalShortcuts portal(KDE 会弹窗确认),或把 KDE 自定义快捷键
