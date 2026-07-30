@@ -199,6 +199,9 @@ pub struct Model {
     /// 绑定姿势的包围盒(米)。**只用来换算屏幕尺寸**(`height_cm` 对应的就是这个高度),
     /// 站姿高度必须稳定,不能跟着动作变。
     pub bounds: (Vec3, Vec3),
+    /// 这份模型是从哪个 glb 读来的。**当缓存键用**:多实体共享网格与 GPU 资源时,
+    /// 按 (包, 形态) 索引就是按它索引(见 wayland.rs 的 `models` / `pet_gpus`)。
+    pub source: std::path::PathBuf,
     /// 把各动作采样一遍取到的包围盒,`bounds` 的超集。**画布与相机取景用这个**:
     /// 伸手、张翅、小跳的姿势会明显超出绑定姿势,只按 `bounds` 取景会把肢体裁掉。
     /// 实测(120 个抽样形态 × Idle/Happy/Show/Walk 各查一次):按绑定盒取景 11 个被裁
@@ -500,6 +503,7 @@ impl Model {
             materials,
             skeleton,
             clips,
+            source: glb_path.to_path_buf(),
             bounds,
             motion_bounds,
         })
@@ -932,6 +936,7 @@ impl Model {
             })
             .collect();
         Self {
+            source: std::path::PathBuf::from("<test>"),
             vertices: Vec::new(),
             indices: Vec::new(),
             primitives: Vec::new(),

@@ -66,7 +66,7 @@ use crate::pet::target::{PetTarget, view_proj};
 use crate::pet::{Model, PetGpu};
 use crate::render::{Gpu, Quad, QuadDraw, Target};
 use crate::sprite::Sprite;
-use crate::stage::{Actor, PetActor, Reaction, Stage, StageEvent};
+use crate::stage::{Actor, EntityId, PetActor, Reaction, Stage, StageEvent};
 
 use super::Options;
 
@@ -163,6 +163,7 @@ pub fn run(options: &Options) -> Result<()> {
         pack,
         current_form,
         models: HashMap::new(),
+        pet_gpus: HashMap::new(),
         px_per_cm: options.px_per_cm,
         stages: Vec::new(),
         pointer: None,
@@ -261,6 +262,19 @@ fn install_signal_source(tx: channel::Sender<Control>) -> Result<()> {
     Ok(())
 }
 
+/// 启动时上几只(调试用)。`ROCOM_PETS_ENTITIES=3` 就是三只,默认一只。
+/// 与 `ROCOM_PETS_NEEDS_SPEED` 同一类开关:只为把某条路走通,不进配置文件。
+fn debug_entity_count() -> usize {
+    static COUNT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *COUNT.get_or_init(|| {
+        std::env::var("ROCOM_PETS_ENTITIES")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|v| *v >= 1)
+            .unwrap_or(1)
+    })
+}
+
 /// 一个 output 上的 stage 表面。
 struct StageWindow {
     output: wl_output::WlOutput,
@@ -268,8 +282,8 @@ struct StageWindow {
     /// 建好但还没配置尺寸时先存着,首次 configure 后移进 `target`。
     pending_surface: Option<wgpu::Surface<'static>>,
     target: Option<Target>,
-    /// 宠物的离屏画布 + 它在 stage 上的合成四边形;精灵模式下是 None。
-    pet: Option<PetSurfaces>,
+    /// 每只宠物一份画布 + 合成四边形;精灵模式下为空。按实体标识对应。
+    pets: Vec<PetSurfaces>,
     /// 精灵模式的合成四边形。
     sprite_quad: Option<Quad>,
     stage: Stage,
@@ -287,10 +301,13 @@ struct StageWindow {
     last_tick: Option<Instant>,
 }
 
-/// 宠物在某个 stage 上的一套 GPU 资源。
-/// 网格/贴图目前每个 stage 各一份:多显示器时略浪费,等真有多屏需求再做共享。
+/// 一只宠物在某个 stage 上的渲染资源。
+///
+/// **管线/网格/贴图(`PetGpu`)是共享的**,按 (包, 形态) 缓存在 `App.pet_gpus` 上 ——
+/// 多实体、多显示器都只有一份。**每实体独立的是画布**(各自渲各自)与它的掩码回读。
 struct PetSurfaces {
-    gpu: PetGpu,
+    id: EntityId,
+    gpu: Arc<PetGpu>,
     canvas: PetTarget,
     quad: Quad,
     /// 轮廓掩码的异步回读:每帧提交一次,好了就换上(滞后一两帧无所谓)。
@@ -336,6 +353,8 @@ struct App {
     /// 已加载的模型,按 glb 路径(= 包 + 形态)缓存。多实体/多屏共享同一份网格与贴图,
     /// 否则每多一只 RSS 就翻一档(单只已经 219MB)。见 design.md §9 Phase 5 第 2 步。
     models: HashMap<PathBuf, Arc<Model>>,
+    /// 同上,GPU 侧:管线/顶点缓冲/贴图按 (包, 形态) 共享。每实体独立的只有画布。
+    pet_gpus: HashMap<PathBuf, Arc<PetGpu>>,
     px_per_cm: f32,
     stages: Vec<StageWindow>,
     pointer: Option<wl_pointer::WlPointer>,
@@ -411,6 +430,7 @@ impl App {
             .pack
             .as_ref()
             .map(|p| p.forms[self.current_form].clone());
+        let form_for_extra = form.clone();
         let actor = match form {
             Some(form) => match self.build_pet_actor(&form) {
                 Ok(actor) => actor,
@@ -424,6 +444,21 @@ impl App {
         };
 
         let mut stage = Stage::new(actor, (1, 1));
+        // 调试开关:一次上多只(共享同一份模型与管线,各有自己的画布与状态)。
+        // 托盘里的「加一只/移除一只」在 Phase 5 第 7 步接,这之前先靠它验多实体这条路。
+        for _ in 1..debug_entity_count() {
+            let extra = match form_for_extra.as_ref() {
+                Some(form) => match self.build_pet_actor(form) {
+                    Ok(actor) => actor,
+                    Err(e) => {
+                        log::error!("output {name}: 多开失败: {e:#}");
+                        break;
+                    }
+                },
+                None => Actor::Sprite(self.sprite.clone()),
+            };
+            stage.spawn(extra);
+        }
         if self.passthrough != stage.passthrough() {
             stage.handle(StageEvent::TogglePassthrough);
         }
@@ -434,7 +469,7 @@ impl App {
             layer,
             pending_surface: Some(surface),
             target: None,
-            pet: None,
+            pets: Vec::new(),
             sprite_quad: None,
             stage,
             logical: (1, 1),
@@ -548,7 +583,7 @@ impl App {
             ((aw as f32 * scale) as u32).max(1),
             ((ah as f32 * scale) as u32).max(1),
         );
-        if let Some(surfaces) = self.stages[index].pet.as_mut() {
+        for surfaces in &mut self.stages[index].pets {
             if surfaces.canvas.resize(&gpu.device, canvas) {
                 surfaces.quad = gpu.create_quad(surfaces.canvas.view());
             }
@@ -570,12 +605,16 @@ impl App {
             }
             let mut reaction = self.stages[index].stage.tick(dt);
 
-            // 看看上一帧要的轮廓回来了没
-            if let (Some(gpu), Some(surfaces)) =
-                (self.gpu.as_ref(), self.stages[index].pet.as_mut())
-            {
-                if let Some(mask) = surfaces.readback.poll(&gpu.device) {
-                    let mask_reaction = self.stages[index].stage.set_pet_mask(mask);
+            // 看看上一帧要的轮廓回来了没(每只各有一份回读)
+            if let Some(gpu) = self.gpu.as_ref() {
+                let mut ready: Vec<(EntityId, _)> = Vec::new();
+                for surfaces in &mut self.stages[index].pets {
+                    if let Some(mask) = surfaces.readback.poll(&gpu.device) {
+                        ready.push((surfaces.id, mask));
+                    }
+                }
+                for (id, mask) in ready {
+                    let mask_reaction = self.stages[index].stage.set_entity_mask(id, mask);
                     reaction.redraw |= mask_reaction.redraw;
                     reaction.regions_dirty |= mask_reaction.regions_dirty;
                 }
@@ -647,7 +686,7 @@ impl App {
                 Ok(actor) => {
                     self.stages[stage_index].stage.replace_actor(actor);
                     // 网格/贴图/画布/掩码缓冲全都跟形态绑,一并重建
-                    self.stages[stage_index].pet = None;
+                    self.stages[stage_index].pets.clear();
                     self.rebuild_pet_surfaces(stage_index);
                     self.apply(
                         stage_index,
@@ -742,28 +781,39 @@ impl App {
             return;
         }
         let scale = stage.scale as f32;
-        let (px, py) = stage.stage.actor_pos();
-        let (aw, ah) = stage.stage.actor().size();
-        let highlight = stage.stage.is_dragging();
 
-        // 宠物:先画进离屏画布,再把画布作为一张纹理合成到 stage 上
-        if let (Actor::Pet(pet), Some(surfaces)) = (stage.stage.actor(), stage.pet.as_mut()) {
+        // 每只宠物先画进**自己的**离屏画布(管线是共享的,画布不是);
+        // 逐只 update + render + submit,所以共享那份 camera/joints 缓冲不会串。
+        let order = stage.stage.draw_order();
+        for id in &order {
+            let Some(entity) = stage.stage.entity(*id) else {
+                continue;
+            };
+            let Actor::Pet(pet) = entity.actor() else {
+                continue;
+            };
+            let (aw, ah) = entity.actor().size();
             let canvas_size = ((aw as f32 * scale) as u32, (ah as f32 * scale) as u32);
-            if surfaces.canvas.resize(&gpu.device, canvas_size) {
-                // 画布重建了,合成用的四边形绑的是旧纹理,要重绑
-                surfaces.quad = gpu.create_quad(surfaces.canvas.view());
-            }
             // 取景用动作包围盒(与 build_pet_actor 的画布尺寸算法必须一致),
             // 描边宽度用绑定姿势的尺度:免得动作一伸展描边就跟着变粗
             let extent = pet.model.bounds.1 - pet.model.bounds.0;
             let outline = extent.length() * 0.004;
+            let view = view_proj(pet.model.motion_bounds, pet.yaw, CANVAS_PADDING);
+            let matrices = pet.player.matrices.clone();
+            let Some(surfaces) = stage.pets.iter_mut().find(|s| s.id == *id) else {
+                continue;
+            };
+            if surfaces.canvas.resize(&gpu.device, canvas_size) {
+                // 画布重建了,合成用的四边形绑的是旧纹理,要重绑
+                surfaces.quad = gpu.create_quad(surfaces.canvas.view());
+            }
             surfaces.gpu.update(
                 &gpu.queue,
-                view_proj(pet.model.motion_bounds, pet.yaw, CANVAS_PADDING),
+                view,
                 Vec3::new(-0.4, 0.8, 0.6),
                 outline,
                 effect_time(),
-                &pet.player.matrices,
+                &matrices,
             );
             surfaces
                 .canvas
@@ -778,19 +828,34 @@ impl App {
                 .request(&gpu.device, &gpu.queue, surfaces.canvas.texture());
         }
 
+        // 再把每只的画布按 z 序合成到 stage 上(靠后的画在上面)
         let stage = &mut self.stages[index];
-        let quad = match (stage.pet.as_ref(), stage.sprite_quad.as_ref()) {
-            (Some(surfaces), _) => &surfaces.quad,
-            (None, Some(quad)) => quad,
-            (None, None) => return,
-        };
+        let mut draws = Vec::with_capacity(order.len().max(1));
+        for id in &order {
+            let Some(entity) = stage.stage.entity(*id) else {
+                continue;
+            };
+            let (px, py) = entity.pos();
+            let (aw, ah) = entity.actor().size();
+            let quad = match stage.pets.iter().find(|s| s.id == *id) {
+                Some(surfaces) => &surfaces.quad,
+                // 精灵模式:整台只有一只,共用那块合成四边形
+                None => match stage.sprite_quad.as_ref() {
+                    Some(quad) => quad,
+                    None => continue,
+                },
+            };
+            draws.push(QuadDraw {
+                quad,
+                pos: (px * scale, py * scale),
+                size: (aw as f32 * scale, ah as f32 * scale),
+                highlight: entity.is_dragging(),
+            });
+        }
+        if draws.is_empty() {
+            return;
+        }
         let target = stage.target.as_mut().expect("上面已判过");
-        let draws = [QuadDraw {
-            quad,
-            pos: (px * scale, py * scale),
-            size: (aw as f32 * scale, ah as f32 * scale),
-            highlight,
-        }];
         if let Err(e) = target.render(gpu, &draws) {
             log::error!("stage {index} 出帧失败: {e:#}");
         }
@@ -818,39 +883,86 @@ impl App {
         self.rebuild_pet_surfaces(index);
     }
 
-    /// (重)建当前形态的 GPU 资源:管线、离屏画布、合成四边形、掩码回读。
-    /// 首次 configure 与切形态都走这里。
+    /// 取这个形态的 GPU 资源(管线/顶点缓冲/贴图):缓存里有就共享,没有才建。
+    /// 键与模型缓存同一把 —— 模型的来源路径,即 (包, 形态)。
+    fn pet_gpu(&mut self, model: &Arc<Model>) -> Result<Arc<PetGpu>> {
+        let Some(gpu) = self.gpu.as_ref() else {
+            anyhow::bail!("GPU 还没初始化");
+        };
+        if let Some(cached) = self.pet_gpus.get(&model.source) {
+            return Ok(Arc::clone(cached));
+        }
+        let built = Arc::new(PetGpu::new(&gpu.device, &gpu.queue, model, gpu.format())?);
+        // 和 `load_model` 同样的清理:没实体在用的就别占着显存
+        self.pet_gpus.retain(|_, cached| Arc::strong_count(cached) > 1);
+        self.pet_gpus
+            .insert(model.source.clone(), Arc::clone(&built));
+        Ok(built)
+    }
+
+    /// (重)建这个 stage 上每只宠物的渲染资源:共享管线 + 每只自己的画布/四边形/掩码回读。
+    /// 首次 configure、切形态、以及上/下实体之后都走这里。
     fn rebuild_pet_surfaces(&mut self, index: usize) {
-        let Some(gpu) = self.gpu.as_ref() else { return };
+        if self.gpu.is_none() {
+            return;
+        }
         let scale = self.stages[index].scale;
-        let (aw, ah) = self.stages[index].stage.actor().size();
-        let canvas_size = (
-            ((aw as f32 * scale) as u32).max(1),
-            ((ah as f32 * scale) as u32).max(1),
-        );
-        match self.stages[index].stage.actor() {
-            Actor::Pet(pet) => match PetGpu::new(&gpu.device, &gpu.queue, &pet.model, gpu.format())
-            {
-                Ok(pet_gpu) => {
-                    let canvas = PetTarget::new(&gpu.device, gpu.format(), canvas_size);
-                    let quad = gpu.create_quad(canvas.view());
-                    let readback = MaskReadback::new(&gpu.device, canvas_size);
-                    self.stages[index].pet = Some(PetSurfaces {
-                        gpu: pet_gpu,
-                        canvas,
-                        quad,
-                        readback,
-                    });
+        // 先收齐这一台上的实体(id, 模型/精灵),免得后面借用打架
+        let mut wanted: Vec<(EntityId, Option<Arc<Model>>, (u32, u32))> = Vec::new();
+        for entity in self.stages[index].stage.entities() {
+            let size = entity.actor().size();
+            let model = match entity.actor() {
+                Actor::Pet(pet) => Some(Arc::clone(&pet.model)),
+                Actor::Sprite(_) => None,
+            };
+            wanted.push((entity.id(), model, size));
+        }
+        // 已经不在场的那些连着画布一起丢掉
+        let live: Vec<EntityId> = wanted.iter().map(|(id, _, _)| *id).collect();
+        self.stages[index].pets.retain(|s| live.contains(&s.id));
+
+        for (id, model, (aw, ah)) in wanted {
+            let canvas_size = (
+                ((aw as f32 * scale) as u32).max(1),
+                ((ah as f32 * scale) as u32).max(1),
+            );
+            let Some(model) = model else {
+                // 调试精灵:整台一块合成四边形,不走离屏画布
+                if let (Some(gpu), Actor::Sprite(sprite)) = (
+                    self.gpu.as_ref(),
+                    self.stages[index]
+                        .stage
+                        .entity(id)
+                        .map(|e| e.actor())
+                        .expect("刚收集的实体"),
+                ) {
+                    let view = gpu.upload_sprite(sprite);
+                    self.stages[index].sprite_quad = Some(gpu.create_quad(&view));
                 }
+                continue;
+            };
+            if self.stages[index].pets.iter().any(|s| s.id == id) {
+                continue; // 已经有了(画布尺寸由 render/resize 负责跟)
+            }
+            let pet_gpu = match self.pet_gpu(&model) {
+                Ok(pet_gpu) => pet_gpu,
                 Err(e) => {
                     log::error!("建宠物管线失败: {e:#}");
                     self.exit = true;
+                    return;
                 }
-            },
-            Actor::Sprite(sprite) => {
-                let view = gpu.upload_sprite(sprite);
-                self.stages[index].sprite_quad = Some(gpu.create_quad(&view));
-            }
+            };
+            let gpu = self.gpu.as_ref().expect("上面判过");
+            let canvas = PetTarget::new(&gpu.device, gpu.format(), canvas_size);
+            let quad = gpu.create_quad(canvas.view());
+            let readback = MaskReadback::new(&gpu.device, canvas_size);
+            self.stages[index].pets.push(PetSurfaces {
+                id,
+                gpu: pet_gpu,
+                canvas,
+                quad,
+                readback,
+            });
         }
     }
 }

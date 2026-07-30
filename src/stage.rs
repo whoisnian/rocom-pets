@@ -563,19 +563,14 @@ impl Entity {
         entity
     }
 
-    // 平台层还按「一只」渲染(Phase 5 第 2 步才改),这几个访问器先没人调。
-    // 和 pack.rs 里那批 manifest 字段同一处理:照契约留着,比等到要用时再补更省事。
-    #[allow(dead_code)]
     pub fn id(&self) -> EntityId {
         self.id
     }
 
-    #[allow(dead_code)]
     pub fn actor(&self) -> &Actor {
         &self.actor
     }
 
-    #[allow(dead_code)]
     pub fn pos(&self) -> (f32, f32) {
         self.pos
     }
@@ -704,13 +699,24 @@ impl Stage {
         self.entities.len() != before
     }
 
-    #[allow(dead_code)] // 平台层按实体渲染时用(Phase 5 第 2 步)
     pub fn entities(&self) -> &[Entity] {
         &self.entities
     }
 
     fn entity_mut(&mut self, id: EntityId) -> Option<&mut Entity> {
         self.entities.iter_mut().find(|e| e.id == id)
+    }
+
+    /// 绘制顺序:**从后往前**(脚底 y 越小越先画,于是靠下的盖在上面)。
+    /// 与 `pick` 的 z 序是同一套判据,只是方向相反。
+    pub fn draw_order(&self) -> Vec<EntityId> {
+        let mut order: Vec<&Entity> = self.entities.iter().collect();
+        order.sort_by(|a, b| a.foot_y().total_cmp(&b.foot_y()).then(a.id.0.cmp(&b.id.0)));
+        order.into_iter().map(|e| e.id).collect()
+    }
+
+    pub fn entity(&self, id: EntityId) -> Option<&Entity> {
+        self.entities.iter().find(|e| e.id == id)
     }
 
     /// 命中测试:**取最上面的那一只**。z 序按脚底 y(越靠下越靠前),
@@ -761,7 +767,9 @@ impl Stage {
         &mut self.primary_mut().actor
     }
 
-    /// 角色左上角位置(表面局部逻辑像素)。
+    /// 角色左上角位置(表面局部逻辑像素)。**过渡访问器**:渲染已改成逐实体取
+    /// `Entity::pos()`,这里只剩测试在用。
+    #[allow(dead_code)]
     pub fn actor_pos(&self) -> (f32, f32) {
         self.primary().pos
     }
@@ -770,7 +778,8 @@ impl Stage {
         self.passthrough
     }
 
-    /// 有没有哪一只正被拎着。
+    /// 有没有哪一只正被拎着。合成时的高亮已改成逐实体判定,这条留给托盘/测试。
+    #[allow(dead_code)]
     pub fn is_dragging(&self) -> bool {
         self.entities.iter().any(Entity::is_dragging)
     }
@@ -910,8 +919,10 @@ impl Stage {
     }
 
     /// 装上新回读到的轮廓掩码(见 pet/mask.rs),顺带刷新输入区。
-    pub fn set_pet_mask(&mut self, mask: Mask) -> Reaction {
-        let entity = self.primary_mut();
+    pub fn set_entity_mask(&mut self, id: EntityId, mask: Mask) -> Reaction {
+        let Some(entity) = self.entity_mut(id) else {
+            return Reaction::NONE;
+        };
         if let Actor::Pet(pet) = &mut entity.actor {
             pet.mask = Some(mask);
             entity.coverage = entity.actor.coverage();
