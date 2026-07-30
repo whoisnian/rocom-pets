@@ -10,7 +10,10 @@
 //! 全局穿透开关在 S1 阶段用 `SIGUSR1` 切换(KDE Wayland 下没有全局按键抓取,
 //! 正式实现要走 KGlobalAccel 的 D-Bus 注册或 XDG GlobalShortcuts portal)。
 
+use std::collections::HashMap;
+use std::path::PathBuf;
 use std::ptr::NonNull;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -159,6 +162,7 @@ pub fn run(options: &Options) -> Result<()> {
         sprite: Sprite::test_pattern(192),
         pack,
         current_form,
+        models: HashMap::new(),
         px_per_cm: options.px_per_cm,
         stages: Vec::new(),
         pointer: None,
@@ -329,6 +333,9 @@ struct App {
     pack: Option<Pack>,
     /// 当前形态在 `pack.forms` 里的下标。
     current_form: usize,
+    /// 已加载的模型,按 glb 路径(= 包 + 形态)缓存。多实体/多屏共享同一份网格与贴图,
+    /// 否则每多一只 RSS 就翻一档(单只已经 219MB)。见 design.md §9 Phase 5 第 2 步。
+    models: HashMap<PathBuf, Arc<Model>>,
     px_per_cm: f32,
     stages: Vec<StageWindow>,
     pointer: Option<wl_pointer::WlPointer>,
@@ -399,9 +406,13 @@ impl App {
             }
         };
 
-        // 宠物模式下每个 stage 各加载一份模型:Model 不便共享,而加载只有几十毫秒
-        let actor = match self.pack.as_ref().map(|p| &p.forms[self.current_form]) {
-            Some(form) => match self.build_pet_actor(form) {
+        // 模型按形态共享(见 `load_model`),这里 clone 的只是 manifest 里那份元数据
+        let form = self
+            .pack
+            .as_ref()
+            .map(|p| p.forms[self.current_form].clone());
+        let actor = match form {
+            Some(form) => match self.build_pet_actor(&form) {
                 Ok(actor) => actor,
                 Err(e) => {
                     log::error!("output {name}: 加载宠物失败: {e:#}");
@@ -436,9 +447,23 @@ impl App {
         });
     }
 
+    /// 取这个形态的模型:缓存里有就直接共享,没有才读盘。
+    ///
+    /// **顺带清掉没人用的**:切形态之后旧模型的 `Arc` 只剩缓存这一份,不清的话
+    /// 每访问一个形态就永久多占几 MB。判据是 `strong_count == 1`(只有缓存持有)。
+    fn load_model(&mut self, form: &Form) -> Result<Arc<Model>> {
+        if let Some(model) = self.models.get(&form.model) {
+            return Ok(Arc::clone(model));
+        }
+        let model = Arc::new(Model::load(&form.model, &form.materials)?);
+        self.models.retain(|_, cached| Arc::strong_count(cached) > 1);
+        self.models.insert(form.model.clone(), Arc::clone(&model));
+        Ok(model)
+    }
+
     /// 把 manifest 里的厘米单位换成屏幕像素,算出画布尺寸与脚底位置。
-    fn build_pet_actor(&self, form: &Form) -> Result<Actor> {
-        let model = Model::load(&form.model, &form.materials)?;
+    fn build_pet_actor(&mut self, form: &Form) -> Result<Actor> {
+        let model = self.load_model(form)?;
         // 两个包围盒各管一件事:**尺寸**按绑定姿势(站姿高度不能随动作变),
         // **取景**按动作包围盒(否则伸手/张翅/跳跃会被画布裁掉,见 model.rs 的 motion_bounds)
         let stand = model.bounds.1 - model.bounds.0;

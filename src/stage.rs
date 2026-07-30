@@ -3,6 +3,7 @@
 //! 平台后端只负责「造表面 / 收事件 / 出帧 / 设输入区」,所有状态都在这里,
 //! 这样 Wayland 与 Windows 两边的行为天然一致,也能脱离窗口系统做单元测试。
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::pet::mask::Mask;
@@ -193,7 +194,8 @@ pub enum PetReaction {
 
 /// 一只宠物:模型 + 播放器 + 屏幕上的表现状态。
 pub struct PetActor {
-    pub model: Model,
+    /// 网格/动画/贴图。**共享**:同物种多实体只有一份(见 design.md §9 Phase 5 第 2 步)。
+    pub model: Arc<Model>,
     pub player: Player,
     /// 屏幕上的显示尺寸(逻辑像素)。
     pub size: (u32, u32),
@@ -419,7 +421,7 @@ impl PetActor {
     }
 
     pub fn new(
-        model: Model,
+        model: Arc<Model>,
         size: (u32, u32),
         foot_offset: f32,
         walk_speed: f32,
@@ -1244,6 +1246,35 @@ mod entity_tests {
     }
 
     #[test]
+    fn same_form_entities_share_one_model() {
+        let model = Arc::new(Model::for_test(&["Idle", "Walk"]));
+        assert_eq!(Arc::strong_count(&model), 1);
+        let mut stage = Stage::new(
+            Actor::Pet(PetActor::new(Arc::clone(&model), (200, 200), 180.0, 100.0, 1)),
+            (1000, 600),
+        );
+        stage.spawn(Actor::Pet(PetActor::new(
+            Arc::clone(&model),
+            (200, 200),
+            180.0,
+            100.0,
+            2,
+        )));
+        // 两只在场,加上这里持有的那份 = 3;网格/动画/贴图只有一份
+        assert_eq!(Arc::strong_count(&model), 3);
+        let (Actor::Pet(a), Actor::Pet(b)) =
+            (&stage.entities[0].actor, &stage.entities[1].actor)
+        else {
+            panic!("两只都该是宠物");
+        };
+        assert!(Arc::ptr_eq(&a.model, &b.model));
+        // 撤掉一只,引用计数跟着降(缓存那边靠它判断能不能清)
+        let second = stage.entities[1].id();
+        assert!(stage.despawn(second));
+        assert_eq!(Arc::strong_count(&model), 2);
+    }
+
+    #[test]
     fn dragging_moves_only_the_picked_one() {
         let mut stage = two_sprites();
         stage.entities[0].pos = (100.0, 100.0);
@@ -1275,7 +1306,7 @@ mod pet_tests {
             "SleepLoop",
             "SleepEnd",
         ]);
-        let actor = Actor::Pet(PetActor::new(model, (200, 200), 180.0, 100.0, 7));
+        let actor = Actor::Pet(PetActor::new(Arc::new(model), (200, 200), 180.0, 100.0, 7));
         Stage::new(actor, (1000, 600))
     }
 
@@ -1466,7 +1497,7 @@ mod behaviour_tests {
             "SleepLoop",
             "SleepEnd",
         ]);
-        let actor = Actor::Pet(PetActor::new(model, (200, 200), 180.0, 100.0, 99));
+        let actor = Actor::Pet(PetActor::new(Arc::new(model), (200, 200), 180.0, 100.0, 99));
         Stage::new(actor, (1000, 600))
     }
 
