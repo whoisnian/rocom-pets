@@ -84,6 +84,18 @@ const BORED_WALK_AT: f32 = 0.6;
 /// 无聊时不走动而是随手做个表情的概率。
 const EMOTE_CHANCE: f32 = 0.35;
 
+/// 邻近感知:多少**身位**以内算「注意到旁边那只」。
+///
+/// 身位 = 两只显示高度的均值,**不能用绝对像素阈值** —— 同一台上 161px 的喵喵与 481px 的
+/// 魔力猫,「挨着站」在像素上差了三倍。也**不能用画布尺寸**:画布带 1.64 倍取景余量
+/// (第 4 步在跑动阈值上已经栽过一次),两只画布挨着时本体还隔着老远。
+const NOTICE_DISTANCE: f32 = 2.0;
+/// 同一对之间隔这么久才会再注意一次。没有它的话两只挨着站会没完没了地互相打招呼。
+const NOTICE_COOLDOWN: f32 = 25.0;
+
+/// 受惊之后往反方向逃开多少身位。逃到可走范围尽头太夸张,给个有限距离。
+const FLEE_DISTANCE: f32 = 3.0;
+
 /// 指针悬在身上时,朝它侧一点身(不是完整转 90°,读起来像「瞥一眼」)。
 /// 真正的视线跟随需要 LookAt BlendSpace(没导出),而且 Wayland 下输入区外根本收不到
 /// 指针事件——想追全屏光标就得吃掉输入,不做。
@@ -190,6 +202,51 @@ impl Needs {
     }
 }
 
+// ── 感知与事件总线(design.md §6) ──────────────────────────────────
+//
+// 行为**只读感知快照**,不自己去摸 `Stage`:一是多实体下「旁边有谁」本来就得由 stage 汇总,
+// 二是这样才能把「察觉到什么」与「于是做什么」拆开 —— 第 6 步的演出脚本要插在这中间,
+// 它得能在意图落地**之前**看到它(比如宠物被戳了,正在跑的时间轴要能让位)。
+
+/// 感知到的邻居。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Neighbor {
+    pub id: EntityId,
+    /// 脚底点之间的距离,单位是**身位**(见 [`NOTICE_DISTANCE`])。
+    /// 用脚底而不是画布中心:两只站在同一条地面线上时,脚底距离才是「看着有多近」。
+    pub distance: f32,
+    /// 它在我右边?(转身朝向它用)
+    pub on_right: bool,
+}
+
+/// 一只在某一 tick 看到的世界。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Perception {
+    /// 最近的那一只;None = 台上就它一个。
+    pub nearest: Option<Neighbor>,
+    /// 指针在表面上的位置(逻辑像素);None = 指针不在表面上。
+    pub pointer: Option<(f32, f32)>,
+    /// 可走范围的右端(左端恒为 0),= 表面宽 − 自己的画布宽。
+    pub max_x: f32,
+}
+
+/// 想做什么。**发出与执行分开**:发的时候只说意图,执行在 [`Stage::dispatch_intents`]。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Intent {
+    pub from: EntityId,
+    pub kind: IntentKind,
+    /// 冲着谁;没有对象就是 None。
+    pub target: Option<EntityId>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum IntentKind {
+    /// 注意到旁边那只:转过去打个招呼。
+    Notice,
+    /// 从 `from_x` 这个位置逃开(受惊后往反方向跑)。
+    Flee { from_x: f32 },
+}
+
 /// 宠物对鼠标的反应(播哪段一次性动作)。
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum PetReaction {
@@ -220,10 +277,18 @@ pub struct PetActor {
     /// 画布顶端到宠物脚底的距离(逻辑像素)。取景留了余量,脚底不在画布最下沿,
     /// 站地面时要按这个值对齐,否则宠物会悬空。
     pub foot_offset: f32,
+    /// 宠物本体的屏幕高度(逻辑像素)= `height_cm × scale × px_per_cm`。
+    /// **和画布尺寸是两回事**(画布带 1.64 倍取景余量),距离阈值一律按它换算成身位。
+    pub body_px: f32,
     /// 轮廓掩码(异步回读而来,见 pet/mask.rs);还没到就退化成包围盒判定。
     pub mask: Option<Mask>,
     /// 内部需求(困倦/无聊),决定待机结束后干什么。
     pub needs: Needs,
+    /// 受惊后待逃的方向源(指针 x)。**不立刻跑**:先把受惊动作播完,
+    /// 在 `React` 结束那一下才起跑,读起来才是「惊 → 逃」而不是「惊被跑打断」。
+    flee_from: Option<f32>,
+    /// 刚打过招呼的邻居与各自剩下的冷却(秒)。挨着站的两只不该没完没了地互相致意。
+    notices: Vec<(EntityId, f32)>,
     clips: Clips,
     petting: Petting,
     rng: Rng,
@@ -367,6 +432,29 @@ impl PetActor {
             .get(index.min(self.clips.emotes.len() - 1))
     }
 
+    /// 受惊之后逃开:往远离 `from_x` 的那一侧跑 [`FLEE_DISTANCE`] 个身位。
+    /// 缺 Run 就走,连 Walk 都没有就只能站着(至少别卡在反应状态里)。
+    fn start_flee(&mut self, from_x: f32, pos_x: f32, max_x: f32) {
+        let center = pos_x + self.size.0 as f32 * 0.5;
+        // 正好被戳在正中间时往右跑;左右都行,不值得为此掷个骰子
+        let away = if center >= from_x { 1.0 } else { -1.0 };
+        let target_x = (pos_x + away * FLEE_DISTANCE * self.body_px).clamp(0.0, max_x);
+        let running = self.clips.run.is_some();
+        let clip = if running { self.clips.run } else { self.clips.walk };
+        match clip {
+            Some(clip) => {
+                self.activity = Activity::Walk { target_x, running };
+                self.target_yaw = camera_yaw(target_x > pos_x);
+                self.player.play(clip);
+                self.needs.boredom = 0.0;
+            }
+            None => {
+                self.activity = Activity::Idle { remaining: 1.0 };
+                self.player.play(self.clips.idle);
+            }
+        }
+    }
+
     /// 进入睡觉:有 SleepStart 就先播入睡,否则直接躺下。
     fn start_sleep(&mut self) {
         self.target_yaw = 0.0;
@@ -447,10 +535,20 @@ impl PetActor {
         clip.map(|c| self.model.clips[c].duration).unwrap_or(0.0)
     }
 
+    /// 这只邻居还在冷却里吗。
+    fn notice_ready(&self, id: EntityId) -> bool {
+        !self.notices.iter().any(|(other, _)| *other == id)
+    }
+
+    fn remember_notice(&mut self, id: EntityId) {
+        self.notices.push((id, NOTICE_COOLDOWN));
+    }
+
     pub fn new(
         model: Arc<Model>,
         size: (u32, u32),
         foot_offset: f32,
+        body_px: f32,
         walk_speed: f32,
         run_speed: f32,
         seed: u64,
@@ -485,8 +583,11 @@ impl PetActor {
             walk_speed,
             run_speed,
             foot_offset,
+            body_px: body_px.max(1.0),
             mask: None,
             needs: Needs::default(),
+            flee_from: None,
+            notices: Vec::new(),
             clips: Clips {
                 idle,
                 walk,
@@ -620,6 +721,20 @@ impl Entity {
         }
     }
 
+    /// 脚底点(表面坐标)。距离一律按它算 —— 两只站在同一条地面线上时,
+    /// 脚底之间的距离才是「看着有多近」;画布中心会被取景余量与身高差带偏。
+    fn foot_point(&self) -> (f32, f32) {
+        (self.pos.0 + self.actor.size().0 as f32 * 0.5, self.foot_y())
+    }
+
+    /// 本体的屏幕高度,用作「身位」的尺度。
+    fn body_px(&self) -> f32 {
+        match &self.actor {
+            Actor::Pet(pet) => pet.body_px,
+            Actor::Sprite(sprite) => sprite.height as f32,
+        }
+    }
+
     /// 摆到初始位置:精灵居中(调试用),宠物站到屏幕底边中间。
     fn reset_position(&mut self, size: (u32, u32)) {
         let (w, h) = self.actor.size();
@@ -704,6 +819,8 @@ pub struct Stage {
     size: (u32, u32),
     pointer: Option<(f64, f64)>,
     passthrough: bool,
+    /// 这一轮攒下的意图,由 [`Stage::dispatch_intents`] 统一落地。
+    intents: Vec<Intent>,
 }
 
 impl Stage {
@@ -716,14 +833,26 @@ impl Stage {
             size,
             pointer: None,
             passthrough: false,
+            intents: Vec::new(),
         }
     }
 
     /// 放一只上台,返回它的标识。
+    ///
+    /// **错开摆**:`Entity::new` 一律摆在正中,于是托盘连加两只同物种的会精确重叠
+    /// (第 5 步做邻近感知时撞见的 —— 距离恒为 0)。按已在场的只数左右轮流错开一个身位。
     pub fn spawn(&mut self, actor: Actor) -> EntityId {
         let id = EntityId(self.next_id);
         self.next_id += 1;
-        self.entities.push(Entity::new(id, actor, self.size));
+        let mut entity = Entity::new(id, actor, self.size);
+        let n = self.entities.len();
+        if n > 0 {
+            let step = n.div_ceil(2) as f32;
+            let side = if n % 2 == 1 { 1.0 } else { -1.0 };
+            entity.pos.0 += side * step * entity.body_px();
+            entity.clamp_to_surface(self.size);
+        }
+        self.entities.push(entity);
         id
     }
 
@@ -849,6 +978,15 @@ impl Stage {
     }
 
     pub fn handle(&mut self, event: StageEvent) -> Reaction {
+        let mut reaction = self.handle_event(event);
+        // 事件里发出来的意图(比如受惊 → 想逃)也在这一轮落地
+        let dispatched = self.dispatch_intents();
+        reaction.redraw |= dispatched.redraw;
+        reaction.regions_dirty |= dispatched.regions_dirty;
+        reaction
+    }
+
+    fn handle_event(&mut self, event: StageEvent) -> Reaction {
         match event {
             StageEvent::Resized { width, height } => {
                 if (width, height) == self.size {
@@ -925,9 +1063,11 @@ impl Stage {
                     }
                 }
                 let size = self.size;
+                let pointer_x = self.pointer.map(|(x, _)| x as f32);
                 let Some(entity) = self.entities.iter_mut().find(|e| e.is_dragging()) else {
                     return Reaction::NONE;
                 };
+                let id = entity.id;
                 entity.drag_offset = None;
                 let clicked = !entity.drag_moved;
                 entity.drag_moved = false;
@@ -936,6 +1076,15 @@ impl Stage {
                         // 只是点了一下 → 受惊(正在醒来的那一下不算)
                         let len = pet.clip_seconds(PetReaction::Startled);
                         pet.react(PetReaction::Startled, len);
+                        // 受惊之后要逃:发个意图,真跑起来在受惊动作播完那一下。
+                        // 走总线而不是就地设状态 —— 第 6 步的演出脚本得能看见「它被戳了」
+                        if let Some(from_x) = pointer_x {
+                            self.intents.push(Intent {
+                                from: id,
+                                kind: IntentKind::Flee { from_x },
+                                target: None,
+                            });
+                        }
                     } else if !clicked {
                         // 拎着放下 → 往地面落。**不再瞬移**:原来是直接把 y 设成地面线,
                         // 从半空松手会「啪」地闪下去。有 JumpFall 就播它,没有就用待机姿势落。
@@ -1031,6 +1180,93 @@ impl Stage {
         Reaction::REDRAW
     }
 
+    /// 给第 `index` 只算一份感知快照。
+    pub fn perceive(&self, index: usize) -> Perception {
+        let me = &self.entities[index];
+        let (my_x, my_y) = me.foot_point();
+        let my_body = me.body_px();
+        let nearest = self
+            .entities
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != index)
+            .map(|(_, other)| {
+                let (ox, oy) = other.foot_point();
+                // 身位取两只的均值:大个子挨小个子时,谁算「近」不该只由其中一方说了算
+                let unit = ((my_body + other.body_px()) * 0.5).max(1.0);
+                Neighbor {
+                    id: other.id,
+                    distance: ((ox - my_x).powi(2) + (oy - my_y).powi(2)).sqrt() / unit,
+                    on_right: ox >= my_x,
+                }
+            })
+            .min_by(|a, b| a.distance.total_cmp(&b.distance));
+        Perception {
+            nearest,
+            pointer: self.pointer.map(|(x, y)| (x as f32, y as f32)),
+            max_x: (self.size.0 as f32 - me.actor.size().0 as f32).max(0.0),
+        }
+    }
+
+    /// 把攒下的意图落地。**发出与执行分开**的那一半在这里 ——
+    /// 第 6 步的演出脚本会插在这之前,先挑走它认得的那些。
+    fn dispatch_intents(&mut self) -> Reaction {
+        if self.intents.is_empty() {
+            return Reaction::NONE;
+        }
+        let mut reaction = Reaction::NONE;
+        for intent in std::mem::take(&mut self.intents) {
+            let applied = match intent.kind {
+                IntentKind::Notice => self.apply_notice(intent),
+                IntentKind::Flee { from_x } => self.apply_flee(intent.from, from_x),
+            };
+            reaction.redraw |= applied;
+        }
+        reaction
+    }
+
+    /// 转过去朝着邻居,播一段打招呼的动作。目标不在了就当没发生过。
+    fn apply_notice(&mut self, intent: Intent) -> bool {
+        let Some(target) = intent.target else {
+            return false;
+        };
+        let Some(their_x) = self.entity(target).map(|e| e.foot_point().0) else {
+            return false;
+        };
+        let Some(entity) = self.entity_mut(intent.from) else {
+            return false;
+        };
+        let my_x = entity.foot_point().0;
+        let Actor::Pet(pet) = &mut entity.actor else {
+            return false;
+        };
+        // 冷却按「打过招呼」记,不按「想打招呼」记:动作缺失时也别每帧重试
+        pet.remember_notice(target);
+        pet.target_yaw = camera_yaw(their_x > my_x);
+        log::debug!("宠物 #{} 注意到 #{}", intent.from.0, target.0);
+        let Some(clip) = pet.clips.happy.or_else(|| pet.clips.emotes.first().copied()) else {
+            return false;
+        };
+        pet.player.play(clip);
+        pet.activity = Activity::React {
+            remaining: pet.model.clips[clip].duration.max(0.3),
+        };
+        true
+    }
+
+    /// 记下要往哪边逃。真跑起来是在受惊动作播完那一下(见 `tick_entity`)。
+    fn apply_flee(&mut self, from: EntityId, from_x: f32) -> bool {
+        let Some(entity) = self.entity_mut(from) else {
+            return false;
+        };
+        let Actor::Pet(pet) = &mut entity.actor else {
+            return false;
+        };
+        pet.flee_from = Some(from_x);
+        log::debug!("宠物 #{} 受惊,准备从 x={from_x:.0} 逃开", from.0);
+        true
+    }
+
     /// 下一次推进该隔多久。只有「正在播的动作几乎不动」时才降频(见 `hz_for_motion`)。
     /// **取各实体里最快的那一个**:一只在走、其余在睡时,整台仍要按走的那只推进。
     pub fn tick_interval(&self) -> Duration {
@@ -1047,16 +1283,28 @@ impl Stage {
     pub fn tick(&mut self, dt: f32) -> Reaction {
         let size = self.size;
         let mut reaction = Reaction::NONE;
+        // 感知**先整台算完再推进**:边算边动的话,后面那几只看到的是同伴已经走过的位置,
+        // 同一帧里的距离判定会不对称
+        let perceptions: Vec<Perception> =
+            (0..self.entities.len()).map(|i| self.perceive(i)).collect();
         for index in 0..self.entities.len() {
             let before = match &self.entities[index].actor {
                 Actor::Pet(pet) => Some(activity_label(&pet.activity)),
                 _ => None,
             };
-            let one = Self::tick_entity(&mut self.entities[index], dt, size);
+            let one = Self::tick_entity(
+                &mut self.entities[index],
+                dt,
+                size,
+                &perceptions[index],
+                &mut self.intents,
+            );
             if let (Some(before), Actor::Pet(pet)) = (before, &self.entities[index].actor) {
                 if before != activity_label(&pet.activity) {
+                    // 带上编号:多只在场时不带编号的日志根本读不出是谁在动
                     log::debug!(
-                        "宠物 → {}(困倦 {:.2} 无聊 {:.2})",
+                        "宠物 #{} → {}(困倦 {:.2} 无聊 {:.2})",
+                        self.entities[index].id.0,
                         activity_label(&pet.activity),
                         pet.needs.sleepiness,
                         pet.needs.boredom
@@ -1066,11 +1314,20 @@ impl Stage {
             reaction.redraw |= one.redraw;
             reaction.regions_dirty |= one.regions_dirty;
         }
+        let dispatched = self.dispatch_intents();
+        reaction.redraw |= dispatched.redraw;
+        reaction.regions_dirty |= dispatched.regions_dirty;
         reaction
     }
 
-    fn tick_entity(entity: &mut Entity, dt: f32, size: (u32, u32)) -> Reaction {
-        let surface_width = size.0 as f32;
+    fn tick_entity(
+        entity: &mut Entity,
+        dt: f32,
+        size: (u32, u32),
+        perception: &Perception,
+        intents: &mut Vec<Intent>,
+    ) -> Reaction {
+        let id = entity.id;
         let dragging = entity.drag_offset.is_some();
         // 地面线要在借出 `pet` 之前算好:它同时看 actor 与 size
         let ground = entity.ground_y(size);
@@ -1080,6 +1337,11 @@ impl Stage {
 
         pet.petting.tick(dt);
         pet.needs.tick(dt, &pet.activity);
+        // 打招呼的冷却
+        for (_, remaining) in pet.notices.iter_mut() {
+            *remaining -= dt;
+        }
+        pet.notices.retain(|(_, remaining)| *remaining > 0.0);
         let mut moved = false;
         if !dragging {
             match pet.activity {
@@ -1105,6 +1367,10 @@ impl Stage {
                     let remaining = remaining - dt;
                     if remaining > 0.0 {
                         pet.activity = Activity::React { remaining };
+                    } else if let Some(from_x) = pet.flee_from.take() {
+                        // 受惊动作播完了 → 往反方向逃开。**用跑**(第 4 步欠的那条):
+                        // 被吓到还慢悠悠走开说不过去;没有 Run 就退回 Walk,再没有就只能站着
+                        pet.start_flee(from_x, entity.pos.0, perception.max_x);
                     } else {
                         pet.activity = Activity::Idle {
                             remaining: 1.0 + pet.rng.next_f32() * 2.0,
@@ -1117,10 +1383,22 @@ impl Stage {
                     let remaining = remaining - dt;
                     if remaining > 0.0 {
                         pet.activity = Activity::Idle { remaining };
+                    } else if let Some(neighbor) = perception
+                        .nearest
+                        .filter(|n| n.distance <= NOTICE_DISTANCE && pet.notice_ready(n.id))
+                    {
+                        // 旁边站了个同伴 → 先打个招呼,再去忙自己的。
+                        // 这里**只发意图**,转身与播动作在 `dispatch_intents` 里
+                        intents.push(Intent {
+                            from: id,
+                            kind: IntentKind::Notice,
+                            target: Some(neighbor.id),
+                        });
+                        // 意图没落地(比如对方这一帧被撤了)也不至于卡住:很快再挑一次
+                        pet.activity = Activity::Idle { remaining: 0.5 };
                     } else {
                         // 待机结束:按需求挑下一件事
-                        let max_x = (surface_width - pet.size.0 as f32).max(0.0);
-                        pet.choose_next(entity.pos.0, max_x);
+                        pet.choose_next(entity.pos.0, perception.max_x);
                     }
                 }
                 Activity::Walk { target_x, running } => {
@@ -1183,6 +1461,11 @@ impl Rng {
         ((x >> 40) as f32) / (1u32 << 24) as f32
     }
 }
+
+/// 测试宠物的本体高度。画布是 200×200,本体比画布小(取景余量),取 120 与真实比例相当;
+/// 于是一个身位 = 120px,`NOTICE_DISTANCE` 折合 240px。
+#[cfg(test)]
+const TEST_BODY_PX: f32 = 120.0;
 
 #[cfg(test)]
 mod tests {
@@ -1377,6 +1660,7 @@ mod entity_tests {
             Arc::clone(&model),
             (200, 200),
             180.0,
+            TEST_BODY_PX,
             100.0,
             250.0,
             1,
@@ -1385,6 +1669,7 @@ mod entity_tests {
             Arc::clone(&model),
             (200, 200),
             180.0,
+            TEST_BODY_PX,
             100.0,
             250.0,
             2,
@@ -1436,7 +1721,15 @@ mod pet_tests {
             "SleepLoop",
             "SleepEnd",
         ]);
-        let actor = Actor::Pet(PetActor::new(Arc::new(model), (200, 200), 180.0, 100.0, 250.0, 7));
+        let actor = Actor::Pet(PetActor::new(
+            Arc::new(model),
+            (200, 200),
+            180.0,
+            TEST_BODY_PX,
+            100.0,
+            250.0,
+            7,
+        ));
         let mut stage = Stage::new((1000, 600));
         stage.spawn(actor);
         stage
@@ -1473,14 +1766,33 @@ mod pet_tests {
             matches!(activity(&s), Activity::React { .. }),
             "点击应触发反应(受惊)"
         );
-        // 反应播完回到待机
+        // 受惊动作播完 → 逃开(**用跑**),而不是原地回待机
+        let start_x = s.actor_pos().0;
+        let mut fled_to = None;
         for _ in 0..40 {
             s.tick(0.05);
+            if let Activity::Walk { running, target_x } = activity(&s) {
+                assert!(running, "受惊逃跑该用跑");
+                fled_to = Some(target_x);
+                break;
+            }
         }
+        let target_x = fled_to.expect("受惊动作播完该起跑逃开");
+        // 点的是画布正中,往哪边逃都行,但得逃出至少一个身位
         assert!(
-            matches!(activity(&s), Activity::Idle { .. }),
-            "反应结束该回待机"
+            (target_x - start_x).abs() > TEST_BODY_PX,
+            "逃跑目标该在一个身位之外,实际从 {start_x} 逃到 {target_x}"
         );
+        // 逃到了就回常规状态(之后爱去哪去哪,不再断言位置)
+        let mut arrived = false;
+        for _ in 0..80 {
+            s.tick(0.05);
+            if (s.actor_pos().0 - target_x).abs() < 1.0 {
+                arrived = true;
+                break;
+            }
+        }
+        assert!(arrived, "该跑到逃跑目标点");
     }
 
     #[test]
@@ -1641,6 +1953,146 @@ mod pet_tests {
     }
 }
 
+/// 感知与事件总线(design.md §9 Phase 5 第 5 步)。
+#[cfg(test)]
+mod perception_tests {
+    use super::*;
+
+    /// 两只宠物,画布 200、本体 120px(一个身位)。
+    fn two_pets() -> Stage {
+        let model = Arc::new(Model::for_test(&["Idle", "Walk", "Run", "Happy"]));
+        let mut stage = Stage::new((1000, 600));
+        for seed in 1..=2 {
+            stage.spawn(Actor::Pet(PetActor::new(
+                Arc::clone(&model),
+                (200, 200),
+                180.0,
+                TEST_BODY_PX,
+                100.0,
+                250.0,
+                seed,
+            )));
+        }
+        stage
+    }
+
+    #[test]
+    fn distance_is_in_body_lengths_not_pixels() {
+        // 关键判据:阈值必须随宠物尺寸缩放。同样隔 240px,
+        // 一个身位 120 的看是 2 身位(算近),身位 60 的看是 4 身位(算远)
+        let mut stage = two_pets();
+        stage.entities[0].pos = (0.0, 400.0);
+        stage.entities[1].pos = (240.0, 400.0);
+        let near = stage.perceive(0).nearest.expect("旁边有一只");
+        assert_eq!(near.id, stage.entities[1].id());
+        assert!((near.distance - 2.0).abs() < 1e-3, "实际 {}", near.distance);
+        assert!(near.on_right, "它在右边");
+        // 反过来看是对称的(身位取两只的均值)
+        let back = stage.perceive(1).nearest.expect("旁边有一只");
+        assert!((back.distance - 2.0).abs() < 1e-3);
+        assert!(!back.on_right);
+
+        // 把两只都缩小一半,像素距离不变 → 身位翻倍
+        for entity in &mut stage.entities {
+            if let Actor::Pet(pet) = &mut entity.actor {
+                pet.body_px = TEST_BODY_PX / 2.0;
+            }
+        }
+        let near = stage.perceive(0).nearest.expect("旁边有一只");
+        assert!((near.distance - 4.0).abs() < 1e-3, "实际 {}", near.distance);
+    }
+
+    #[test]
+    fn nearest_is_by_foot_point_and_ignores_self() {
+        let mut stage = two_pets();
+        stage.spawn(Actor::Sprite(Sprite::test_pattern(64)));
+        stage.entities[0].pos = (0.0, 400.0);
+        stage.entities[1].pos = (600.0, 400.0);
+        // 精灵摆在 0 号右边一点:它比 1 号近,感知不该只认宠物
+        stage.entities[2].pos = (100.0, 400.0);
+        let near = stage.perceive(0).nearest.expect("旁边有东西");
+        assert_eq!(near.id, stage.entities[2].id(), "该取最近的那一个");
+        // 台上只剩自己时没有邻居
+        let id = stage.entities[0].id();
+        let others: Vec<EntityId> = stage
+            .entities()
+            .iter()
+            .map(|e| e.id())
+            .filter(|other| *other != id)
+            .collect();
+        for other in others {
+            stage.despawn(other);
+        }
+        assert_eq!(stage.perceive(0).nearest, None, "自己不算自己的邻居");
+    }
+
+    #[test]
+    fn neighbours_greet_once_then_go_on_cooldown() {
+        let mut stage = two_pets();
+        // 挨着站(1.5 身位,在 NOTICE_DISTANCE 之内)
+        stage.entities[0].pos = (0.0, 400.0);
+        stage.entities[1].pos = (TEST_BODY_PX * 1.5, 400.0);
+        let (a, b) = (stage.entities[0].id(), stage.entities[1].id());
+
+        // 待机结束时会发注意意图并当场落地。**判据是冷却表**:只有真走完
+        // 「发意图 → dispatch → apply_notice」这条链才会有记录
+        for _ in 0..200 {
+            stage.tick(0.05);
+            // 别让它们走开:这条测的是打招呼与冷却,不是走位
+            stage.entities[0].pos.0 = 0.0;
+            stage.entities[1].pos.0 = TEST_BODY_PX * 1.5;
+        }
+        for entity in stage.entities() {
+            if let Actor::Pet(pet) = entity.actor() {
+                let other = if entity.id() == a { b } else { a };
+                assert!(!pet.notice_ready(other), "挨着站该互相打过招呼并进冷却");
+            }
+        }
+
+        // 打招呼看得见的那一半:转过去 + 播一段动作
+        stage.entities[0].pos = (0.0, 400.0);
+        if let Actor::Pet(pet) = &mut stage.entities[0].actor {
+            pet.notices.clear();
+            pet.target_yaw = 0.0;
+            pet.activity = Activity::Idle { remaining: 5.0 };
+        }
+        assert!(stage.apply_notice(Intent {
+            from: a,
+            kind: IntentKind::Notice,
+            target: Some(b),
+        }));
+        match stage.entities[0].actor() {
+            Actor::Pet(pet) => {
+                assert!(matches!(pet.activity, Activity::React { .. }), "该播一段");
+                assert_eq!(pet.target_yaw, camera_yaw(true), "该转向右边那只");
+            }
+            _ => panic!("不是宠物"),
+        }
+        // 对象已经不在台上:当没发生过,不能恐慌
+        stage.despawn(b);
+        assert!(!stage.apply_notice(Intent {
+            from: a,
+            kind: IntentKind::Notice,
+            target: Some(b),
+        }));
+    }
+
+    #[test]
+    fn a_lone_pet_never_greets() {
+        // 台上只有一只时,待机结束该照常去走动/做表情,而不是卡在「等意图落地」
+        let mut stage = two_pets();
+        let extra = stage.entities[1].id();
+        stage.despawn(extra);
+        for _ in 0..400 {
+            stage.tick(0.05);
+        }
+        assert!(stage.intents.is_empty(), "没有邻居就不该发注意意图");
+        if let Actor::Pet(pet) = stage.entities[0].actor() {
+            assert!(pet.notices.is_empty(), "没打过招呼,冷却表该是空的");
+        }
+    }
+}
+
 #[cfg(test)]
 mod rate_tests {
     use super::*;
@@ -1674,7 +2126,15 @@ mod behaviour_tests {
             "SleepLoop",
             "SleepEnd",
         ]);
-        let actor = Actor::Pet(PetActor::new(Arc::new(model), (200, 200), 180.0, 100.0, 250.0, 99));
+        let actor = Actor::Pet(PetActor::new(
+            Arc::new(model),
+            (200, 200),
+            180.0,
+            TEST_BODY_PX,
+            100.0,
+            250.0,
+            99,
+        ));
         let mut stage = Stage::new((1000, 600));
         stage.spawn(actor);
         stage

@@ -560,6 +560,8 @@ impl App {
             model,
             (side as u32, side as u32),
             foot_offset,
+            // 本体高度(≠ 画布边长:画布带取景余量)。距离阈值按它换算成「身位」
+            height_px,
             walk_speed_cm * self.px_per_cm,
             run_speed_cm * self.px_per_cm,
             seed,
