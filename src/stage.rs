@@ -6,6 +6,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::act::{self, Beat, Script, Step};
 use crate::pet::mask::Mask;
 use crate::pet::target::camera_yaw;
 use crate::pet::{Model, Player};
@@ -258,6 +259,20 @@ pub enum PetReaction {
     PickedUp,
 }
 
+/// 造一只宠物要的东西。**用结构体而不是一串位置参数**:到第 6 步已经是 8 个,
+/// 其中四个都是 `f32`(脚底、本体高、走速、跑速),位置传错了编译器也不会拦。
+pub struct PetBuild {
+    pub model: Arc<Model>,
+    pub size: (u32, u32),
+    pub foot_offset: f32,
+    pub body_px: f32,
+    pub walk_speed: f32,
+    pub run_speed: f32,
+    /// 形态 id(manifest 里 `[[forms]].id`)。演出脚本按它选角。
+    pub form_id: i64,
+    pub seed: u64,
+}
+
 /// 一只宠物:模型 + 播放器 + 屏幕上的表现状态。
 pub struct PetActor {
     /// 网格/动画/贴图。**共享**:同物种多实体只有一份(见 design.md §9 Phase 5 第 2 步)。
@@ -280,6 +295,11 @@ pub struct PetActor {
     /// 宠物本体的屏幕高度(逻辑像素)= `height_cm × scale × px_per_cm`。
     /// **和画布尺寸是两回事**(画布带 1.64 倍取景余量),距离阈值一律按它换算成身位。
     pub body_px: f32,
+    /// 形态 id;演出脚本按它选角(见 act.rs)。
+    pub form_id: i64,
+    /// 正被演出脚本编排着。**外部打断会把它清掉**(受惊/摸头/被拎起都走 `react`
+    /// 或直接设 `Dragged`),演出那边看见就收场 —— 打断语义只此一处,不散在各个分支里。
+    acting: bool,
     /// 轮廓掩码(异步回读而来,见 pet/mask.rs);还没到就退化成包围盒判定。
     pub mask: Option<Mask>,
     /// 内部需求(困倦/无聊),决定待机结束后干什么。
@@ -363,7 +383,11 @@ struct Clips {
 
 impl PetActor {
     /// 播一次性反应动作,播完回待机。缺对应动作就只改状态(至少行为语义还在)。
+    ///
+    /// **一切外部打断都从这儿过**(受惊/摸头/被拎起),所以演出的「被打断」判定挂在这里:
+    /// 人一伸手,正在演的那场就该让位。
     fn react(&mut self, reaction: PetReaction, model_len: f32) {
+        self.acting = false;
         let clip = match reaction {
             PetReaction::Startled => self.clips.startled,
             PetReaction::Petted => self.clips.happy,
@@ -432,6 +456,24 @@ impl PetActor {
             .get(index.min(self.clips.emotes.len() - 1))
     }
 
+    /// 走到某个左上角 x,顺带转向那一侧。缺 `Run` 就走;连 `Walk` 都没有就走不了,
+    /// 返回 false 让调用方兜底。
+    fn walk_to(&mut self, target_x: f32, pos_x: f32, running: bool) -> bool {
+        let running = running && self.clips.run.is_some();
+        let clip = if running {
+            self.clips.run
+        } else {
+            self.clips.walk
+        };
+        let Some(clip) = clip else {
+            return false;
+        };
+        self.activity = Activity::Walk { target_x, running };
+        self.target_yaw = camera_yaw(target_x > pos_x);
+        self.player.play(clip);
+        true
+    }
+
     /// 受惊之后逃开:往远离 `from_x` 的那一侧跑 [`FLEE_DISTANCE`] 个身位。
     /// 缺 Run 就走,连 Walk 都没有就只能站着(至少别卡在反应状态里)。
     fn start_flee(&mut self, from_x: f32, pos_x: f32, max_x: f32) {
@@ -439,19 +481,12 @@ impl PetActor {
         // 正好被戳在正中间时往右跑;左右都行,不值得为此掷个骰子
         let away = if center >= from_x { 1.0 } else { -1.0 };
         let target_x = (pos_x + away * FLEE_DISTANCE * self.body_px).clamp(0.0, max_x);
-        let running = self.clips.run.is_some();
-        let clip = if running { self.clips.run } else { self.clips.walk };
-        match clip {
-            Some(clip) => {
-                self.activity = Activity::Walk { target_x, running };
-                self.target_yaw = camera_yaw(target_x > pos_x);
-                self.player.play(clip);
-                self.needs.boredom = 0.0;
-            }
-            None => {
-                self.activity = Activity::Idle { remaining: 1.0 };
-                self.player.play(self.clips.idle);
-            }
+        if self.walk_to(target_x, pos_x, true) {
+            self.needs.boredom = 0.0;
+        } else {
+            // 连 Walk 都没有的形态:逃不了,至少别卡在反应状态里
+            self.activity = Activity::Idle { remaining: 1.0 };
+            self.player.play(self.clips.idle);
         }
     }
 
@@ -544,15 +579,17 @@ impl PetActor {
         self.notices.push((id, NOTICE_COOLDOWN));
     }
 
-    pub fn new(
-        model: Arc<Model>,
-        size: (u32, u32),
-        foot_offset: f32,
-        body_px: f32,
-        walk_speed: f32,
-        run_speed: f32,
-        seed: u64,
-    ) -> Self {
+    pub fn new(build: PetBuild) -> Self {
+        let PetBuild {
+            model,
+            size,
+            foot_offset,
+            body_px,
+            walk_speed,
+            run_speed,
+            form_id,
+            seed,
+        } = build;
         // Idle 一定要有:没有 Idle 的包等于没法待机,退化成用第 0 段动作
         let idle = model.clip("Idle").unwrap_or(0);
         let walk = model.clip("Walk");
@@ -584,6 +621,8 @@ impl PetActor {
             run_speed,
             foot_offset,
             body_px: body_px.max(1.0),
+            form_id,
+            acting: false,
             mask: None,
             needs: Needs::default(),
             flee_from: None,
@@ -821,6 +860,24 @@ pub struct Stage {
     passthrough: bool,
     /// 这一轮攒下的意图,由 [`Stage::dispatch_intents`] 统一落地。
     intents: Vec<Intent>,
+    /// 正在演的那一场;同时只演一场(两只在演、第三只在旁边溜达是可以的)。
+    performance: Option<Performance>,
+    /// 每个脚本剩下的冷却(秒)。
+    script_cooldown: Vec<(&'static str, f32)>,
+    /// 拿到过真实表面尺寸没有。见 [`Stage::place`]。
+    placed: bool,
+}
+
+/// 正在跑的一场演出。
+struct Performance {
+    script: &'static Script,
+    /// 各角色对应台上的哪一只,下标与 `script.cast` 对齐。
+    cast: [EntityId; 2],
+    /// 各自开演前站的位置(`GoHome` 要回到这儿)。
+    home: [f32; 2],
+    elapsed: f32,
+    /// 下一拍在 `script.steps` 里的下标。
+    next: usize,
 }
 
 impl Stage {
@@ -834,26 +891,46 @@ impl Stage {
             pointer: None,
             passthrough: false,
             intents: Vec::new(),
+            performance: None,
+            script_cooldown: Vec::new(),
+            placed: false,
         }
     }
 
     /// 放一只上台,返回它的标识。
     ///
     /// **错开摆**:`Entity::new` 一律摆在正中,于是托盘连加两只同物种的会精确重叠
-    /// (第 5 步做邻近感知时撞见的 —— 距离恒为 0)。按已在场的只数左右轮流错开一个身位。
+    /// (第 5 步做邻近感知时撞见的 —— 距离恒为 0)。见 [`Stage::place`]。
     pub fn spawn(&mut self, actor: Actor) -> EntityId {
         let id = EntityId(self.next_id);
         self.next_id += 1;
         let mut entity = Entity::new(id, actor, self.size);
-        let n = self.entities.len();
-        if n > 0 {
-            let step = n.div_ceil(2) as f32;
-            let side = if n % 2 == 1 { 1.0 } else { -1.0 };
-            entity.pos.0 += side * step * entity.body_px();
-            entity.clamp_to_surface(self.size);
-        }
+        Self::place(&mut entity, self.entities.len(), self.size);
         self.entities.push(entity);
         id
+    }
+
+    /// 把第 `index` 只摆到位:居中,再按次序左右轮流错开一个身位。
+    ///
+    /// **表面尺寸还没定下来时摆了也白摆**:stage 是先建再等 configure 的,那之前
+    /// `size` 是 (1, 1),错开量会被 `clamp_to_surface` 整个吃掉 —— 实测两只 315px 的宠物
+    /// 双双落在 x = 0,开演时「相隔 0.0 身位」。所以首次拿到真实尺寸时要重摆一遍。
+    fn place(entity: &mut Entity, index: usize, size: (u32, u32)) {
+        entity.reset_position(size);
+        if index > 0 {
+            let step = index.div_ceil(2) as f32;
+            let side = if index % 2 == 1 { 1.0 } else { -1.0 };
+            entity.pos.0 += side * step * entity.body_px();
+            entity.clamp_to_surface(size);
+        }
+    }
+
+    /// 全部重摆(召回,以及首次拿到真实表面尺寸时)。
+    fn place_all(&mut self) {
+        let size = self.size;
+        for (index, entity) in self.entities.iter_mut().enumerate() {
+            Self::place(entity, index, size);
+        }
     }
 
     /// 撤掉一只。找不到就是 false(标识可能已经失效)。
@@ -953,11 +1030,9 @@ impl Stage {
     }
 
     /// 所有实体重新落地(改屏幕尺寸/切形态之后)。
+    /// 全部召回到屏幕中间。**也要错开**:三只叠在一起的「召回」等于把它们藏成一只。
     pub fn reset_position(&mut self) {
-        let size = self.size;
-        for entity in &mut self.entities {
-            entity.reset_position(size);
-        }
+        self.place_all();
     }
 
     /// 当前该交给合成器的输入区(表面局部坐标)。穿透时为空。
@@ -992,7 +1067,14 @@ impl Stage {
                 if (width, height) == self.size {
                     return Reaction::NONE;
                 }
+                // 头一次拿到真实尺寸:之前那次摆位是按 (1, 1) 算的,全作废,重摆
+                let first = !self.placed;
                 self.size = (width, height);
+                self.placed = true;
+                if first {
+                    self.place_all();
+                    return Reaction::BOTH;
+                }
                 let size = self.size;
                 for entity in &mut self.entities {
                     if matches!(entity.actor, Actor::Pet(_)) {
@@ -1016,7 +1098,7 @@ impl Stage {
                             // 真被拎起来了才播害怕:轻点一下不该惊动它
                             if pet.activity != Activity::Dragged {
                                 let len = pet.clip_seconds(PetReaction::PickedUp);
-                                pet.react(PetReaction::PickedUp, len);
+                                pet.react(PetReaction::PickedUp, len); // 顺带清掉 acting
                                 pet.activity = Activity::Dragged;
                             }
                         }
@@ -1244,7 +1326,11 @@ impl Stage {
         pet.remember_notice(target);
         pet.target_yaw = camera_yaw(their_x > my_x);
         log::debug!("宠物 #{} 注意到 #{}", intent.from.0, target.0);
-        let Some(clip) = pet.clips.happy.or_else(|| pet.clips.emotes.first().copied()) else {
+        let Some(clip) = pet
+            .clips
+            .happy
+            .or_else(|| pet.clips.emotes.first().copied())
+        else {
             return false;
         };
         pet.player.play(clip);
@@ -1267,6 +1353,189 @@ impl Stage {
         true
     }
 
+    // ── 演出脚本(见 act.rs) ──────────────────────────────────────
+
+    /// 两只之间的「身位」尺度。与 `perceive` 同一把尺:取两只本体高度的均值。
+    fn body_unit(&self, a: EntityId, b: EntityId) -> f32 {
+        let of = |id| self.entity(id).map(Entity::body_px).unwrap_or(1.0);
+        ((of(a) + of(b)) * 0.5).max(1.0)
+    }
+
+    /// 这只现在能不能被拉去演:得是宠物、闲着、没在睡也没被拎着。
+    fn free_to_act(&self, id: EntityId) -> bool {
+        match self.entity(id).map(Entity::actor) {
+            Some(Actor::Pet(pet)) => {
+                matches!(pet.activity, Activity::Idle { .. }) && !pet.acting && !pet.is_sleeping()
+            }
+            _ => false,
+        }
+    }
+
+    /// 选角:台上有没有这个脚本要的两只(按形态 id,取先找到的)。
+    fn cast_for(&self, script: &Script) -> Option<[EntityId; 2]> {
+        let find = |form_id: i64, skip: Option<EntityId>| {
+            self.entities
+                .iter()
+                .find(|e| {
+                    Some(e.id) != skip
+                        && matches!(e.actor(), Actor::Pet(pet) if pet.form_id == form_id)
+                })
+                .map(|e| e.id)
+        };
+        let a = find(script.cast[0], None)?;
+        // 第二个角色要**另一只**:同一形态在场两只时不能自己跟自己演
+        let b = find(script.cast[1], Some(a))?;
+        Some([a, b])
+    }
+
+    /// 没在演的时候,看看能不能开一场。
+    fn try_start_performance(&mut self) {
+        for script in act::SCRIPTS {
+            if self.script_cooldown.iter().any(|(id, _)| *id == script.id) {
+                continue;
+            }
+            let Some(cast) = self.cast_for(script) else {
+                continue;
+            };
+            if !cast.iter().all(|id| self.free_to_act(*id)) {
+                continue;
+            }
+            // 太远就不开演:第一拍是喊话,隔半个屏幕喊不合理;而且 `Approach` 的档期
+            // 是按时间给的,起点太远根本走不到
+            let (ax, _) = self.entity(cast[0]).expect("刚选出来").foot_point();
+            let (bx, _) = self.entity(cast[1]).expect("刚选出来").foot_point();
+            let distance = (ax - bx).abs() / self.body_unit(cast[0], cast[1]);
+            if distance > script.max_distance {
+                continue;
+            }
+            let home = [
+                self.entity(cast[0]).expect("刚选出来").pos.0,
+                self.entity(cast[1]).expect("刚选出来").pos.0,
+            ];
+            for id in cast {
+                if let Some(Actor::Pet(pet)) = self.entity_mut(id).map(|e| &mut e.actor) {
+                    pet.acting = true;
+                }
+            }
+            log::info!("开演《{}》(相隔 {distance:.1} 身位)", script.name);
+            self.performance = Some(Performance {
+                script,
+                cast,
+                home,
+                elapsed: 0.0,
+                next: 0,
+            });
+            return;
+        }
+    }
+
+    /// 推进正在演的那一场。返回是否要重画。
+    fn tick_performance(&mut self, dt: f32) -> bool {
+        for (_, remaining) in self.script_cooldown.iter_mut() {
+            *remaining -= dt;
+        }
+        self.script_cooldown
+            .retain(|(_, remaining)| *remaining > 0.0);
+
+        let Some(perf) = self.performance.as_mut() else {
+            self.try_start_performance();
+            return self.performance.is_some();
+        };
+        // 有人被打断(受惊/摸头/拎起都会清掉 acting),或者干脆被撤下了 → 收场
+        let cast = perf.cast;
+        let script = perf.script;
+        let still_acting = cast.iter().all(
+            |id| matches!(self.entity(*id).map(Entity::actor), Some(Actor::Pet(pet)) if pet.acting),
+        );
+        if !still_acting {
+            log::info!("《{}》被打断,收场", script.name);
+            self.end_performance();
+            return true;
+        }
+
+        let perf = self.performance.as_mut().expect("上面判过");
+        perf.elapsed += dt;
+        let elapsed = perf.elapsed;
+        // 这一拍到点的全放出来。**允许打断自己**:上一段动作没播完就换下一件事是可以的
+        let mut pending: Vec<Step> = Vec::new();
+        while perf.next < script.steps.len() && script.steps[perf.next].at <= elapsed {
+            pending.push(script.steps[perf.next]);
+            perf.next += 1;
+        }
+        let home = perf.home;
+        let done = elapsed >= script.length;
+        for step in pending {
+            let other = 1 - step.role;
+            self.apply_beat(cast[step.role], cast[other], step.beat, home[step.role]);
+        }
+        if done {
+            log::info!("《{}》演完", script.name);
+            self.end_performance();
+        }
+        true
+    }
+
+    /// 收场:放开两位演员,记下冷却。
+    fn end_performance(&mut self) {
+        let Some(perf) = self.performance.take() else {
+            return;
+        };
+        for id in perf.cast {
+            if let Some(Actor::Pet(pet)) = self.entity_mut(id).map(|e| &mut e.actor) {
+                pet.acting = false;
+                // 停在哪儿就是哪儿,别把它们弹回原位。**还在走的让它走完**:
+                // 收场时正走在回家路上的那只,半步停下会僵在半路
+                if !matches!(pet.activity, Activity::Dragged | Activity::Walk { .. }) {
+                    pet.activity = Activity::Idle { remaining: 1.0 };
+                    pet.player.play(pet.clips.idle);
+                }
+            }
+        }
+        // 被打断的也要记冷却:不然人一松手它俩立刻又演一遍
+        self.script_cooldown
+            .push((perf.script.id, perf.script.cooldown));
+    }
+
+    /// 走一拍。
+    fn apply_beat(&mut self, who: EntityId, other: EntityId, beat: Beat, home_x: f32) {
+        let unit = self.body_unit(who, other);
+        let Some(other_x) = self.entity(other).map(|e| e.foot_point().0) else {
+            return;
+        };
+        let Some(entity) = self.entity_mut(who) else {
+            return;
+        };
+        let my_x = entity.foot_point().0;
+        let pos_x = entity.pos.0;
+        let width = entity.actor.size().0 as f32;
+        let Actor::Pet(pet) = &mut entity.actor else {
+            return;
+        };
+        log::debug!("演出:#{} {beat:?}", who.0);
+        match beat {
+            Beat::Face => pet.target_yaw = camera_yaw(other_x > my_x),
+            Beat::Play(name) => match pet.model.clip(name) {
+                Some(clip) => {
+                    pet.player.play(clip);
+                    pet.activity = Activity::React {
+                        remaining: pet.model.clips[clip].duration.max(0.3),
+                    };
+                }
+                // 缺这段动作就跳过这一拍,整场照演 —— 全库动作覆盖不齐
+                None => log::debug!("演出里缺 {name},跳过这一拍"),
+            },
+            Beat::Approach { gap, running } => {
+                // 停在自己当前这一侧,不穿过对方
+                let side = if my_x >= other_x { 1.0 } else { -1.0 };
+                let target_center = other_x + side * gap * unit;
+                pet.walk_to(target_center - width * 0.5, pos_x, running);
+            }
+            Beat::GoHome { running } => {
+                pet.walk_to(home_x, pos_x, running);
+            }
+        }
+    }
+
     /// 下一次推进该隔多久。只有「正在播的动作几乎不动」时才降频(见 `hz_for_motion`)。
     /// **取各实体里最快的那一个**:一只在走、其余在睡时,整台仍要按走的那只推进。
     pub fn tick_interval(&self) -> Duration {
@@ -1287,29 +1556,23 @@ impl Stage {
         // 同一帧里的距离判定会不对称
         let perceptions: Vec<Perception> =
             (0..self.entities.len()).map(|i| self.perceive(i)).collect();
-        for index in 0..self.entities.len() {
-            let before = match &self.entities[index].actor {
+        for (entity, perception) in self.entities.iter_mut().zip(&perceptions) {
+            let before = match &entity.actor {
                 Actor::Pet(pet) => Some(activity_label(&pet.activity)),
                 _ => None,
             };
-            let one = Self::tick_entity(
-                &mut self.entities[index],
-                dt,
-                size,
-                &perceptions[index],
-                &mut self.intents,
-            );
-            if let (Some(before), Actor::Pet(pet)) = (before, &self.entities[index].actor) {
-                if before != activity_label(&pet.activity) {
-                    // 带上编号:多只在场时不带编号的日志根本读不出是谁在动
-                    log::debug!(
-                        "宠物 #{} → {}(困倦 {:.2} 无聊 {:.2})",
-                        self.entities[index].id.0,
-                        activity_label(&pet.activity),
-                        pet.needs.sleepiness,
-                        pet.needs.boredom
-                    );
-                }
+            let one = Self::tick_entity(entity, dt, size, perception, &mut self.intents);
+            if let (Some(before), Actor::Pet(pet)) = (before, &entity.actor)
+                && before != activity_label(&pet.activity)
+            {
+                // 带上编号:多只在场时不带编号的日志根本读不出是谁在动
+                log::debug!(
+                    "宠物 #{} → {}(困倦 {:.2} 无聊 {:.2})",
+                    entity.id.0,
+                    activity_label(&pet.activity),
+                    pet.needs.sleepiness,
+                    pet.needs.boredom
+                );
             }
             reaction.redraw |= one.redraw;
             reaction.regions_dirty |= one.regions_dirty;
@@ -1317,6 +1580,8 @@ impl Stage {
         let dispatched = self.dispatch_intents();
         reaction.redraw |= dispatched.redraw;
         reaction.regions_dirty |= dispatched.regions_dirty;
+        // 演出**在个体行为之后**推进:这一拍下的指令要压过它们自己刚挑的事
+        reaction.redraw |= self.tick_performance(dt);
         reaction
     }
 
@@ -1383,6 +1648,9 @@ impl Stage {
                     let remaining = remaining - dt;
                     if remaining > 0.0 {
                         pet.activity = Activity::Idle { remaining };
+                    } else if pet.acting {
+                        // 正在演出里,两拍之间的空档:站着等下一拍,别自己跑去溜达
+                        pet.activity = Activity::Idle { remaining: 0.5 };
                     } else if let Some(neighbor) = perception
                         .nearest
                         .filter(|n| n.distance <= NOTICE_DISTANCE && pet.notice_ready(n.id))
@@ -1466,6 +1734,21 @@ impl Rng {
 /// 于是一个身位 = 120px,`NOTICE_DISTANCE` 折合 240px。
 #[cfg(test)]
 const TEST_BODY_PX: f32 = 120.0;
+
+/// 一份测试宠物的参数。要改哪项就 `PetBuild { form_id: 3758, ..test_build(m, 1) }`。
+#[cfg(test)]
+fn test_build(model: Arc<Model>, seed: u64) -> PetBuild {
+    PetBuild {
+        model,
+        size: (200, 200),
+        foot_offset: 180.0,
+        body_px: TEST_BODY_PX,
+        walk_speed: 100.0,
+        run_speed: 250.0,
+        form_id: 0,
+        seed,
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -1588,6 +1871,43 @@ mod entity_tests {
     }
 
     #[test]
+    fn placement_waits_for_the_real_surface_size() {
+        // stage 是先建再等 configure 的:那之前尺寸是 (1, 1),错开量会被整个夹掉。
+        // 实测两只 315px 的宠物双双落在 x = 0,演出开场「相隔 0.0 身位」
+        let mut stage = Stage::new((1, 1));
+        for _ in 0..2 {
+            stage.spawn(Actor::Sprite(Sprite::test_pattern(64)));
+        }
+        assert_eq!(
+            stage.entities[0].pos.0, stage.entities[1].pos.0,
+            "这时确实重叠"
+        );
+        stage.handle(StageEvent::Resized {
+            width: 800,
+            height: 600,
+        });
+        assert_ne!(
+            stage.entities[0].pos.0, stage.entities[1].pos.0,
+            "拿到真实尺寸就该重摆开"
+        );
+        // 之后的尺寸变化不再重摆(用户自己拖过的位置要留着)
+        stage.entities[1].pos.0 = 700.0;
+        stage.handle(StageEvent::Resized {
+            width: 900,
+            height: 600,
+        });
+        assert_eq!(stage.entities[1].pos.0, 700.0, "后续 resize 不该把它挪回去");
+        // 召回也要错开:三只叠在一起的「召回」等于把它们藏成一只
+        stage.spawn(Actor::Sprite(Sprite::test_pattern(64)));
+        stage.reset_position();
+        let xs: Vec<f32> = stage.entities.iter().map(|e| e.pos.0).collect();
+        assert!(
+            xs[0] != xs[1] && xs[1] != xs[2] && xs[0] != xs[2],
+            "召回之后不该叠在一起: {xs:?}"
+        );
+    }
+
+    #[test]
     fn empty_stage_is_a_valid_state() {
         // 托盘可以把最后一只也撤掉。那之后 stage 必须还能正常挨帧推进:
         // 输入区空 = 全穿透,点哪儿都不在,tick 也不该恐慌
@@ -1656,24 +1976,8 @@ mod entity_tests {
         let model = Arc::new(Model::for_test(&["Idle", "Walk"]));
         assert_eq!(Arc::strong_count(&model), 1);
         let mut stage = Stage::new((1000, 600));
-        stage.spawn(Actor::Pet(PetActor::new(
-            Arc::clone(&model),
-            (200, 200),
-            180.0,
-            TEST_BODY_PX,
-            100.0,
-            250.0,
-            1,
-        )));
-        stage.spawn(Actor::Pet(PetActor::new(
-            Arc::clone(&model),
-            (200, 200),
-            180.0,
-            TEST_BODY_PX,
-            100.0,
-            250.0,
-            2,
-        )));
+        stage.spawn(Actor::Pet(PetActor::new(test_build(Arc::clone(&model), 1))));
+        stage.spawn(Actor::Pet(PetActor::new(test_build(Arc::clone(&model), 2))));
         // 两只在场,加上这里持有的那份 = 3;网格/动画/贴图只有一份
         assert_eq!(Arc::strong_count(&model), 3);
         let (Actor::Pet(a), Actor::Pet(b)) =
@@ -1721,15 +2025,7 @@ mod pet_tests {
             "SleepLoop",
             "SleepEnd",
         ]);
-        let actor = Actor::Pet(PetActor::new(
-            Arc::new(model),
-            (200, 200),
-            180.0,
-            TEST_BODY_PX,
-            100.0,
-            250.0,
-            7,
-        ));
+        let actor = Actor::Pet(PetActor::new(test_build(Arc::new(model), 7)));
         let mut stage = Stage::new((1000, 600));
         stage.spawn(actor);
         stage
@@ -1963,15 +2259,10 @@ mod perception_tests {
         let model = Arc::new(Model::for_test(&["Idle", "Walk", "Run", "Happy"]));
         let mut stage = Stage::new((1000, 600));
         for seed in 1..=2 {
-            stage.spawn(Actor::Pet(PetActor::new(
+            stage.spawn(Actor::Pet(PetActor::new(test_build(
                 Arc::clone(&model),
-                (200, 200),
-                180.0,
-                TEST_BODY_PX,
-                100.0,
-                250.0,
                 seed,
-            )));
+            ))));
         }
         stage
     }
@@ -2093,6 +2384,185 @@ mod perception_tests {
     }
 }
 
+/// 演出脚本(design.md §9 Phase 5 第 6 步)。
+#[cfg(test)]
+mod act_tests {
+    use super::*;
+
+    fn script() -> &'static Script {
+        &act::SCRIPTS[0]
+    }
+
+    /// 两位正主,挨着站(1 身位),都闲着。
+    fn cast_on_stage() -> Stage {
+        let model = Arc::new(Model::for_test(&[
+            "Idle", "Walk", "Run", "CallOut", "Alert", "Show", "Happy", "Shock",
+        ]));
+        let mut stage = Stage::new((2000, 600));
+        for form_id in script().cast {
+            stage.spawn(Actor::Pet(PetActor::new(PetBuild {
+                form_id,
+                ..test_build(Arc::clone(&model), form_id as u64)
+            })));
+        }
+        stage.entities[0].pos = (400.0, 400.0);
+        stage.entities[1].pos = (400.0 + TEST_BODY_PX, 400.0);
+        stage
+    }
+
+    fn acting(stage: &Stage, index: usize) -> bool {
+        match stage.entities[index].actor() {
+            Actor::Pet(pet) => pet.acting,
+            _ => false,
+        }
+    }
+
+    /// 推进到开演,返回用掉的秒数。
+    fn run_until_start(stage: &mut Stage) -> f32 {
+        let mut t = 0.0;
+        for _ in 0..400 {
+            stage.tick(0.05);
+            t += 0.05;
+            if stage.performance.is_some() {
+                return t;
+            }
+        }
+        panic!("一直没开演");
+    }
+
+    #[test]
+    fn casting_needs_both_and_close_enough() {
+        let mut stage = cast_on_stage();
+        run_until_start(&mut stage);
+        assert!(acting(&stage, 0) && acting(&stage, 1), "两位都该被占住");
+
+        // 隔太远(> max_distance 身位)就不开演
+        let mut far = cast_on_stage();
+        far.entities[1].pos.0 = 400.0 + TEST_BODY_PX * (script().max_distance + 2.0);
+        for _ in 0..400 {
+            far.tick(0.05);
+        }
+        assert!(far.performance.is_none(), "隔太远不该开演");
+
+        // 少一位也不开演
+        let mut alone = cast_on_stage();
+        let second = alone.entities[1].id();
+        alone.despawn(second);
+        for _ in 0..400 {
+            alone.tick(0.05);
+        }
+        assert!(alone.performance.is_none(), "少一位不该开演");
+    }
+
+    #[test]
+    fn same_form_twice_does_not_cast_itself() {
+        // 台上两只**同一形态**时,不能拿同一只凑两个角色
+        let model = Arc::new(Model::for_test(&["Idle", "Walk", "CallOut"]));
+        let mut stage = Stage::new((2000, 600));
+        for seed in 0..2 {
+            stage.spawn(Actor::Pet(PetActor::new(PetBuild {
+                form_id: script().cast[0],
+                ..test_build(Arc::clone(&model), seed)
+            })));
+        }
+        assert_eq!(stage.cast_for(script()), None);
+    }
+
+    #[test]
+    fn a_poke_ends_the_show() {
+        let mut stage = cast_on_stage();
+        run_until_start(&mut stage);
+        // 戳一下正在演的那只:受惊走 `react`,acting 被清掉,演出该收场
+        let poked = stage.entities[1].id();
+        if let Some(Actor::Pet(pet)) = stage.entity_mut(poked).map(|e| &mut e.actor) {
+            pet.react(PetReaction::Startled, 0.5);
+        }
+        stage.tick(0.05);
+        assert!(stage.performance.is_none(), "被打断该收场");
+        assert!(!acting(&stage, 0) && !acting(&stage, 1), "两位都该放开");
+        // 打断的也记冷却:松手之后不该立刻又演一遍
+        for _ in 0..400 {
+            stage.tick(0.05);
+        }
+        assert!(stage.performance.is_none(), "冷却里不该再开演");
+    }
+
+    #[test]
+    fn a_removed_actor_ends_the_show() {
+        let mut stage = cast_on_stage();
+        run_until_start(&mut stage);
+        let gone = stage.entities[1].id();
+        stage.despawn(gone);
+        stage.tick(0.05);
+        assert!(stage.performance.is_none(), "演员被撤下该收场");
+        assert!(!acting(&stage, 0), "剩下那位该放开");
+    }
+
+    #[test]
+    fn the_whole_show_runs_and_then_releases() {
+        let mut stage = cast_on_stage();
+        run_until_start(&mut stage);
+        let length = script().length;
+        // 演完之前不许有人自己溜达走(`acting` 期间待机不触发 choose_next)
+        let mut ticks = 0.0;
+        while ticks < length - 0.2 {
+            stage.tick(0.05);
+            ticks += 0.05;
+            assert!(stage.performance.is_some(), "{ticks:.1}s 时不该提前收场");
+        }
+        // 到点收场,两位都放开
+        for _ in 0..20 {
+            stage.tick(0.05);
+        }
+        assert!(stage.performance.is_none(), "到点该收场");
+        assert!(!acting(&stage, 0) && !acting(&stage, 1));
+        // 所有拍子都放过了
+        assert!(
+            stage
+                .script_cooldown
+                .iter()
+                .any(|(id, _)| *id == script().id)
+        );
+    }
+
+    #[test]
+    fn a_missing_clip_only_skips_that_beat() {
+        // 全库动作覆盖不齐:缺 CallOut 的形态也得能把整场演完
+        let model = Arc::new(Model::for_test(&["Idle", "Walk", "Run", "Show"]));
+        let mut stage = Stage::new((2000, 600));
+        for form_id in script().cast {
+            stage.spawn(Actor::Pet(PetActor::new(PetBuild {
+                form_id,
+                ..test_build(Arc::clone(&model), form_id as u64)
+            })));
+        }
+        stage.entities[0].pos = (400.0, 400.0);
+        stage.entities[1].pos = (400.0 + TEST_BODY_PX, 400.0);
+        run_until_start(&mut stage);
+        for _ in 0..(script().length / 0.05) as usize + 20 {
+            stage.tick(0.05);
+        }
+        assert!(stage.performance.is_none(), "缺动作也该演到收场");
+    }
+
+    #[test]
+    fn the_walker_ends_up_near_its_partner() {
+        // 「跑过去」那一拍真的把它带到对方旁边:开演时隔 2 身位,`Approach{gap:1.3}` 之后
+        // 该落在 1.3 身位附近
+        let mut stage = cast_on_stage();
+        stage.entities[1].pos.0 = 400.0 + TEST_BODY_PX * 2.0;
+        run_until_start(&mut stage);
+        // Approach 在第 2.0 秒,跑完给到 3.5 秒
+        for _ in 0..70 {
+            stage.tick(0.05);
+        }
+        let a = stage.entities[0].foot_point().0;
+        let b = stage.entities[1].foot_point().0;
+        let gap = (a - b).abs() / TEST_BODY_PX;
+        assert!((gap - 1.3).abs() < 0.4, "该停在 1.3 身位左右,实际 {gap:.2}");
+    }
+}
+
 #[cfg(test)]
 mod rate_tests {
     use super::*;
@@ -2126,15 +2596,7 @@ mod behaviour_tests {
             "SleepLoop",
             "SleepEnd",
         ]);
-        let actor = Actor::Pet(PetActor::new(
-            Arc::new(model),
-            (200, 200),
-            180.0,
-            TEST_BODY_PX,
-            100.0,
-            250.0,
-            99,
-        ));
+        let actor = Actor::Pet(PetActor::new(test_build(Arc::new(model), 99)));
         let mut stage = Stage::new((1000, 600));
         stage.spawn(actor);
         stage

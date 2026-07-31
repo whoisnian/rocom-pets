@@ -3,6 +3,7 @@
 //! 默认起 stage(每个显示器一个透明置顶表面,见 platform/);
 //! `--render` 是离屏模式,不开窗口,把宠物渲成对比图用于验收与回归(见 offscreen.rs)。
 
+mod act;
 mod config;
 mod control;
 mod offscreen;

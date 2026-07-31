@@ -67,7 +67,7 @@ use crate::pet::{Model, PetGpu};
 use crate::render::{Gpu, Quad, QuadDraw, Target};
 use crate::roster::{Roster, Slot};
 use crate::sprite::Sprite;
-use crate::stage::{Actor, EntityId, PetActor, Reaction, Stage, StageEvent};
+use crate::stage::{Actor, EntityId, PetActor, PetBuild, Reaction, Stage, StageEvent};
 
 use super::Options;
 
@@ -556,16 +556,17 @@ impl App {
             walk_speed_cm,
             run_speed_cm
         );
-        Ok(Actor::Pet(PetActor::new(
+        Ok(Actor::Pet(PetActor::new(PetBuild {
             model,
-            (side as u32, side as u32),
+            size: (side as u32, side as u32),
             foot_offset,
             // 本体高度(≠ 画布边长:画布带取景余量)。距离阈值按它换算成「身位」
-            height_px,
-            walk_speed_cm * self.px_per_cm,
-            run_speed_cm * self.px_per_cm,
+            body_px: height_px,
+            walk_speed: walk_speed_cm * self.px_per_cm,
+            run_speed: run_speed_cm * self.px_per_cm,
+            form_id: form.id,
             seed,
-        )))
+        })))
     }
 
     /// 合成器告知这个表面的精确缩放(单位 1/120)。
