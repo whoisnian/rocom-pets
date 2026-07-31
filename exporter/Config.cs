@@ -33,6 +33,9 @@ public class GameConfig
     private readonly JObject _model;
     private readonly JObject _anim;
     private readonly Dictionary<int, string> _animNames = new();
+    /// 宠物 id → 拼音。叫声的 SoundBank 按拼音命名(`Pet_Vo_MiaoMiao.bnk`),
+    /// **每个形态各有一个**(点点 DianDian / 珀尔鼬 BoErYou),不是按物种。
+    private readonly Dictionary<int, string> _pinyin = new();
 
     public GameConfig(string parsedRoot)
     {
@@ -51,7 +54,15 @@ public class GameConfig
             var name = value?["anim_name"]?.Value<string>();
             if (name is not null && int.TryParse(key, out var id)) _animNames[id] = name;
         }
+        foreach (var (key, value) in Rows(binDir, "PET_NAME_MAP_CONF"))
+        {
+            var name = value?["name"]?.Value<string>();
+            if (!string.IsNullOrEmpty(name) && int.TryParse(key, out var id)) _pinyin[id] = name;
+        }
     }
+
+    /// 这个形态的拼音;表里没有就返回 null(实测 667 条覆盖不全)。
+    public string? PinyinOf(int petId) => _pinyin.GetValueOrDefault(petId);
 
     private static JObject Rows(string dir, string table)
     {

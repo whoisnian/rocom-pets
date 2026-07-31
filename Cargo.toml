@@ -16,6 +16,7 @@ ksni = { version = "0.3.6", default-features = false, features = ["blocking", "a
 log = "0.4.33"
 pollster = "1.0.1"
 raw-window-handle = "0.6.2"
+rodio = { version = "0.22.2", default-features = false, features = ["playback", "vorbis"] }
 serde = { version = "1.0.229", features = ["derive"] }
 toml = "1.1.3"
 wgpu = "30.0.0"

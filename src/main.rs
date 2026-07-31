@@ -4,6 +4,7 @@
 //! `--render` 是离屏模式,不开窗口,把宠物渲成对比图用于验收与回归(见 offscreen.rs)。
 
 mod act;
+mod audio;
 mod config;
 mod control;
 mod offscreen;
@@ -31,6 +32,7 @@ stage 模式(不给参数时读 ~/.config/rocom-pets/config.toml,首次运行会
   --form <资产名>    选形态,默认包里第一个(链首)
   --px-per-cm <n>    每厘米多少逻辑像素(默认 2.0:80cm 的喵喵 → 160px 高)
   --config <文件>    换个配置文件
+  --volume <0..1>    叫声音量(默认 0.35;0 = 不开音频)
   --no-tray          不起托盘图标
   --passthrough      启动就开鼠标穿透
 
@@ -79,6 +81,7 @@ fn main() -> anyhow::Result<()> {
     let mut config_path: Option<PathBuf> = None;
     let mut cli_form: Option<String> = None;
     let mut cli_px_per_cm: Option<f32> = None;
+    let mut cli_volume: Option<f32> = None;
     let mut cli_passthrough = false;
     let mut no_tray = false;
     let mut cli_pack_name: Option<String> = None;
@@ -117,6 +120,7 @@ fn main() -> anyhow::Result<()> {
             "--packs-dir" => cli_packs_dir = Some(PathBuf::from(next("--packs-dir", &mut args)?)),
             "--list" => list_packs = true,
             "--px-per-cm" => cli_px_per_cm = Some(next("--px-per-cm", &mut args)?.parse()?),
+            "--volume" => cli_volume = Some(next("--volume", &mut args)?.parse()?),
             "--config" => config_path = Some(PathBuf::from(next("--config", &mut args)?)),
             "--no-tray" => no_tray = true,
             "--passthrough" => cli_passthrough = true,
@@ -232,6 +236,7 @@ fn main() -> anyhow::Result<()> {
         passthrough: cli_passthrough || file.passthrough,
         tray: !no_tray,
         hotkey: file.hotkey,
+        volume: cli_volume.unwrap_or(file.volume).clamp(0.0, 1.0),
     };
     platform::run(options)
 }

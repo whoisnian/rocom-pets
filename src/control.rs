@@ -13,6 +13,8 @@ use zbus::zvariant::{OwnedObjectPath, OwnedValue, Value};
 pub enum Control {
     /// 切换鼠标穿透。
     TogglePassthrough,
+    /// 切换叫声静音。
+    ToggleMute,
     /// 把宠物召回到屏幕中间(它跑到边角或看不见时用)。
     Recall,
     /// 把阵容里第 `slot` 只切到进化链上的第 `form` 个形态。
@@ -43,6 +45,8 @@ const ADD_CHUNK: usize = 24;
 pub struct Tray {
     sender: Sender<Control>,
     passthrough: bool,
+    /// 叫声开着没有;None = 压根没有音频设备(菜单里就不显示这一项)。
+    voice: Option<bool>,
     /// 在场阵容,**下标即插槽号**(命令里带的就是它)。
     pets: Vec<TrayPet>,
     /// 包目录里能加的包名,下标即 [`Control::AddPet`] 的参数。
@@ -85,6 +89,17 @@ impl ksni::Tray for Tray {
             }
             .into(),
         ];
+        if let Some(on) = self.voice {
+            items.push(
+                CheckmarkItem {
+                    label: "叫声".into(),
+                    checked: on,
+                    activate: Box::new(|tray: &mut Self| tray.send(Control::ToggleMute)),
+                    ..Default::default()
+                }
+                .into(),
+            );
+        }
 
         items.push(ksni::MenuItem::Separator);
 
@@ -220,6 +235,10 @@ impl TrayHandle {
     pub fn set_roster(&self, pets: Vec<TrayPet>) {
         self.0.update(move |tray: &mut Tray| tray.pets = pets);
     }
+
+    pub fn set_voice(&self, on: bool) {
+        self.0.update(move |tray: &mut Tray| tray.voice = Some(on));
+    }
 }
 
 /// 起托盘。失败不致命(没有托盘宿主的桌面照样能跑),调用方只记个日志。
@@ -228,11 +247,13 @@ pub fn spawn_tray(
     passthrough: bool,
     pets: Vec<TrayPet>,
     available: Vec<String>,
+    voice: Option<bool>,
 ) -> Result<TrayHandle> {
     use ksni::blocking::TrayMethods;
     let handle = Tray {
         sender,
         passthrough,
+        voice,
         pets,
         available,
     }
@@ -397,6 +418,11 @@ impl DbusControl {
         self.send(Control::TogglePassthrough);
     }
 
+    /// 切换叫声静音。
+    fn toggle_mute(&self) {
+        self.send(Control::ToggleMute);
+    }
+
     /// 把宠物召回屏幕中间。
     fn recall(&self) {
         self.send(Control::Recall);
@@ -442,6 +468,7 @@ pub fn send_dbus_command(control: Control) -> Result<()> {
         .context("拿不到控制接口")?;
     let method = match control {
         Control::TogglePassthrough => "TogglePassthrough",
+        Control::ToggleMute => "ToggleMute",
         Control::Recall => "Recall",
         Control::Quit => "Quit",
         // 这几个要带下标,命令行没暴露(托盘菜单里选更直观)

@@ -29,6 +29,10 @@ passthrough = false
 # 全局热键(切换鼠标穿透)。走 XDG GlobalShortcuts portal 申请,
 # KDE 会弹窗让你确认/改键;不支持的桌面上会自动跳过,用托盘菜单即可。
 hotkey = "CTRL+ALT+p"
+
+# 叫声音量 0~1。桌宠是常驻程序,默认小声;设成 0 就完全不开音频设备。
+# 托盘里的「叫声」勾选是临时静音,不写回这里。
+volume = 0.35
 "#;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -44,6 +48,12 @@ pub struct Config {
     pub passthrough: bool,
     #[serde(default = "default_hotkey")]
     pub hotkey: Option<String>,
+    #[serde(default = "default_volume")]
+    pub volume: f32,
+}
+
+fn default_volume() -> f32 {
+    crate::audio::DEFAULT_VOLUME
 }
 
 fn default_px_per_cm() -> f32 {
@@ -62,6 +72,7 @@ impl Default for Config {
             px_per_cm: default_px_per_cm(),
             passthrough: false,
             hotkey: default_hotkey(),
+            volume: default_volume(),
         }
     }
 }
@@ -123,6 +134,7 @@ mod tests {
         assert_eq!(parsed.px_per_cm, default.px_per_cm);
         assert_eq!(parsed.passthrough, default.passthrough);
         assert_eq!(parsed.hotkey, default.hotkey);
+        assert_eq!(parsed.volume, default.volume);
         assert!(parsed.pack.is_none() && parsed.form.is_none());
     }
 

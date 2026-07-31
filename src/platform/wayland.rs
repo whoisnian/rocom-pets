@@ -59,6 +59,7 @@ use smithay_client_toolkit::{
     },
 };
 
+use crate::audio::Audio;
 use crate::control::{self, Control, TrayHandle, TrayPet};
 use crate::pack::{Form, Pack, PackEntry};
 use crate::pet::mask::MaskReadback;
@@ -67,7 +68,9 @@ use crate::pet::{Model, PetGpu};
 use crate::render::{Gpu, Quad, QuadDraw, Target};
 use crate::roster::{Roster, Slot};
 use crate::sprite::Sprite;
-use crate::stage::{Actor, EntityId, PetActor, PetBuild, Reaction, Stage, StageEvent};
+use crate::stage::{
+    Actor, EntityId, PetActor, PetBuild, Reaction, Stage, StageEvent, VoiceBank, VoiceKind,
+};
 
 use super::Options;
 
@@ -193,6 +196,13 @@ pub fn run(options: Options) -> Result<()> {
         roster_path: options.roster_path,
         models: HashMap::new(),
         pet_gpus: HashMap::new(),
+        voices: HashMap::new(),
+        audio: if options.volume > 0.0 {
+            Audio::open(options.volume)
+        } else {
+            log::info!("音量为 0,不开音频");
+            None
+        },
         px_per_cm: options.px_per_cm,
         stages: Vec::new(),
         pointer: None,
@@ -212,7 +222,14 @@ pub fn run(options: Options) -> Result<()> {
     if options.tray {
         let pets = app.tray_pets();
         let available = app.available.iter().map(|p| p.name.clone()).collect();
-        match control::spawn_tray(control_tx.clone(), options.passthrough, pets, available) {
+        let voice = app.audio.as_ref().map(|a| !a.muted());
+        match control::spawn_tray(
+            control_tx.clone(),
+            options.passthrough,
+            pets,
+            available,
+            voice,
+        ) {
             Ok(tray) => app.tray = Some(tray),
             Err(e) => log::warn!("托盘不可用({e:#});用 kill -USR1 或热键代替"),
         }
@@ -365,6 +382,10 @@ struct App {
     models: HashMap<PathBuf, Arc<Model>>,
     /// 同上,GPU 侧:管线/顶点缓冲/贴图按 (包, 形态) 共享。每实体独立的只有画布。
     pet_gpus: HashMap<PathBuf, Arc<PetGpu>>,
+    /// 叫声库,同一把键(glb 路径 = 包 + 形态)。ogg 很小,读进内存共享。
+    voices: HashMap<PathBuf, Arc<VoiceBank>>,
+    /// 音频输出;None = 没声卡或用户关了声音。
+    audio: Option<Audio>,
     px_per_cm: f32,
     stages: Vec<StageWindow>,
     pointer: Option<wl_pointer::WlPointer>,
@@ -500,6 +521,61 @@ impl App {
         Ok(model)
     }
 
+    /// 取这个形态的叫声库:和模型同一把键、同一套「没人用就清掉」。
+    /// 读不到文件只警告 —— 少一段叫声不该让宠物上不了台。
+    fn voice_bank(&mut self, form: &Form) -> Option<Arc<VoiceBank>> {
+        self.audio.as_ref()?; // 没有音频设备就不必读文件了
+        if let Some(bank) = self.voices.get(&form.model) {
+            return Some(Arc::clone(bank));
+        }
+        let Some(voice) = form.voice.as_ref() else {
+            log::debug!("{} 没有叫声", form.name);
+            return None;
+        };
+        // **加载时就解码**:每次叫都重解是白费,而且直接把解码器丢进 mixer 出不了声
+        // (见 audio.rs 的 `Pcm`)
+        let mut clips = HashMap::new();
+        for (key, clip) in &voice.clips {
+            match crate::audio::decode(&clip.path) {
+                Ok(pcm) => {
+                    if pcm.peak() <= 0.0 {
+                        log::warn!("叫声 {:?} 解出来是静音的", clip.path);
+                    }
+                    clips.insert(key.clone(), Arc::new(pcm));
+                }
+                Err(e) => log::warn!("叫声读不了({e:#})"),
+            }
+        }
+        if clips.is_empty() {
+            return None;
+        }
+        let bank = Arc::new(VoiceBank {
+            clips,
+            cents_low: voice.cents_low,
+            cents_high: voice.cents_high,
+        });
+        log::debug!("{} 的叫声 {} 段", form.name, bank.clips.len());
+        self.voices
+            .retain(|_, cached| Arc::strong_count(cached) > 1);
+        self.voices.insert(form.model.clone(), Arc::clone(&bank));
+        Some(bank)
+    }
+
+    /// 把各 stage 攒下的叫声放出去。
+    ///
+    /// **多显示器下会重复**:每个 output 上是各自独立的一只,tick 驱动的叫声(睡醒)
+    /// 两边会同时响。手上只有单屏,先留着这条已知问题(见 design.md 横向待办)。
+    fn flush_sounds(&mut self) {
+        let Some(audio) = self.audio.as_ref() else {
+            return;
+        };
+        for stage in &mut self.stages {
+            for cue in stage.stage.take_sounds() {
+                audio.play(&cue);
+            }
+        }
+    }
+
     /// 把 manifest 里的厘米单位换成屏幕像素,算出画布尺寸与脚底位置。
     fn build_pet_actor(&mut self, form: &Form) -> Result<Actor> {
         let model = self.load_model(form)?;
@@ -556,6 +632,7 @@ impl App {
             walk_speed_cm,
             run_speed_cm
         );
+        let voice = self.voice_bank(form);
         Ok(Actor::Pet(PetActor::new(PetBuild {
             model,
             size: (side as u32, side as u32),
@@ -565,6 +642,7 @@ impl App {
             walk_speed: walk_speed_cm * self.px_per_cm,
             run_speed: run_speed_cm * self.px_per_cm,
             form_id: form.id,
+            voice,
             seed,
         })))
     }
@@ -650,6 +728,7 @@ impl App {
             }
             self.apply(index, reaction);
         }
+        self.flush_sounds();
     }
 
     /// 所有 stage 里最急的那个推进间隔(姿势几乎不动时会自动放慢)。
@@ -693,6 +772,7 @@ impl App {
     fn handle_control(&mut self, control: Control) {
         match control {
             Control::TogglePassthrough => self.toggle_passthrough(),
+            Control::ToggleMute => self.toggle_mute(),
             Control::Recall => self.recall(),
             Control::SwitchForm { slot, form } => self.switch_form(slot, form),
             Control::AddPet(index) => self.add_pet(index),
@@ -822,6 +902,9 @@ impl App {
             }
             let id = self.stages[stage_index].stage.spawn(actor);
             self.stages[stage_index].slots.push(id);
+            // 「启用召唤」那一声(design.md §7 的触发点之一)。开机恢复阵容时不叫 ——
+            // 每次登录被三只宠物同时喊一嗓子不是好体验
+            self.stages[stage_index].stage.speak(id, VoiceKind::CallOut);
             self.rebuild_pet_surfaces(stage_index);
             self.apply(
                 stage_index,
@@ -833,6 +916,7 @@ impl App {
         }
         self.sprite_mode = false;
         self.roster.push(Member { pack, form: 0 });
+        self.flush_sounds();
         self.ensure_timer();
         self.save_roster();
         self.refresh_tray();
@@ -926,6 +1010,20 @@ impl App {
             );
         }
         log::info!("宠物已召回");
+    }
+
+    /// 静音开关。**只在内存里**:配置文件里的 `volume` 是「默认多大声」,
+    /// 临时闭嘴不该改用户手写的那份配置。
+    fn toggle_mute(&mut self) {
+        let Some(audio) = self.audio.as_mut() else {
+            return;
+        };
+        let muted = !audio.muted();
+        audio.set_muted(muted);
+        log::info!("叫声: {}", if muted { "关" } else { "开" });
+        if let Some(tray) = &self.tray {
+            tray.set_voice(!muted);
+        }
     }
 
     fn toggle_passthrough(&mut self) {
@@ -1422,6 +1520,8 @@ impl PointerHandler for App {
             let reaction = self.stages[index].stage.handle(stage_event);
             self.apply(index, reaction);
         }
+        // 受惊/摸头那两声是事件驱动的,不能等下一次 tick
+        self.flush_sounds();
     }
 }
 

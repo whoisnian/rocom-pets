@@ -7,8 +7,9 @@
 拖放,拎起的只是被点中的那只)、穿透开关、托盘里加一只/撤下/切形态且重启恢复阵容,
 全量宠物包已导完(530 条进化链 / 831 个形态)。
 宠物之间会互相注意到并打招呼、受惊会跑开,凑近了还会演一段跨宠互动
-(珀尔鼬指挥捕尘长绒清扫)。
-**九条原始需求只剩叫声与 Windows 后端两条没结。**
+(珀尔鼬指挥捕尘长绒清扫)。叫声也接上了:摸头/受惊/召唤/睡醒各一段,
+每只实体的嗓音随机(游戏里那个 −100~100 的 `voice` 属性),默认小声、托盘可静音。
+**九条原始需求只剩 Windows 后端一条没结。**
 需求对照与后续计划见 [docs/design.md](docs/design.md) §9。
 
 支持矩阵：**Windows 10+** 与 **KDE Plasma Wayland**(开发环境 Plasma 6.7.3 / kwin_wayland)。
@@ -19,7 +20,9 @@ GNOME 等不实现 wlr-layer-shell 的合成器不在支持范围，也不做 X1
   骨骼动画 + toon 着色已跑通([docs/spike-s2.md](docs/spike-s2.md));
   **宠物已经能站在桌面上待机、走动、睡觉、被摸头与拖放**(Phase 1–4,见 design.md §9)。
 - 导出器(`exporter/`)：C# + CUE4Parse，从自己的游戏 pak 生成宠物包;
-  一条进化链一个包(glb 含全部动作 + 贴图 + manifest.toml)，见 [docs/spike-s3.md](docs/spike-s3.md)。
+  一条进化链一个包(glb 含全部动作 + 贴图 + 叫声 + manifest.toml)，见 [docs/spike-s3.md](docs/spike-s3.md)。
+  叫声要 `vgmstream-cli` 与 `ffmpeg`(缺了自动跳过,`--no-voice` 显式关);
+  全库 835 个形态里 **499 个有叫声**,合计 31MB。
 - 验证工具(`tools/verify_glb.py`)：按 glTF 规范自采样 + 蒙皮 + 光栅化，渲图肉眼核对动画正确性。
 - shader 逆向(`scripts/`)：cooked 包里材质图被剥了、只剩参数值与静态开关,而编译产物里公式是全的、
   静态开关也已定死。这批脚本把公式从 shader library 里读出来 ——

@@ -88,7 +88,9 @@ public record FormReport(
     List<MaterialEntry> Materials,
     int GlbBytes,
     float HeightCm,
-    List<string> Warnings);
+    List<string> Warnings,
+    /// 叫声;null = 这个形态没有(没有 `Pet_Vo_*` 库,或者外部工具不在)。
+    VoiceInfo? Voice = null);
 
 public static class Manifest
 {
@@ -144,6 +146,20 @@ public static class Manifest
                 sb.AppendLine(
                     $"  {ClipKey(clip.Logical)} = {{ clip = {Quote(clip.Logical)}, " +
                     $"ms = {(int)MathF.Round(clip.Seconds * 1000f)}, frames = {clip.Frames}{extra} }}");
+            }
+
+            if (report.Voice is { } voice)
+            {
+                sb.AppendLine();
+                sb.AppendLine("  [forms.voice]   # 叫声:Wwise Pet_Vo_<拼音>.bnk 的事件 → ogg");
+                // 游戏里 -100~100 的 `voice` 属性喂给 Wwise 的 Pet_Vo_Pitch,由 RTPC 曲线变调;
+                // 这两端就是「粗嗓门」「婉转声」。Wwise 的 pitch 本身就是重采样(变调同时变速),
+                // 所以运行时按播放速率 2^(音分/1200) 放就是等价实现
+                sb.AppendLine($"  cents_low = {voice.CentsLow}    # voice = -100(粗嗓门)");
+                sb.AppendLine($"  cents_high = {voice.CentsHigh}   # voice = +100(婉转声)");
+                foreach (var clip in voice.Clips)
+                    sb.AppendLine(
+                        $"  {clip.Key} = {{ path = {Quote(clip.RelativePath)}, ms = {clip.Ms} }}");
             }
 
             if (report.Textures.Count > 0)

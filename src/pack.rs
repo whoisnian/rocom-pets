@@ -48,6 +48,28 @@ struct RawForm {
     clips: HashMap<String, RawClip>,
     #[serde(default)]
     materials: HashMap<String, RawMaterial>,
+    #[serde(default)]
+    voice: Option<RawVoice>,
+}
+
+/// `[forms.voice]`:叫声。`cents_low/high` 是游戏里 `voice` 属性拉到 ±100 时的音分
+/// (「粗嗓门」「婉转声」),运行时按 `2^(音分/1200)` 调播放速率复刻。
+#[derive(Deserialize)]
+struct RawVoice {
+    #[serde(default)]
+    cents_low: f32,
+    #[serde(default)]
+    cents_high: f32,
+    /// 其余键都是「触发点 → 音频文件」。
+    #[serde(flatten)]
+    clips: HashMap<String, RawVoiceClip>,
+}
+
+#[derive(Deserialize)]
+struct RawVoiceClip {
+    path: String,
+    #[serde(default)]
+    ms: u32,
 }
 
 /// `[forms.materials]` 一条:导出器从游戏材质实例里解出来的「这个槽该画什么」。
@@ -254,9 +276,29 @@ pub struct Form {
     pub height_cm: f32,
     pub locomotion: String,
     pub clips: HashMap<String, Clip>,
+    /// 叫声;None = 这个形态没导出(没有 `Pet_Vo_*` 库,或者导出时缺 vgmstream/ffmpeg)。
+    pub voice: Option<Voice>,
     /// glb 里的材质名 → 该画什么。**载入模型必需**,空的话 `Model::load` 直接报错
     /// (旧版导出的包没有这一节,重导即可)。
     pub materials: HashMap<String, Material>,
+}
+
+/// 一个形态的叫声。
+#[derive(Clone)]
+pub struct Voice {
+    /// `voice` 属性拉到 ±100 时的音分(粗嗓门 / 婉转声),运行时按
+    /// `2^(音分/1200)` 调播放速率 —— Wwise 的 pitch 本来就是重采样。
+    pub cents_low: f32,
+    pub cents_high: f32,
+    /// 触发点(happy/shock/callout/relax)→ 音频文件。
+    pub clips: HashMap<String, VoiceClip>,
+}
+
+#[derive(Clone)]
+pub struct VoiceClip {
+    pub path: PathBuf,
+    #[allow(dead_code)] // 时长目前只用于排查;播放不需要预先知道长度
+    pub seconds: f32,
 }
 
 impl Form {
@@ -404,6 +446,23 @@ impl Pack {
                     80.0
                 },
                 locomotion: form.locomotion,
+                voice: form.voice.map(|v| Voice {
+                    cents_low: v.cents_low,
+                    cents_high: v.cents_high,
+                    clips: v
+                        .clips
+                        .into_iter()
+                        .map(|(key, clip)| {
+                            (
+                                key,
+                                VoiceClip {
+                                    path: dir.join(clip.path),
+                                    seconds: clip.ms as f32 / 1000.0,
+                                },
+                            )
+                        })
+                        .collect(),
+                }),
                 clips: form
                     .clips
                     .into_iter()

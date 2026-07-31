@@ -248,6 +248,59 @@ pub enum IntentKind {
     Flee { from_x: f32 },
 }
 
+// ── 叫声 ────────────────────────────────────────────────────────
+//
+// `stage` **不碰音频设备**:这里只产出「放哪段字节、什么速率」,平台层交给 audio.rs。
+// 行为逻辑因此照旧能脱离声卡做单元测试。
+
+/// 一段待播的叫声。
+#[derive(Clone)]
+pub struct SoundCue {
+    /// 解好的样本。**共享**:同物种多实体只有一份(和模型一样)。
+    pub pcm: Arc<crate::audio::Pcm>,
+    /// 播放速率 = 变调。见 [`speed_for_cents`]。
+    pub speed: f32,
+}
+
+/// 音分 → 播放速率。一个八度 = 1200 音分 = 两倍速。
+///
+/// Wwise 的 pitch 本身就是重采样(变调同时变速),所以调播放速率就是等价实现,
+/// 不需要为每个音调预生成音频。
+pub fn speed_for_cents(cents: f32) -> f32 {
+    (cents / 1200.0).exp2()
+}
+
+/// 一个形态的叫声库(加载时就解好的样本)。按形态共享。
+pub struct VoiceBank {
+    pub clips: std::collections::HashMap<String, Arc<crate::audio::Pcm>>,
+    pub cents_low: f32,
+    pub cents_high: f32,
+}
+
+/// 什么时候叫。键与导出器写进 manifest 的一致。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VoiceKind {
+    /// 摸头满意。
+    Happy,
+    /// 受惊。
+    Shock,
+    /// 上台召唤。
+    CallOut,
+    /// 睡醒。
+    Relax,
+}
+
+impl VoiceKind {
+    fn key(self) -> &'static str {
+        match self {
+            VoiceKind::Happy => "happy",
+            VoiceKind::Shock => "shock",
+            VoiceKind::CallOut => "callout",
+            VoiceKind::Relax => "relax",
+        }
+    }
+}
+
 /// 宠物对鼠标的反应(播哪段一次性动作)。
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum PetReaction {
@@ -270,6 +323,8 @@ pub struct PetBuild {
     pub run_speed: f32,
     /// 形态 id(manifest 里 `[[forms]].id`)。演出脚本按它选角。
     pub form_id: i64,
+    /// 叫声库;None = 这个形态没有(或者用户把声音关了)。
+    pub voice: Option<Arc<VoiceBank>>,
     pub seed: u64,
 }
 
@@ -300,6 +355,13 @@ pub struct PetActor {
     /// 正被演出脚本编排着。**外部打断会把它清掉**(受惊/摸头/被拎起都走 `react`
     /// 或直接设 `Dragged`),演出那边看见就收场 —— 打断语义只此一处,不散在各个分支里。
     acting: bool,
+    voice: Option<Arc<VoiceBank>>,
+    /// 这一只的嗓音属性 −1..1(游戏里是 −100~100)。**开台时随机**:
+    /// 同物种两只听着不一样,和游戏里每只宠物各有一个 `voice` 值是同一个意思。
+    voice_value: f32,
+    /// 待播的叫声,由 `Stage::take_sounds` 收走。行为侧发声的地方分散在各处
+    /// (`react`/`wake_up`/上台),挂在这儿就不必给每处都传一个出参。
+    pending_sound: Option<SoundCue>,
     /// 轮廓掩码(异步回读而来,见 pet/mask.rs);还没到就退化成包围盒判定。
     pub mask: Option<Mask>,
     /// 内部需求(困倦/无聊),决定待机结束后干什么。
@@ -388,6 +450,12 @@ impl PetActor {
     /// 人一伸手,正在演的那场就该让位。
     fn react(&mut self, reaction: PetReaction, model_len: f32) {
         self.acting = false;
+        // 被拎起来不叫:拖动过程里指针一动就可能重入,叫起来会连成一串
+        match reaction {
+            PetReaction::Startled => self.speak(VoiceKind::Shock),
+            PetReaction::Petted => self.speak(VoiceKind::Happy),
+            PetReaction::PickedUp => {}
+        }
         let clip = match reaction {
             PetReaction::Startled => self.clips.startled,
             PetReaction::Petted => self.clips.happy,
@@ -513,6 +581,7 @@ impl PetActor {
 
     /// 醒来:有 SleepEnd 就先播,否则直接站起。被打扰时也走这里。
     fn wake_up(&mut self) {
+        self.speak(VoiceKind::Relax);
         match self.clips.sleep_end {
             Some(clip) => {
                 self.player.play(clip);
@@ -570,6 +639,26 @@ impl PetActor {
         clip.map(|c| self.model.clips[c].duration).unwrap_or(0.0)
     }
 
+    /// 排一段叫声。缺这一段(或者没有叫声库)就静默跳过。
+    fn speak(&mut self, kind: VoiceKind) {
+        let Some(bank) = self.voice.as_ref() else {
+            return;
+        };
+        let Some(data) = bank.clips.get(kind.key()) else {
+            return;
+        };
+        // voice ∈ [−1, 1] 在曲线两端之间插值:0 = 原声
+        let cents = if self.voice_value >= 0.0 {
+            bank.cents_high * self.voice_value
+        } else {
+            bank.cents_low * -self.voice_value
+        };
+        self.pending_sound = Some(SoundCue {
+            pcm: Arc::clone(data),
+            speed: speed_for_cents(cents),
+        });
+    }
+
     /// 这只邻居还在冷却里吗。
     fn notice_ready(&self, id: EntityId) -> bool {
         !self.notices.iter().any(|(other, _)| *other == id)
@@ -588,6 +677,7 @@ impl PetActor {
             walk_speed,
             run_speed,
             form_id,
+            voice,
             seed,
         } = build;
         // Idle 一定要有:没有 Idle 的包等于没法待机,退化成用第 0 段动作
@@ -610,6 +700,7 @@ impl PetActor {
             .filter_map(|name| model.clip(name))
             .collect();
         let player = Player::new(&model, idle);
+        let mut rng = Rng::new(seed);
         Self {
             model,
             player,
@@ -623,6 +714,10 @@ impl PetActor {
             body_px: body_px.max(1.0),
             form_id,
             acting: false,
+            voice,
+            // 均匀取 −1..1:游戏里 voice 是逐只随机的属性,两端各 2% 才算「粗嗓门/婉转声」
+            voice_value: rng.next_f32() * 2.0 - 1.0,
+            pending_sound: None,
             mask: None,
             needs: Needs::default(),
             flee_from: None,
@@ -641,7 +736,7 @@ impl PetActor {
                 emotes,
             },
             petting: Petting::default(),
-            rng: Rng::new(seed),
+            rng,
         }
     }
 }
@@ -897,6 +992,19 @@ impl Stage {
         }
     }
 
+    /// 收走这一轮攒下的叫声。平台层每次 tick / 处理事件之后取一遍交给 audio.rs。
+    pub fn take_sounds(&mut self) -> Vec<SoundCue> {
+        let mut out = Vec::new();
+        for entity in &mut self.entities {
+            if let Actor::Pet(pet) = &mut entity.actor
+                && let Some(cue) = pet.pending_sound.take()
+            {
+                out.push(cue);
+            }
+        }
+        out
+    }
+
     /// 放一只上台,返回它的标识。
     ///
     /// **错开摆**:`Entity::new` 一律摆在正中,于是托盘连加两只同物种的会精确重叠
@@ -930,6 +1038,13 @@ impl Stage {
         let size = self.size;
         for (index, entity) in self.entities.iter_mut().enumerate() {
             Self::place(entity, index, size);
+        }
+    }
+
+    /// 让某一只叫一声(平台层在「托盘加了一只」这类外部事件上调)。
+    pub fn speak(&mut self, id: EntityId, kind: VoiceKind) {
+        if let Some(Actor::Pet(pet)) = self.entity_mut(id).map(|e| &mut e.actor) {
+            pet.speak(kind);
         }
     }
 
@@ -1715,8 +1830,15 @@ impl Stage {
 struct Rng(u64);
 
 impl Rng {
+    /// **先空转几轮**:xorshift 头一个输出被低位主导,种子相近时结果也相近。
+    /// 第 6 步撞见过 —— 四只宠物用 7919 的倍数当种子,取到的嗓音属性全是 −1
+    /// (听着一模一样)。运行时的种子取自纳秒时钟,本来就散;这是给「种子相近」兜底。
     fn new(seed: u64) -> Self {
-        Self(seed | 1)
+        let mut rng = Self(seed | 1);
+        for _ in 0..4 {
+            rng.next_f32();
+        }
+        rng
     }
 
     fn next_f32(&mut self) -> f32 {
@@ -1746,6 +1868,7 @@ fn test_build(model: Arc<Model>, seed: u64) -> PetBuild {
         walk_speed: 100.0,
         run_speed: 250.0,
         form_id: 0,
+        voice: None,
         seed,
     }
 }
@@ -2560,6 +2683,136 @@ mod act_tests {
         let b = stage.entities[1].foot_point().0;
         let gap = (a - b).abs() / TEST_BODY_PX;
         assert!((gap - 1.3).abs() < 0.4, "该停在 1.3 身位左右,实际 {gap:.2}");
+    }
+}
+
+/// 叫声(design.md §7 与 §9 Phase 6)。
+#[cfg(test)]
+mod voice_tests {
+    use super::*;
+
+    /// 一套假叫声:字节内容无所谓,测试不解码。曲线取实测最常见的 ±300 音分。
+    fn bank() -> Arc<VoiceBank> {
+        let mut clips = std::collections::HashMap::new();
+        for key in ["happy", "shock", "callout", "relax"] {
+            clips.insert(key.to_string(), Arc::new(crate::audio::Pcm::for_test()));
+        }
+        Arc::new(VoiceBank {
+            clips,
+            cents_low: -300.0,
+            cents_high: 300.0,
+        })
+    }
+
+    fn pet_with_voice(voice_value: f32) -> Stage {
+        let model = Arc::new(Model::for_test(&["Idle", "Walk", "Shock", "Happy"]));
+        let mut stage = Stage::new((1000, 600));
+        stage.spawn(Actor::Pet(PetActor::new(PetBuild {
+            voice: Some(bank()),
+            ..test_build(model, 7)
+        })));
+        if let Actor::Pet(pet) = &mut stage.entities[0].actor {
+            pet.voice_value = voice_value;
+        }
+        stage
+    }
+
+    #[test]
+    fn pitch_follows_the_voice_attribute() {
+        // 游戏里 voice ∈ −100..100 经 RTPC 曲线变调,而 Wwise 的 pitch 就是重采样,
+        // 所以这里是「按 2^(音分/1200) 调播放速率」。0 = 原声、+1 = 婉转、−1 = 粗嗓门
+        for (value, cents) in [(0.0, 0.0), (1.0, 300.0), (-1.0, -300.0), (0.5, 150.0)] {
+            let mut stage = pet_with_voice(value);
+            let id = stage.entities[0].id();
+            stage.speak(id, VoiceKind::Happy);
+            let cues = stage.take_sounds();
+            assert_eq!(cues.len(), 1, "voice={value} 该出一声");
+            assert!(
+                (cues[0].speed - speed_for_cents(cents)).abs() < 1e-6,
+                "voice={value} 该按 {cents} 音分放,实际速率 {}",
+                cues[0].speed
+            );
+        }
+    }
+
+    #[test]
+    fn cues_are_drained_once() {
+        let mut stage = pet_with_voice(0.0);
+        let id = stage.entities[0].id();
+        stage.speak(id, VoiceKind::CallOut);
+        assert_eq!(stage.take_sounds().len(), 1);
+        assert!(stage.take_sounds().is_empty(), "收过就没了,不会一直重放");
+    }
+
+    #[test]
+    fn a_poke_cries_and_a_pickup_does_not() {
+        // 受惊要出声;**被拎起来不出声** —— 拖动时指针一动就可能重入,
+        // 叫起来会连成一串
+        let mut stage = pet_with_voice(0.0);
+        let (x, y) = (500.0f64, (600.0 - GROUND_MARGIN - 90.0) as f64);
+        stage.handle(StageEvent::PointerPressed { x, y });
+        stage.handle(StageEvent::PointerReleased);
+        assert_eq!(stage.take_sounds().len(), 1, "点一下该受惊出声");
+
+        stage.handle(StageEvent::PointerPressed { x, y });
+        stage.handle(StageEvent::PointerMoved { x: x + 60.0, y });
+        assert!(stage.take_sounds().is_empty(), "拎起来不该出声");
+    }
+
+    #[test]
+    fn a_form_without_that_clip_stays_silent() {
+        // 全库叫声覆盖不齐:缺哪一段就不出声,不能恐慌也不能放错的那段
+        let model = Arc::new(Model::for_test(&["Idle"]));
+        let mut clips = std::collections::HashMap::new();
+        clips.insert("happy".to_string(), Arc::new(crate::audio::Pcm::for_test()));
+        let mut stage = Stage::new((1000, 600));
+        stage.spawn(Actor::Pet(PetActor::new(PetBuild {
+            voice: Some(Arc::new(VoiceBank {
+                clips,
+                cents_low: -300.0,
+                cents_high: 300.0,
+            })),
+            ..test_build(model, 3)
+        })));
+        let id = stage.entities[0].id();
+        stage.speak(id, VoiceKind::Shock);
+        assert!(stage.take_sounds().is_empty(), "缺 shock 就该没声");
+        stage.speak(id, VoiceKind::Happy);
+        assert_eq!(stage.take_sounds().len(), 1, "有 happy 就该有声");
+    }
+
+    #[test]
+    fn no_voice_bank_is_silent() {
+        // 没导出叫声的形态(或者用户把音量设成 0)照样得能跑
+        let model = Arc::new(Model::for_test(&["Idle", "Shock"]));
+        let mut stage = Stage::new((1000, 600));
+        stage.spawn(Actor::Pet(PetActor::new(test_build(model, 5))));
+        let id = stage.entities[0].id();
+        stage.speak(id, VoiceKind::Shock);
+        assert!(stage.take_sounds().is_empty());
+    }
+
+    #[test]
+    fn same_species_pets_sound_different() {
+        // 游戏里每只宠物各有一个 voice 属性,同物种也不一样;这里靠各自的种子随机
+        let model = Arc::new(Model::for_test(&["Idle"]));
+        let mut stage = Stage::new((1000, 600));
+        for seed in 1..=4u64 {
+            stage.spawn(Actor::Pet(PetActor::new(PetBuild {
+                voice: Some(bank()),
+                ..test_build(Arc::clone(&model), seed * 7919)
+            })));
+        }
+        let ids: Vec<EntityId> = stage.entities().iter().map(|e| e.id()).collect();
+        for id in ids {
+            stage.speak(id, VoiceKind::Happy);
+        }
+        let speeds: Vec<f32> = stage.take_sounds().iter().map(|c| c.speed).collect();
+        assert_eq!(speeds.len(), 4);
+        assert!(
+            speeds.windows(2).any(|w| (w[0] - w[1]).abs() > 1e-4),
+            "四只不该是同一个音调: {speeds:?}"
+        );
     }
 }
 
