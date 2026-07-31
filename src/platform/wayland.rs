@@ -28,7 +28,7 @@ use smithay_client_toolkit::{
     globals::GlobalData,
     output::{OutputHandler, OutputState},
     reexports::calloop::{
-        EventLoop, channel,
+        EventLoop, LoopHandle, channel,
         timer::{TimeoutAction, Timer},
     },
     reexports::calloop_wayland_source::WaylandSource,
@@ -59,12 +59,13 @@ use smithay_client_toolkit::{
     },
 };
 
-use crate::control::{self, Control, TrayHandle};
-use crate::pack::{Form, Pack};
+use crate::control::{self, Control, TrayHandle, TrayPet};
+use crate::pack::{Form, Pack, PackEntry};
 use crate::pet::mask::MaskReadback;
 use crate::pet::target::{PetTarget, view_proj};
 use crate::pet::{Model, PetGpu};
 use crate::render::{Gpu, Quad, QuadDraw, Target};
+use crate::roster::{Roster, Slot};
 use crate::sprite::Sprite;
 use crate::stage::{Actor, EntityId, PetActor, Reaction, Stage, StageEvent};
 
@@ -88,7 +89,7 @@ fn effect_time() -> f32 {
     START.get_or_init(Instant::now).elapsed().as_secs_f32()
 }
 
-pub fn run(options: &Options) -> Result<()> {
+pub fn run(options: Options) -> Result<()> {
     let conn = Connection::connect_to_env().context("连不上 Wayland 合成器")?;
     let (globals, event_queue) = registry_queue_init(&conn).context("注册表初始化失败")?;
     let qh = event_queue.handle();
@@ -121,33 +122,58 @@ pub fn run(options: &Options) -> Result<()> {
         })
         .flatten();
 
-    // 包在起窗口前就读掉:manifest 有问题要立刻报错,而不是等到画第一帧
-    let (pack, current_form) = match &options.pack {
+    // 包已经由 main 读好(读不动的在那边就报错/警告过了),这里只挑形态
+    let mut roster: Vec<Member> = Vec::new();
+    for pet in options.pets {
+        let form = match pet.pack.form_index(pet.form.as_deref()) {
+            Ok(index) => index,
+            Err(e) => {
+                log::warn!("{} 的形态选不出来({e:#}),退用链首", pet.pack.species_name);
+                0
+            }
+        };
+        let f = &pet.pack.forms[form];
+        log::info!(
+            "宠物包 {}({}):{} 个形态,当前 {}({}),高 {:.0}cm,{} 个动作",
+            pet.pack.species_name,
+            pet.pack.species_id,
+            pet.pack.forms.len(),
+            f.name,
+            f.asset,
+            f.height_cm,
+            f.clips.len()
+        );
+        roster.push(Member {
+            pack: pet.pack,
+            form,
+        });
+    }
+    // 调试精灵是「一只都没有」时的占位(S1 的平台层验收对象):托盘里加了真宠物就撤掉,
+    // 之后撤空也不再回来 —— 用过托盘的人再看见测试图案只会以为是坏了
+    let sprite_mode = roster.is_empty();
+    if sprite_mode {
+        log::info!("阵容是空的,先用调试精灵占位(托盘里「加一只」就换成真宠物)");
+    }
+    // 「加一只」菜单要列整个包目录。**只读名字**:全库 539 个包,把动作表与材质表
+    // 全解析出来只为显示一行字,启动就得多花一秒
+    let available = match options.packs_dir.as_deref() {
         Some(dir) => {
-            let pack = Pack::load(dir)?;
-            let index = pack.form_index(options.form.as_deref())?;
-            let form = &pack.forms[index];
-            log::info!(
-                "宠物包 {}({}):{} 个形态,当前 {}({}),高 {:.0}cm,{} 个动作",
-                pack.species_name,
-                pack.species_id,
-                pack.forms.len(),
-                form.name,
-                form.asset,
-                form.height_cm,
-                form.clips.len()
-            );
-            (Some(pack), index)
+            let entries = Pack::list_entries(dir);
+            log::info!("包目录 {} 里有 {} 个包可加", dir.display(), entries.len());
+            entries
         }
-        None => {
-            log::info!("没给 --pack,用调试精灵(平台层验收模式)");
-            (None, 0)
-        }
+        None => Vec::new(),
     };
 
     let mut instance_desc = wgpu::InstanceDescriptor::new_without_display_handle();
     instance_desc.backends = wgpu::Backends::VULKAN;
     let instance = wgpu::Instance::new(instance_desc);
+
+    // 事件循环要先建:App 得攥着它的句柄 —— 空着台起来的那种情况下动画定时器是
+    // 加第一只宠物时才挂上去的(见 `ensure_timer`)
+    let mut event_loop: EventLoop<'static, App> =
+        EventLoop::try_new().context("建 calloop 事件循环失败")?;
+    let handle = event_loop.handle();
 
     let mut app = App {
         registry_state: RegistryState::new(&globals),
@@ -160,8 +186,11 @@ pub fn run(options: &Options) -> Result<()> {
         instance,
         gpu: None,
         sprite: Sprite::test_pattern(192),
-        pack,
-        current_form,
+        roster,
+        available,
+        sprite_mode,
+        packs_dir: options.packs_dir,
+        roster_path: options.roster_path,
         models: HashMap::new(),
         pet_gpus: HashMap::new(),
         px_per_cm: options.px_per_cm,
@@ -169,11 +198,11 @@ pub fn run(options: &Options) -> Result<()> {
         pointer: None,
         tray: None,
         passthrough: options.passthrough,
+        loop_handle: handle.clone(),
+        ticking: false,
         exit: false,
     };
 
-    let mut event_loop: EventLoop<App> = EventLoop::try_new().context("建 calloop 事件循环失败")?;
-    let handle = event_loop.handle();
     WaylandSource::new(conn.clone(), event_queue)
         .insert(handle.clone())
         .map_err(|e| anyhow::anyhow!("挂 Wayland 事件源失败: {e}"))?;
@@ -181,25 +210,14 @@ pub fn run(options: &Options) -> Result<()> {
     let (control_tx, control_rx) = channel::channel();
     install_signal_source(control_tx.clone())?;
     if options.tray {
-        let (name, forms) = match &app.pack {
-            Some(pack) => (
-                pack.forms[app.current_form].name.clone(),
-                pack.forms.iter().map(|f| f.name.clone()).collect(),
-            ),
-            None => (String::new(), Vec::new()),
-        };
-        match control::spawn_tray(
-            control_tx.clone(),
-            name,
-            options.passthrough,
-            forms,
-            app.current_form,
-        ) {
+        let pets = app.tray_pets();
+        let available = app.available.iter().map(|p| p.name.clone()).collect();
+        match control::spawn_tray(control_tx.clone(), options.passthrough, pets, available) {
             Ok(tray) => app.tray = Some(tray),
             Err(e) => log::warn!("托盘不可用({e:#});用 kill -USR1 或热键代替"),
         }
     }
-    if let Some(trigger) = options.hotkey.clone() {
+    if let Some(trigger) = options.hotkey {
         control::spawn_hotkey(control_tx.clone(), trigger);
     }
     // 自己的 D-Bus 接口:给「KDE 自定义快捷键绑命令」与脚本用
@@ -215,19 +233,7 @@ pub fn run(options: &Options) -> Result<()> {
         .map_err(|e| anyhow::anyhow!("挂控制通道失败: {e}"))?;
 
     // 只有宠物需要推进时间;精灵模式保持「只在事件时出帧」,空闲 CPU 才能是 0
-    if app.pack.is_some() {
-        let interval = Duration::from_secs_f32(1.0 / TICK_HZ);
-        handle
-            .insert_source(
-                Timer::from_duration(interval),
-                move |_, _, app: &mut App| {
-                    app.tick();
-                    // 间隔随状态变:待机降到 12fps,交互/行走回到 30fps
-                    TimeoutAction::ToDuration(app.tick_interval())
-                },
-            )
-            .map_err(|e| anyhow::anyhow!("挂动画定时器失败: {e}"))?;
-    }
+    app.ensure_timer();
 
     log::info!(
         "pid {} 就位:托盘菜单 / 全局热键 / `rocom-pets --toggle-passthrough` / kill -USR1 都能切穿透",
@@ -262,17 +268,10 @@ fn install_signal_source(tx: channel::Sender<Control>) -> Result<()> {
     Ok(())
 }
 
-/// 启动时上几只(调试用)。`ROCOM_PETS_ENTITIES=3` 就是三只,默认一只。
-/// 与 `ROCOM_PETS_NEEDS_SPEED` 同一类开关:只为把某条路走通,不进配置文件。
-fn debug_entity_count() -> usize {
-    static COUNT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *COUNT.get_or_init(|| {
-        std::env::var("ROCOM_PETS_ENTITIES")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .filter(|v| *v >= 1)
-            .unwrap_or(1)
-    })
+/// 阵容里的一只:包(整条进化链都在,供切形态)+ 当前形态下标。
+struct Member {
+    pack: Pack,
+    form: usize,
 }
 
 /// 一个 output 上的 stage 表面。
@@ -302,6 +301,9 @@ struct StageWindow {
     /// 掩码回读的轮转游标:**一帧最多回读一只**。N 只同帧全回读会把 Phase 2 压下去的
     /// 开销乘回来 —— 取景改按动作包围盒之后画布面积还涨了 1.64 倍,回读量按面积走。
     readback_cursor: usize,
+    /// 阵容插槽 → 这台上对应实体的标识。**下标与 `App::roster` 严格对齐**:
+    /// 托盘发过来的是插槽号,而每台上的 `EntityId` 各自独立(各 stage 自己发号)。
+    slots: Vec<EntityId>,
 }
 
 /// 一只宠物在某个 stage 上的渲染资源。
@@ -349,10 +351,15 @@ struct App {
     instance: wgpu::Instance,
     gpu: Option<Gpu>,
     sprite: Sprite,
-    /// 宠物包(整条进化链都在里面,供形态切换);None = 调试精灵模式。
-    pack: Option<Pack>,
-    /// 当前形态在 `pack.forms` 里的下标。
-    current_form: usize,
+    /// 在场阵容。**下标即插槽号**,托盘菜单与各 stage 的 `slots` 都按它对齐。
+    roster: Vec<Member>,
+    /// 包目录里能加的包(只有名字与位置,选中了才 `Pack::load`)。
+    available: Vec<PackEntry>,
+    /// 现在台上是不是那只调试精灵(阵容空着起来才有,加了真宠物就永久撤掉)。
+    sprite_mode: bool,
+    packs_dir: Option<PathBuf>,
+    /// 阵容存档路径;None = 定不出位置,这次的加/撤只在内存里。
+    roster_path: Option<PathBuf>,
     /// 已加载的模型,按 glb 路径(= 包 + 形态)缓存。多实体/多屏共享同一份网格与贴图,
     /// 否则每多一只 RSS 就翻一档(单只已经 219MB)。见 design.md §9 Phase 5 第 2 步。
     models: HashMap<PathBuf, Arc<Model>>,
@@ -365,6 +372,11 @@ struct App {
     tray: Option<TrayHandle>,
     /// 当前是否穿透(stage 各自也有,这里存一份用于新建 stage 与回显托盘)。
     passthrough: bool,
+    /// 事件循环句柄:动画定时器是**按需**挂的(空着台起来时不挂),见 `ensure_timer`。
+    loop_handle: LoopHandle<'static, App>,
+    /// 定时器已经挂上了。挂上就不摘 —— 撤空之后再加回来还得用它,
+    /// 而空台的 `tick` 本身就是一次空转。
+    ticking: bool,
     exit: bool,
 }
 
@@ -429,38 +441,25 @@ impl App {
         };
 
         // 模型按形态共享(见 `load_model`),这里 clone 的只是 manifest 里那份元数据
-        let form = self
-            .pack
-            .as_ref()
-            .map(|p| p.forms[self.current_form].clone());
-        let form_for_extra = form.clone();
-        let actor = match form {
-            Some(form) => match self.build_pet_actor(&form) {
-                Ok(actor) => actor,
+        let forms: Vec<Form> = self
+            .roster
+            .iter()
+            .map(|m| m.pack.forms[m.form].clone())
+            .collect();
+        let mut stage = Stage::new((1, 1));
+        let mut slots = Vec::with_capacity(forms.len());
+        for form in &forms {
+            match self.build_pet_actor(form) {
+                Ok(actor) => slots.push(stage.spawn(actor)),
                 Err(e) => {
                     log::error!("output {name}: 加载宠物失败: {e:#}");
                     self.exit = true;
                     return;
                 }
-            },
-            None => Actor::Sprite(self.sprite.clone()),
-        };
-
-        let mut stage = Stage::new(actor, (1, 1));
-        // 调试开关:一次上多只(共享同一份模型与管线,各有自己的画布与状态)。
-        // 托盘里的「加一只/移除一只」在 Phase 5 第 7 步接,这之前先靠它验多实体这条路。
-        for _ in 1..debug_entity_count() {
-            let extra = match form_for_extra.as_ref() {
-                Some(form) => match self.build_pet_actor(form) {
-                    Ok(actor) => actor,
-                    Err(e) => {
-                        log::error!("output {name}: 多开失败: {e:#}");
-                        break;
-                    }
-                },
-                None => Actor::Sprite(self.sprite.clone()),
-            };
-            stage.spawn(extra);
+            }
+        }
+        if self.sprite_mode {
+            stage.spawn(Actor::Sprite(self.sprite.clone()));
         }
         if self.passthrough != stage.passthrough() {
             stage.handle(StageEvent::TogglePassthrough);
@@ -483,6 +482,7 @@ impl App {
             configured: false,
             last_tick: None,
             readback_cursor: 0,
+            slots,
         });
     }
 
@@ -592,14 +592,24 @@ impl App {
         if let Some(target) = self.stages[index].target.as_mut() {
             target.resize(gpu, physical);
         }
-        // 宠物画布跟着缩放走:换算在 render 里做,这里只要保证 buffer 尺寸对上
-        let (aw, ah) = self.stages[index].stage.actor().size();
+        // 宠物画布跟着缩放走:换算在 render 里做,这里只要保证 buffer 尺寸对上。
+        // **画布尺寸得逐只取**:阵容里可以是 161px 的喵喵配 481px 的魔力猫,
+        // 拿其中一只的尺寸套到全台上,另一只不是糊就是被裁
         let scale = self.stages[index].scale;
-        let canvas = (
-            ((aw as f32 * scale) as u32).max(1),
-            ((ah as f32 * scale) as u32).max(1),
-        );
-        for surfaces in &mut self.stages[index].pets {
+        let sizes: Vec<(EntityId, (u32, u32))> = self.stages[index]
+            .stage
+            .entities()
+            .iter()
+            .map(|e| (e.id(), e.actor().size()))
+            .collect();
+        for (id, (aw, ah)) in sizes {
+            let canvas = (
+                ((aw as f32 * scale) as u32).max(1),
+                ((ah as f32 * scale) as u32).max(1),
+            );
+            let Some(surfaces) = self.stages[index].pets.iter_mut().find(|s| s.id == id) else {
+                continue;
+            };
             if surfaces.canvas.resize(&gpu.device, canvas) {
                 surfaces.quad = gpu.create_quad(surfaces.canvas.view());
             }
@@ -681,43 +691,223 @@ impl App {
         match control {
             Control::TogglePassthrough => self.toggle_passthrough(),
             Control::Recall => self.recall(),
-            Control::SwitchForm(index) => self.switch_form(index),
+            Control::SwitchForm { slot, form } => self.switch_form(slot, form),
+            Control::AddPet(index) => self.add_pet(index),
+            Control::RemovePet(slot) => self.remove_pet(slot),
             Control::Quit => self.exit = true,
         }
     }
 
-    /// 切到进化链上的另一个形态:重建模型与那套 GPU 资源,位置重新落地。
-    fn switch_form(&mut self, index: usize) {
-        let Some(pack) = self.pack.as_ref() else {
+    /// 动画定时器按需挂上:空着台起来时不挂,加第一只宠物时才挂 ——
+    /// 精灵模式的「空闲 CPU 0」是 S1 验收项,不能为了将来可能加宠物就一直空转。
+    fn ensure_timer(&mut self) {
+        if self.ticking || self.roster.is_empty() {
+            return;
+        }
+        let interval = Duration::from_secs_f32(1.0 / TICK_HZ);
+        match self.loop_handle.insert_source(
+            Timer::from_duration(interval),
+            |_, _, app: &mut App| {
+                app.tick();
+                // 间隔随状态变:待机降到 12fps,交互/行走回到 30fps
+                TimeoutAction::ToDuration(app.tick_interval())
+            },
+        ) {
+            Ok(_) => self.ticking = true,
+            Err(e) => log::error!("挂动画定时器失败({e});宠物不会动"),
+        }
+    }
+
+    /// 托盘菜单要的那份阵容快照。
+    fn tray_pets(&self) -> Vec<TrayPet> {
+        self.roster
+            .iter()
+            .map(|m| TrayPet {
+                name: m.pack.forms[m.form].name.clone(),
+                forms: m.pack.forms.iter().map(|f| f.name.clone()).collect(),
+                current_form: m.form,
+            })
+            .collect()
+    }
+
+    fn refresh_tray(&self) {
+        if let Some(tray) = &self.tray {
+            tray.set_roster(self.tray_pets());
+        }
+    }
+
+    /// 把阵容写回存档。存**包名**而不是路径 —— 包目录整个搬走时阵容还认得出来;
+    /// 只有包不在包目录里(`--pack /some/where`)才存绝对路径。
+    fn save_roster(&self) {
+        let Some(path) = self.roster_path.as_deref() else {
             return;
         };
-        if index >= pack.forms.len() || index == self.current_form {
-            return;
+        let roster = Roster {
+            pets: self
+                .roster
+                .iter()
+                .map(|m| {
+                    let in_packs_dir = self
+                        .packs_dir
+                        .as_deref()
+                        .is_some_and(|dir| m.pack.dir.parent() == Some(dir));
+                    let pack = match (in_packs_dir, m.pack.dir.file_name()) {
+                        (true, Some(name)) => name.to_string_lossy().into_owned(),
+                        _ => m.pack.dir.to_string_lossy().into_owned(),
+                    };
+                    Slot {
+                        pack,
+                        form: Some(m.pack.forms[m.form].asset.clone()),
+                    }
+                })
+                .collect(),
+        };
+        if let Err(e) = roster.save(path) {
+            log::warn!("阵容没存上({e:#});下次启动会回到上一次的阵容");
         }
-        let form = pack.forms[index].clone();
-        log::info!("切换形态 → {}({})", form.name, form.asset);
-        self.current_form = index;
-        for stage_index in 0..self.stages.len() {
+    }
+
+    /// 没实体在用的模型与管线丢掉。撤一只/切形态之后不清的话,它的网格与贴图
+    /// 会一直占着(单只就有一两百 MB)。
+    fn prune_caches(&mut self) {
+        self.models.retain(|_, cached| Arc::strong_count(cached) > 1);
+        self.pet_gpus.retain(|_, cached| Arc::strong_count(cached) > 1);
+    }
+
+    /// 从包目录里加一只。
+    fn add_pet(&mut self, index: usize) {
+        let Some(entry) = self.available.get(index) else {
+            log::warn!("要加的包不在列表里(下标 {index})");
+            return;
+        };
+        let dir = entry.dir.clone();
+        let pack = match Pack::load(&dir) {
+            Ok(pack) => pack,
+            Err(e) => {
+                log::error!("加一只失败:{dir:?} 读不了: {e:#}");
+                return;
+            }
+        };
+        let form = pack.forms[0].clone();
+        // **先把每台的角色都建出来再提交**:中途失败会让插槽与实体对不上号,
+        // 而插槽错位比「加不上」难查得多
+        let mut actors = Vec::with_capacity(self.stages.len());
+        for _ in 0..self.stages.len() {
             match self.build_pet_actor(&form) {
-                Ok(actor) => {
-                    self.stages[stage_index].stage.replace_actor(actor);
-                    // 网格/贴图/画布/掩码缓冲全都跟形态绑,一并重建
-                    self.stages[stage_index].pets.clear();
-                    self.rebuild_pet_surfaces(stage_index);
-                    self.apply(
-                        stage_index,
-                        Reaction {
-                            redraw: true,
-                            regions_dirty: true,
-                        },
-                    );
+                Ok(actor) => actors.push(actor),
+                Err(e) => {
+                    log::error!("加一只 {} 失败: {e:#}", pack.species_name);
+                    return;
                 }
-                Err(e) => log::error!("切形态失败: {e:#}"),
             }
         }
-        if let Some(tray) = &self.tray {
-            tray.set_form(index, form.name);
+        log::info!("加一只 {}({})", pack.species_name, form.name);
+        for (stage_index, actor) in actors.into_iter().enumerate() {
+            // 占位的调试精灵让位
+            if self.sprite_mode {
+                let sprites: Vec<EntityId> = self.stages[stage_index]
+                    .stage
+                    .entities()
+                    .iter()
+                    .filter(|e| matches!(e.actor(), Actor::Sprite(_)))
+                    .map(|e| e.id())
+                    .collect();
+                for id in sprites {
+                    self.stages[stage_index].stage.despawn(id);
+                }
+                self.stages[stage_index].sprite_quad = None;
+            }
+            let id = self.stages[stage_index].stage.spawn(actor);
+            self.stages[stage_index].slots.push(id);
+            self.rebuild_pet_surfaces(stage_index);
+            self.apply(
+                stage_index,
+                Reaction {
+                    redraw: true,
+                    regions_dirty: true,
+                },
+            );
         }
+        self.sprite_mode = false;
+        self.roster.push(Member { pack, form: 0 });
+        self.ensure_timer();
+        self.save_roster();
+        self.refresh_tray();
+    }
+
+    /// 撤下阵容里的第几只。撤空了就是空台 —— 调试精灵不会回来。
+    fn remove_pet(&mut self, slot: usize) {
+        if slot >= self.roster.len() {
+            return;
+        }
+        let member = self.roster.remove(slot);
+        log::info!(
+            "撤下 {}(还剩 {} 只)",
+            member.pack.species_name,
+            self.roster.len()
+        );
+        drop(member);
+        for stage_index in 0..self.stages.len() {
+            if slot >= self.stages[stage_index].slots.len() {
+                continue;
+            }
+            let id = self.stages[stage_index].slots.remove(slot);
+            self.stages[stage_index].stage.despawn(id);
+            self.stages[stage_index].pets.retain(|s| s.id != id);
+            self.apply(
+                stage_index,
+                Reaction {
+                    redraw: true,
+                    regions_dirty: true,
+                },
+            );
+        }
+        self.prune_caches();
+        self.save_roster();
+        self.refresh_tray();
+    }
+
+    /// 把某一只切到进化链上的另一个形态:重建模型与那套 GPU 资源,位置重新落地。
+    fn switch_form(&mut self, slot: usize, index: usize) {
+        let Some(member) = self.roster.get(slot) else {
+            return;
+        };
+        if index >= member.pack.forms.len() || index == member.form {
+            return;
+        }
+        let form = member.pack.forms[index].clone();
+        // 同 `add_pet`:全建出来才提交,免得一半的台换了一半没换
+        let mut actors = Vec::with_capacity(self.stages.len());
+        for _ in 0..self.stages.len() {
+            match self.build_pet_actor(&form) {
+                Ok(actor) => actors.push(actor),
+                Err(e) => {
+                    log::error!("切形态失败: {e:#}");
+                    return;
+                }
+            }
+        }
+        log::info!("切换形态 → {}({})", form.name, form.asset);
+        self.roster[slot].form = index;
+        for (stage_index, actor) in actors.into_iter().enumerate() {
+            let Some(id) = self.stages[stage_index].slots.get(slot).copied() else {
+                continue;
+            };
+            self.stages[stage_index].stage.replace_actor(id, actor);
+            // 网格/贴图/画布/掩码缓冲全都跟形态绑,**只重建这一只的**
+            self.stages[stage_index].pets.retain(|s| s.id != id);
+            self.rebuild_pet_surfaces(stage_index);
+            self.apply(
+                stage_index,
+                Reaction {
+                    redraw: true,
+                    regions_dirty: true,
+                },
+            );
+        }
+        self.prune_caches();
+        self.save_roster();
+        self.refresh_tray();
     }
 
     /// 把宠物召回屏幕中间(跑到边角、或多屏切换后找不着了)。
@@ -882,9 +1072,8 @@ impl App {
                 highlight: entity.is_dragging(),
             });
         }
-        if draws.is_empty() {
-            return;
-        }
+        // **空台也要出一帧**:撤掉最后一只之后不画的话,合成器留着的还是上一帧,
+        // 宠物看着像是没撤掉。空 draws 就是清成透明。
         let target = stage.target.as_mut().expect("上面已判过");
         if let Err(e) = target.render(gpu, &draws) {
             log::error!("stage {index} 出帧失败: {e:#}");

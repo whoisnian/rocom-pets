@@ -9,6 +9,6 @@
 //! - 输入区没有 Wayland 那种 region 概念,用 `crate::stage::Stage::hit_test` 逐点判定即可,
 //!   `Sprite::coverage_rects` 那套矩形近似在这边用不上。
 
-pub fn run(_options: &super::Options) -> anyhow::Result<()> {
+pub fn run(_options: super::Options) -> anyhow::Result<()> {
     anyhow::bail!("Windows 后端还没实现,见 docs/spike-s1.md")
 }

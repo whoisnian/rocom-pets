@@ -707,16 +707,16 @@ pub struct Stage {
 }
 
 impl Stage {
-    pub fn new(actor: Actor, size: (u32, u32)) -> Self {
-        let mut stage = Self {
+    /// 空台。**允许台上一只都没有**:托盘可以把最后一只也撤掉(见 design.md
+    /// §9 Phase 5 第 7 步),这时输入区为空、每帧清成透明,程序还在跑。
+    pub fn new(size: (u32, u32)) -> Self {
+        Self {
             entities: Vec::new(),
             next_id: 0,
             size,
             pointer: None,
             passthrough: false,
-        };
-        stage.spawn(actor);
-        stage
+        }
     }
 
     /// 放一只上台,返回它的标识。
@@ -728,7 +728,6 @@ impl Stage {
     }
 
     /// 撤掉一只。找不到就是 false(标识可能已经失效)。
-    #[allow(dead_code)] // 托盘的「移除这只」在 Phase 5 第 7 步接
     pub fn despawn(&mut self, id: EntityId) -> bool {
         let before = self.entities.len();
         self.entities.retain(|e| e.id != id);
@@ -769,53 +768,57 @@ impl Stage {
             .map(|e| e.id)
     }
 
-    // ── 单实体便利访问 ────────────────────────────────────────────
-    // 平台层目前仍按「一只」写(见 design.md §9 Phase 5 第 1 步),这几个先落到
-    // **第一只**上。等平台层改成按实体渲染后一并删掉。
-
-    /// 第一只(平台层过渡用)。台上至少有一只是 `Stage::new` 保证的。
-    fn primary(&self) -> &Entity {
-        &self.entities[0]
-    }
-
-    fn primary_mut(&mut self) -> &mut Entity {
-        &mut self.entities[0]
-    }
-
-    pub fn actor(&self) -> &Actor {
-        &self.primary().actor
-    }
-
-    /// 换角色(切形态):尺寸与轮廓都变了,重算覆盖区并重新落地。
-    pub fn replace_actor(&mut self, actor: Actor) {
+    /// 换掉某一只的角色(切形态):尺寸与轮廓都变了,重算覆盖区并重新落地。
+    /// 标识不变 —— 托盘的插槽与掩码回读都还认着它。
+    pub fn replace_actor(&mut self, id: EntityId, actor: Actor) -> bool {
         let size = self.size;
-        let entity = self.primary_mut();
+        let Some(entity) = self.entity_mut(id) else {
+            return false;
+        };
         entity.actor = actor;
         entity.coverage = entity.actor.coverage();
         entity.drag_offset = None;
         entity.drag_moved = false;
         entity.reset_position(size);
-    }
-
-    /// 只给测试用:直接改角色状态(比如把困倦顶到阈值,省去等几分钟)。
-    #[cfg(test)]
-    pub fn actor_mut_for_test(&mut self) -> &mut Actor {
-        &mut self.primary_mut().actor
-    }
-
-    /// 角色左上角位置(表面局部逻辑像素)。**过渡访问器**:渲染已改成逐实体取
-    /// `Entity::pos()`,这里只剩测试在用。
-    #[allow(dead_code)]
-    pub fn actor_pos(&self) -> (f32, f32) {
-        self.primary().pos
+        true
     }
 
     pub fn passthrough(&self) -> bool {
         self.passthrough
     }
 
-    /// 有没有哪一只正被拎着。合成时的高亮已改成逐实体判定,这条留给托盘/测试。
-    #[allow(dead_code)]
+    // ── 单实体便利访问(只给测试) ──────────────────────────────────
+    // 平台层已经全部改成按实体走了(第 7 步删掉了最后几处调用)。测试里台上通常
+    // 只有一只,这几个省去每次先取标识。
+
+    #[cfg(test)]
+    fn primary(&self) -> &Entity {
+        &self.entities[0]
+    }
+
+    #[cfg(test)]
+    fn primary_mut(&mut self) -> &mut Entity {
+        &mut self.entities[0]
+    }
+
+    #[cfg(test)]
+    pub fn actor(&self) -> &Actor {
+        &self.primary().actor
+    }
+
+    /// 直接改角色状态(比如把困倦顶到阈值,省去等几分钟)。
+    #[cfg(test)]
+    pub fn actor_mut_for_test(&mut self) -> &mut Actor {
+        &mut self.primary_mut().actor
+    }
+
+    #[cfg(test)]
+    pub fn actor_pos(&self) -> (f32, f32) {
+        self.primary().pos
+    }
+
+    /// 有没有哪一只正被拎着。
+    #[cfg(test)]
     pub fn is_dragging(&self) -> bool {
         self.entities.iter().any(Entity::is_dragging)
     }
@@ -1186,7 +1189,9 @@ mod tests {
     use super::*;
 
     fn stage() -> Stage {
-        Stage::new(Actor::Sprite(Sprite::test_pattern(64)), (800, 600))
+        let mut stage = Stage::new((800, 600));
+        stage.spawn(Actor::Sprite(Sprite::test_pattern(64)));
+        stage
     }
 
     #[test]
@@ -1281,8 +1286,10 @@ mod entity_tests {
 
     /// 两只精灵:第二只放在第一只右下方一点,重叠一块。
     fn two_sprites() -> Stage {
-        let mut stage = Stage::new(Actor::Sprite(Sprite::test_pattern(64)), (800, 600));
-        stage.spawn(Actor::Sprite(Sprite::test_pattern(64)));
+        let mut stage = Stage::new((800, 600));
+        for _ in 0..2 {
+            stage.spawn(Actor::Sprite(Sprite::test_pattern(64)));
+        }
         stage
     }
 
@@ -1295,6 +1302,44 @@ mod entity_tests {
         assert_eq!(stage.entities().len(), 1);
         // 同一个标识不会再命中(下标滑动了也不会误伤别人)
         assert!(!stage.despawn(second));
+    }
+
+    #[test]
+    fn empty_stage_is_a_valid_state() {
+        // 托盘可以把最后一只也撤掉。那之后 stage 必须还能正常挨帧推进:
+        // 输入区空 = 全穿透,点哪儿都不在,tick 也不该恐慌
+        let mut stage = Stage::new((800, 600));
+        assert!(stage.entities().is_empty());
+        assert!(stage.input_regions().is_empty());
+        assert_eq!(stage.pick(400.0, 300.0), None);
+        assert_eq!(stage.tick(0.1), Reaction::NONE);
+        assert!(stage.tick_interval() > Duration::ZERO, "空台的间隔不能是 0");
+    }
+
+    #[test]
+    fn replace_actor_keeps_the_id_and_spares_the_others() {
+        // 切形态换的是**那一只**:标识必须留着(托盘插槽与掩码回读都还认着它),
+        // 同台其余的不能被动到 —— 早先那版 `replace_actor` 只认第一只,
+        // 于是第二只永远换不了形态,而第一只会被别人的操作换掉
+        let mut stage = two_sprites();
+        stage.entities[1].pos = (100.0, 100.0);
+        let target = stage.entities()[1].id();
+        let untouched = stage.entities()[0].pos();
+
+        assert!(stage.replace_actor(target, Actor::Sprite(Sprite::test_pattern(128))));
+        assert_eq!(stage.entities().len(), 2);
+        assert_eq!(stage.entities()[1].id(), target, "标识不该变");
+        assert_eq!(
+            stage.entity(target).expect("还在台上").actor().size(),
+            (128, 128)
+        );
+        assert_eq!(stage.entities()[0].pos(), untouched, "不该动到别人");
+        assert_eq!(stage.entities()[0].actor().size(), (64, 64));
+
+        // 已经撤掉的标识:换不上,也不能误伤还在台上的
+        assert!(stage.despawn(target));
+        assert!(!stage.replace_actor(target, Actor::Sprite(Sprite::test_pattern(32))));
+        assert_eq!(stage.entities()[0].actor().size(), (64, 64));
     }
 
     #[test]
@@ -1327,10 +1372,15 @@ mod entity_tests {
     fn same_form_entities_share_one_model() {
         let model = Arc::new(Model::for_test(&["Idle", "Walk"]));
         assert_eq!(Arc::strong_count(&model), 1);
-        let mut stage = Stage::new(
-            Actor::Pet(PetActor::new(Arc::clone(&model), (200, 200), 180.0, 100.0, 250.0, 1)),
-            (1000, 600),
-        );
+        let mut stage = Stage::new((1000, 600));
+        stage.spawn(Actor::Pet(PetActor::new(
+            Arc::clone(&model),
+            (200, 200),
+            180.0,
+            100.0,
+            250.0,
+            1,
+        )));
         stage.spawn(Actor::Pet(PetActor::new(
             Arc::clone(&model),
             (200, 200),
@@ -1387,7 +1437,9 @@ mod pet_tests {
             "SleepEnd",
         ]);
         let actor = Actor::Pet(PetActor::new(Arc::new(model), (200, 200), 180.0, 100.0, 250.0, 7));
-        Stage::new(actor, (1000, 600))
+        let mut stage = Stage::new((1000, 600));
+        stage.spawn(actor);
+        stage
     }
 
     fn activity(stage: &Stage) -> Activity {
@@ -1623,7 +1675,9 @@ mod behaviour_tests {
             "SleepEnd",
         ]);
         let actor = Actor::Pet(PetActor::new(Arc::new(model), (200, 200), 180.0, 100.0, 250.0, 99));
-        Stage::new(actor, (1000, 600))
+        let mut stage = Stage::new((1000, 600));
+        stage.spawn(actor);
+        stage
     }
 
     fn pet(stage: &Stage) -> &PetActor {

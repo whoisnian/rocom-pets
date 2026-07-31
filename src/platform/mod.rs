@@ -11,12 +11,21 @@ mod wayland;
 #[cfg(target_os = "windows")]
 mod windows;
 
-/// 起 stage 时的配置。给不出宠物包时退回 `--sprite` 调试精灵(S1 的验收对象)。
-pub struct Options {
-    /// 宠物包目录(含 manifest.toml);None = 调试精灵。
-    pub pack: Option<PathBuf>,
-    /// 用哪个形态(资产名或中文名),None = 包里第一个。
+/// 启动阵容里的一只:已经读好的包 + 要用哪个形态。
+pub struct StartupPet {
+    pub pack: crate::pack::Pack,
+    /// 形态资产名或中文名;None = 包里第一个(链首)。
     pub form: Option<String>,
+}
+
+/// 起 stage 时的配置。阵容为空时退回调试精灵(S1 的验收对象)。
+pub struct Options {
+    /// 启动阵容(命令行 / 阵容存档 / 配置,由 main 定优先级);空 = 调试精灵。
+    pub pets: Vec<StartupPet>,
+    /// 包目录:托盘的「加一只」从这里列包,存阵容时也按它决定存名字还是存路径。
+    pub packs_dir: Option<PathBuf>,
+    /// 阵容存档路径(托盘改动后写回);None = 定不出位置,只在内存里。
+    pub roster_path: Option<PathBuf>,
     /// 每厘米多少逻辑像素:宠物的屏幕高度 = height_cm × 这个值。
     pub px_per_cm: f32,
     /// 启动就开鼠标穿透。
@@ -27,7 +36,7 @@ pub struct Options {
     pub hotkey: Option<String>,
 }
 
-pub fn run(options: &Options) -> anyhow::Result<()> {
+pub fn run(options: Options) -> anyhow::Result<()> {
     #[cfg(target_os = "linux")]
     return wayland::run(options);
     #[cfg(target_os = "windows")]

@@ -12,6 +12,8 @@ use serde::Deserialize;
 const TEMPLATE: &str = r#"# rocom-pets 配置。命令行参数会覆盖这里的值。
 
 # 宠物包目录(含 manifest.toml)。不填就只显示调试精灵。
+# 注意:这里只管「还没用过托盘」时上哪一只。一旦在托盘里加/撤过宠物,
+# 在场阵容就存到同目录的 roster.toml 里,启动时优先按它恢复。
 # pack = "~/.local/share/rocom-pets/packs/喵喵"
 
 # 用哪个形态(资产名或中文名)。不填 = 包里第一个(链首)。

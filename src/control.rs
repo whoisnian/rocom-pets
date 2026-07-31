@@ -15,20 +15,38 @@ pub enum Control {
     TogglePassthrough,
     /// 把宠物召回到屏幕中间(它跑到边角或看不见时用)。
     Recall,
-    /// 切到进化链上的第几个形态(下标)。
-    SwitchForm(usize),
+    /// 把阵容里第 `slot` 只切到进化链上的第 `form` 个形态。
+    SwitchForm { slot: usize, form: usize },
+    /// 从可选包列表里加一只(下标)。
+    AddPet(usize),
+    /// 撤下阵容里的第几只(下标)。
+    RemovePet(usize),
     /// 退出。
     Quit,
 }
 
-/// 托盘图标 + 菜单。菜单动作发命令,穿透状态回显在勾选项上。
+/// 菜单里的一只宠物。
+#[derive(Debug, Clone)]
+pub struct TrayPet {
+    /// 当前形态名(菜单上显示的那一行)。
+    pub name: String,
+    /// 进化链上的形态名,与 `current_form` 的下标对应。
+    pub forms: Vec<String>,
+    pub current_form: usize,
+}
+
+/// 「加一只」菜单一屏最多列这么多个包;超了就切成一段一段的子菜单。
+/// 全库 539 个包平铺出来根本没法用,而按首字分组的话中文名会分出上百个组。
+const ADD_CHUNK: usize = 24;
+
+/// 托盘图标 + 菜单。菜单动作发命令,状态(穿透、在场阵容)回显在菜单上。
 pub struct Tray {
     sender: Sender<Control>,
     passthrough: bool,
-    pet_name: String,
-    /// 进化链上的形态名(用于菜单),与 `current_form` 的下标对应。
-    forms: Vec<String>,
-    current_form: usize,
+    /// 在场阵容,**下标即插槽号**(命令里带的就是它)。
+    pets: Vec<TrayPet>,
+    /// 包目录里能加的包名,下标即 [`Control::AddPet`] 的参数。
+    available: Vec<String>,
 }
 
 impl ksni::Tray for Tray {
@@ -37,10 +55,10 @@ impl ksni::Tray for Tray {
     }
 
     fn title(&self) -> String {
-        if self.pet_name.is_empty() {
-            "rocom-pets".into()
-        } else {
-            format!("rocom-pets — {}", self.pet_name)
+        match self.pets.len() {
+            0 => "rocom-pets".into(),
+            1 => format!("rocom-pets — {}", self.pets[0].name),
+            n => format!("rocom-pets — {} 等 {n} 只", self.pets[0].name),
         }
     }
 
@@ -68,29 +86,58 @@ impl ksni::Tray for Tray {
             .into(),
         ];
 
-        // 进化链有多个形态才给切换菜单(单形态的包不必多这一层)
-        if self.forms.len() > 1 {
+        items.push(ksni::MenuItem::Separator);
+
+        // 在场的每一只一个子菜单:换形态 + 撤下。**插槽下标要按值搬进闭包** ——
+        // 菜单是回调,点的时候 `self.pets` 早就可能变了。
+        for (slot, pet) in self.pets.iter().enumerate() {
+            let mut submenu: Vec<ksni::MenuItem<Self>> = Vec::new();
+            // 单形态的包不必多「形态」这一层
+            if pet.forms.len() > 1 {
+                submenu.push(
+                    RadioGroup {
+                        selected: pet.current_form,
+                        select: Box::new(move |tray: &mut Self, form| {
+                            tray.send(Control::SwitchForm { slot, form })
+                        }),
+                        options: pet
+                            .forms
+                            .iter()
+                            .map(|name| RadioItem {
+                                label: name.clone(),
+                                ..Default::default()
+                            })
+                            .collect(),
+                    }
+                    .into(),
+                );
+                submenu.push(ksni::MenuItem::Separator);
+            }
+            submenu.push(
+                StandardItem {
+                    label: "撤下".into(),
+                    icon_name: "list-remove".into(),
+                    activate: Box::new(move |tray: &mut Self| tray.send(Control::RemovePet(slot))),
+                    ..Default::default()
+                }
+                .into(),
+            );
             items.push(
                 SubMenu {
-                    label: "形态".into(),
-                    submenu: vec![
-                        RadioGroup {
-                            selected: self.current_form,
-                            select: Box::new(|tray: &mut Self, index| {
-                                tray.send(Control::SwitchForm(index))
-                            }),
-                            options: self
-                                .forms
-                                .iter()
-                                .map(|name| RadioItem {
-                                    label: name.clone(),
-                                    ..Default::default()
-                                })
-                                .collect(),
-                            ..Default::default()
-                        }
-                        .into(),
-                    ],
+                    label: pet.name.clone(),
+                    submenu,
+                    ..Default::default()
+                }
+                .into(),
+            );
+        }
+
+        if !self.available.is_empty() {
+            items.push(
+                SubMenu {
+                    label: "加一只".into(),
+                    icon_name: "list-add".into(),
+                    submenu: self.add_menu(),
                     ..Default::default()
                 }
                 .into(),
@@ -112,6 +159,46 @@ impl ksni::Tray for Tray {
 }
 
 impl Tray {
+    /// 「加一只」的内容:包少就平铺,包多就按名字切段。段的标签取首尾两个名字,
+    /// 于是能像翻通讯录一样找 —— 全库 539 个包平铺是没法用的。
+    fn add_menu(&self) -> Vec<ksni::MenuItem<Self>> {
+        use ksni::menu::{StandardItem, SubMenu};
+
+        let item = |index: usize, label: &str| -> ksni::MenuItem<Self> {
+            StandardItem {
+                label: label.to_string(),
+                activate: Box::new(move |tray: &mut Self| tray.send(Control::AddPet(index))),
+                ..Default::default()
+            }
+            .into()
+        };
+        if self.available.len() <= ADD_CHUNK {
+            return self
+                .available
+                .iter()
+                .enumerate()
+                .map(|(i, name)| item(i, name))
+                .collect();
+        }
+        self.available
+            .chunks(ADD_CHUNK)
+            .enumerate()
+            .map(|(chunk, names)| {
+                let base = chunk * ADD_CHUNK;
+                SubMenu {
+                    label: format!("{} … {}", names[0], names[names.len() - 1]),
+                    submenu: names
+                        .iter()
+                        .enumerate()
+                        .map(|(i, name)| item(base + i, name))
+                        .collect(),
+                    ..Default::default()
+                }
+                .into()
+            })
+            .collect()
+    }
+
     fn send(&self, control: Control) {
         if self.sender.send(control).is_err() {
             log::warn!("主循环已退出,托盘命令没送出去");
@@ -129,30 +216,25 @@ impl TrayHandle {
             .update(move |tray: &mut Tray| tray.passthrough = passthrough);
     }
 
-    /// 形态换了之后同步单选与标题。
-    pub fn set_form(&self, index: usize, name: String) {
-        self.0.update(move |tray: &mut Tray| {
-            tray.current_form = index;
-            tray.pet_name = name;
-        });
+    /// 阵容变了(加/撤/换形态)之后重建那几项与标题。
+    pub fn set_roster(&self, pets: Vec<TrayPet>) {
+        self.0.update(move |tray: &mut Tray| tray.pets = pets);
     }
 }
 
 /// 起托盘。失败不致命(没有托盘宿主的桌面照样能跑),调用方只记个日志。
 pub fn spawn_tray(
     sender: Sender<Control>,
-    pet_name: String,
     passthrough: bool,
-    forms: Vec<String>,
-    current_form: usize,
+    pets: Vec<TrayPet>,
+    available: Vec<String>,
 ) -> Result<TrayHandle> {
     use ksni::blocking::TrayMethods;
     let handle = Tray {
         sender,
         passthrough,
-        pet_name,
-        forms,
-        current_form,
+        pets,
+        available,
     }
     .spawn()
     .context("注册托盘图标失败(桌面没有 StatusNotifier 宿主?)")?;
@@ -362,8 +444,10 @@ pub fn send_dbus_command(control: Control) -> Result<()> {
         Control::TogglePassthrough => "TogglePassthrough",
         Control::Recall => "Recall",
         Control::Quit => "Quit",
-        // 换形态要带下标,命令行没暴露(托盘菜单里选更直观)
-        Control::SwitchForm(_) => anyhow::bail!("换形态请用托盘菜单"),
+        // 这几个要带下标,命令行没暴露(托盘菜单里选更直观)
+        Control::SwitchForm { .. } | Control::AddPet(_) | Control::RemovePet(_) => {
+            anyhow::bail!("加/撤宠物与换形态请用托盘菜单")
+        }
     };
     proxy
         .call::<_, _, ()>(method, &())

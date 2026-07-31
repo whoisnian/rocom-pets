@@ -265,6 +265,12 @@ impl Form {
     }
 }
 
+/// 包目录里的一项,只带名字与位置(见 [`Pack::list_entries`])。
+pub struct PackEntry {
+    pub name: String,
+    pub dir: PathBuf,
+}
+
 pub struct Pack {
     pub species_id: i64,
     pub species_name: String,
@@ -305,6 +311,45 @@ impl Pack {
                 }
             })
             .collect()
+    }
+
+    /// 只列**名字**,不读形态。托盘的「加一只」菜单要把包目录整个列出来
+    /// (手上就有 539 个),而 [`Pack::list`] 会把每个包的动作表与材质表全解析出来 ——
+    /// 菜单只需要一行字,真选中了再 [`Pack::load`]。
+    ///
+    /// 解析不了的包退用目录名:它多半仍能加载(名字这一节坏了不代表形态坏了),
+    /// 真加载失败时再报错也不迟。
+    pub fn list_entries(dir: &Path) -> Vec<PackEntry> {
+        #[derive(Deserialize)]
+        struct NameOnly {
+            species: RawSpecies,
+        }
+
+        let mut entries: Vec<PathBuf> = match std::fs::read_dir(dir) {
+            Ok(read) => read
+                .filter_map(|e| e.ok().map(|e| e.path()))
+                .filter(|p| p.join("manifest.toml").is_file())
+                .collect(),
+            Err(e) => {
+                log::debug!("包目录 {dir:?} 读不了: {e}");
+                return Vec::new();
+            }
+        };
+        entries.sort();
+        let mut packs: Vec<PackEntry> = entries
+            .into_iter()
+            .map(|dir| {
+                let name = std::fs::read_to_string(dir.join("manifest.toml"))
+                    .ok()
+                    .and_then(|text| toml::from_str::<NameOnly>(&text).ok())
+                    .map(|raw| raw.species.name)
+                    .or_else(|| dir.file_name().map(|n| n.to_string_lossy().into_owned()))
+                    .unwrap_or_else(|| "?".to_string());
+                PackEntry { name, dir }
+            })
+            .collect();
+        packs.sort_by(|a, b| a.name.cmp(&b.name));
+        packs
     }
 
     /// 按「路径」或「包名」定位一个包:优先当路径用,否则在包目录里按物种名/目录名找。

@@ -11,6 +11,7 @@ mod pack_list;
 mod pet;
 mod platform;
 mod render;
+mod roster;
 mod sprite;
 mod stage;
 
@@ -36,6 +37,10 @@ stage 模式(不给参数时读 ~/.config/rocom-pets/config.toml,首次运行会
   --list             列出包目录里的宠物包(默认 ~/.local/share/rocom-pets/packs)
   --packs-dir <目录> 换个包目录
   (--pack 既接受目录路径,也接受包名/物种名,后者在包目录里找)
+
+在场阵容(同时上几只):
+  托盘菜单里「加一只」/「撤下」,阵容存在 ~/.config/rocom-pets/roster.toml,
+  下次启动自动恢复。给了 --pack 就只上这一只,不读也不动那份存档。
 
 控制已在运行的实例(走 D-Bus,可绑到 KDE 自定义快捷键):
   --toggle-passthrough  切换鼠标穿透
@@ -166,23 +171,66 @@ fn main() -> anyhow::Result<()> {
             config::Config::default()
         }
     };
-    // 包的来源:命令行 --pack(路径或包名)优先,否则配置文件里的 pack
-    let wanted = cli_pack_name.or_else(|| file.pack.clone());
-    let pack_dir = match wanted {
-        Some(value) => Some(
-            pack::Pack::resolve(&value, packs_dir.as_deref())
-                .map(|pack| pack.dir)
-                .with_context(|| format!("解析 --pack {value} 失败"))?,
+    // 阵容来源,三选一(命令行 > 阵容存档 > 配置):
+    // 命令行点名了就只上这一只(调试时要的就是「只看这只」);没点名才恢复上次的阵容;
+    // 都没有就用配置里那只单宠 —— 这条是给还没碰过托盘的用户留的老路。
+    let roster_path = path.as_deref().map(roster::Roster::path_beside);
+    // `from_user`:这份名单是用户当场写的(命令行/配置)还是程序自己存的(阵容存档)。
+    // 读不动时的处理完全不同,见下面。
+    let (slots, from_user) = match cli_pack_name {
+        Some(name) => (
+            vec![roster::Slot {
+                pack: name,
+                form: cli_form.clone(),
+            }],
+            true,
         ),
-        None => None,
+        None => match roster_path
+            .as_deref()
+            .and_then(roster::Roster::load)
+            .filter(|r| !r.pets.is_empty())
+        {
+            Some(saved) => (saved.pets, false),
+            None => (
+                file.pack
+                    .clone()
+                    .map(|pack| {
+                        vec![roster::Slot {
+                            pack,
+                            form: cli_form.clone().or_else(|| file.form.clone()),
+                        }]
+                    })
+                    .unwrap_or_default(),
+                true,
+            ),
+        },
     };
+
+    // 包在起窗口前就读掉:manifest 有问题要立刻报错,而不是等到画第一帧。
+    // **只有存档里那些**读不动才降级成警告 —— 它是机器写的,某个包被删了不该拦住启动;
+    // 命令行/配置里点名的读不动就是硬错误,用户写的东西不生效必须让他看见。
+    let mut pets = Vec::new();
+    for slot in slots {
+        match pack::Pack::resolve(&slot.pack, packs_dir.as_deref()) {
+            Ok(pack) => pets.push(platform::StartupPet {
+                pack,
+                form: slot.form,
+            }),
+            Err(e) if from_user => {
+                return Err(e).with_context(|| format!("解析宠物包 {} 失败", slot.pack));
+            }
+            Err(e) => log::warn!("阵容里的 {} 上不了台({e:#}),跳过", slot.pack),
+        }
+    }
+
     let options = platform::Options {
-        pack: pack_dir,
-        form: cli_form.or(file.form),
+        pets,
+        packs_dir,
+        roster_path,
         px_per_cm: cli_px_per_cm.unwrap_or(file.px_per_cm),
         passthrough: cli_passthrough || file.passthrough,
         tray: !no_tray,
         hotkey: file.hotkey,
     };
-    platform::run(&options)
+    platform::run(options)
 }
