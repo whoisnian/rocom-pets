@@ -16,9 +16,14 @@ struct Camera {
     outline_width: f32,
     // 秒;特效层的 UV 卷动靠它推进
     time: f32,
+    // ⚠ `vec2<f32>` 按 8 字节对齐:这里它落在 88 而不是紧挨着 time 的 84。
+    // Rust 那边必须留一个 f32 的填充,否则两侧错开一个字段(见 gpu.rs 的说明)。
+    // 表情:脸那两个材质的 UV 偏移(整格)。**每只一份**,所以放在这儿而不是材质里 ——
+    // 材质是按形态共享的,同一个形态的两只可以是两种表情。
+    face_uv: vec2<f32>,
     // 不要在这儿补 vec3 占位:WGSL 里 vec3 要 16 字节对齐,会把结构体从 96 撑到 112,
-    // 和 Rust 侧的 96 对不上(wgpu 会报 "bound with size 96 where the shader expects 112")。
-    // mat4x4 已经让整个结构按 16 对齐,尾部的 12 字节填充由规则自动补上。
+    // 和 Rust 侧的对不上(wgpu 会报 "bound with size 96 where the shader expects 112")。
+    // mat4x4 已经让整个结构按 16 对齐,尾部的填充由规则自动补上。
 };
 
 /// 每材质一份。普通材质也有(tint 全 1、params.z=0),两条通道共用布局。
@@ -581,7 +586,10 @@ fn matcap_light(n: vec3<f32>) -> vec3<f32> {
 
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
-    let tex = textureSample(base_color, base_sampler, in.uv);
+    // 表情:脸那两个槽的贴图是 2×4 的图集,网格 UV 落在左上那一格,
+    // 换表情就是整格地偏一下(flags.x = 这是脸)。其余材质偏移量恒为 0。
+    let uv = in.uv + camera.face_uv * step(0.5, material.flags.x);
+    let tex = textureSample(base_color, base_sampler, uv);
     // **alpha 有三种含义,由材质决定**(params.x / params.z):
     // - 镂空遮罩(眼/嘴的表情图集,params.x):按阈值剔,不剔就是一块方糊;
     // - **不透明度**(params.z,静态开关 `Opacity or OpacityMask` 点名的 11 个材质);

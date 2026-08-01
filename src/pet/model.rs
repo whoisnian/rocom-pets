@@ -46,6 +46,8 @@ pub struct Primitive {
 
 pub struct Material {
     pub name: String,
+    /// 脸(眼/嘴)那两个槽 —— 表情图集就贴在它们身上,见 pack.rs 的 `Material::face`。
+    pub face: bool,
     /// 基色贴图(RGBA8),路径来自 manifest 的材质表;读失败才是 None,渲染时用白色兜底。
     pub base_color: Option<Image>,
     /// 贴图 alpha 是**镂空遮罩**(眼/嘴的表情图集)还是**线条遮罩**(本体的纹路)。
@@ -383,6 +385,7 @@ impl Model {
                 materials.push(Material {
                     name: name.clone(),
                     base_color,
+                    face: spec.face,
                     cutout: spec.mask_alpha,
                     line_detail,
                     translucent: spec.translucent,

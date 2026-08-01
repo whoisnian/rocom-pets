@@ -39,10 +39,10 @@ pub struct Options {
     pub passthrough: bool,
     /// 起托盘图标(没有托盘宿主的桌面上失败也不致命)。
     pub tray: bool,
-    /// 全局热键的建议按键;None = 不申请。
-    pub hotkey: Option<String>,
     /// 叫声音量 0..1;0 = 干脆不开音频设备。
     pub volume: f32,
+    /// 目标帧率;台上在干什么都按它推进。
+    pub fps: u32,
 }
 
 pub fn run(options: Options) -> anyhow::Result<()> {

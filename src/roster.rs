@@ -15,9 +15,17 @@ use serde::{Deserialize, Serialize};
 const HEADER: &str = "\
 # rocom-pets 的在场阵容 —— 托盘或配置窗口里改动时自动重写。
 # 手改也认,但下次改动会整份覆盖(注释保不住,这就是它没和 config.toml 放一起的原因)。
-# pack 写包名、包目录名、`.rkpet` 文件名或路径;form 写形态资产名,不写 = 链首。
-# scale 相对大小(1.0 = 按 config.toml 的 px_per_cm);persona 性格;emotes 表情池。
-# 后三项不写就是默认(1.0 / 乖巧 / 全部表情)。
+#
+# pack        包名、包目录名、`.rkpet` 文件名或路径
+# form        形态资产名,不写 = 链首
+# scale       相对大小,1.0 = 按 config.toml 的 px_per_cm 算出来的尺寸
+# persona     性格,照搬游戏的性格名(平和/调皮/天真/懒散/冷静/理性/胆小/急躁)
+#             表情跟着性格走,没有单独的表情池
+# voice       参与叫声,不写 = 参与
+# voice_value 嗓音 −100~100,不写 = 0(原调);配置窗口里可以重掷
+# remember    记住落脚点;home_x 是运行时写的「上次站在可走范围的百分之几」
+#
+# 除 pack 外都可以不写,不写就是默认。
 
 ";
 
@@ -25,6 +33,10 @@ const HEADER: &str = "\
 ///
 /// 除 `pack` 外全是 `Option`,而且**默认值一律不写出去**:存档要能一眼看出
 /// 「哪几只是特意调过的」,而不是每只都糊上一整套等于默认的字段。
+///
+/// 字段分两类:大部分归**配置窗口/托盘**改,而 `voice_value` 与 `home_x` 是
+/// **运行时写回来的**(掷出来的嗓音、站过的位置)。配置窗口存盘时会把后两项从盘上
+/// 原样带过去,别把桌宠刚记下的东西盖掉(见 settings/mod.rs 的 `carry_over_runtime_fields`)。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Slot {
     pub pack: String,
@@ -36,9 +48,20 @@ pub struct Slot {
     /// 性格 id,见 persona.rs。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub persona: Option<String>,
-    /// 允许的表情(stage.rs 的 `EMOTES` 里的动作名);不写 = 全部。
+    /// 参与叫声;不写 = 参与。整体静音在托盘里,这一项是「只让这一只闭嘴」。
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub emotes: Option<Vec<String>>,
+    pub voice: Option<bool>,
+    /// 嗓音 −100~100(游戏里那个 `voice` 属性的量纲)。**不写 = 0**,也就是原调;
+    /// 想要一只与众不同的嗓子,在配置窗口里按「重掷」。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub voice_value: Option<f32>,
+    /// 记住落脚点;不写 = 不记(每次上台重新摆)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remember: Option<bool>,
+    /// 上次站在可走范围的百分之几(0~1)。**运行时写的**,存比例而不是像素 ——
+    /// 换了分辨率或多显示器时像素值毫无意义。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub home_x: Option<f32>,
 }
 
 impl Slot {
@@ -49,7 +72,10 @@ impl Slot {
             form,
             scale: None,
             persona: None,
-            emotes: None,
+            voice: None,
+            voice_value: None,
+            remember: None,
+            home_x: None,
         }
     }
 }
@@ -118,7 +144,10 @@ mod tests {
                     form: Some("Gra_MiaoMiao2_001".into()),
                     scale: Some(1.4),
                     persona: Some("lively".into()),
-                    emotes: Some(vec!["Happy".into(), "Show".into()]),
+                    voice: Some(false),
+                    voice_value: Some(-37.0),
+                    remember: Some(true),
+                    home_x: Some(0.62),
                 },
                 Slot::new("/abs/path/波波拉".into(), None),
             ],
@@ -143,7 +172,6 @@ mod tests {
         assert_eq!(roster.pets[0], Slot::new("喵喵".into(), None));
         assert_eq!(roster.pets[1].scale, None);
         assert_eq!(roster.pets[1].persona, None);
-        assert_eq!(roster.pets[1].emotes, None);
     }
 
     #[test]

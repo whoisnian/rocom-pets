@@ -1,294 +1,299 @@
-//! 「活跃宠物」那一页:加/撤宠物,改每一只的形态、大小、性格、表情。
+//! 「活跃宠物」逐只编辑。侧栏把每只展开成一项,这里画选中那一只的详情。
 //!
-//! 这一页编辑的就是 `roster.toml` 里那一串 `[[pet]]`。托盘菜单里也能改其中几项
-//! (形态/大小/性格),但表情池是多选、大小是连续值 —— 菜单表达不了,只有这儿有。
+//! 编辑的就是 `roster.toml` 里那一段 `[[pet]]`。**改完立刻生效**:形态、大小、性格、
+//! 表情池、参与叫声、记住落脚点,每一项都会让桌宠那边重建这只角色。
+//! 唯一的例外是大小那一行 —— 拖的时候只动数字,松手(或数值框提交)才落盘
+//! (见 mod.rs 的说明)。
 
 use eframe::egui;
 
-use super::SettingsApp;
+use super::common::percent_slider;
+use super::{Page, SettingsApp, theme};
 use crate::persona;
-use crate::platform::PetOptions;
-use crate::roster::Slot;
-use crate::stage::EMOTES;
+use crate::platform::{PetOptions, SCALE_RANGE};
 
 impl SettingsApp {
-    pub(super) fn pets_tab(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            ui.heading("活跃宠物");
-            ui.label(format!("({} 只)", self.roster.len()));
-        });
-        ui.small("这里改的是「桌面上现在有哪几只、各是什么脾气」。改完记得保存。");
-        ui.add_space(6.0);
-
-        egui::ScrollArea::vertical()
-            .auto_shrink([false, false])
-            .show(ui, |ui| {
-                self.add_section(ui);
-                ui.add_space(8.0);
-                if self.roster.is_empty() {
-                    ui.label("台上一只都没有。从上面挑一个包加进来。");
-                    return;
-                }
-                // 撤下要等这一轮画完再做,否则下标会在遍历中途错位
-                let mut remove: Option<usize> = None;
-                for slot in 0..self.roster.len() {
-                    if self.pet_card(ui, slot) {
-                        remove = Some(slot);
-                    }
-                    ui.add_space(6.0);
-                }
-                if let Some(slot) = remove {
-                    self.roster.remove(slot);
-                    self.dirty = true;
-                    self.status.ok("已撤下,记得保存");
-                }
-            });
-    }
-
-    /// 「添加宠物」:一个查找框 + 匹配到的包。
-    ///
-    /// **不做成下拉菜单**:包目录里有五百多个包,拉一个五百项的列表没法用;
-    /// 打两个字筛出来才是实际的用法(与托盘「加一只」按名字切段是同一个问题的两种解法)。
-    fn add_section(&mut self, ui: &mut egui::Ui) {
-        egui::CollapsingHeader::new("添加宠物")
-            .default_open(self.roster.is_empty())
-            .show(ui, |ui| {
-                if self.entries.is_empty() {
-                    ui.label("包目录里没有包。去「宠物包」那页导入。");
-                    return;
-                }
-                ui.horizontal(|ui| {
-                    ui.label("查找");
-                    ui.text_edit_singleline(&mut self.filter);
-                });
-                let needle = self.filter.trim().to_lowercase();
-                let hits: Vec<(String, std::path::PathBuf)> = self
-                    .entries
-                    .iter()
-                    .filter(|e| needle.is_empty() || e.name.to_lowercase().contains(&needle))
-                    .map(|e| (e.name.clone(), e.path.clone()))
-                    .collect();
-                // 一屏放不下就先给个提示,别把五百个按钮全画出来
-                const MAX_SHOWN: usize = 40;
-                ui.small(format!(
-                    "{} 个匹配{}",
-                    hits.len(),
-                    if hits.len() > MAX_SHOWN {
-                        format!(",只列前 {MAX_SHOWN} 个,再打几个字缩小范围")
-                    } else {
-                        String::new()
-                    }
-                ));
-                egui::ScrollArea::vertical()
-                    .id_salt("add-pet")
-                    .max_height(160.0)
-                    .show(ui, |ui| {
-                        for (name, path) in hits.iter().take(MAX_SHOWN) {
-                            if ui.button(format!("+ {name}")).clicked() {
-                                self.add_to_roster(path);
-                            }
-                        }
-                    });
-            });
-    }
-
-    /// 一只宠物的那一块。返回 true 表示「撤下我」。
-    fn pet_card(&mut self, ui: &mut egui::Ui, slot: usize) -> bool {
-        let pack = self.pack_for_slot(slot);
-        let title = match &pack {
-            Some(pack) => pack.species_name.clone(),
-            None => self.roster[slot].pack.clone(),
+    pub(super) fn pet_page(&mut self, ui: &mut egui::Ui, slot: usize) {
+        if slot >= self.roster.len() {
+            self.page = Page::Packs;
+            return;
+        }
+        let Some(pack) = self.pack_for_slot(slot) else {
+            self.missing_pack(ui, slot);
+            return;
         };
-        let mut remove = false;
+        let form_index = self.form_index(&pack, slot);
+        let form = &pack.forms[form_index];
 
-        egui::Frame::group(ui.style()).show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.strong(&title);
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("撤下").clicked() {
-                        remove = true;
-                    }
-                });
-            });
-
-            let Some(pack) = pack else {
-                // 包被删了或者改名了。**不自动清掉**:也可能只是包目录暂时没挂上,
-                // 由用户决定要不要撤下
-                ui.colored_label(
-                    ui.visuals().error_fg_color,
-                    "这个包在包目录里找不到了,它上不了台。",
+        // ── 标题 + 来源行 + 撤下 ───────────────────────────────
+        ui.horizontal(|ui| {
+            ui.vertical(|ui| {
+                ui.heading(&form.name);
+                ui.add_space(2.0);
+                let archived = self
+                    .path_for_slot(slot)
+                    .is_some_and(|p| p.is_file());
+                theme::hint(
+                    ui,
+                    format!(
+                        "{} 进化链 · 第 {} 形态 · 包 {} {} · {}",
+                        pack.species_name,
+                        form_index + 1,
+                        pack.species_id,
+                        pack.species_name,
+                        if archived { "rkpet" } else { "目录" }
+                    ),
                 );
-                return;
-            };
+            });
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::TOP), |ui| {
+                if ui.button("撤下").clicked() {
+                    self.roster.remove(slot);
+                    self.page = if self.roster.is_empty() {
+                        Page::Packs
+                    } else {
+                        Page::Pet(slot.min(self.roster.len() - 1))
+                    };
+                    self.apply();
+                    self.status.ok("已撤下");
+                }
+            });
+        });
+        ui.add_space(14.0);
+        ui.separator();
+        ui.add_space(14.0);
 
-            // 编辑的是运行时形状,改完再写回存档形状(默认值不落盘)
-            let mut options = PetOptions::from_slot(&self.roster[slot]);
-            let mut changed = false;
+        // ── 表单 ──────────────────────────────────────────────
+        let mut options = PetOptions::from_slot(&self.roster[slot]);
+        let before = options.clone();
+        let mut form_changed = false;
+        let mut commit = false;
 
-            egui::Grid::new(("pet", slot))
-                .num_columns(2)
-                .spacing([12.0, 8.0])
-                .show(ui, |ui| {
-                    // ── 形态 ─────────────────────────────────
-                    if pack.forms.len() > 1 {
-                        ui.label("形态");
-                        let current = self.roster[slot]
-                            .form
-                            .as_deref()
-                            .and_then(|want| {
-                                pack.forms.iter().position(|f| f.asset == want || f.name == want)
-                            })
-                            .unwrap_or(0);
-                        let mut picked = current;
+        egui::Grid::new(("pet", slot))
+            .num_columns(2)
+            .min_col_width(theme::LABEL_W)
+            .spacing([14.0, 16.0])
+            .show(ui, |ui| {
+                if pack.forms.len() > 1 {
+                    label(ui, "形态:");
+                    ui.horizontal(|ui| {
+                        let mut picked = form_index;
                         egui::ComboBox::from_id_salt(("form", slot))
-                            .selected_text(&pack.forms[current].name)
+                            .width(220.0)
+                            .selected_text(format!(
+                                "{}({} / {})",
+                                pack.forms[form_index].name,
+                                form_index + 1,
+                                pack.forms.len()
+                            ))
                             .show_ui(ui, |ui| {
-                                for (index, form) in pack.forms.iter().enumerate() {
+                                for (index, f) in pack.forms.iter().enumerate() {
                                     ui.selectable_value(
                                         &mut picked,
                                         index,
-                                        format!("{}({:.0}cm)", form.name, form.height_cm),
+                                        format!("{}({:.0}cm)", f.name, f.height_cm),
                                     );
                                 }
                             });
-                        if picked != current {
+                        if picked != form_index {
                             self.roster[slot].form = Some(pack.forms[picked].asset.clone());
-                            changed = true;
+                            form_changed = true;
                         }
-                        ui.end_row();
+                        theme::hint(ui, "切换后立即在桌面上变身");
+                    });
+                    ui.end_row();
+                }
+
+                label(ui, "大小:");
+                ui.horizontal(|ui| {
+                    if percent_slider(ui, &mut options.scale, SCALE_RANGE) {
+                        commit = true;
                     }
+                    // 屏幕像素比倍率直观:范围那句在旁边解释能调到哪儿
+                    let px =
+                        form.height_cm * form.scale * self.config.px_per_cm * options.scale;
+                    theme::hint(ui, format!("屏幕上约 {px:.0}px 高 · 50% – 200%"));
+                });
+                ui.end_row();
 
-                    // ── 大小 ─────────────────────────────────
-                    ui.label("大小");
-                    ui.vertical(|ui| {
-                        if ui
-                            .add(
-                                egui::Slider::new(
-                                    &mut options.scale,
-                                    crate::platform::SCALE_RANGE,
-                                )
-                                .suffix("×")
-                                .fixed_decimals(2),
-                            )
-                            .changed()
-                        {
-                            changed = true;
-                        }
-                        // 换算成像素:倍率本身没有直觉,像素高度有
-                        let form = &pack.forms[self.roster[slot]
-                            .form
-                            .as_deref()
-                            .and_then(|want| {
-                                pack.forms.iter().position(|f| f.asset == want || f.name == want)
-                            })
-                            .unwrap_or(0)];
-                        ui.small(format!(
-                            "屏幕上约 {:.0}px 高",
-                            form.height_cm * form.scale * self.config.px_per_cm * options.scale
-                        ));
-                    });
-                    ui.end_row();
-
-                    // ── 性格 ─────────────────────────────────
-                    ui.label("性格");
-                    ui.vertical(|ui| {
-                        egui::ComboBox::from_id_salt(("persona", slot))
-                            .selected_text(options.persona.name)
-                            .show_ui(ui, |ui| {
-                                for candidate in persona::ALL {
-                                    if ui
-                                        .selectable_label(
-                                            options.persona.id == candidate.id,
-                                            candidate.name,
-                                        )
-                                        .clicked()
-                                    {
-                                        options.persona = *candidate;
-                                        changed = true;
-                                    }
-                                }
-                            });
-                        ui.small(options.persona.about);
-                    });
-                    ui.end_row();
-
-                    // ── 表情 ─────────────────────────────────
-                    ui.label("表情");
-                    ui.vertical(|ui| {
-                        // 存档里 None = 全都要;这里摊成一组勾选,勾满了再存回 None。
-                        // **`allowed` 拿的是 String 而不是 `&str`**:借着 `options.emotes`
-                        // 的话,下面那一行赋值就借不到了
-                        let mut allowed: Vec<String> = match &options.emotes {
-                            Some(list) => list.clone(),
-                            None => EMOTES.iter().map(|(name, _)| name.to_string()).collect(),
-                        };
-                        let mut touched = false;
-                        ui.horizontal_wrapped(|ui| {
-                            for (name, label) in EMOTES {
-                                let mut on = allowed.iter().any(|n| n == name);
-                                // 包里没有这段动作的话勾了也没用,直接标出来
-                                let missing =
-                                    !pack.forms.iter().any(|f| f.clips.contains_key(*name));
-                                let response =
-                                    ui.add_enabled(!missing, egui::Checkbox::new(&mut on, *label));
-                                if missing {
-                                    response.on_disabled_hover_text("这个包里没有这段动作");
-                                } else if response.changed() {
-                                    if on {
-                                        allowed.push(name.to_string());
-                                    } else {
-                                        allowed.retain(|n| n != name);
-                                    }
-                                    touched = true;
+                label(ui, "性格:");
+                ui.horizontal(|ui| {
+                    egui::ComboBox::from_id_salt(("persona", slot))
+                        .width(150.0)
+                        .selected_text(options.persona.name)
+                        .show_ui(ui, |ui| {
+                            for candidate in persona::ALL {
+                                if ui
+                                    .selectable_label(
+                                        options.persona.id == candidate.id,
+                                        candidate.name,
+                                    )
+                                    .clicked()
+                                {
+                                    options.persona = *candidate;
                                 }
                             }
                         });
-                        if touched {
-                            options.emotes =
-                                (allowed.len() != EMOTES.len()).then_some(allowed);
-                            changed = true;
-                        }
-                        ui.small("待机时随手做的表情。一个不留的话它就只会站着。");
-                    });
-                    ui.end_row();
+                    // 表情没有单独一行:它**改不了**(跟着性格走),摆一行只读的字
+                    // 反而像是能点。非「默认」脸的才提一句 —— 那是肉眼看得出来的区别
+                    let face = options.persona.face.name;
+                    match face == crate::persona::DEFAULT_FACE.name {
+                        true => theme::hint(ui, options.persona.about),
+                        false => theme::hint(ui, format!("{} · 眼睛「{face}」", options.persona.about)),
+                    }
                 });
+                ui.end_row();
 
-            if changed {
-                write_options(&mut self.roster[slot], &options);
-                self.dirty = true;
+                label(ui, "叫声:");
+                ui.horizontal(|ui| {
+                    ui.checkbox(&mut options.voice, "参与叫声");
+                    theme::hint(ui, "嗓音");
+                    ui.label(theme::value(format!("{:+.0}", options.voice_value.unwrap_or(0.0))));
+                    // 0 = 原调。**不再自动掷**:同一个包的两只听着一样是正常的,
+                    // 想要不一样就自己按一下
+                    theme::hint(ui, "0 = 原调");
+                    if ui.add_enabled(options.voice, egui::Button::new("重掷")).clicked() {
+                        options.voice_value = Some(reroll(&mut self.status));
+                    }
+                });
+                ui.end_row();
+
+                self.actions_row(ui, slot, form);
+
+                label(ui, "位置:");
+                ui.horizontal(|ui| {
+                    ui.checkbox(&mut options.remember, "记住上次落脚点");
+                    match (options.remember, options.home_x) {
+                        (true, Some(x)) => {
+                            theme::hint(ui, "上次站在");
+                            ui.label(theme::value(theme::percent(x)));
+                            theme::hint(ui, "处");
+                        }
+                        (true, None) => theme::hint(ui, "还没记到位置"),
+                        (false, _) => theme::hint(ui, "每次上台重新摆"),
+                    }
+                });
+                ui.end_row();
+            });
+
+
+        if options != before {
+            options.write_into(&mut self.roster[slot]);
+            // 滑杆还在拖的时候不落盘;其余改动立刻生效
+            if commit || options.scale == before.scale {
+                self.apply();
             }
+        } else if form_changed || commit {
+            self.apply();
+        }
+    }
+
+    /// 包不在了(被删了或改名了)。**不自动清掉**:也可能只是包目录暂时没挂上,
+    /// 由用户决定要不要撤下。
+    fn missing_pack(&mut self, ui: &mut egui::Ui, slot: usize) {
+        let name = self.roster[slot].pack.clone();
+        ui.heading(&name);
+        ui.add_space(10.0);
+        ui.colored_label(
+            ui.visuals().error_fg_color,
+            "这个包在包目录里找不到了,它上不了台。",
+        );
+        ui.add_space(12.0);
+        if ui.button("撤下").clicked() {
+            self.roster.remove(slot);
+            self.page = Page::Packs;
+            self.apply();
+            self.status.ok("已撤下");
+        }
+    }
+
+    /// 这只宠物的动作:**和上面那几行同一张表**里的一行,一格一个按钮。
+    /// 这个形态没有的置灰,点一下当场在桌面上播一次。
+    ///
+    /// 有没有这段动作是**现算的**,不是读 manifest 的 `[report]`(全库没有一个包写了
+    /// 那一节);降级也算有,见 stage.rs 的 `has_clip`。
+    ///
+    /// 点一下走 `Control::Play`:配置窗口是**另一个进程**,只能喊一声让桌宠去播。
+    fn actions_row(&mut self, ui: &mut egui::Ui, slot: usize, form: &crate::pack::Form) {
+        let clips = crate::stage::RUNTIME_CLIPS;
+        let have = clips
+            .iter()
+            .filter(|(name, _)| crate::stage::has_clip(form, name))
+            .count();
+        let running = crate::control::is_running();
+        let mut play: Option<(usize, &'static str)> = None;
+        label(ui, "动作:");
+        ui.vertical(|ui| {
+            ui.horizontal(|ui| {
+                ui.label(theme::value(format!("{have} / {}", clips.len())));
+                theme::hint(ui, "点击预览");
+            });
+            ui.add_space(6.0);
+            egui::Grid::new(("actions", slot))
+                .num_columns(6)
+                .spacing([6.0, 6.0])
+                .show(ui, |ui| {
+                    for (index, (name, label)) in clips.iter().enumerate() {
+                        let ok = crate::stage::has_clip(form, name);
+                        let button =
+                            egui::Button::new(*label).min_size(egui::vec2(74.0, theme::CONTROL_H));
+                        let response = ui.add_enabled(ok && running, button);
+                        if !ok {
+                            response.on_disabled_hover_text("这个形态没有这段动作");
+                        } else if !running {
+                            response.on_disabled_hover_text("桌宠没在跑");
+                        } else if response.clicked() {
+                            play = Some((index, label));
+                        }
+                        if index % 6 == 5 {
+                            ui.end_row();
+                        }
+                    }
+                });
         });
-        remove
+        ui.end_row();
+        if let Some((index, label)) = play {
+            match crate::control::play(slot as u32, index as u32) {
+                Ok(()) => self.status.ok(format!("让它做了个「{label}」")),
+                Err(e) => self.status.fail(format!("没送出去:{e:#}")),
+            }
+        }
     }
 }
 
-/// 把编辑中的选项写回存档形状。**默认值不落盘**,理由见 roster.rs 的 `Slot`。
+fn label(ui: &mut egui::Ui, text: &str) {
+    // 表单标签右对齐 —— 设计稿 KDE 栏的规格
+    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+        ui.label(text);
+    });
+}
+
+/// 掷一个新嗓音 −100~100。
 ///
-/// 不复用 `PetOptions::write_into`:那个是 platform 内部用的(私有),
-/// 而这里还要把 `scale` 按合法区间夹一次 —— 滑杆给的值总在区间里,但存档是文本文件,
-/// 谁都可能手改。
-fn write_options(slot: &mut Slot, options: &PetOptions) {
-    let scale = options.scale.clamp(
-        *crate::platform::SCALE_RANGE.start(),
-        *crate::platform::SCALE_RANGE.end(),
-    );
-    slot.scale = (scale != 1.0).then_some(scale);
-    slot.persona = options.persona.saved_id();
-    slot.emotes = options.emotes.clone();
+/// 用时间当种子:这里只掷一个数,犯不着为它把 stage 里那个 xorshift 搬过来。
+fn reroll(status: &mut super::Status) -> f32 {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    let value = (nanos % 2001) as f32 / 10.0 - 100.0;
+    status.ok(format!("嗓音重掷成 {value:+.0}"));
+    value
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::roster::Slot;
 
     #[test]
     fn defaults_do_not_land_in_the_saved_slot() {
         // 默认那一只在存档里只该有 pack/form,不然「谁被调过」就看不出来了
         let mut slot = Slot::new("喵喵".into(), None);
-        write_options(&mut slot, &PetOptions::default());
+        PetOptions::default().write_into(&mut slot);
         assert_eq!(slot.scale, None);
         assert_eq!(slot.persona, None);
-        assert_eq!(slot.emotes, None);
+        assert_eq!(slot.voice, None);
+        assert_eq!(slot.remember, None);
     }
 
     #[test]
@@ -297,23 +302,31 @@ mod tests {
         let options = PetOptions {
             scale: 1.5,
             persona: persona::Persona::by_id("lazy"),
-            emotes: Some(vec!["Happy".into()]),
+            voice: false,
+            voice_value: Some(-37.0),
+            remember: true,
+            home_x: Some(0.62),
         };
-        write_options(&mut slot, &options);
+        options.write_into(&mut slot);
         assert_eq!(PetOptions::from_slot(&slot), options);
     }
 
     #[test]
     fn a_hand_edited_scale_is_clamped() {
         // 存档是文本文件:有人写个 99 进去,画布就会大到显存装不下
-        let mut slot = Slot::new("喵喵".into(), None);
-        write_options(
-            &mut slot,
-            &PetOptions {
-                scale: 99.0,
-                ..PetOptions::default()
-            },
-        );
-        assert_eq!(slot.scale, Some(*crate::platform::SCALE_RANGE.end()));
+        let slot = Slot {
+            scale: Some(99.0),
+            ..Slot::new("喵喵".into(), None)
+        };
+        assert_eq!(PetOptions::from_slot(&slot).scale, *SCALE_RANGE.end());
+    }
+
+    #[test]
+    fn a_reroll_lands_in_range() {
+        let mut status = super::super::Status::default();
+        for _ in 0..64 {
+            let v = reroll(&mut status);
+            assert!((-100.0..=100.0).contains(&v), "{v}");
+        }
     }
 }

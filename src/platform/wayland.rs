@@ -59,7 +59,7 @@ use smithay_client_toolkit::{
 };
 
 use crate::audio::Audio;
-use crate::control::{self, Control, TrayHandle, TrayPet};
+use crate::control::{self, Control, TrayHandle};
 use crate::pack::{Form, Pack, PackEntry};
 use crate::pet::mask::MaskReadback;
 use crate::pet::target::{PetTarget, view_proj};
@@ -71,7 +71,8 @@ use crate::stage::{Actor, EntityId, Reaction, Stage, StageEvent, VoiceKind};
 use super::Options;
 use super::shared::{self, Assets, CANVAS_PADDING, Member, PetOptions};
 
-/// 定时器的起始间隔;之后每次由 `Stage::tick_interval` 按状态决定(待机降频)。
+/// 台上一只都没有时定时器的间隔(有台就按 `Stage::tick_interval`,
+/// 那是配置里的目标帧率)。
 const TICK_HZ: f32 = 30.0;
 
 /// 鼠标左键(linux input event code)。
@@ -172,6 +173,7 @@ pub fn run(options: Options) -> Result<()> {
             None
         },
         px_per_cm: options.px_per_cm,
+        fps: options.fps,
         stages: Vec::new(),
         pointer: None,
         tray: None,
@@ -184,29 +186,27 @@ pub fn run(options: Options) -> Result<()> {
     WaylandSource::new(conn.clone(), event_queue)
         .insert(handle.clone())
         .map_err(|e| anyhow::anyhow!("挂 Wayland 事件源失败: {e}"))?;
-    // 托盘 / 热键 / 信号都往同一个通道发命令
+    // 托盘 / D-Bus / 信号都往同一个通道发命令
     let (control_tx, control_rx) = channel::channel();
     install_signal_source(control_tx.clone())?;
     if options.tray {
         let pets = app.tray_pets();
-        let available = app.available.iter().map(|p| p.name.clone()).collect();
-        let voice = app.audio.as_ref().map(|a| !a.muted());
+        let muted = app.audio.as_ref().map(|a| a.muted());
         let volume = app.audio.as_ref().map(|a| a.volume()).unwrap_or(0.0);
         match control::spawn_tray(
             control_tx.clone(),
             options.passthrough,
             pets,
-            available,
-            voice,
-            app.px_per_cm,
-            volume,
+            muted,
+            control::Common {
+                fps: app.fps,
+                px_per_cm: app.px_per_cm,
+                volume,
+            },
         ) {
             Ok(tray) => app.tray = Some(tray),
             Err(e) => log::warn!("托盘不可用({e:#});用 kill -USR1 或热键代替"),
         }
-    }
-    if let Some(trigger) = options.hotkey {
-        control::spawn_hotkey(control_tx.clone(), trigger);
     }
     // 自己的 D-Bus 接口:给「KDE 自定义快捷键绑命令」与脚本用
     if let Err(e) = control::serve_dbus(control_tx.clone()) {
@@ -350,6 +350,8 @@ struct App {
     /// 音频输出;None = 没声卡或用户关了声音。
     audio: Option<Audio>,
     px_per_cm: f32,
+    /// 目标帧率,新建 stage 时交给它(见 `Stage::set_fps`)。
+    fps: u32,
     stages: Vec<StageWindow>,
     pointer: Option<wl_pointer::WlPointer>,
     /// 托盘句柄:拿着它才能把勾选状态同步回菜单;None = 没起托盘。
@@ -425,16 +427,24 @@ impl App {
         };
 
         // 模型按形态共享(见 `load_model`),这里 clone 的只是 manifest 里那份元数据
-        let builds: Vec<(Form, PetOptions)> = self
+        // 第三项是落脚点:勾了「记住」的回它自己那儿,其余交给 Stage 错开摆
+        let builds: Vec<(Form, PetOptions, Option<f32>)> = self
             .roster
             .iter()
-            .map(|m| (m.pack.forms[m.form].clone(), m.options.clone()))
+            .map(|m| {
+                (
+                    m.pack.forms[m.form].clone(),
+                    m.options.clone(),
+                    shared::home_of(m),
+                )
+            })
             .collect();
         let mut stage = Stage::new((1, 1));
+        stage.set_fps(self.fps as f32);
         let mut slots = Vec::with_capacity(builds.len());
-        for (form, options) in &builds {
+        for (form, options, home) in &builds {
             match self.build_actor(form, options) {
-                Ok(actor) => slots.push(stage.spawn(actor)),
+                Ok(actor) => slots.push(stage.spawn_at(actor, *home)),
                 Err(e) => {
                     log::error!("output {name}: 加载宠物失败: {e:#}");
                     self.exit = true;
@@ -624,34 +634,61 @@ impl App {
             Control::TogglePassthrough => self.toggle_passthrough(),
             Control::ToggleMute => self.toggle_mute(),
             Control::Recall => self.recall(),
-            Control::SwitchForm { slot, form } => self.switch_form(slot, form),
-            Control::AddPet(index) => self.add_pet(index),
-            Control::RemovePet(slot) => self.remove_pet(slot),
+            Control::Play(slot, clip) => self.play_clip(slot, clip),
+            Control::SetFps(value) => self.set_fps(value),
             Control::SetPxPerCm(value) => self.set_px_per_cm(value),
             Control::SetVolume(value) => self.set_volume(value),
-            Control::SetPetScale { slot, scale } => {
-                let Some(member) = self.roster.get(slot) else {
-                    return;
-                };
-                let options = PetOptions {
-                    scale,
-                    ..member.options.clone()
-                };
-                self.set_pet_options(slot, options);
-            }
-            Control::SetPetPersona { slot, persona } => {
-                let Some(member) = self.roster.get(slot) else {
-                    return;
-                };
-                let options = PetOptions {
-                    persona: crate::persona::Persona::at(persona),
-                    ..member.options.clone()
-                };
-                self.set_pet_options(slot, options);
-            }
             Control::Reload => self.reload(),
-            Control::OpenSettings => control::open_settings(),
-            Control::Quit => self.exit = true,
+            Control::OpenSettings(page) => control::open_settings(page),
+            // 退出是「这套东西都收了」——配置窗口是另一个进程,得单独叫一声
+            Control::Quit => {
+                control::close_settings();
+                self.exit = true;
+            }
+        }
+    }
+
+    /// 配置窗口的动作表点了一下:让第 `slot` 只播那段动作。
+    ///
+    /// **每台都播**:多显示器下同一只在每个 output 上各有一份,只播一台会看着不同步。
+    fn play_clip(&mut self, slot: u32, clip: u32) {
+        let Some((name, label)) = crate::stage::RUNTIME_CLIPS.get(clip as usize) else {
+            return;
+        };
+        let mut played = false;
+        for stage in &mut self.stages {
+            if let Some(id) = stage.slots.get(slot as usize) {
+                played |= stage.stage.play_clip(*id, name);
+            }
+        }
+        log::info!("手动播 {label}{}", if played { "" } else { "(这只没有这段)" });
+        for index in 0..self.stages.len() {
+            self.apply(index, Reaction::BOTH);
+        }
+        self.flush_sounds();
+    }
+
+    /// 改目标帧率。**不用重建任何东西**:它只影响定时器下一次的间隔,
+    /// 而定时器每次触发都重新问一遍 `tick_interval`。
+    fn set_fps(&mut self, value: u32) {
+        let value = value.clamp(
+            *crate::config::FPS_RANGE.start(),
+            *crate::config::FPS_RANGE.end(),
+        );
+        if self.fps == value {
+            return;
+        }
+        log::info!("帧率: {value} 帧/秒");
+        self.fps = value;
+        self.write_config(&[("fps", crate::config::Setting::Int(value))]);
+        self.apply_fps();
+        self.refresh_tray();
+    }
+
+    /// 把目标帧率交给每一台。新建 stage 的那条路在 `add_stage` 里。
+    fn apply_fps(&mut self) {
+        for stage in &mut self.stages {
+            stage.stage.set_fps(self.fps as f32);
         }
     }
 
@@ -683,7 +720,7 @@ impl App {
     }
 
     /// 写回 config.toml。失败只警告:值在内存里已经生效了。
-    fn write_config(&self, updates: &[(&str, crate::config::Setting<'_>)]) {
+    fn write_config(&self, updates: &[(&str, crate::config::Setting)]) {
         let Some(path) = self.config_path.as_deref() else {
             return;
         };
@@ -701,6 +738,8 @@ impl App {
             match crate::config::Config::load_or_create(path) {
                 Ok(config) => {
                     self.px_per_cm = config.px_per_cm;
+                    self.fps = config.fps;
+                    self.apply_fps();
                     if let Some(audio) = self.audio.as_mut() {
                         audio.set_volume(config.volume);
                     }
@@ -714,7 +753,16 @@ impl App {
             .and_then(crate::roster::Roster::load)
             .map(|saved| saved.pets)
             .unwrap_or_default();
+        // 「新来的那几只要打个招呼」——加宠物现在走配置窗口 + Reload,
+        // 不再有专门的 add_pet 命令,这一声就得在这儿认出来。按包名比,
+        // 够用了:同一个包加两只时第二只也算新来的,而那正是想要的效果。
+        let before: Vec<String> = self
+            .roster
+            .iter()
+            .map(|m| m.pack.species_name.clone())
+            .collect();
         self.roster = shared::load_roster(&slots, self.packs_dir.as_deref());
+        let greeting = shared::newcomers(&before, &self.roster);
         // 包目录里可能刚导入/删掉了包,「加一只」那张表也要跟着更新
         if let Some(dir) = self.packs_dir.as_deref() {
             self.available = Pack::list_entries(dir);
@@ -724,6 +772,16 @@ impl App {
             self.sprite_mode = false;
         }
         self.respawn_all();
+        // 「启用召唤」那一声(design.md §7 的触发点之一)。开机恢复阵容时不叫 ——
+        // 每次登录被三只宠物同时喊一嗓子不是好体验
+        for stage in &mut self.stages {
+            for slot in &greeting {
+                if let Some(id) = stage.slots.get(*slot) {
+                    stage.stage.speak(*id, VoiceKind::CallOut);
+                }
+            }
+        }
+        self.flush_sounds();
         self.prune_caches();
         self.ensure_timer();
         self.refresh_tray();
@@ -731,10 +789,11 @@ impl App {
 
     /// 把每台上的角色全部推倒重建(reload 用)。
     fn respawn_all(&mut self) {
-        let builds: Vec<(Form, PetOptions)> = self
+        // 第三项是落脚点:勾了「记住」的回它自己那儿,其余交给 Stage 错开摆
+        let builds: Vec<(Form, PetOptions, Option<f32>)> = self
             .roster
             .iter()
-            .map(|m| (m.form().clone(), m.options.clone()))
+            .map(|m| (m.form().clone(), m.options.clone(), shared::home_of(m)))
             .collect();
         for index in 0..self.stages.len() {
             let old: Vec<EntityId> = self.stages[index]
@@ -749,10 +808,10 @@ impl App {
             self.stages[index].slots.clear();
             self.stages[index].pets.clear();
             self.stages[index].sprite_quad = None;
-            for (form, options) in &builds {
+            for (form, options, home) in &builds {
                 match self.build_actor(form, options) {
                     Ok(actor) => {
-                        let id = self.stages[index].stage.spawn(actor);
+                        let id = self.stages[index].stage.spawn_at(actor, *home);
                         self.stages[index].slots.push(id);
                     }
                     Err(e) => log::error!("重载 {} 失败: {e:#}", form.name),
@@ -778,7 +837,7 @@ impl App {
             Timer::from_duration(interval),
             |_, _, app: &mut App| {
                 app.tick();
-                // 间隔随状态变:待机降到 12fps,交互/行走回到 30fps
+                // **每次都重问一遍**,所以托盘里改帧率不用碰定时器
                 TimeoutAction::ToDuration(app.tick_interval())
             },
         ) {
@@ -787,25 +846,30 @@ impl App {
         }
     }
 
-    /// 托盘菜单要的那份阵容快照。
-    fn tray_pets(&self) -> Vec<TrayPet> {
+    /// 托盘标题要的那份阵容快照(只要名字)。
+    fn tray_pets(&self) -> Vec<String> {
         shared::tray_pets(&self.roster)
     }
 
     fn refresh_tray(&self) {
         if let Some(tray) = &self.tray {
             tray.set_roster(self.tray_pets());
-            tray.set_common(
-                self.px_per_cm,
-                self.audio.as_ref().map(|a| a.volume()).unwrap_or(0.0),
-            );
-            tray.set_available(self.available.iter().map(|p| p.name.clone()).collect());
+            tray.set_common(control::Common {
+                fps: self.fps,
+                px_per_cm: self.px_per_cm,
+                volume: self.audio.as_ref().map(|a| a.volume()).unwrap_or(0.0),
+            });
         }
     }
 
     /// 把阵容写回存档。存**包名**而不是路径 —— 包目录整个搬走时阵容还认得出来;
     /// 只有包不在包目录里(`--pack /some/where`)才存绝对路径。
-    fn save_roster(&self) {
+    /// 把阵容写回存档。先把运行时才知道的两项(嗓音、落脚点)收回来,见 shared.rs。
+    fn save_roster(&mut self) {
+        if let Some(first) = self.stages.first() {
+            let slots = first.slots.clone();
+            shared::sync_runtime_fields(&mut self.roster, &first.stage, &slots);
+        }
         shared::save_roster(
             &self.roster,
             self.packs_dir.as_deref(),
@@ -817,141 +881,6 @@ impl App {
     /// 会一直占着(单只就有一两百 MB)。
     fn prune_caches(&mut self) {
         self.assets.prune();
-    }
-
-    /// 从包目录里加一只。
-    fn add_pet(&mut self, index: usize) {
-        let Some(entry) = self.available.get(index) else {
-            log::warn!("要加的包不在列表里(下标 {index})");
-            return;
-        };
-        let path = entry.path.clone();
-        let pack = match Pack::load(&path) {
-            Ok(pack) => pack,
-            Err(e) => {
-                log::error!("加一只失败:{path:?} 读不了: {e:#}");
-                return;
-            }
-        };
-        let form = pack.forms[0].clone();
-        let options = PetOptions::default();
-        // **先把每台的角色都建出来再提交**:中途失败会让插槽与实体对不上号,
-        // 而插槽错位比「加不上」难查得多
-        let mut actors = Vec::with_capacity(self.stages.len());
-        for _ in 0..self.stages.len() {
-            match self.build_actor(&form, &options) {
-                Ok(actor) => actors.push(actor),
-                Err(e) => {
-                    log::error!("加一只 {} 失败: {e:#}", pack.species_name);
-                    return;
-                }
-            }
-        }
-        log::info!("加一只 {}({})", pack.species_name, form.name);
-        for (stage_index, actor) in actors.into_iter().enumerate() {
-            // 占位的调试精灵让位
-            if self.sprite_mode {
-                let sprites: Vec<EntityId> = self.stages[stage_index]
-                    .stage
-                    .entities()
-                    .iter()
-                    .filter(|e| matches!(e.actor(), Actor::Sprite(_)))
-                    .map(|e| e.id())
-                    .collect();
-                for id in sprites {
-                    self.stages[stage_index].stage.despawn(id);
-                }
-                self.stages[stage_index].sprite_quad = None;
-            }
-            let id = self.stages[stage_index].stage.spawn(actor);
-            self.stages[stage_index].slots.push(id);
-            // 「启用召唤」那一声(design.md §7 的触发点之一)。开机恢复阵容时不叫 ——
-            // 每次登录被三只宠物同时喊一嗓子不是好体验
-            self.stages[stage_index].stage.speak(id, VoiceKind::CallOut);
-            self.rebuild_pet_surfaces(stage_index);
-            self.apply(
-                stage_index,
-                Reaction {
-                    redraw: true,
-                    regions_dirty: true,
-                },
-            );
-        }
-        self.sprite_mode = false;
-        self.roster.push(Member {
-            pack,
-            form: 0,
-            options,
-        });
-        self.flush_sounds();
-        self.ensure_timer();
-        self.save_roster();
-        self.refresh_tray();
-    }
-
-    /// 撤下阵容里的第几只。撤空了就是空台 —— 调试精灵不会回来。
-    fn remove_pet(&mut self, slot: usize) {
-        if slot >= self.roster.len() {
-            return;
-        }
-        let member = self.roster.remove(slot);
-        log::info!(
-            "撤下 {}(还剩 {} 只)",
-            member.pack.species_name,
-            self.roster.len()
-        );
-        drop(member);
-        for stage_index in 0..self.stages.len() {
-            if slot >= self.stages[stage_index].slots.len() {
-                continue;
-            }
-            let id = self.stages[stage_index].slots.remove(slot);
-            self.stages[stage_index].stage.despawn(id);
-            self.stages[stage_index].pets.retain(|s| s.id != id);
-            self.apply(
-                stage_index,
-                Reaction {
-                    redraw: true,
-                    regions_dirty: true,
-                },
-            );
-        }
-        self.prune_caches();
-        self.save_roster();
-        self.refresh_tray();
-    }
-
-    /// 把某一只切到进化链上的另一个形态。
-    fn switch_form(&mut self, slot: usize, index: usize) {
-        let Some(member) = self.roster.get(slot) else {
-            return;
-        };
-        if index >= member.pack.forms.len() || index == member.form {
-            return;
-        }
-        self.roster[slot].form = index;
-        let form = self.roster[slot].form();
-        log::info!("切换形态 → {}({})", form.name, form.asset);
-        self.rebuild_slot(slot);
-    }
-
-    /// 改这一只的选项(大小/性格/表情)。改完要重建角色:大小定的是画布尺寸,
-    /// 性格与表情池是造角色时读进去的。
-    fn set_pet_options(&mut self, slot: usize, options: PetOptions) {
-        let Some(member) = self.roster.get_mut(slot) else {
-            return;
-        };
-        if member.options == options {
-            return;
-        }
-        log::info!(
-            "{} 的选项:大小 ×{:.2},性格 {}",
-            member.pack.species_name,
-            options.scale,
-            options.persona.name
-        );
-        member.options = options;
-        self.rebuild_slot(slot);
     }
 
     /// 按阵容里现在的形态与选项,把这一只在每台上的角色重建一遍
@@ -1019,7 +948,7 @@ impl App {
         audio.set_muted(muted);
         log::info!("叫声: {}", if muted { "关" } else { "开" });
         if let Some(tray) = &self.tray {
-            tray.set_voice(!muted);
+            tray.set_muted(muted);
         }
     }
 
@@ -1104,6 +1033,8 @@ impl App {
             let outline = extent.length() * 0.004;
             let view = view_proj(pet.model.motion_bounds, pet.yaw, CANVAS_PADDING);
             let matrices = pet.player.matrices.clone();
+            // 表情:性格决定脸上那张图集用哪一格(见 persona.rs)
+            let face_uv = pet.face_uv();
             let Some(surfaces) = stage.pets.iter_mut().find(|s| s.id == *id) else {
                 continue;
             };
@@ -1113,10 +1044,13 @@ impl App {
             }
             surfaces.gpu.update(
                 &gpu.queue,
-                view,
-                Vec3::new(-0.4, 0.8, 0.6),
-                outline,
-                effect_time(),
+                &crate::pet::FrameParams {
+                    view_proj: view,
+                    light_dir: Vec3::new(-0.4, 0.8, 0.6),
+                    outline_width: outline,
+                    time: effect_time(),
+                    face_uv,
+                },
                 &matrices,
             );
             surfaces

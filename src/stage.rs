@@ -93,12 +93,51 @@ const EMOTE_CHANCE: f32 = 0.35;
 /// 一个都不开或者包里一个都没有,那只就只会站桩,行为上是允许的。
 pub const EMOTES: &[(&str, &str)] = &[
     ("Happy", "开心"),
+    ("Relax", "放松"),
+    ("Show", "展示"),
+    ("Anger", "生气"),
+    ("Sad", "难过"),
+    ("Fear", "害怕"),
+];
+
+/// 运行时会去找的**全部**动作:动作名 → 中文名。配置窗口按它算「动作覆盖率」。
+///
+/// **不是照 manifest 的 `[report]` 算的** —— 全库没有一个包写了那一节。
+/// 这张表问的是另一个更有用的问题:*这只宠物在桌面上有哪些事做不了*。
+/// 缺 `Run` 就只会走,缺 `SleepStart` 就直接躺下,缺 `JumpFall` 就落地没动作 ——
+/// 都不是错误,只是少一点戏。
+pub const RUNTIME_CLIPS: &[(&str, &str)] = &[
+    ("Idle", "待机"),
+    ("Walk", "行走"),
+    ("Run", "奔跑"),
+    ("JumpFall", "落地"),
+    ("Shock", "受惊"),
+    ("Happy", "开心"),
+    ("Fear", "害怕"),
     ("Sad", "难过"),
     ("Anger", "生气"),
-    ("Show", "得意"),
+    ("Show", "展示"),
     ("Relax", "放松"),
     ("Alert", "警觉"),
+    ("SleepStart", "入睡"),
+    ("SleepLoop", "睡着"),
+    ("SleepEnd", "醒来"),
+    ("CallOut", "召唤"),
 ];
+
+/// 这个形态做不做得了某段动作。**降级也算有**:`PetActor::new` 里那几条 `or_else`
+/// 是行为的一部分 —— 幽星光没有 `SleepLoop` 但有 `SleepStand`,它照样睡得着,
+/// 不该记成缺。这里的 `fallback` 必须与那边一一对应,改了一边就要改另一边。
+pub fn has_clip(form: &crate::pack::Form, name: &str) -> bool {
+    let fallback: &[&str] = match name {
+        "Shock" => &["Alert"],
+        "Happy" => &["Show"],
+        "Fear" => &["Shock", "Alert"],
+        "SleepLoop" => &["SleepStand"],
+        _ => &[],
+    };
+    form.clip(name).is_some() || fallback.iter().any(|alt| form.clip(alt).is_some())
+}
 
 /// 邻近感知:多少**身位**以内算「注意到旁边那只」。
 ///
@@ -117,17 +156,6 @@ const FLEE_DISTANCE: f32 = 3.0;
 /// 指针事件——想追全屏光标就得吃掉输入,不做。
 const GLANCE_RATIO: f32 = 0.45;
 
-/// 推进频率的上下限。
-///
-/// 降频**只看姿势实际变化速度**,不按状态硬分档:待机动画本身带明显起伏
-/// (实测关节最大速度 ~6m/s,行走 ~4.7m/s),一律按「待机」降到 12Hz 会看着发顿——
-/// 这是实机反馈改过来的。频率由 [`hz_for_motion`] 连续映射,睡觉那类近乎静止的动作
-/// 自动落到下限,不需要给每段动作手工标注。
-const ACTIVE_HZ: f32 = 30.0;
-const STILL_HZ: f32 = 10.0;
-/// 关节速度到多少就跑满帧(米/秒)。取 1.0:实测有动作的段都在 4m/s 以上,余量充足。
-const FULL_RATE_MOTION: f32 = 1.0;
-
 /// 状态的可读名字,只用于日志(睡觉的三段也分开,便于确认作息真的走完了)。
 fn activity_label(activity: &Activity) -> &'static str {
     match activity {
@@ -141,11 +169,6 @@ fn activity_label(activity: &Activity) -> &'static str {
         Activity::Sleeping(SleepPhase::Asleep) => "睡着",
         Activity::Sleeping(SleepPhase::Waking { .. }) => "醒来",
     }
-}
-
-/// 姿势变化速度 → 推进频率。
-fn hz_for_motion(motion: f32) -> f32 {
-    (motion / FULL_RATE_MOTION * ACTIVE_HZ).clamp(STILL_HZ, ACTIVE_HZ)
 }
 
 /// 宠物当前在干什么。
@@ -347,8 +370,9 @@ pub struct PetBuild {
     pub voice: Option<Arc<VoiceBank>>,
     /// 脾气(见 persona.rs);不配就是「乖巧」= 基线行为。
     pub persona: Persona,
-    /// 允许的表情([`EMOTES`] 里的动作名);None = 全都要。
-    pub emotes: Option<Vec<String>>,
+    /// 嗓音 −1~1;**None = 没设过,按 0(原调)来**。
+    /// 不自动掷:同一个包的两只听着一样是正常的,想要不一样就在配置窗口里重掷。
+    pub voice_value: Option<f32>,
     pub seed: u64,
 }
 
@@ -382,9 +406,12 @@ pub struct PetActor {
     /// 或直接设 `Dragged`),演出那边看见就收场 —— 打断语义只此一处,不散在各个分支里。
     acting: bool,
     voice: Option<Arc<VoiceBank>>,
-    /// 这一只的嗓音属性 −1..1(游戏里是 −100~100)。**开台时随机**:
-    /// 同物种两只听着不一样,和游戏里每只宠物各有一个 `voice` 值是同一个意思。
-    voice_value: f32,
+    /// 这一只的嗓音属性 −1..1(游戏里是 −100~100)。同物种两只听着不一样,
+    /// 和游戏里每只宠物各有一个 `voice` 值是同一个意思。
+    ///
+    /// 存档里写多少就是多少,不写就是 0;平台层存盘时把它收回 roster.toml
+    /// (见 `PetBuild::voice_value`),不然同一只每次启动都换个嗓子。
+    pub voice_value: f32,
     /// 待播的叫声,由 `Stage::take_sounds` 收走。行为侧发声的地方分散在各处
     /// (`react`/`wake_up`/上台),挂在这儿就不必给每处都传一个出参。
     pending_sound: Option<SoundCue>,
@@ -465,11 +492,18 @@ struct Clips {
     sleep_start: Option<usize>,
     sleep_loop: Option<usize>,
     sleep_end: Option<usize>,
-    /// 待机时随手做的表情池(有哪个算哪个)。
+    /// 待机时随手做的表情池(有哪个算哪个),由性格定,见 persona.rs。
     emotes: Vec<usize>,
+    /// 性格的默认表情在这只身上对应哪一段;None = 这个性格没有默认表情(或者包里缺)。
+    default_emote: Option<usize>,
 }
 
 impl PetActor {
+    /// 这只脸上那张图集要偏多少 —— 性格定的(见 persona.rs 的 `Expression`)。
+    pub fn face_uv(&self) -> [f32; 2] {
+        self.persona.face.uv_offset()
+    }
+
     /// 播一次性反应动作,播完回待机。缺对应动作就只改状态(至少行为语义还在)。
     ///
     /// **一切外部打断都从这儿过**(受惊/摸头/被拎起),所以演出的「被打断」判定挂在这里:
@@ -549,9 +583,15 @@ impl PetActor {
         };
     }
 
+    /// 挑一个表情。**有默认表情的,一半时候做的就是它** ——
+    /// 「默认表情」这四个字在游戏里指的是这只宠物平时那张脸,不是「唯一会做的表情」,
+    /// 所以不是只做它,而是偏向它。
     fn pick_emote(&mut self) -> Option<&usize> {
         if self.clips.emotes.is_empty() {
             return None;
+        }
+        if self.clips.default_emote.is_some() && self.rng.next_f32() < 0.5 {
+            return self.clips.default_emote.as_ref();
         }
         let index = (self.rng.next_f32() * self.clips.emotes.len() as f32) as usize;
         self.clips
@@ -714,7 +754,7 @@ impl PetActor {
             form_id,
             voice,
             persona,
-            emotes: wanted_emotes,
+            voice_value,
             seed,
         } = build;
         // Idle 一定要有:没有 Idle 的包等于没法待机,退化成用第 0 段动作
@@ -731,19 +771,20 @@ impl PetActor {
         let sleep_start = model.clip("SleepStart");
         let sleep_loop = model.clip("SleepLoop").or_else(|| model.clip("SleepStand"));
         let sleep_end = model.clip("SleepEnd");
-        // 表情池:待机时偶尔来一个,让它看着不是只会站桩。
-        // 用户可以只留几个(配置窗口里勾),不配就是全都要 —— 和以前的行为一致。
-        let emotes = EMOTES
+        // 表情池**由性格定**(见 persona.rs:游戏的 NATURE_CONF + LLM_PET_BEHAVIOR_CONF)。
+        // 包里没有的那几段自然就掉出去了。
+        let emotes: Vec<usize> = persona
+            .emote_pool()
             .iter()
-            .filter(|(name, _)| {
-                wanted_emotes
-                    .as_ref()
-                    .is_none_or(|want| want.iter().any(|w| w == name))
-            })
-            .filter_map(|(name, _)| model.clip(name))
+            .filter_map(|name| model.clip(name))
             .collect();
+        // 默认表情在池子里的位置(`emote_pool` 保证它排第一),给 `pick_emote` 加权用
+        let default_emote = persona
+            .default_emote
+            .and_then(|name| model.clip(name))
+            .filter(|clip| emotes.first() == Some(clip));
         let player = Player::new(&model, idle);
-        let mut rng = Rng::new(seed);
+        let rng = Rng::new(seed);
         Self {
             model,
             player,
@@ -759,8 +800,9 @@ impl PetActor {
             persona,
             acting: false,
             voice,
-            // 均匀取 −1..1:游戏里 voice 是逐只随机的属性,两端各 2% 才算「粗嗓门/婉转声」
-            voice_value: rng.next_f32() * 2.0 - 1.0,
+            // 均匀取 −1..1:游戏里 voice 是逐只随机的属性,两端各 2% 才算「粗嗓门/婉转声」。
+            // 不写就是 0 = 原调(以前这里是随机掷一个,那让同一只每次启动都换嗓子)
+            voice_value: voice_value.unwrap_or(0.0),
             pending_sound: None,
             mask: None,
             needs: Needs::default(),
@@ -778,6 +820,7 @@ impl PetActor {
                 sleep_loop,
                 sleep_end,
                 emotes,
+                default_emote,
             },
             petting: Petting::default(),
             rng,
@@ -854,6 +897,9 @@ pub struct Entity {
     pos: (f32, f32),
     /// 角色局部坐标下的覆盖矩形,只在角色变了才重算。
     coverage: Vec<Rect>,
+    /// 上台时给的落脚点(可走范围的百分之几)。**表面尺寸定下来之前摆了也白摆**
+    /// (那时 `size` 还是 (1,1)),所以要留着,首次 configure 时重摆一遍。
+    home: Option<f32>,
     /// 按下时记下的「指针 - 角色左上角」偏移。
     drag_offset: Option<(f64, f64)>,
     /// 本次按下之后指针是否移动过(用来区分「点一下」与「拎起来拖」)。
@@ -868,11 +914,20 @@ impl Entity {
             actor,
             pos: (0.0, 0.0),
             coverage,
+            home: None,
             drag_offset: None,
             drag_moved: false,
         };
         entity.reset_position(size);
         entity
+    }
+
+    /// 摆到可走范围的百分之几处(y 照旧落地)。
+    fn set_home_fraction(&mut self, fraction: f32, size: (u32, u32)) {
+        self.reset_position(size);
+        let max_x = (size.0 as f32 - self.actor.size().0 as f32).max(0.0);
+        self.pos.0 = fraction.clamp(0.0, 1.0) * max_x;
+        self.clamp_to_surface(size);
     }
 
     pub fn id(&self) -> EntityId {
@@ -952,29 +1007,6 @@ impl Entity {
         }
     }
 
-    /// 这只自己想要的推进频率。行走/拖动/反应中位置本身在变,不看姿势也得跑满;
-    /// 待机与睡觉交给姿势速度决定(睡着几乎不动 → 自动落到下限)。
-    fn tick_hz(&self) -> f32 {
-        match &self.actor {
-            Actor::Pet(pet) => {
-                let busy = self.drag_offset.is_some()
-                    || matches!(
-                        pet.activity,
-                        Activity::Walk { .. }
-                            | Activity::Falling { .. }
-                            | Activity::React { .. }
-                            | Activity::Dragged
-                    );
-                if busy {
-                    ACTIVE_HZ
-                } else {
-                    hz_for_motion(pet.player.motion())
-                }
-            }
-            Actor::Sprite(_) => ACTIVE_HZ,
-        }
-    }
-
     /// 表面坐标是否落在这只的可见部分上。
     fn hit_test(&self, x: f64, y: f64) -> bool {
         let lx = (x - self.pos.0 as f64).floor() as i32;
@@ -1006,6 +1038,8 @@ pub struct Stage {
     script_cooldown: Vec<(&'static str, f32)>,
     /// 拿到过真实表面尺寸没有。见 [`Stage::place`]。
     placed: bool,
+    /// 目标帧率(配置里的 `fps`)。见 [`Stage::set_fps`]。
+    hz: f32,
 }
 
 /// 正在跑的一场演出。
@@ -1034,7 +1068,13 @@ impl Stage {
             performance: None,
             script_cooldown: Vec::new(),
             placed: false,
+            hz: crate::config::DEFAULT_FPS as f32,
         }
+    }
+
+    /// 改目标帧率(配置里的 `fps`)。台上不管在干什么都按这个推进。
+    pub fn set_fps(&mut self, hz: f32) {
+        self.hz = hz.max(1.0);
     }
 
     /// 收走这一轮攒下的叫声。平台层每次 tick / 处理事件之后取一遍交给 audio.rs。
@@ -1055,12 +1095,36 @@ impl Stage {
     /// **错开摆**:`Entity::new` 一律摆在正中,于是托盘连加两只同物种的会精确重叠
     /// (第 5 步做邻近感知时撞见的 —— 距离恒为 0)。见 [`Stage::place`]。
     pub fn spawn(&mut self, actor: Actor) -> EntityId {
+        self.spawn_at(actor, None)
+    }
+
+    /// 放一只上台,可以指定落脚点(可走范围的百分之几,见 [`Stage::home_fraction`])。
+    ///
+    /// 给了落脚点就不参与错开:那是「上次它自己站的地方」,再挪一下就白记了。
+    pub fn spawn_at(&mut self, actor: Actor, home_x: Option<f32>) -> EntityId {
         let id = EntityId(self.next_id);
         self.next_id += 1;
         let mut entity = Entity::new(id, actor, self.size);
-        Self::place(&mut entity, self.entities.len(), self.size);
+        match home_x {
+            Some(fraction) => {
+                log::debug!("记着上次的落脚点,回可走范围的 {:.0}% 处", fraction * 100.0);
+                entity.set_home_fraction(fraction, self.size);
+            }
+            None => Self::place(&mut entity, self.entities.len(), self.size),
+        }
+        entity.home = home_x;
         self.entities.push(entity);
         id
+    }
+
+    /// 这一只现在站在可走范围的百分之几。撤下/存盘时读它写进阵容存档。
+    ///
+    /// 存**比例**而不是像素:换分辨率、换显示器之后像素值毫无意义,
+    /// 而「靠左三成」在哪块屏上都说得通。
+    pub fn home_fraction(&self, id: EntityId) -> Option<f32> {
+        let entity = self.entities.iter().find(|e| e.id == id)?;
+        let max_x = (self.size.0 as f32 - entity.actor.size().0 as f32).max(1.0);
+        Some((entity.pos.0 / max_x).clamp(0.0, 1.0))
     }
 
     /// 把第 `index` 只摆到位:居中,再按次序左右轮流错开一个身位。
@@ -1078,10 +1142,26 @@ impl Stage {
         }
     }
 
-    /// 全部重摆(召回,以及首次拿到真实表面尺寸时)。
+    /// 全部重摆(首次拿到真实表面尺寸时)。记了落脚点的回它自己那儿,其余按次序错开。
     fn place_all(&mut self) {
         let size = self.size;
         for (index, entity) in self.entities.iter_mut().enumerate() {
+            match entity.home {
+                Some(fraction) => entity.set_home_fraction(fraction, size),
+                None => Self::place(entity, index, size),
+            }
+        }
+    }
+
+    /// 召回:**不管记没记落脚点,全都摆回中间**,并把记下的那个作废。
+    ///
+    /// 召回的用途就是「它跑没影了,给我拉回来」,这时候还尊重旧位置就等于没召回。
+    /// 记录也要一起清:留着的话下一次重建角色(改大小、切形态)又会把它拽回去。
+    /// 之后它自己走到哪儿,哪儿就是新的落脚点。
+    fn recall_all(&mut self) {
+        let size = self.size;
+        for (index, entity) in self.entities.iter_mut().enumerate() {
+            entity.home = None;
             Self::place(entity, index, size);
         }
     }
@@ -1092,6 +1172,26 @@ impl Stage {
         if let Some(Actor::Pet(pet)) = self.entity_mut(id).map(|e| &mut e.actor) {
             pet.speak(kind);
         }
+    }
+
+    /// 手动播一段动作(配置窗口那张动作表点出来的)。
+    ///
+    /// 走的是**和受惊/摸头同一条路**(`React`):播完自己回待机,也会打断正在演的那场。
+    /// 找不到这只、或者这个形态没这段动作,返回 false —— 界面据此把按钮置灰。
+    pub fn play_clip(&mut self, id: EntityId, name: &str) -> bool {
+        let Some(Actor::Pet(pet)) = self.entity_mut(id).map(|e| &mut e.actor) else {
+            return false;
+        };
+        let Some(clip) = pet.model.clip(name) else {
+            return false;
+        };
+        // 睡着的时候点一下动作,它该醒过来做 —— 不然看着像没反应
+        pet.acting = false;
+        pet.player.play(clip);
+        pet.activity = Activity::React {
+            remaining: pet.model.clips[clip].duration.max(0.3),
+        };
+        true
     }
 
     /// 撤掉一只。找不到就是 false(标识可能已经失效)。
@@ -1144,7 +1244,13 @@ impl Stage {
         entity.coverage = entity.actor.coverage();
         entity.drag_offset = None;
         entity.drag_moved = false;
-        entity.reset_position(size);
+        // 换了角色画布尺寸就变了,位置必须重算。**记了落脚点的回它自己那儿** ——
+        // 一律居中的话,改一次整体大小就把每只记下的位置抹成正中间,
+        // 而那个「正中间」还会被当成新的落脚点存进阵容(实测就是这么丢的)。
+        match entity.home {
+            Some(fraction) => entity.set_home_fraction(fraction, size),
+            None => entity.reset_position(size),
+        }
         true
     }
 
@@ -1188,10 +1294,9 @@ impl Stage {
         self.entities.iter().any(Entity::is_dragging)
     }
 
-    /// 所有实体重新落地(改屏幕尺寸/切形态之后)。
     /// 全部召回到屏幕中间。**也要错开**:三只叠在一起的「召回」等于把它们藏成一只。
     pub fn reset_position(&mut self) {
-        self.place_all();
+        self.recall_all();
     }
 
     /// 当前该交给合成器的输入区(表面局部坐标)。穿透时为空。
@@ -1696,16 +1801,13 @@ impl Stage {
         }
     }
 
-    /// 下一次推进该隔多久。只有「正在播的动作几乎不动」时才降频(见 `hz_for_motion`)。
-    /// **取各实体里最快的那一个**:一只在走、其余在睡时,整台仍要按走的那只推进。
+    /// 下一次推进该隔多久 —— 就是配置里那个目标帧率,**台上在干什么都不影响它**。
+    ///
+    /// 这里曾经按姿势变化速度自动降频(睡着的宠物落到 10Hz)。取消了:省下的那点
+    /// CPU 换来的是「什么时候降、降到多少」全凭它自己判断,而帧率是用户看得见、
+    /// 也说得出偏好的东西 —— 那就让配置里写多少就是多少。
     pub fn tick_interval(&self) -> Duration {
-        let hz = self
-            .entities
-            .iter()
-            .map(Entity::tick_hz)
-            .fold(f32::MIN, f32::max)
-            .max(hz_for_motion(0.0));
-        Duration::from_secs_f32(1.0 / hz)
+        Duration::from_secs_f32(1.0 / self.hz)
     }
 
     /// 推进时间:宠物的行为与动画。返回是否要重画/重设输入区。
@@ -1811,13 +1913,9 @@ impl Stage {
                     } else if pet.acting {
                         // 正在演出里,两拍之间的空档:站着等下一拍,别自己跑去溜达
                         pet.activity = Activity::Idle { remaining: 0.5 };
-                    } else if let Some(neighbor) = perception
-                        .nearest
-                        .filter(|n| {
-                            n.distance <= NOTICE_DISTANCE * pet.persona.social
-                                && pet.notice_ready(n.id)
-                        })
-                    {
+                    } else if let Some(neighbor) = perception.nearest.filter(|n| {
+                        n.distance <= NOTICE_DISTANCE * pet.persona.social && pet.notice_ready(n.id)
+                    }) {
                         // 旁边站了个同伴 → 先打个招呼,再去忙自己的。
                         // 这里**只发意图**,转身与播动作在 `dispatch_intents` 里
                         intents.push(Intent {
@@ -1918,8 +2016,109 @@ fn test_build(model: Arc<Model>, seed: u64) -> PetBuild {
         form_id: 0,
         voice: None,
         persona: Persona::default(),
-        emotes: None,
+        voice_value: None,
         seed,
+    }
+}
+
+#[cfg(test)]
+mod home_tests {
+    use super::*;
+
+    /// 落脚点存的是**比例**,所以换了屏幕宽度还能回到「同样靠左三成」的地方。
+    #[test]
+    fn a_remembered_spot_survives_a_resize() {
+        let mut stage = Stage::new((1000, 600));
+        let model = Arc::new(Model::for_test(&["Idle", "Walk"]));
+        let id = stage.spawn_at(Actor::Pet(PetActor::new(test_build(model, 1))), Some(0.25));
+        // 可走范围 = 1000 − 画布 200 = 800,四分之一处是 200
+        assert!((stage.entity(id).expect("在台上").pos().0 - 200.0).abs() < 1.0);
+        assert!((stage.home_fraction(id).expect("该读得到") - 0.25).abs() < 0.01);
+
+        // 换到更宽的屏:比例不变,像素跟着变
+        stage.handle(StageEvent::Resized {
+            width: 2000,
+            height: 600,
+        });
+        assert!((stage.home_fraction(id).expect("该读得到") - 0.25).abs() < 0.01);
+        assert!((stage.entity(id).expect("在台上").pos().0 - 450.0).abs() < 1.0);
+    }
+
+    /// 召回**不**尊重落脚点:它的用途就是「跑没影了,拉回来」。
+    #[test]
+    fn recall_ignores_the_remembered_spot() {
+        let mut stage = Stage::new((1000, 600));
+        let model = Arc::new(Model::for_test(&["Idle", "Walk"]));
+        let id = stage.spawn_at(
+            Actor::Pet(PetActor::new(test_build(model.clone(), 1))),
+            Some(0.9),
+        );
+        stage.reset_position();
+        let centred = stage.entity(id).expect("在台上").pos().0;
+        assert!((centred - 400.0).abs() < 1.0, "该回到正中,实际 {centred}");
+
+        // **记录也要作废**:留着的话下一次重建角色又会把它拽回 90% 去
+        stage.replace_actor(id, Actor::Pet(PetActor::new(test_build(model, 2))));
+        let after = stage.entity(id).expect("在台上").pos().0;
+        assert!((after - 400.0).abs() < 1.0, "重建之后又跑回去了:{after}");
+    }
+
+    /// 重建角色(改整体大小、切形态)要回到记下的落脚点,而不是一律居中。
+    ///
+    /// 这条是实机逮到的:改一次整体大小,每只记下的位置就被抹成正中间,
+    /// 而那个「正中间」还会被当成新的落脚点存回阵容 —— 记了等于没记。
+    #[test]
+    fn rebuilding_an_actor_returns_to_the_remembered_spot() {
+        let mut stage = Stage::new((1000, 600));
+        let model = Arc::new(Model::for_test(&["Idle", "Walk"]));
+        let id = stage.spawn_at(
+            Actor::Pet(PetActor::new(test_build(model.clone(), 1))),
+            Some(0.9),
+        );
+        assert!((stage.home_fraction(id).expect("该读得到") - 0.9).abs() < 0.01);
+
+        stage.replace_actor(id, Actor::Pet(PetActor::new(test_build(model, 2))));
+        assert!(
+            (stage.home_fraction(id).expect("该读得到") - 0.9).abs() < 0.01,
+            "重建之后落脚点被抹掉了"
+        );
+    }
+
+    /// 嗓音给了就用给的,没给才随机 —— 存档里存的就是掷出来那一次。
+    #[test]
+    fn a_saved_voice_value_is_used_verbatim() {
+        let model = Arc::new(Model::for_test(&["Idle", "Walk"]));
+        let pet = PetActor::new(PetBuild {
+            voice_value: Some(-0.37),
+            ..test_build(model.clone(), 1)
+        });
+        assert!((pet.voice_value + 0.37).abs() < 1e-6);
+        // 不给就现掷一个,落在 −1..1
+        let rolled = PetActor::new(test_build(model, 7));
+        assert!((-1.0..=1.0).contains(&rolled.voice_value));
+    }
+
+    /// 覆盖率把「降级也算有」算进去 —— 否则只有 SleepStand 的那批会被误报成不会睡。
+    #[test]
+    fn coverage_counts_the_documented_fallbacks() {
+        let mut clips = std::collections::HashMap::new();
+        for name in ["Idle", "Walk", "SleepStand", "Alert", "Show"] {
+            clips.insert(
+                name.to_string(),
+                crate::pack::Clip {
+                    seconds: 1.0,
+                    speed_cm_s: 0.0,
+                },
+            );
+        }
+        let form = crate::pack::Form::for_test(clips);
+        // SleepLoop→SleepStand、Shock→Alert、Happy→Show、Fear→Alert 四个降级都该算有
+        for name in ["SleepLoop", "Shock", "Happy", "Fear"] {
+            assert!(has_clip(&form, name), "{name} 该按降级算有");
+        }
+        // 真没有的照样要报出来
+        assert!(!has_clip(&form, "Run"));
+        assert!(!has_clip(&form, "CallOut"));
     }
 }
 
@@ -2371,17 +2570,17 @@ mod pet_tests {
         );
     }
 
+    /// 帧率**不随台上在干什么变**。以前静止时会自动降频,取消了 ——
+    /// 用户选了 30 帧就该一直是 30 帧。
     #[test]
-    fn still_pose_ticks_slower_than_moving() {
+    fn the_frame_rate_ignores_what_the_pet_is_doing() {
         let mut s = pet_stage();
-        // 合成模型没有动画通道 → 姿势纹丝不动,量过两帧后应当降频
+        s.set_fps(30.0);
+        let want = Duration::from_secs_f32(1.0 / 30.0);
+        // 合成模型没有动画通道 → 姿势纹丝不动,这正是以前会被降频的情形
         s.tick(0.05);
         s.tick(0.05);
-        let still = s.tick_interval();
-        assert!(
-            still > Duration::from_secs_f32(1.0 / 20.0),
-            "静止姿势该降频"
-        );
+        assert_eq!(s.tick_interval(), want, "站着不动也该按 30 帧推进");
         // 逼它走起来:待机计时耗尽 + 无聊攒够才会挑目标点(中间可能先做几个表情)
         for _ in 0..600 {
             s.tick(0.1);
@@ -2393,7 +2592,7 @@ mod pet_tests {
             matches!(activity(&s), Activity::Walk { .. }),
             "待机够久该开始走"
         );
-        assert!(s.tick_interval() < still, "行走时该比静止更勤地推进");
+        assert_eq!(s.tick_interval(), want, "走起来也还是 30 帧");
     }
 
     #[test]
@@ -2844,17 +3043,24 @@ mod voice_tests {
         assert!(stage.take_sounds().is_empty());
     }
 
+    /// 不设嗓音就是**原调**,四只同物种听着就该一样 —— 以前这里是上台随机掷,
+    /// 于是同一只每次启动都换个嗓子;现在要变声得自己去配置窗口里重掷。
     #[test]
-    fn same_species_pets_sound_different() {
-        // 游戏里每只宠物各有一个 voice 属性,同物种也不一样;这里靠各自的种子随机
+    fn pets_sound_the_same_until_someone_rerolls() {
         let model = Arc::new(Model::for_test(&["Idle"]));
         let mut stage = Stage::new((1000, 600));
-        for seed in 1..=4u64 {
+        for seed in 1..=3u64 {
             stage.spawn(Actor::Pet(PetActor::new(PetBuild {
                 voice: Some(bank()),
                 ..test_build(Arc::clone(&model), seed * 7919)
             })));
         }
+        // 第四只手动设过嗓音(配置窗口里重掷出来的那种)
+        stage.spawn(Actor::Pet(PetActor::new(PetBuild {
+            voice: Some(bank()),
+            voice_value: Some(-0.6),
+            ..test_build(Arc::clone(&model), 42)
+        })));
         let ids: Vec<EntityId> = stage.entities().iter().map(|e| e.id()).collect();
         for id in ids {
             stage.speak(id, VoiceKind::Happy);
@@ -2862,8 +3068,12 @@ mod voice_tests {
         let speeds: Vec<f32> = stage.take_sounds().iter().map(|c| c.speed).collect();
         assert_eq!(speeds.len(), 4);
         assert!(
-            speeds.windows(2).any(|w| (w[0] - w[1]).abs() > 1e-4),
-            "四只不该是同一个音调: {speeds:?}"
+            speeds[..3].windows(2).all(|w| (w[0] - w[1]).abs() < 1e-6),
+            "没设过嗓音的该是同一个音调: {speeds:?}"
+        );
+        assert!(
+            (speeds[3] - speeds[0]).abs() > 1e-4,
+            "重掷过的那只该听得出来不一样: {speeds:?}"
         );
     }
 }
@@ -2872,17 +3082,28 @@ mod voice_tests {
 mod rate_tests {
     use super::*;
 
-    /// 把「姿势速度 → 帧率」的映射钉住:待机实测 ~6m/s 必须跑满,
-    /// 睡觉那类近乎静止的必须落到下限,中间连续过渡。
+    /// 每一档都要真的落到推进间隔上,**空台也算** ——
+    /// 台上没有宠物时也得有个合法的间隔,否则定时器排不出下一次。
     #[test]
-    fn frame_rate_follows_motion() {
-        assert_eq!(hz_for_motion(0.0), STILL_HZ);
-        assert_eq!(hz_for_motion(6.0), ACTIVE_HZ, "待机实测量级该跑满帧");
-        assert_eq!(hz_for_motion(4.7), ACTIVE_HZ, "行走实测量级该跑满帧");
-        let mid = hz_for_motion(0.5);
-        assert!(
-            mid > STILL_HZ && mid < ACTIVE_HZ,
-            "中间值该连续过渡,实际 {mid}"
+    fn every_step_reaches_the_interval() {
+        let mut stage = Stage::new((800, 600));
+        for (fps, _) in crate::control::FPS_STEPS {
+            stage.set_fps(*fps as f32);
+            assert_eq!(
+                stage.tick_interval(),
+                Duration::from_secs_f32(1.0 / *fps as f32),
+                "{fps} 帧没落到间隔上"
+            );
+        }
+    }
+
+    /// 默认值必须是配置里那个,否则「没配过」的台和「配了默认值」的台跑得不一样。
+    #[test]
+    fn a_fresh_stage_runs_at_the_configured_default() {
+        let stage = Stage::new((800, 600));
+        assert_eq!(
+            stage.tick_interval(),
+            Duration::from_secs_f32(1.0 / crate::config::DEFAULT_FPS as f32)
         );
     }
 }
@@ -3042,10 +3263,11 @@ mod behaviour_tests {
         assert_eq!(pet(&s).target_yaw, 0.0);
     }
 
+    /// 睡着也照样按目标帧率推进。这里曾经降到 10Hz —— 那条优化取消了。
     #[test]
-    fn sleep_pose_lets_the_frame_rate_drop() {
-        // 合成模型的动作没有通道 → 睡着时姿势不动,帧率该落到下限
+    fn sleeping_does_not_change_the_frame_rate() {
         let mut s = pet_stage();
+        s.set_fps(60.0);
         match s.actor_mut_for_test() {
             Actor::Pet(pet) => pet.needs.sleepiness = 0.99,
             _ => unreachable!(),
@@ -3053,8 +3275,6 @@ mod behaviour_tests {
         run(&mut s, 30.0, |s| {
             matches!(pet(s).activity, Activity::Sleeping(SleepPhase::Asleep))
         });
-        // 刚切段时有 0.18s 交叉淡化,那段姿势在动、帧率理应还是满的;等淡化过去再看
-        run(&mut s, 0.5, |_| false);
-        assert_eq!(s.tick_interval(), Duration::from_secs_f32(1.0 / STILL_HZ));
+        assert_eq!(s.tick_interval(), Duration::from_secs_f32(1.0 / 60.0));
     }
 }

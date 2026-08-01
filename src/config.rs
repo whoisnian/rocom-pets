@@ -26,14 +26,16 @@ px_per_cm = 2.0
 # 启动时就开鼠标穿透(宠物只显示、不接鼠标)。
 passthrough = false
 
-# 全局热键(切换鼠标穿透)。走 XDG GlobalShortcuts portal 申请,
-# KDE 会弹窗让你确认/改键;不支持的桌面上会自动跳过,用托盘菜单即可。
-# 写空串 "" = 不要热键;**整行删掉不等于不要**,那是「用默认值」。
-hotkey = "CTRL+ALT+p"
+# 没有全局热键这一项:抢组合键这件事交给系统更合适 —— 在 KDE「自定义快捷键」里
+# 把任意键绑到 `rocom-pets --toggle-passthrough`(或 --recall / --reload)即可。
 
 # 叫声音量 0~1。桌宠是常驻程序,默认小声;设成 0 就完全不开音频设备。
 # 托盘里的「叫声」勾选是临时静音,不写回这里。
-volume = 0.35
+volume = 0.30
+
+# 目标帧率:台上在干什么都按这个推进(没有「没动就降频」那回事)。
+# 托盘里给 20 / 30 / 60 三档;手写别的值也认,10~240 之外会被拉回来。
+fps = 30
 "#;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -47,33 +49,41 @@ pub struct Config {
     pub px_per_cm: f32,
     #[serde(default)]
     pub passthrough: bool,
-    #[serde(default = "default_hotkey")]
-    pub hotkey: Option<String>,
     #[serde(default = "default_volume")]
     pub volume: f32,
+    /// 目标帧率。台上在干什么都按这个推进(见 `Stage::tick_interval`)。
+    #[serde(default = "default_fps")]
+    pub fps: u32,
 }
 
 /// 要写回配置文件的一个值。[`Config::write_back`] 的入参。
 ///
-/// **没有「删掉这一项」**:删掉不等于关掉,而是「回到内置默认值」——
-/// 想表达「不要热键」得写空串,见 [`Config::load_or_create`]。
+/// **没有「删掉这一项」**:删掉不等于关掉,而是「回到内置默认值」。
 #[derive(Debug, Clone, Copy)]
-pub enum Setting<'a> {
+pub enum Setting {
     Num(f32),
+    /// 整数(帧率)。**和 `Num` 分开**:走 `Num` 会写成 `fps = 30.0`,再读回来时
+    /// serde 要的是 u32,直接解析失败 —— 一次写回就把配置文件弄成读不了的。
+    Int(u32),
     Flag(bool),
-    Text(&'a str),
 }
 
 fn default_volume() -> f32 {
     crate::audio::DEFAULT_VOLUME
 }
 
-fn default_px_per_cm() -> f32 {
-    2.0
+/// 默认目标帧率。30 就是原来写死在 stage.rs 里的那个值。
+pub const DEFAULT_FPS: u32 = 30;
+
+/// 手写的 `fps` 会被拉回这个区间。低于 10 就是在看幻灯片,高于 240 只是白烧 CPU。
+pub const FPS_RANGE: std::ops::RangeInclusive<u32> = 10..=240;
+
+fn default_fps() -> u32 {
+    DEFAULT_FPS
 }
 
-fn default_hotkey() -> Option<String> {
-    Some("CTRL+ALT+p".to_string())
+fn default_px_per_cm() -> f32 {
+    2.0
 }
 
 impl Default for Config {
@@ -83,8 +93,8 @@ impl Default for Config {
             form: None,
             px_per_cm: default_px_per_cm(),
             passthrough: false,
-            hotkey: default_hotkey(),
             volume: default_volume(),
+            fps: default_fps(),
         }
     }
 }
@@ -104,13 +114,15 @@ impl Config {
     pub fn load_or_create(path: &Path) -> Result<Self> {
         match std::fs::read_to_string(path) {
             Ok(text) => {
-                let mut config: Config =
-                    toml::from_str(&text).with_context(|| format!("{path:?} 格式有误"))?;
-                // **空串 = 明确不要热键**,与「这一项没写 = 用内置默认」区分开。
-                // 少了这一条,配置窗口里把热键清空就没法保存 —— 删掉那一行只会让它
-                // 落回默认的 CTRL+ALT+p(单元测试就是这么发现的)。
-                if config.hotkey.as_deref().is_some_and(str::is_empty) {
-                    config.hotkey = None;
+                // 认不得的键也算错(拼错了要让人看见)。**老版本留下的键会撞在这儿** ——
+                // 删掉这个文件就会重新生成一份带注释的默认配置。
+                let mut config: Config = toml::from_str(&text)
+                    .with_context(|| format!("{path:?} 格式有误(删掉它会重新生成一份)"))?;
+                // 帧率是手写得进去的,而 0 会让 `1.0 / fps` 变成无穷大的定时器间隔
+                let clamped = config.fps.clamp(*FPS_RANGE.start(), *FPS_RANGE.end());
+                if clamped != config.fps {
+                    log::warn!("fps = {} 超出 {FPS_RANGE:?},按 {clamped} 用", config.fps);
+                    config.fps = clamped;
                 }
                 log::info!("读配置 {}", path.display());
                 Ok(config)
@@ -137,7 +149,7 @@ impl Config {
     ///
     /// 文件不在就从模板起头(于是新生成的那份也带注释)。**失败只警告不报错**:
     /// 托盘里调个音量不该让桌宠崩掉,值在内存里已经生效了,顶多下次启动回到旧值。
-    pub fn write_back(path: &Path, updates: &[(&str, Setting<'_>)]) -> Result<()> {
+    pub fn write_back(path: &Path, updates: &[(&str, Setting)]) -> Result<()> {
         let text = match std::fs::read_to_string(path) {
             Ok(text) => text,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => TEMPLATE.to_string(),
@@ -148,11 +160,11 @@ impl Config {
             .with_context(|| format!("{path:?} 格式有误,不敢改"))?;
         for (key, setting) in updates {
             match setting {
-                // 模板里这些键多半是**注释掉的**(pack/form),写的时候要真加一行;
+                // 老配置里可能压根没有这个键(比如 `fps` 是后加的),
                 // toml_edit 的 `doc[key] = value` 正好就是「有则改,无则加」
                 Setting::Num(v) => doc[*key] = toml_edit::value(*v as f64),
+                Setting::Int(v) => doc[*key] = toml_edit::value(i64::from(*v)),
                 Setting::Flag(v) => doc[*key] = toml_edit::value(*v),
-                Setting::Text(v) => doc[*key] = toml_edit::value(*v),
             }
         }
         if let Some(dir) = path.parent() {
@@ -202,9 +214,31 @@ mod tests {
         let default = Config::default();
         assert_eq!(parsed.px_per_cm, default.px_per_cm);
         assert_eq!(parsed.passthrough, default.passthrough);
-        assert_eq!(parsed.hotkey, default.hotkey);
         assert_eq!(parsed.volume, default.volume);
+        assert_eq!(parsed.fps, default.fps);
         assert!(parsed.pack.is_none() && parsed.form.is_none());
+    }
+
+    #[test]
+    fn the_frame_rate_survives_a_write_back() {
+        // `Setting::Int` 存在的唯一理由:写成 30.0 的话下次 `load_or_create` 直接报格式错
+        let dir = std::env::temp_dir().join(format!("rocom-fps-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("该能建目录");
+        let path = dir.join("config.toml");
+        std::fs::write(&path, TEMPLATE).expect("该能写");
+
+        Config::write_back(&path, &[("fps", Setting::Int(60))]).expect("该能写回");
+        let text = std::fs::read_to_string(&path).expect("该能读回");
+        assert!(text.contains("fps = 60"), "写成了别的样子:{text}");
+        assert_eq!(Config::load_or_create(&path).expect("该还能读").fps, 60);
+
+        // 手写的怪值要被拉回区间,而不是让定时器间隔变成无穷大
+        std::fs::write(&path, "fps = 0\n").expect("该能写");
+        assert_eq!(
+            Config::load_or_create(&path).expect("该能读").fps,
+            *FPS_RANGE.start()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -227,8 +261,6 @@ mod tests {
                 ("px_per_cm", Setting::Num(3.0)),
                 ("volume", Setting::Num(0.6)),
                 ("passthrough", Setting::Flag(true)),
-                // 模板里 pack 是注释掉的,写回时要真长出一行来
-                ("pack", Setting::Text("喵喵")),
             ],
         )
         .expect("该能写回");
@@ -240,29 +272,28 @@ mod tests {
         assert_eq!(parsed.px_per_cm, 3.0);
         assert_eq!(parsed.volume, 0.6);
         assert!(parsed.passthrough);
-        assert_eq!(parsed.pack.as_deref(), Some("喵喵"));
         // 没点名的键原样不动
-        assert_eq!(parsed.hotkey, default_hotkey());
+        assert_eq!(parsed.fps, DEFAULT_FPS);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// 没写过某个键的配置:读的时候用默认值,写回时把它**加出来**。
+    /// (`fps` 就是后加的键,老配置里没有那一行。)
     #[test]
-    fn an_empty_hotkey_means_none_but_a_missing_one_means_default() {
-        // 这两件事不一样,而且**必须**不一样:配置窗口里把热键清空要存得住,
-        // 而「这一项没写」的老配置该照常拿到默认键
-        let dir = std::env::temp_dir().join(format!("rocom-hotkey-{}", std::process::id()));
+    fn a_missing_key_reads_as_default_and_gets_written_in() {
+        let dir = std::env::temp_dir().join(format!("rocom-missing-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("该能建目录");
+        let path = dir.join("config.toml");
+        std::fs::write(&path, "px_per_cm = 1.5\nvolume = 1.0\n").expect("该能写");
 
-        let cleared = dir.join("cleared.toml");
-        std::fs::write(&cleared, "hotkey = \"\"\n").expect("该能写");
-        assert_eq!(Config::load_or_create(&cleared).expect("该能读").hotkey, None);
+        let parsed = Config::load_or_create(&path).expect("该能读");
+        assert_eq!(parsed.px_per_cm, 1.5);
+        assert_eq!(parsed.fps, DEFAULT_FPS, "没写 fps 就用默认值");
 
-        let missing = dir.join("missing.toml");
-        std::fs::write(&missing, "px_per_cm = 2.0\n").expect("该能写");
-        assert_eq!(
-            Config::load_or_create(&missing).expect("该能读").hotkey,
-            default_hotkey()
-        );
+        Config::write_back(&path, &[("fps", Setting::Int(60))]).expect("该能写回");
+        let text = std::fs::read_to_string(&path).expect("该能读回");
+        assert!(text.contains("fps = 60"), "新键该被加出来:{text}");
+        assert!(text.contains("volume = 1.0"), "没点名的键不该被动");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -44,13 +44,14 @@ stage 模式(不给参数时读配置文件,首次运行会生成模板;
   --form <资产名>    选形态,默认包里第一个(链首)
   --px-per-cm <n>    每厘米多少逻辑像素(默认 2.0:80cm 的喵喵 → 160px 高)
   --config <文件>    换个配置文件
-  --volume <0..1>    叫声音量(默认 0.35;0 = 不开音频)
+  --volume <0..1>    叫声音量(默认 0.30;0 = 不开音频)
   --no-tray          不起托盘图标
   --passthrough      启动就开鼠标穿透
 
 配置窗口:
-  --settings         打开配置窗口(宠物包管理 / 活跃宠物 / 常用配置)
-                     托盘菜单里也能开;改完点「保存并应用」,在跑的桌宠会立刻跟着变
+  --settings         打开配置窗口(宠物包 / 活跃宠物 / 常用配置)
+  --page <哪一页>    pets | packs | common,默认 packs
+  托盘菜单里也能开。窗口里改什么都**即时生效**,顶上那条给「撤销」。
 
 包管理:
   --list             列出包目录里的宠物包(默认 ~/.local/share/rocom-pets/packs)
@@ -58,9 +59,8 @@ stage 模式(不给参数时读配置文件,首次运行会生成模板;
   (--pack 接受包目录、`.rkpet` 文件,也接受包名/物种名,后者在包目录里找)
 
 在场阵容(同时上几只):
-  托盘菜单里「加一只」/「撤下」,阵容存在配置同目录的 roster.toml,
-  下次启动自动恢复。给了 --pack 就只上这一只,不读也不动那份存档。
-  (Windows 的托盘还没有加/撤菜单,只能手改 roster.toml 重启)
+  在配置窗口的「活跃宠物」里加/撤、改每只的形态与选项;阵容存在配置同目录的
+  roster.toml,下次启动自动恢复。给了 --pack 就只上这一只,不读也不动那份存档。
 
 控制已在运行的实例(走 D-Bus,可绑到 KDE 自定义快捷键):
   --toggle-passthrough  切换鼠标穿透
@@ -162,6 +162,7 @@ fn main() -> anyhow::Result<()> {
     let mut cli_packs_dir: Option<PathBuf> = None;
     let mut list_packs = false;
     let mut open_settings = false;
+    let mut settings_page = control::SettingsPage::Packs;
     let next = |flag: &str, args: &mut dyn Iterator<Item = String>| -> anyhow::Result<String> {
         args.next()
             .ok_or_else(|| anyhow::anyhow!("{flag} 缺少参数值\n{USAGE}"))
@@ -195,6 +196,11 @@ fn main() -> anyhow::Result<()> {
             "--packs-dir" => cli_packs_dir = Some(PathBuf::from(next("--packs-dir", &mut args)?)),
             "--list" => list_packs = true,
             "--settings" => open_settings = true,
+            "--page" => {
+                let value = next("--page", &mut args)?;
+                settings_page = control::SettingsPage::parse(&value)
+                    .ok_or_else(|| anyhow::anyhow!("--page 只认 pets/packs/common,给的是 {value}"))?;
+            }
             "--px-per-cm" => cli_px_per_cm = Some(next("--px-per-cm", &mut args)?.parse()?),
             "--volume" => cli_volume = Some(next("--volume", &mut args)?.parse()?),
             "--config" => config_path = Some(PathBuf::from(next("--config", &mut args)?)),
@@ -205,7 +211,11 @@ fn main() -> anyhow::Result<()> {
             }
             "--recall" => return control::send_command(control::Control::Recall),
             "--reload" => return control::send_command(control::Control::Reload),
-            "--settings-window" => return control::send_command(control::Control::OpenSettings),
+            "--settings-window" => {
+                return control::send_command(control::Control::OpenSettings(
+                    control::SettingsPage::Packs,
+                ));
+            }
             "--quit" => return control::send_command(control::Control::Quit),
             // --form 两个模式都用得到
             "--form" if request.is_none() => cli_form = Some(next("--form", &mut args)?),
@@ -249,7 +259,7 @@ fn main() -> anyhow::Result<()> {
     let path = config_path.or_else(config::Config::default_path);
 
     if open_settings {
-        return settings::run(path, packs_dir);
+        return settings::run(path, packs_dir, settings_page);
     }
 
     // stage 模式:配置文件打底,命令行覆盖
@@ -315,8 +325,8 @@ fn main() -> anyhow::Result<()> {
         px_per_cm: cli_px_per_cm.unwrap_or(file.px_per_cm),
         passthrough: cli_passthrough || file.passthrough,
         tray: !no_tray,
-        hotkey: file.hotkey,
         volume: cli_volume.unwrap_or(file.volume).clamp(0.0, 1.0),
+        fps: file.fps,
     };
     platform::run(options)
 }

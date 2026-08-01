@@ -169,7 +169,19 @@ pub fn render(request: &Request) -> Result<()> {
     // 空的 `Player`。这样至少能看见它们;运行时要不要当桌宠是另一回事(不能动)。
     if model.clips.is_empty() {
         let identity = vec![glam::Mat4::IDENTITY; model.skeleton.joints.len()];
-        pet.update(&queue, view_proj, light_dir, outline_width, request.time, &identity);
+        // 离屏渲染不带性格,一律默认那张脸
+        let face = crate::persona::DEFAULT_FACE.uv_offset();
+        pet.update(
+            &queue,
+            &crate::pet::FrameParams {
+                view_proj: view_proj,
+                light_dir: light_dir,
+                outline_width: outline_width,
+                time: request.time,
+                face_uv: face,
+            },
+            &identity,
+        );
         let pixels = draw_and_read(
             &device, &queue, &pet, &color, &color_view, &depth_view, &readback, size, padded_row,
         )?;
@@ -186,10 +198,13 @@ pub fn render(request: &Request) -> Result<()> {
         player.update(&model);
         pet.update(
             &queue,
-            view_proj,
-            light_dir,
-            outline_width,
-            request.time,
+            &crate::pet::FrameParams {
+                view_proj: view_proj,
+                light_dir: light_dir,
+                outline_width: outline_width,
+                time: request.time,
+                face_uv: crate::persona::DEFAULT_FACE.uv_offset(),
+            },
             &player.matrices,
         );
         let pixels = draw_and_read(
@@ -220,10 +235,13 @@ pub fn render(request: &Request) -> Result<()> {
             player.update(&model);
             pet.update(
                 &queue,
-                view_proj,
-                light_dir,
-                outline_width,
-                request.time,
+                &crate::pet::FrameParams {
+                    view_proj: view_proj,
+                    light_dir: light_dir,
+                    outline_width: outline_width,
+                    time: request.time,
+                    face_uv: crate::persona::DEFAULT_FACE.uv_offset(),
+                },
                 &player.matrices,
             );
             let pixels = draw_and_read(
@@ -295,10 +313,13 @@ fn benchmark(
         player.update(model);
         pet.update(
             queue,
-            view_proj,
-            light,
-            0.004,
-            frame_time,
+            &crate::pet::FrameParams {
+                view_proj: view_proj,
+                light_dir: light,
+                outline_width: 0.004,
+                time: frame_time,
+                face_uv: crate::persona::DEFAULT_FACE.uv_offset(),
+            },
             &player.matrices,
         );
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -495,3 +516,4 @@ fn locate_glb(pack: &Path, form: Option<&str>) -> Result<PathBuf> {
     let index = loaded.form_index(form)?;
     Ok(loaded.forms[index].model.clone())
 }
+

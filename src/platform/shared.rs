@@ -13,13 +13,12 @@ use std::sync::Arc;
 
 use anyhow::Result;
 
-use crate::control::TrayPet;
 use crate::pack::{Form, Pack};
 use crate::persona::Persona;
 use crate::pet::{Model, PetGpu};
 use crate::render::Gpu;
 use crate::roster::{Roster, Slot};
-use crate::stage::{Actor, PetActor, PetBuild, VoiceBank};
+use crate::stage::{Actor, EntityId, PetActor, PetBuild, VoiceBank};
 
 /// 离屏画布的取景余量。伸展类动作已经算进 `Model::motion_bounds`,这里只给描边外扩与
 /// 边缘光留一点边。**两个后端必须用同一个值**:它同时是 `view_proj` 的入参。
@@ -33,20 +32,31 @@ pub const CANVAS_PADDING: f32 = 1.15;
 pub struct PetOptions {
     /// 相对大小倍数。
     pub scale: f32,
+    /// 脾气,顺带定了表情池与默认表情(见 persona.rs)。
     pub persona: Persona,
-    /// 允许的表情;None = 全部。
-    pub emotes: Option<Vec<String>>,
+    /// 这一只参不参与叫声(整体静音是另一回事,在托盘里)。
+    pub voice: bool,
+    /// 嗓音 −100~100;None = 没设过,按 0(原调)来。**不再自动掷** ——
+    /// 想要一只与众不同的嗓子就在配置窗口里按「重掷」。
+    pub voice_value: Option<f32>,
+    /// 记住落脚点。
+    pub remember: bool,
+    /// 上次站在可走范围的百分之几(0~1)。**运行时写的**,配置窗口只读不改。
+    pub home_x: Option<f32>,
 }
 
 /// 大小倍数的上下限。太小看不清,太大挡住半个屏幕 —— 两头都不是「桌宠」了。
-pub const SCALE_RANGE: std::ops::RangeInclusive<f32> = 0.3..=3.0;
+pub const SCALE_RANGE: std::ops::RangeInclusive<f32> = 0.5..=2.0;
 
 impl Default for PetOptions {
     fn default() -> Self {
         Self {
             scale: 1.0,
             persona: Persona::default(),
-            emotes: None,
+            voice: true,
+            voice_value: None,
+            remember: false,
+            home_x: None,
         }
     }
 }
@@ -66,15 +76,26 @@ impl PetOptions {
                 .as_deref()
                 .map(Persona::by_id)
                 .unwrap_or_default(),
-            emotes: slot.emotes.clone(),
+            voice: slot.voice.unwrap_or(true),
+            // 手改成 999 的话调出来的速率会离谱到听不出是叫声
+            voice_value: slot
+                .voice_value
+                .filter(|v| v.is_finite())
+                .map(|v| v.clamp(-100.0, 100.0)),
+            remember: slot.remember.unwrap_or(false),
+            home_x: slot.home_x.filter(|v| v.is_finite()).map(|v| v.clamp(0.0, 1.0)),
         }
     }
 
     /// 写回存档形状。默认值一律留空,见 [`Slot`] 的说明。
-    fn write_into(&self, slot: &mut Slot) {
+    pub fn write_into(&self, slot: &mut Slot) {
         slot.scale = (self.scale != 1.0).then_some(self.scale);
         slot.persona = self.persona.saved_id();
-        slot.emotes = self.emotes.clone();
+        slot.voice = (!self.voice).then_some(false);
+        slot.voice_value = self.voice_value;
+        slot.remember = self.remember.then_some(true);
+        // 不记落脚点就把记下的那个也清掉,免得下次勾上时跳回一个很旧的位置
+        slot.home_x = self.remember.then_some(self.home_x).flatten();
     }
 }
 
@@ -255,7 +276,8 @@ impl Assets {
                 format!(",大小 ×{:.2}", options.scale)
             }
         );
-        let voice = self.voice(form, with_audio);
+        // 这一只关了叫声就干脆不读它的音频(省几 MB,也省一次解码)
+        let voice = self.voice(form, with_audio && options.voice);
         Ok(Actor::Pet(PetActor::new(PetBuild {
             model,
             size: (side as u32, side as u32),
@@ -267,7 +289,8 @@ impl Assets {
             form_id: form.id,
             voice,
             persona: options.persona,
-            emotes: options.emotes.clone(),
+            // −100~100 换成 stage 里用的 −1~1
+            voice_value: options.voice_value.map(|v| v / 100.0),
             seed,
         })))
     }
@@ -331,18 +354,48 @@ pub fn load_roster(slots: &[Slot], packs_dir: Option<&Path>) -> Vec<Member> {
     roster
 }
 
-/// 托盘菜单要的那份阵容快照。
-pub fn tray_pets(roster: &[Member]) -> Vec<TrayPet> {
-    roster
-        .iter()
-        .map(|m| TrayPet {
-            name: m.form().name.clone(),
-            forms: m.pack.forms.iter().map(|f| f.name.clone()).collect(),
-            current_form: m.form,
-            scale: m.options.scale,
-            persona: m.options.persona.index(),
-        })
-        .collect()
+/// 上台时用哪个落脚点:勾了「记住」才用,没勾就交给 `Stage` 按次序错开摆。
+pub fn home_of(member: &Member) -> Option<f32> {
+    member.options.remember.then_some(member.options.home_x).flatten()
+}
+
+/// 把**运行时才知道的那两项**收回阵容:掷出来的嗓音、站过的位置。存盘前调。
+///
+/// 嗓音是第一次上台随机掷的,不收回来的话同一只每次启动都换个嗓子;
+/// 落脚点更是只有台上才知道。两项都只从**第一台**读 —— 多显示器上每台一只独立的,
+/// 位置各不相同,存哪个都是武断的,那就固定存第一台的(已知问题,见 design.md)。
+pub fn sync_runtime_fields(roster: &mut [Member], stage: &crate::stage::Stage, slots: &[EntityId]) {
+    for (member, id) in roster.iter_mut().zip(slots) {
+        if let Some(Actor::Pet(pet)) = stage.entity(*id).map(|e| e.actor()) {
+            member.options.voice_value = Some(pet.voice_value * 100.0);
+        }
+        if member.options.remember {
+            member.options.home_x = stage.home_fraction(*id);
+        }
+    }
+}
+
+/// 重载后**新来的**是哪几个插槽(按包名比对旧阵容)。它们要喊一声「启用召唤」。
+///
+/// 按名字而不是按身份比:阵容是从文件重读的,没有能跨越重载的身份。
+/// 同一个包加第二只时第二只也算新来的 —— 那正是想要的效果。
+pub fn newcomers(before: &[String], after: &[Member]) -> Vec<usize> {
+    let mut pool: Vec<&String> = before.iter().collect();
+    let mut fresh = Vec::new();
+    for (index, member) in after.iter().enumerate() {
+        match pool.iter().position(|name| **name == member.pack.species_name) {
+            Some(hit) => {
+                pool.swap_remove(hit);
+            }
+            None => fresh.push(index),
+        }
+    }
+    fresh
+}
+
+/// 托盘标题要的那份阵容快照。托盘只显示「几只在场」,所以只要名字。
+pub fn tray_pets(roster: &[Member]) -> Vec<String> {
+    roster.iter().map(|m| m.form().name.clone()).collect()
 }
 
 /// 把阵容写回存档。存**包名**而不是路径 —— 包目录整个搬走时阵容还认得出来;

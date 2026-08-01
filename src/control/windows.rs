@@ -3,14 +3,12 @@
 //! 与 Linux 那边的差别:
 //! - 托盘走 `Shell_NotifyIconW`,不是 StatusNotifier;菜单是**点的时候现建**的 `HMENU`,
 //!   不像 ksni 那样声明一棵树。
-//! - 没有 GlobalShortcuts portal 那种「向桌面申请热键」的机制。要全局热键得
-//!   `RegisterHotKey` 自己占一个组合键 —— 那是**抢**而不是申请,冲突了别人就用不了,
-//!   所以这里不做;`rocom-pets --toggle-passthrough` 仍然可用(见下),
-//!   要热键就在快捷方式上挂「快捷键」或用任何一个第三方热键工具调它。
+//! - 不申请也不抢全局热键(两个平台都不做了):要快捷键就把系统的自定义快捷键
+//!   绑到 `rocom-pets --toggle-passthrough`,或者在快捷方式上挂一个。
 //! - 「通知已在跑的实例」不走 D-Bus:按窗口类名找到那个隐藏的消息窗口,`PostMessage` 过去。
 //!
-//! 托盘图标本身实机验过(能出现、四项菜单能点);**加一只/撤下/切形态那几项是后补的,
-//! 还没验**。见 docs/design.md §9 Phase 8。
+//! 托盘图标本身实机验过(能出现、菜单能点);**后来重排过两轮菜单、加了档位子菜单,
+//! 那些改动只在 Linux 上验过**。见 docs/design.md §9 Phase 8。
 
 use std::sync::mpsc::Sender;
 
@@ -28,7 +26,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use windows::core::{HSTRING, PCWSTR};
 
 use super::{
-    Control, PX_PER_CM_STEPS, SCALE_STEPS, TrayPet, VOLUME_STEPS, nearest_step,
+    Common, Control, FPS_STEPS, PX_PER_CM_STANDARD, SIZE_STEPS, SettingsPage, VOLUME_STEPS,
+    exact_step, nearest_step,
 };
 
 /// 隐藏的消息窗口的类名。`--toggle-passthrough` 这类命令靠它找到在跑的实例。
@@ -39,37 +38,21 @@ pub const WM_TRAY: u32 = WM_APP + 1;
 /// 外部实例发来的命令,`wparam` 是 [`Control`] 的编号。
 pub const WM_CONTROL: u32 = WM_APP + 2;
 
-// 菜单项 id。0 是「没选」,所以从 100 起;后面几段各占一个号段。
+// 菜单项 id。0 是「没选」,所以从 100 起;两组档位各占一个号段。
 // **`TrackPopupMenu` 只把这个数字还回来**,所以「点了哪一项」要能从数字反解出来。
-// 号段一律「起点 + 下标」,而且**只增不改**:`dispatch` 是按从大到小的门槛反解的,
-// 中间插一段会把后面所有的都错开。
 const ID_PASSTHROUGH: usize = 100;
 const ID_RECALL: usize = 101;
 const ID_MUTE: usize = 102;
 const ID_QUIT: usize = 103;
-const ID_SETTINGS: usize = 104;
-/// 整体大小的第 n 档:`ID_PX_PER_CM + index`(档位表在 control/mod.rs)。
-const ID_PX_PER_CM: usize = 200;
+const ID_SETTINGS: usize = 105;
+const ID_RELOAD: usize = 106;
+const ID_CUSTOM_SIZE: usize = 107;
+/// 大小倍率的第 n 档:`ID_SIZE + index`(档位表在 control/mod.rs)。
+const ID_SIZE: usize = 200;
 /// 音量的第 n 档。
 const ID_VOLUME: usize = 300;
-/// 撤下第 n 只:`ID_REMOVE + slot`。
-const ID_REMOVE: usize = 2000;
-/// 把第 n 只切到第 f 个形态:`ID_FORM + slot * FORMS_PER_PET + f`。
-/// 进化链最长也就几阶,留 64 个号绰绰有余。
-const ID_FORM: usize = 3000;
-const FORMS_PER_PET: usize = 64;
-/// 第 n 只的大小档:`ID_PET_SCALE + slot * STEPS_PER_PET + index`。
-const ID_PET_SCALE: usize = 5000;
-/// 第 n 只的性格:`ID_PET_PERSONA + slot * STEPS_PER_PET + index`。
-const ID_PET_PERSONA: usize = 7000;
-/// 每只在这两个号段里各占多少号。档位与性格都只有个位数,16 是宽裕的留量。
-const STEPS_PER_PET: usize = 16;
-/// 加第 n 个包:`ID_ADD + index`。包目录里有五百多个,号段要够宽
-/// (菜单 id 实际只有 16 位可用,10000 + 600 还远没到 65535)。
-const ID_ADD: usize = 10000;
-/// 「加一只」菜单一屏最多列这么多个包;超了就切成一段一段的子菜单。
-/// 全库 539 个包平铺出来根本没法用,而按首字分组的话中文名会分出上百个组。
-const ADD_CHUNK: usize = 24;
+/// 帧率的第 n 档。
+const ID_FPS: usize = 400;
 
 /// 命令 ↔ 编号。跨进程只能传数字,所以要一张明确的表(别拿 `as` 硬转:
 /// 带字段的变体转不了,而且加变体时静默改值)。
@@ -81,15 +64,11 @@ fn code_of(control: Control) -> Option<u32> {
         Control::Quit => 4,
         // 配置窗口存完盘就发这个,是**跨进程**的主用途
         Control::Reload => 5,
-        Control::OpenSettings => 6,
+        Control::OpenSettings(_) => 6,
+        // 配置窗口的动作表用,参数走 lparam(见 `play`)
+        Control::Play(..) => 7,
         // 带参数的那几个只在本进程的托盘里发,不跨进程
-        Control::SwitchForm { .. }
-        | Control::AddPet(_)
-        | Control::RemovePet(_)
-        | Control::SetPxPerCm(_)
-        | Control::SetVolume(_)
-        | Control::SetPetScale { .. }
-        | Control::SetPetPersona { .. } => return None,
+        Control::SetFps(_) | Control::SetPxPerCm(_) | Control::SetVolume(_) => return None,
     })
 }
 
@@ -100,9 +79,64 @@ pub fn control_of(code: u32) -> Option<Control> {
         3 => Control::Recall,
         4 => Control::Quit,
         5 => Control::Reload,
-        6 => Control::OpenSettings,
+        6 => Control::OpenSettings(SettingsPage::Packs),
+        // 7 带参数,由 `control_from_message` 拆 lparam,不走这儿
         _ => return None,
     })
+}
+
+/// 叫台上第 `slot` 只播一段动作。配置窗口那张动作表用。
+///
+/// 两个参数塞进 `lparam` 的高低 16 位 —— 窗口消息只有 wparam/lparam 两个格子,
+/// wparam 已经装着命令编号了。阵容与动作表都远不到 65535 条。
+pub fn play(slot: u32, clip: u32) -> Result<()> {
+    let class = HSTRING::from(CONTROL_CLASS);
+    // SAFETY: 只读地按类名查窗口;找不到返回错误。
+    let hwnd = unsafe { FindWindowW(PCWSTR(class.as_ptr()), PCWSTR::null()) }
+        .context("找不到在跑的 rocom-pets(它没起来?)")?;
+    let packed = ((slot & 0xffff) << 16) | (clip & 0xffff);
+    // SAFETY: hwnd 刚由系统给出;PostMessage 不等对方处理。
+    unsafe {
+        PostMessageW(
+            Some(hwnd),
+            WM_CONTROL,
+            WPARAM(7),
+            LPARAM(packed as isize),
+        )
+    }
+    .context("发命令失败")
+}
+
+/// 叫配置窗口关掉(托盘点「退出」时)。**它是另一个进程**,只能喊一声。
+///
+/// 走具名事件而不是「按标题找窗口发 `WM_CLOSE`」:winit 的窗口类名是通用的,
+/// 只能按标题匹配,而标题是会变的界面文案 —— 具名内核对象才是给进程间用的那种名字。
+/// 打不开就是窗口没开着,静悄悄地算了。
+pub fn close_settings() {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Threading::{EVENT_MODIFY_STATE, OpenEventW, SetEvent};
+
+    let name = HSTRING::from(super::SETTINGS_QUIT_EVENT);
+    // SAFETY: 只按名字开一个已存在的事件,置位后立刻关掉自己这一份句柄。
+    unsafe {
+        let Ok(event) = OpenEventW(EVENT_MODIFY_STATE, false, PCWSTR(name.as_ptr())) else {
+            return;
+        };
+        match SetEvent(event) {
+            Ok(()) => log::info!("配置窗口跟着关"),
+            Err(e) => log::debug!("通知配置窗口失败({e})"),
+        }
+        let _ = CloseHandle(event);
+    }
+}
+
+/// 桌宠在不在跑:那个隐藏的消息窗口在不在。配置窗口的状态栏要说这件事。
+///
+/// **只查不发**:发一条命令过去也能试出来,但那会有副作用。
+pub fn is_running() -> bool {
+    let class = HSTRING::from(CONTROL_CLASS);
+    // SAFETY: 只读地按类名查窗口。
+    unsafe { FindWindowW(PCWSTR(class.as_ptr()), PCWSTR::null()) }.is_ok()
 }
 
 /// 通知已在跑的实例执行某个命令。
@@ -124,13 +158,12 @@ pub struct TrayHandle {
     hwnd: HWND,
     sender: Sender<Control>,
     passthrough: bool,
-    voice: Option<bool>,
-    pets: Vec<TrayPet>,
-    /// 包目录里能加的包名,下标即 [`Control::AddPet`] 的参数。
-    available: Vec<String>,
-    /// 当前的每厘米像素数与音量,菜单里回显选中的那一档。
-    px_per_cm: f32,
-    volume: f32,
+    /// 静音了没有;None = 压根没有音频设备(那两项就不显示)。
+    muted: Option<bool>,
+    /// 在场宠物的名字,只用来写托盘提示。
+    pets: Vec<String>,
+    /// 当前的帧率、每厘米像素数与音量,菜单里回显选中的那一档。
+    common: Common,
 }
 
 impl TrayHandle {
@@ -138,23 +171,17 @@ impl TrayHandle {
         self.passthrough = passthrough;
     }
 
-    pub fn set_voice(&mut self, on: bool) {
-        self.voice = Some(on);
+    pub fn set_muted(&mut self, muted: bool) {
+        self.muted = Some(muted);
     }
 
-    /// 「常用配置」那两组单选要回显真实值(可能是配置窗口改的,不是从这儿点的)。
-    pub fn set_common(&mut self, px_per_cm: f32, volume: f32) {
-        self.px_per_cm = px_per_cm;
-        self.volume = volume;
-    }
-
-    /// 包目录变了(配置窗口里导入/删除了包),「加一只」那张表要跟着换。
-    pub fn set_available(&mut self, available: Vec<String>) {
-        self.available = available;
+    /// 「常用配置」那三组单选要回显真实值(可能是配置窗口改的,不是从这儿点的)。
+    pub fn set_common(&mut self, common: Common) {
+        self.common = common;
     }
 
     /// 阵容变了。Windows 这边菜单是点的时候现建的,存下来就行。
-    pub fn set_roster(&mut self, pets: Vec<TrayPet>) {
+    pub fn set_roster(&mut self, pets: Vec<String>) {
         self.pets = pets;
         self.update_tip();
     }
@@ -170,6 +197,7 @@ impl TrayHandle {
         }
     }
 
+    /// 弹菜单。结构与 KDE 那边逐条对齐;在场数量两边都只在图标的悬停提示里。
     fn popup(&self) -> Result<()> {
         let mut point = POINT::default();
         // SAFETY: 取当前光标位置,只写我们自己的栈变量。
@@ -183,20 +211,49 @@ impl TrayHandle {
                 menu,
                 checked(self.passthrough),
                 ID_PASSTHROUGH,
-                &HSTRING::from("鼠标穿透"),
+                &HSTRING::from("点击穿透"),
             )?;
-            AppendMenuW(menu, MF_STRING, ID_RECALL, &HSTRING::from("召回宠物"))?;
-            if let Some(on) = self.voice {
-                AppendMenuW(menu, checked(on), ID_MUTE, &HSTRING::from("叫声"))?;
+            // **勾上 = 静音**,与 KDE 那边同一套说法
+            if let Some(muted) = self.muted {
+                AppendMenuW(menu, checked(muted), ID_MUTE, &HSTRING::from("静音叫声"))?;
             }
+            AppendMenuW(menu, MF_STRING, ID_RECALL, &HSTRING::from("召回宠物"))?;
             AppendMenuW(menu, MF_SEPARATOR, 0usize, PCWSTR::null())?;
 
-            let common = self.common_menu()?;
-            AppendMenuW(menu, MF_POPUP, common.0 as usize, &HSTRING::from("常用配置"))?;
-            let pets = self.pets_menu()?;
-            AppendMenuW(menu, MF_POPUP, pets.0 as usize, &HSTRING::from("宠物配置"))?;
+            // **三组档位各自一个子菜单**,不再套一层「常用配置」:套着的时候
+            // 调个音量要点两次才看得见选项,而这三样正是最常调的
+            let fps = CreatePopupMenu()?;
+            steps(
+                fps,
+                FPS_STEPS,
+                exact_step(FPS_STEPS, self.common.fps),
+                ID_FPS,
+            )?;
+            AppendMenuW(menu, MF_POPUP, fps.0 as usize, &HSTRING::from("帧率设置"))?;
+
+            let size = self.size_menu()?;
+            AppendMenuW(menu, MF_POPUP, size.0 as usize, &HSTRING::from("大小倍率"))?;
+
+            // 没有音频设备时这一项点了也没用
+            if self.muted.is_some() {
+                let volume = CreatePopupMenu()?;
+                steps(
+                    volume,
+                    VOLUME_STEPS,
+                    nearest_step(VOLUME_STEPS, self.common.volume),
+                    ID_VOLUME,
+                )?;
+                AppendMenuW(
+                    menu,
+                    MF_POPUP,
+                    volume.0 as usize,
+                    &HSTRING::from("叫声音量"),
+                )?;
+            }
 
             AppendMenuW(menu, MF_SEPARATOR, 0usize, PCWSTR::null())?;
+            AppendMenuW(menu, MF_STRING, ID_SETTINGS, &HSTRING::from("首选项"))?;
+            AppendMenuW(menu, MF_STRING, ID_RELOAD, &HSTRING::from("重新载入"))?;
             AppendMenuW(menu, MF_STRING, ID_QUIT, &HSTRING::from("退出"))?;
 
             // 不 SetForegroundWindow 的话菜单会「点别处不消失」——这是 Win32 的老毛病
@@ -216,206 +273,45 @@ impl TrayHandle {
         Ok(())
     }
 
-    /// 「常用配置」:整体大小与音量各一组单选,末尾一条通往配置窗口(与 Linux 托盘同构)。
+    /// 「大小倍率」:三档 + 一条「自定义…」通向窗口。
+    /// 帧率与音量没有这一条 —— 那几档就是全部选择。
     ///
     /// # Safety
     /// 返回的 `HMENU` 必须挂到某个会被 `DestroyMenu` 的菜单上,否则泄漏。
-    unsafe fn common_menu(&self) -> Result<HMENU> {
+    unsafe fn size_menu(&self) -> Result<HMENU> {
         unsafe {
             let root = CreatePopupMenu()?;
-            let size = self.steps_menu(PX_PER_CM_STEPS, self.px_per_cm, ID_PX_PER_CM)?;
-            AppendMenuW(root, MF_POPUP, size.0 as usize, &HSTRING::from("整体大小"))?;
-            // 没有音频设备时这一项点了也没用
-            if self.voice.is_some() {
-                let volume = self.steps_menu(VOLUME_STEPS, self.volume, ID_VOLUME)?;
-                AppendMenuW(
-                    root,
-                    MF_POPUP,
-                    volume.0 as usize,
-                    &HSTRING::from("叫声音量"),
-                )?;
-            }
-            AppendMenuW(root, MF_SEPARATOR, 0usize, PCWSTR::null())?;
-            AppendMenuW(
-                root,
-                MF_STRING,
-                ID_SETTINGS,
-                &HSTRING::from("打开配置窗口…"),
-            )?;
-            Ok(root)
-        }
-    }
-
-    /// 一组档位做成单选菜单(选中的打勾)。`base + 下标` 就是菜单 id。
-    ///
-    /// # Safety
-    /// 同 [`Self::common_menu`]。
-    unsafe fn steps_menu(
-        &self,
-        steps: &[(f32, &str)],
-        current: f32,
-        base: usize,
-    ) -> Result<HMENU> {
-        unsafe {
-            let menu = CreatePopupMenu()?;
-            let selected = nearest_step(steps, current);
-            for (index, (_, label)) in steps.iter().enumerate() {
-                let flag = if index == selected {
-                    MF_CHECKED
-                } else {
-                    MF_STRING
-                };
-                AppendMenuW(menu, flag, base + index, &HSTRING::from(*label))?;
-            }
-            Ok(menu)
-        }
-    }
-
-    /// 「宠物配置」:在场的每一只一个子菜单(形态/大小/性格/撤下),再加「加一只」与配置窗口。
-    ///
-    /// # Safety
-    /// 同 [`Self::common_menu`]。
-    unsafe fn pets_menu(&self) -> Result<HMENU> {
-        unsafe {
-            let root = CreatePopupMenu()?;
-            let checked = |on: bool| if on { MF_CHECKED } else { MF_STRING };
-            for (slot, pet) in self.pets.iter().enumerate() {
-                let sub = CreatePopupMenu()?;
-                // 单形态的包不必多「形态」这一层
-                if pet.forms.len() > 1 {
-                    let forms = CreatePopupMenu()?;
-                    for (index, name) in pet.forms.iter().enumerate().take(FORMS_PER_PET) {
-                        AppendMenuW(
-                            forms,
-                            checked(index == pet.current_form),
-                            ID_FORM + slot * FORMS_PER_PET + index,
-                            &HSTRING::from(name.as_str()),
-                        )?;
-                    }
-                    AppendMenuW(sub, MF_POPUP, forms.0 as usize, &HSTRING::from("形态"))?;
-                }
-                let scale = self.steps_menu(
-                    SCALE_STEPS,
-                    pet.scale,
-                    ID_PET_SCALE + slot * STEPS_PER_PET,
-                )?;
-                AppendMenuW(sub, MF_POPUP, scale.0 as usize, &HSTRING::from("大小"))?;
-                let persona = CreatePopupMenu()?;
-                for (index, p) in crate::persona::ALL.iter().enumerate() {
-                    AppendMenuW(
-                        persona,
-                        checked(index == pet.persona),
-                        ID_PET_PERSONA + slot * STEPS_PER_PET + index,
-                        &HSTRING::from(p.name),
-                    )?;
-                }
-                AppendMenuW(sub, MF_POPUP, persona.0 as usize, &HSTRING::from("性格"))?;
-                AppendMenuW(sub, MF_SEPARATOR, 0usize, PCWSTR::null())?;
-                AppendMenuW(sub, MF_STRING, ID_REMOVE + slot, &HSTRING::from("撤下"))?;
-                AppendMenuW(
-                    root,
-                    MF_POPUP,
-                    sub.0 as usize,
-                    &HSTRING::from(pet.name.as_str()),
-                )?;
-            }
-
-            if !self.pets.is_empty() {
-                AppendMenuW(root, MF_SEPARATOR, 0usize, PCWSTR::null())?;
-            }
-            if !self.available.is_empty() {
-                let add = self.add_menu()?;
-                AppendMenuW(root, MF_POPUP, add.0 as usize, &HSTRING::from("加一只"))?;
-            }
-            // 表情池、精确的大小、宠物包的导入/删除都只在窗口里
-            AppendMenuW(
-                root,
-                MF_STRING,
-                ID_SETTINGS,
-                &HSTRING::from("管理宠物与包…"),
-            )?;
-            Ok(root)
-        }
-    }
-
-    /// 「加一只」的内容:包少就平铺,包多就按名字切段(与 Linux 托盘同一套做法)。
-    /// 段的标签取首尾两个名字,于是能像翻通讯录一样找。
-    ///
-    /// # Safety
-    /// 返回的 `HMENU` 必须挂到某个会被 `DestroyMenu` 的菜单上,否则泄漏。
-    unsafe fn add_menu(&self) -> Result<HMENU> {
-        unsafe {
-            let root = CreatePopupMenu()?;
-            if self.available.len() <= ADD_CHUNK {
-                for (index, name) in self.available.iter().enumerate() {
-                    AppendMenuW(
-                        root,
-                        MF_STRING,
-                        ID_ADD + index,
-                        &HSTRING::from(name.as_str()),
-                    )?;
-                }
-                return Ok(root);
-            }
-            for (chunk, names) in self.available.chunks(ADD_CHUNK).enumerate() {
-                let sub = CreatePopupMenu()?;
-                let base = chunk * ADD_CHUNK;
-                for (i, name) in names.iter().enumerate() {
-                    AppendMenuW(
-                        sub,
-                        MF_STRING,
-                        ID_ADD + base + i,
-                        &HSTRING::from(name.as_str()),
-                    )?;
-                }
-                let label = format!("{} … {}", names[0], names[names.len() - 1]);
-                AppendMenuW(root, MF_POPUP, sub.0 as usize, &HSTRING::from(label))?;
-            }
+            let factor = self.common.px_per_cm / PX_PER_CM_STANDARD;
+            steps(root, SIZE_STEPS, nearest_step(SIZE_STEPS, factor), ID_SIZE)?;
+            AppendMenuW(root, MF_STRING, ID_CUSTOM_SIZE, &HSTRING::from("自定义…"))?;
             Ok(root)
         }
     }
 
     /// 菜单 id → 命令。**从大到小按号段门槛反解**,所以号段只能往后加,不能插在中间。
     fn dispatch(&self, id: usize) {
-        // 档位类的号段:取出「第几只」与「第几档」,查表拿到真值
-        let step = |base: usize, steps: &[(f32, &str)]| -> Option<(usize, f32)> {
-            let offset = id - base;
-            let slot = offset / STEPS_PER_PET;
-            let (value, _) = steps.get(offset % STEPS_PER_PET)?;
-            Some((slot, *value))
-        };
         let control = match id {
             ID_PASSTHROUGH => Control::TogglePassthrough,
             ID_RECALL => Control::Recall,
             ID_MUTE => Control::ToggleMute,
             ID_QUIT => Control::Quit,
-            ID_SETTINGS => Control::OpenSettings,
-            id if id >= ID_ADD => Control::AddPet(id - ID_ADD),
-            id if id >= ID_PET_PERSONA => {
-                let offset = id - ID_PET_PERSONA;
-                Control::SetPetPersona {
-                    slot: offset / STEPS_PER_PET,
-                    persona: offset % STEPS_PER_PET,
-                }
-            }
-            id if id >= ID_PET_SCALE => match step(ID_PET_SCALE, SCALE_STEPS) {
-                Some((slot, scale)) => Control::SetPetScale { slot, scale },
+            // 「完整配置」落在常用配置页:从子菜单点进来的人本来就在找这几项
+            ID_SETTINGS => Control::OpenSettings(SettingsPage::Common),
+            ID_RELOAD => Control::Reload,
+            ID_CUSTOM_SIZE => Control::OpenSettings(SettingsPage::Common),
+            id if id >= ID_FPS => match FPS_STEPS.get(id - ID_FPS) {
+                Some((value, _)) => Control::SetFps(*value),
                 None => return,
             },
-            id if id >= ID_FORM => Control::SwitchForm {
-                slot: (id - ID_FORM) / FORMS_PER_PET,
-                form: (id - ID_FORM) % FORMS_PER_PET,
-            },
-            id if id >= ID_REMOVE => Control::RemovePet(id - ID_REMOVE),
             id if id >= ID_VOLUME => match VOLUME_STEPS.get(id - ID_VOLUME) {
                 Some((value, _)) => Control::SetVolume(*value),
                 None => return,
             },
-            id if id >= ID_PX_PER_CM => match PX_PER_CM_STEPS.get(id - ID_PX_PER_CM) {
-                Some((value, _)) => Control::SetPxPerCm(*value),
+            id if id >= ID_SIZE => match SIZE_STEPS.get(id - ID_SIZE) {
+                Some((factor, _)) => Control::SetPxPerCm(factor * PX_PER_CM_STANDARD),
                 None => return,
             },
-            _ => return, // 0 = 什么都没选
+            _ => return, // 0 = 什么都没选,或者点在禁用的分组标题上
         };
         if self.sender.send(control).is_err() {
             log::warn!("主循环已退出,托盘命令没送出去");
@@ -426,9 +322,8 @@ impl TrayHandle {
         let mut data = self.icon_data();
         data.uFlags = NIF_TIP;
         let tip = match self.pets.len() {
-            0 => "rocom-pets".to_string(),
-            1 => format!("rocom-pets — {}", self.pets[0].name),
-            n => format!("rocom-pets — {} 等 {n} 只", self.pets[0].name),
+            0 => "rocom-pets · 台上没有".to_string(),
+            n => format!("rocom-pets · {n} 只在场"),
         };
         write_tip(&mut data, &tip);
         // SAFETY: data 的 hWnd/uID 与注册时一致;失败只是提示文字没更新。
@@ -453,6 +348,33 @@ impl Drop for TrayHandle {
     }
 }
 
+/// 一组档位直接追加到 `menu` 上(选中的打勾)。`base + 下标` 就是菜单 id。
+///
+/// **不套一层子菜单**:这几组就是平铺在「常用配置」下面的,靠禁用项标题分段。
+/// `selected` 由调用方算(连续量用 `nearest_step`、整数用 `exact_step`),
+/// `None` = 一个都不勾(窗口里调出来的 124% 就是这种)。
+///
+/// # Safety
+/// `menu` 必须是个有效的、之后会被销毁的菜单。
+unsafe fn steps<T: Copy>(
+    menu: HMENU,
+    steps: &[(T, &str)],
+    selected: Option<usize>,
+    base: usize,
+) -> Result<()> {
+    unsafe {
+        for (index, (_, label)) in steps.iter().enumerate() {
+            let flag = if Some(index) == selected {
+                MF_CHECKED
+            } else {
+                MF_STRING
+            };
+            AppendMenuW(menu, flag, base + index, &HSTRING::from(*label))?;
+        }
+        Ok(())
+    }
+}
+
 /// 提示文字要写进定长数组(128 个 UTF-16 单元,含结尾 0)。
 fn write_tip(data: &mut NOTIFYICONDATAW, text: &str) {
     let wide: Vec<u16> = text.encode_utf16().collect();
@@ -466,21 +388,17 @@ pub fn spawn_tray(
     hwnd: HWND,
     sender: Sender<Control>,
     passthrough: bool,
-    pets: Vec<TrayPet>,
-    available: Vec<String>,
-    voice: Option<bool>,
-    px_per_cm: f32,
-    volume: f32,
+    pets: Vec<String>,
+    muted: Option<bool>,
+    common: Common,
 ) -> Result<TrayHandle> {
     let handle = TrayHandle {
         hwnd,
         sender,
         passthrough,
-        voice,
+        muted,
         pets,
-        available,
-        px_per_cm,
-        volume,
+        common,
     };
     let mut data = handle.icon_data();
     data.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
@@ -501,8 +419,12 @@ pub fn is_tray_message(message: u32) -> bool {
     message == WM_TRAY
 }
 
-/// 从窗口消息里取出命令(`WM_CONTROL` 的 `wparam`)。
-pub fn control_from_message(wparam: WPARAM) -> Option<Control> {
+/// 从窗口消息里取出命令(`WM_CONTROL` 的 `wparam`;`Play` 的两个参数在 `lparam`)。
+pub fn control_from_message(wparam: WPARAM, lparam: LPARAM) -> Option<Control> {
+    if wparam.0 as u32 == 7 {
+        let packed = lparam.0 as u32;
+        return Some(Control::Play(packed >> 16, packed & 0xffff));
+    }
     control_of(wparam.0 as u32)
 }
 

@@ -87,6 +87,10 @@ struct RawMaterial {
     /// 本体贴图不是(它的 alpha 是美术塞的遮罩通道,拿来剔会把身体啃掉)。
     #[serde(default)]
     mask_alpha: bool,
+    /// 材质的父链(游戏里的材质实例继承)。**眼/嘴那两个槽认它**:
+    /// 表情是贴在 `M_P_Eyes` 这一族上的图集(见 `Material::face`)。
+    #[serde(default)]
+    parents: Vec<String>,
     /// 以下都只对特效层有意义(`base_color` 缺失时)。
     #[serde(default)]
     tint: Option<[f32; 4]>,
@@ -188,6 +192,11 @@ pub struct Material {
     /// 基色贴图的绝对路径;None = 纯特效层,走 `effect` 那套画法。
     pub base_color: Option<PathBuf>,
     pub mask_alpha: bool,
+    /// 这是脸(眼睛/嘴)吗 —— 父链里有 `M_P_Eyes` 就是。
+    ///
+    /// **表情就画在这两个槽上**:贴图是 2×4 的表情图集,网格 UV 落在左上那一格,
+    /// 换表情 = 给 UV 加一个整格的偏移(见 persona.rs 的 `Expression`)。
+    pub face: bool,
     /// 只在 `base_color` 为 None 时有效。
     pub effect: Effect,
     /// 半透。**有基色的材质也可能是半透**:暮星辰的裙子与那两个球都是,
@@ -308,13 +317,52 @@ impl Form {
     pub fn clip(&self, logical: &str) -> Option<&Clip> {
         self.clips.get(logical)
     }
+
+    /// 只带一张动作表的形态,给动作覆盖率的单测用。
+    #[cfg(test)]
+    pub fn for_test(clips: HashMap<String, Clip>) -> Self {
+        Self {
+            id: 0,
+            name: "测试".into(),
+            stage: 1,
+            asset: "Test_001".into(),
+            model: PathBuf::from("<test>"),
+            scale: 1.0,
+            height_cm: 80.0,
+            locomotion: "ground".into(),
+            clips,
+            voice: None,
+            materials: HashMap::new(),
+        }
+    }
 }
 
-/// 包目录里的一项,只带名字与位置(见 [`Pack::list_entries`])。
+/// 包目录里的一项:够列一行表格,但**不含动作表与材质表**(见 [`Pack::list_entries`])。
 pub struct PackEntry {
+    /// 物种名(链首的名字)。
     pub name: String,
+    /// 整条进化链的形态名。列表里直接写成「喵喵 → 喵呜 → 魔力猫」——
+    /// 比只写链名好搜:想找魔力猫的人不一定记得它的链首叫喵喵。
+    pub forms: Vec<String>,
     /// 包的位置:目录,或者 `.rkpet` 文件。
     pub path: PathBuf,
+    /// 占多少字节。
+    pub size: u64,
+}
+
+impl PackEntry {
+    /// 「喵喵 → 喵呜 → 魔力猫」。单形态的包就只有一个名字。
+    pub fn chain(&self) -> String {
+        if self.forms.is_empty() {
+            return self.name.clone();
+        }
+        self.forms.join(" → ")
+    }
+
+    /// 是 `.rkpet` 归档还是解开的目录。列表里要标出来(对应 `--list` 的 `[rkpet]`)。
+    pub fn archived(&self) -> bool {
+        self.path.is_file()
+    }
 }
 
 pub struct Pack {
@@ -387,35 +435,63 @@ impl Pack {
     pub fn list_entries(dir: &Path) -> Vec<PackEntry> {
         let mut packs: Vec<PackEntry> = Self::candidates(dir)
             .into_iter()
-            .map(|path| PackEntry {
-                name: Self::peek_name(&path),
-                path,
+            .map(|path| {
+                let (name, forms) = Self::peek(&path);
+                let size = crate::assets::size(&path);
+                PackEntry {
+                    name,
+                    forms,
+                    path,
+                    size,
+                }
             })
             .collect();
         packs.sort_by(|a, b| a.name.cmp(&b.name));
         packs
     }
 
-    /// 只把 manifest 里的物种名抠出来。读不动就退用文件名(去掉 `.rkpet` 后缀)。
-    pub fn peek_name(path: &Path) -> String {
+    /// 只把 manifest 里的物种名与形态名抠出来。读不动就退用文件名(去掉 `.rkpet` 后缀)。
+    ///
+    /// **这一趟已经把 manifest 读进内存了**,顺手多解一层 `[[forms]].name` 是白捡的 ——
+    /// 比起单独为「列表要显示进化链」再读一遍全库五百多个 manifest 划算得多。
+    /// 动作表与材质表仍然不解:那才是 `Pack::load` 慢的地方。
+    pub fn peek(path: &Path) -> (String, Vec<String>) {
         #[derive(Deserialize)]
-        struct NameOnly {
+        struct NamesOnly {
             species: RawSpecies,
+            #[serde(default)]
+            forms: Vec<FormName>,
+        }
+        #[derive(Deserialize)]
+        struct FormName {
+            name: String,
         }
 
-        crate::assets::read_manifest(path)
+        let parsed = crate::assets::read_manifest(path)
             .ok()
-            .and_then(|text| toml::from_str::<NameOnly>(&text).ok())
-            .map(|raw| raw.species.name)
-            .or_else(|| {
+            .and_then(|text| toml::from_str::<NamesOnly>(&text).ok());
+        match parsed {
+            Some(raw) => (
+                raw.species.name,
+                raw.forms.into_iter().map(|f| f.name).collect(),
+            ),
+            None => {
                 let stem = if path.is_file() {
                     path.file_stem()
                 } else {
                     path.file_name()
                 };
-                stem.map(|n| n.to_string_lossy().into_owned())
-            })
-            .unwrap_or_else(|| "?".to_string())
+                let name = stem
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "?".to_string());
+                (name, Vec::new())
+            }
+        }
+    }
+
+    /// 只要名字那一半。
+    pub fn peek_name(path: &Path) -> String {
+        Self::peek(path).0
     }
 
     /// 按「路径」或「包名」定位一个包:优先当路径用,否则在包目录里按物种名/文件名找。
@@ -519,6 +595,10 @@ impl Pack {
                             Material {
                                 base_color: mat.base_color.map(|rel| root.join(rel)),
                                 mask_alpha: mat.mask_alpha,
+                                face: mat
+                                    .parents
+                                    .iter()
+                                    .any(|p| p.contains("P_Eyes")),
                                 effect: Effect {
                                     // 没给主色就用白,至少形体在
                                     tint: mat.tint.unwrap_or([1.0; 4]),

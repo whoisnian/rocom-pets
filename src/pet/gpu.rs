@@ -19,7 +19,27 @@ struct CameraUniform {
     outline_width: f32,
     /// 秒。特效层的 UV 卷动靠它推进(火焰在流动)。
     time: f32,
-    _pad: [f32; 3],
+    /// **必须留着这 4 字节。** WGSL 里 `vec2<f32>` 按 8 字节对齐,`time` 之后是 84,
+    /// 不是 8 的倍数 —— 着色器那边会把 `face_uv` 放到 88。这里不补,两侧就错开一个
+    /// `f32`:着色器读到的 `face_uv.x` 其实是 Rust 这边的 `.y`,而 `.y` 读到填充的 0。
+    /// (踩过:表情的 u 偏移完全没反应,v 偏移却在**横向**换格子。)
+    _pad: f32,
+    /// 表情:脸那两个材质的 UV 偏移(整格,见 persona.rs 的 `Expression`)。
+    /// **放在相机这份 uniform 里**是因为它是**每只**的(同一个形态的两只可以不同表情),
+    /// 而材质那份是按形态共享的 —— 那边只存「这是不是脸」。
+    face_uv: [f32; 2],
+}
+
+/// 画一帧要给的东西。**打包传**:拆成参数的话 `update` 要排到第八个,而它们
+/// 每帧一起变。
+pub struct FrameParams {
+    pub view_proj: Mat4,
+    pub light_dir: Vec3,
+    pub outline_width: f32,
+    /// 秒;特效层的 UV 卷动靠它推进。
+    pub time: f32,
+    /// 表情:脸那两个材质的 UV 偏移(见 persona.rs 的 `Expression`)。
+    pub face_uv: [f32; 2],
 }
 
 /// 每个材质一份的特效参数。**普通材质也占一份**(tint 全 1、flags=0),
@@ -30,10 +50,10 @@ struct MaterialUniform {
     tint: [f32; 4],
     flow: [f32; 4],
     /// 纯特效层 [opacity, glow, additive(0/1), 有噪声贴图(0/1)]
-    /// 有基色的 [alpha 是镂空遮罩(0/1), 线条提亮倍数, -, -]
+    /// 有基色的 [alpha 是镂空遮罩(0/1), 线条提亮倍数, alpha 是不透明度(0/1), 这是脸(0/1)]
     params: [f32; 4],
     /// 纯特效层 [遮罩是否 matcap(0/1), -, 有星点(0/1), 有 matcap(0/1)]
-    /// 有基色的 [-, 是玻璃/纱(0/1), 有星点(0/1), 有 matcap(0/1)]
+    /// 有基色的 [**这是脸**(0/1), 是玻璃/纱(0/1), 有星点(0/1), 有 matcap(0/1)]
     flags: [f32; 4],
     /// [星点 u 平铺, v 平铺, 边缘光强度, 不透明度]
     star: [f32; 4],
@@ -427,9 +447,10 @@ impl PetGpu {
                         has(material.star_fake_trans),
                     ],
                     // flags.y = 1 表示「玻璃/纱」:fs_main 据此加 MatCap 高光与材质边缘光,
-                    // 普通不透明宠物无条件叠这两样会整只发白
+                    // 普通不透明宠物无条件叠这两样会整只发白。
+                    // flags.x 在这条路上原来是空的,拿来放「这是脸」(表情要偏 UV)
                     flags: [
-                        0.0,
+                        has(material.face),
                         has(material.translucent),
                         has(material.star.is_some()),
                         has(material.matcap.is_some()),
@@ -659,24 +680,17 @@ impl PetGpu {
     }
 
     /// 上传本帧的相机与蒙皮矩阵。
-    pub fn update(
-        &self,
-        queue: &wgpu::Queue,
-        view_proj: Mat4,
-        light_dir: Vec3,
-        outline_width: f32,
-        time: f32,
-        matrices: &[Mat4],
-    ) {
+    pub fn update(&self, queue: &wgpu::Queue, frame: &FrameParams, matrices: &[Mat4]) {
         queue.write_buffer(
             &self.camera,
             0,
             bytemuck::bytes_of(&CameraUniform {
-                view_proj: view_proj.to_cols_array_2d(),
-                light_dir: light_dir.normalize().to_array(),
-                outline_width,
-                time,
-                _pad: [0.0; 3],
+                view_proj: frame.view_proj.to_cols_array_2d(),
+                light_dir: frame.light_dir.normalize().to_array(),
+                outline_width: frame.outline_width,
+                time: frame.time,
+                _pad: 0.0,
+                face_uv: frame.face_uv,
             }),
         );
         let count = matrices.len().min(self.joint_capacity);

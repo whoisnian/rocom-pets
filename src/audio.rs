@@ -18,7 +18,11 @@ use rodio::{ChannelCount, SampleRate, Source};
 use crate::stage::SoundCue;
 
 /// 默认音量。桌宠是常驻程序,**默认必须小声**。
-pub const DEFAULT_VOLUME: f32 = 0.35;
+///
+/// 取 30% 而不是随手一个 0.35:托盘菜单里音量是几个固定档位(静音/30%/60%/100%),
+/// 默认值落在档位上,菜单一打开就能看出「现在是哪一档」。差 5% 听不出来,
+/// 而「一个档都没勾」是要解释的。
+pub const DEFAULT_VOLUME: f32 = 0.30;
 
 /// 解好的一段 PCM。
 ///
