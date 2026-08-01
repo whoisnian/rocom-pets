@@ -205,6 +205,8 @@ impl Gpu {
     }
 
     /// 把精灵位图上传成纹理(仅 `--sprite` 调试模式用)。
+    /// Windows 后端还没有调试精灵模式,那边用不到。
+    #[cfg_attr(target_os = "windows", allow(dead_code))]
     pub fn upload_sprite(&self, sprite: &Sprite) -> wgpu::TextureView {
         let texture = self.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("sprite"),

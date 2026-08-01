@@ -1,0 +1,4 @@
+# Windows 目标静态链接 CRT:免得目标机器还要装 VC++ 运行库(默认动态链接会依赖
+# VCRUNTIME140.dll 与一串 api-ms-win-crt-*)。桌宠是「拷过去双击就跑」的东西。
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

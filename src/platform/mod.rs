@@ -6,6 +6,8 @@
 
 use std::path::PathBuf;
 
+mod shared;
+
 #[cfg(target_os = "linux")]
 mod wayland;
 #[cfg(target_os = "windows")]
@@ -19,6 +21,10 @@ pub struct StartupPet {
 }
 
 /// 起 stage 时的配置。阵容为空时退回调试精灵(S1 的验收对象)。
+///
+/// `packs_dir` / `roster_path` 只有 Wayland 后端在用:Windows 的托盘还没有加/撤宠物的
+/// 菜单,也就无处改阵容、无需存回去。
+#[cfg_attr(target_os = "windows", allow(dead_code))]
 pub struct Options {
     /// 启动阵容(命令行 / 阵容存档 / 配置,由 main 定优先级);空 = 调试精灵。
     pub pets: Vec<StartupPet>,

@@ -688,7 +688,7 @@ missing_clips = ["hide"]
 | # | 需求 | 状态 |
 | --- | --- | --- |
 | 1 | 独立新仓库、不限定语言 | ✅ Rust 运行时 + C# 导出器 |
-| 2 | 至少支持 Windows 与 Linux Wayland | ⚠️ **KDE Wayland 已跑通，Windows 后端 0%**(`src/platform/windows.rs` 是空壳) |
+| 2 | 至少支持 Windows 与 Linux Wayland | ✅ 两个后端都实机可用(KDE Wayland 日常在跑;Windows 2026-08-01 实机确认) |
 | 3 | GB 级数据 → 主程序 + 宠物插件、按需启用 | ✅ 包目录 + `--list`/`--pack` + 托盘「加一只」列整个包目录，启动只读 manifest |
 | 4 | 同一进化链形态封装进一个包、启用时可切 | ✅ 一链一包，托盘「形态」子菜单单选切换 |
 | 5 | 同时启用多个包 / 一个包开多个实体 | ✅ `Stage` 持实体集合,托盘里加一只/撤下,阵容存 `roster.toml` 重启恢复 |
@@ -700,7 +700,8 @@ missing_clips = ["hide"]
 结论(当时)：**多实体是最大的一块缺口，且同时卡着 #5/#6/#9**，所以它是下一步；`Run` 是几小时
 的小补丁，顺手在同一阶段做掉。剩下的 Windows 与叫声都是独立块，不互相阻塞。
 
-**Phase 5 与 Phase 6 都做完之后**：九条需求里只剩 **#2 的 Windows 半边**(Phase 8)没结。
+**Phase 5 / 6 / 8 都做完之后:九条原始需求全部结掉。** 剩下的是 Phase 7(打磨与分发)
+与横向待办里那些渲染保真度的条目。
 
 ### Phase 0 — 技术验证(spike，各 1–2 天，失败即换路线)
 
@@ -997,15 +998,113 @@ missing_clips = ["hide"]
 - **已知问题**:多显示器下每个 output 是各自独立的一只,tick 驱动的叫声(睡醒)两边会
   同时响。手上只有单屏,留着。
 
-### Phase 8 — Windows 后端
+### Phase 8 — Windows 后端 ✅ 可用(2026-08-01 实机确认)
 
-S1 只做完了一半，这是**剩下风险最高的一块**，且需要用户的 Windows 机器实测，不能留到最后。
-放在 Phase 5 之后是为了对着定稿的平台层 trait 写一遍。验收项直接复用 S1 那份清单
-(置顶、逐像素 alpha 无黑边、命中/穿透、多显示器、叠放次序、空闲/活动占用)。
-已知要点：必须 `CreateSwapChainForComposition`(GDI 的 `UpdateLayeredWindow` 不适合 GPU 渲染)，
-wgpu 侧大概要 `SurfaceTargetUnsafe::CompositionVisual` 自建 surface；穿透是
-`WS_EX_TRANSPARENT` + `WM_NCHITTEST` 返回 `HTTRANSPARENT`——**没有 Wayland 那种输入区**，
-轮廓命中要在 `WM_NCHITTEST` 里查掩码。
+`src/platform/windows.rs` + `src/control/windows.rs`。四轮实机来回之后可用:
+上桌、置顶、逐像素 alpha、宠物之外点击穿透、命中与拖放、托盘(含加一只 / 撤下 / 切形态)、
+阵容存盘恢复。**开发机是 Linux**,整条路是「交叉编译 + wine 冒烟 + 实机反馈」磨出来的。
+
+先说**怎么在 Linux 上写这一块**(命令见 README「编译 rocom-pets.exe」):
+
+1. `cargo check --target x86_64-pc-windows-msvc` —— 只要 std,连链接器都不用。全部 Win32
+   调用的签名、常量所在模块、句柄类型都是编译器逐个纠出来的,不是照文档抄的。
+2. `cargo xwin build` —— **能真的链出 exe**。这一步比类型检查强:它证明每个 Win32 导入
+   符号都解析得了(`Shell_NotifyIconW`、`DCompositionCreateDevice` 这类要对上库与
+   feature),而类型检查只看得到声明。
+3. **`wine` 跑一遍**。DX12 在 wine 下起不来(DXVK 那层没给出 wgpu 认的适配器),但**在此
+   之前的整条启动路径都真的执行了**:注册窗口类、建消息窗口、`EnumDisplayMonitors` +
+   `GetMonitorInfoW`(拿到真实工作区 3840x2052)、`CreateWindowExW` 带
+   `WS_EX_NOREDIRECTIONBITMAP`、`GetDpiForWindow`、`Shell_NotifyIconW` 挂托盘、
+   打开音频设备。**这一步当场逮到一个真 bug**:配置与包目录只按 XDG 找
+   (`HOME`/`XDG_CONFIG_HOME`),Windows 上一个都没有 —— 日志里直接是「定不出配置文件
+   位置」,配置和阵容全丢。已改成 `%APPDATA%` / `%LOCALAPPDATA%`,重跑确认落在
+   `C:\users\…\AppData\Roaming\rocom-pets\config.toml`。
+
+这三步都不能代替实机验收,但它们把「写完全靠猜」压缩到了只剩**渲染与交互**没法验。
+
+已经落地的:
+
+- **DComp 那段 COM 不用手写**。上面原计划写「自己建 `IDCompositionDevice` 再把 visual
+  交给 `SurfaceTargetUnsafe::CompositionVisual`」;wgpu 30 的 dx12 后端有
+  `Dx12SwapchainKind::DxgiFromVisual`,给个 HWND 它就自己建一棵最小合成树。
+  于是只要 `WS_EX_NOREDIRECTIONBITMAP` 的窗口 + `Backends::DX12` + 这个开关。
+  (`CompositionVisual` 那条路仍然通,将来要自己管合成树时再用。)
+- **穿透两件事一起做**:`WM_NCHITTEST` 恒返回 `HTTRANSPARENT`,**并且**加
+  `WS_EX_TRANSPARENT`。前者管命中,后者让系统连 hover 都跳过我们。
+- **输入区在 Win32 叫「窗口区域」**(`SetWindowRgn`),和 `wl_surface::set_input_region`
+  是同一件事,`Stage::input_regions()` 两边共用。
+  ~~原本以为 Win32 只能逐点回答 `WM_NCHITTEST`~~ —— **那是错的,而且是实机第一次跑就
+  暴露的错**:`HTTRANSPARENT` 只在**同一线程**的窗口之间往下转发命中,穿不到别的进程去。
+  于是那个铺满工作区的窗口把整屏的点击全吃了,除了任务栏(不在 `rcWork` 里)哪儿都点不动。
+  改成按掩码矩形设窗口区域之后,区域外的像素压根不属于这个窗口,点击自然落到下面的程序上。
+  代价是**窗口区域同时裁剪渲染**(Wayland 的输入区只管输入)。矩形跟着位置走是准的
+  (`coverage` 是角色局部坐标,每帧按当前位置平移),但**姿势**是异步回读来的、滞后约
+  140ms —— 跑起来时甩动的四肢可能越出上一帧的格子被裁掉一角,所以区域往外放了两格
+  (`REGION_MARGIN` = 16 逻辑像素)当保险,代价是宠物周围多一圈十几像素也吃鼠标。
+  **这个余量是拍的,没在实机上调过**:要是跑动时仍看到边缘被切,加大它;要是觉得
+  宠物周围「点不到桌面」的圈太大,减小它。`WM_NCHITTEST` 仍然留着,但只负责在区域内
+  按掩码逐点细化。
+- **窗口铺满 `MONITORINFO::rcWork`**(已去掉任务栏),与 Wayland 那边 `exclusive_zone(0)`
+  拿到的区域同义:宠物踩在任务栏上沿而不是藏到后面。`WM_DPICHANGED`/`WM_DISPLAYCHANGE`
+  时重新贴合(重新量工作区 + `SetWindowPos` + 重配表面 + 逐只重建画布)。
+- **窗口过程里的 App 要套 `RefCell`**。Win32 有一堆调用会**同步**把消息派回窗口过程 ——
+  `CreateWindowExW` 发 `WM_CREATE`、`SetWindowPos` 发 `WM_WINDOWPOSCHANGED`、
+  `TrackPopupMenu` 干脆自己跑一个模态消息循环。这时外层已经握着 `&mut App`,
+  裸指针再借一次就是**别名 UB**。借不到就把消息交回系统。
+- **动画定时器只挂一个,挂在那个隐藏的控制窗口上**。每个 stage 窗口各挂一个的话,
+  两块屏一个间隔里会 tick 两次(而 `tick` 自己已经遍历了所有 stage),动画直接快一倍。
+- 阵容为空时也有**调试精灵**(与 Wayland 同义),没有宠物包也能验这一层。
+
+**还没做的**(都不属于「平台层」,但用起来会缺):
+
+- ~~托盘只有四项~~ **已补齐**(2026-08-01,实机反馈之后):加一只 / 撤下 / 切形态
+  与 Linux 托盘同构。趁这一步把两个后端共用的那一半抽进了 `platform/shared.rs`:
+  资产缓存(模型/管线/叫声,三张表同一把键、同一套「没人用就清掉」)、
+  manifest → 角色的换算、阵容与托盘状态。**划界依据是「碰不碰窗口系统」** ——
+  shared 里一句 Wayland/Win32 都没有。
+  抽的时机是**故意压后**的:实机验通之前先抽公共层是本末倒置,那时连它能不能跑都不知道;
+  验通之后再抽,才知道哪些是真共用、哪些是某个平台的特例(比如输入区两边差得很远)。
+- **没有全局热键**。Win32 只有 `RegisterHotKey`,那是**抢**一个组合键而不是像
+  XDG GlobalShortcuts 那样向桌面申请,冲突了别人就用不了。
+  `rocom-pets --toggle-passthrough` 仍然可用(按窗口类名找到实例 `PostMessage` 过去),
+  要热键就挂在快捷方式上。
+- 显示器**插拔**(多一块/少一块)没处理,只处理了已有显示器的分辨率/缩放变化。
+- ~~仍然是控制台程序~~ **已关掉黑窗口**:release 版按 GUI 子系统链接,而启动时
+  `AttachConsole(ATTACH_PARENT_PROCESS)` 挂回父控制台 —— 双击干净、从命令行跑仍有日志。
+  **必须自己把 `CONOUT$` 设成标准句柄**(AttachConsole 不替进程改这几个),
+  而且要在任何输出之前调:Rust 的 stdout 会缓存第一次拿到的句柄。
+
+**实机反馈(2026-08-01)**,两轮:
+
+1. 启动后除任务栏外整屏点击失效 —— 根因是上面那条「`HTTRANSPARENT` 穿不到别的进程」,
+   已改用 `SetWindowRgn`。
+2. 改完之后:**双击起来什么都不显示**,点托盘「召回宠物」才冒出来;之后拖动、落到
+   任务栏上沿都正常。根因是**首帧从来没画**:之后的帧全由 `WM_TIMER` 驱动,而 tick 只在
+   `Reaction::redraw` 时才出帧,**调试精灵永远不产生 redraw**(`tick_entity` 对非宠物
+   直接返回 `Reaction::NONE`)—— 于是窗口一直是空的,而「召回」里正好有一次 render。
+   Wayland 那边碰不到,因为首次 configure 的处理里就渲了一帧。已在建完 stage 时补上首帧;
+   顺带修了 `recall()` 只 render 不更新窗口区域(宠物走到新位置会被停在原处的旧区域裁掉)。
+
+3. 桌面点击正常、真宠物(火花)显示正常;**托盘菜单只有四项** —— 这条不是 bug,是上面
+   那个「先不抽公共层」的决定留下的缺口。实机既然验通了,前提就满足了,于是抽出
+   `platform/shared.rs` 并把加/撤/切形态补齐。
+4. 补齐之后回报**「可用」**。
+
+**实机验过的**:窗口建得出来、置顶、逐像素 alpha、真宠物渲染、命中与拖动、
+落地停在任务栏上沿(`rcWork` 那条是对的)、宠物之外的点击穿透、托盘(含加一只 / 撤下 /
+切形态)。**Windows 后端到此可用。**
+
+**仍然没验的**(都不拦日常使用):跑动时边缘会不会被窗口区域裁掉(`REGION_MARGIN`
+那 16px 是拍的)、多显示器、叠放次序、空闲/活动占用、显示器插拔。
+
+**已经能在 Linux 上确认的**:链接通过(每个 Win32 导入符号都解析得了)、
+启动路径跑到 GPU 初始化为止(窗口/显示器/DPI/托盘/音频都真的调过)、
+配置与包目录落在 Windows 该在的位置、exe 不依赖 VC++ 运行库(`+crt-static`)。
+
+**验收清单(全部待验,需要你的 Windows 机器)**:置顶、逐像素 alpha 无黑边、
+命中/穿透、多显示器、叠放次序、空闲/活动占用。另外几条这个后端特有的:
+`WS_EX_NOREDIRECTIONBITMAP` 窗口在没出第一帧前会不会闪、`TrackPopupMenu` 那个模态循环
+期间宠物会不会僵住、`WM_TIMER` 在鼠标忙的时候会不会被饿死(它是低优先级合成消息)。
 
 ### Phase 7 — 打磨与分发
 
@@ -1051,7 +1150,7 @@ N 只宠物的性能与内存实测、Windows 安装包 / Linux AppImage。
 | damage 局部提交 | §3.3 的提交策略只做了降频这一条 | 小 |
 | 多显示器实测 | 代码按 per-output 写的，但手上只有单屏。**已知一条**:每个 output 上是各自独立的一只,tick 驱动的叫声(睡醒)两边会同时响 | 需要第二块屏 |
 
-**推荐执行顺序：~~Phase 5 → Phase 6~~ → Phase 8 → Phase 7**(前两个已完成)，横向待办里的材质参数建议在
+**推荐执行顺序：~~Phase 5 → Phase 6 → Phase 8~~ → Phase 7**(前三个已完成)，横向待办里的材质参数建议在
 Phase 5 之后单独插一轮(它是纯导出器侧的活，和运行时不冲突)。
 
 ## 10. 风险与未决问题

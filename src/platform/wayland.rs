@@ -10,7 +10,6 @@
 //! 全局穿透开关在 S1 阶段用 `SIGUSR1` 切换(KDE Wayland 下没有全局按键抓取,
 //! 正式实现要走 KGlobalAccel 的 D-Bus 注册或 XDG GlobalShortcuts portal)。
 
-use std::collections::HashMap;
 use std::path::PathBuf;
 use std::ptr::NonNull;
 use std::sync::Arc;
@@ -66,20 +65,14 @@ use crate::pet::mask::MaskReadback;
 use crate::pet::target::{PetTarget, view_proj};
 use crate::pet::{Model, PetGpu};
 use crate::render::{Gpu, Quad, QuadDraw, Target};
-use crate::roster::{Roster, Slot};
 use crate::sprite::Sprite;
-use crate::stage::{
-    Actor, EntityId, PetActor, PetBuild, Reaction, Stage, StageEvent, VoiceBank, VoiceKind,
-};
+use crate::stage::{Actor, EntityId, Reaction, Stage, StageEvent, VoiceKind};
 
 use super::Options;
+use super::shared::{self, Assets, CANVAS_PADDING, Member};
 
 /// 定时器的起始间隔;之后每次由 `Stage::tick_interval` 按状态决定(待机降频)。
 const TICK_HZ: f32 = 30.0;
-
-/// 离屏画布的取景余量。伸展类动作已经算进 `Model::motion_bounds` 了,
-/// 这里只需给描边外扩与边缘光留一点边。
-const CANVAS_PADDING: f32 = 1.15;
 
 /// 鼠标左键(linux input event code)。
 const BTN_LEFT: u32 = 0x110;
@@ -194,9 +187,7 @@ pub fn run(options: Options) -> Result<()> {
         sprite_mode,
         packs_dir: options.packs_dir,
         roster_path: options.roster_path,
-        models: HashMap::new(),
-        pet_gpus: HashMap::new(),
-        voices: HashMap::new(),
+        assets: Assets::default(),
         audio: if options.volume > 0.0 {
             Audio::open(options.volume)
         } else {
@@ -285,12 +276,6 @@ fn install_signal_source(tx: channel::Sender<Control>) -> Result<()> {
     Ok(())
 }
 
-/// 阵容里的一只:包(整条进化链都在,供切形态)+ 当前形态下标。
-struct Member {
-    pack: Pack,
-    form: usize,
-}
-
 /// 一个 output 上的 stage 表面。
 struct StageWindow {
     output: wl_output::WlOutput,
@@ -377,13 +362,9 @@ struct App {
     packs_dir: Option<PathBuf>,
     /// 阵容存档路径;None = 定不出位置,这次的加/撤只在内存里。
     roster_path: Option<PathBuf>,
-    /// 已加载的模型,按 glb 路径(= 包 + 形态)缓存。多实体/多屏共享同一份网格与贴图,
-    /// 否则每多一只 RSS 就翻一档(单只已经 219MB)。见 design.md §9 Phase 5 第 2 步。
-    models: HashMap<PathBuf, Arc<Model>>,
-    /// 同上,GPU 侧:管线/顶点缓冲/贴图按 (包, 形态) 共享。每实体独立的只有画布。
-    pet_gpus: HashMap<PathBuf, Arc<PetGpu>>,
-    /// 叫声库,同一把键(glb 路径 = 包 + 形态)。ogg 很小,读进内存共享。
-    voices: HashMap<PathBuf, Arc<VoiceBank>>,
+    /// 按形态共享的模型/管线/叫声(见 platform/shared.rs)。多实体、多屏都只有一份 ——
+    /// 否则每多一只 RSS 就翻一档(单只已经 219MB)。
+    assets: Assets,
     /// 音频输出;None = 没声卡或用户关了声音。
     audio: Option<Audio>,
     px_per_cm: f32,
@@ -470,7 +451,7 @@ impl App {
         let mut stage = Stage::new((1, 1));
         let mut slots = Vec::with_capacity(forms.len());
         for form in &forms {
-            match self.build_pet_actor(form) {
+            match self.build_actor(form) {
                 Ok(actor) => slots.push(stage.spawn(actor)),
                 Err(e) => {
                     log::error!("output {name}: 加载宠物失败: {e:#}");
@@ -507,58 +488,11 @@ impl App {
         });
     }
 
-    /// 取这个形态的模型:缓存里有就直接共享,没有才读盘。
-    ///
-    /// **顺带清掉没人用的**:切形态之后旧模型的 `Arc` 只剩缓存这一份,不清的话
-    /// 每访问一个形态就永久多占几 MB。判据是 `strong_count == 1`(只有缓存持有)。
-    fn load_model(&mut self, form: &Form) -> Result<Arc<Model>> {
-        if let Some(model) = self.models.get(&form.model) {
-            return Ok(Arc::clone(model));
-        }
-        let model = Arc::new(Model::load(&form.model, &form.materials)?);
-        self.models.retain(|_, cached| Arc::strong_count(cached) > 1);
-        self.models.insert(form.model.clone(), Arc::clone(&model));
-        Ok(model)
-    }
-
-    /// 取这个形态的叫声库:和模型同一把键、同一套「没人用就清掉」。
-    /// 读不到文件只警告 —— 少一段叫声不该让宠物上不了台。
-    fn voice_bank(&mut self, form: &Form) -> Option<Arc<VoiceBank>> {
-        self.audio.as_ref()?; // 没有音频设备就不必读文件了
-        if let Some(bank) = self.voices.get(&form.model) {
-            return Some(Arc::clone(bank));
-        }
-        let Some(voice) = form.voice.as_ref() else {
-            log::debug!("{} 没有叫声", form.name);
-            return None;
-        };
-        // **加载时就解码**:每次叫都重解是白费,而且直接把解码器丢进 mixer 出不了声
-        // (见 audio.rs 的 `Pcm`)
-        let mut clips = HashMap::new();
-        for (key, clip) in &voice.clips {
-            match crate::audio::decode(&clip.path) {
-                Ok(pcm) => {
-                    if pcm.peak() <= 0.0 {
-                        log::warn!("叫声 {:?} 解出来是静音的", clip.path);
-                    }
-                    clips.insert(key.clone(), Arc::new(pcm));
-                }
-                Err(e) => log::warn!("叫声读不了({e:#})"),
-            }
-        }
-        if clips.is_empty() {
-            return None;
-        }
-        let bank = Arc::new(VoiceBank {
-            clips,
-            cents_low: voice.cents_low,
-            cents_high: voice.cents_high,
-        });
-        log::debug!("{} 的叫声 {} 段", form.name, bank.clips.len());
-        self.voices
-            .retain(|_, cached| Arc::strong_count(cached) > 1);
-        self.voices.insert(form.model.clone(), Arc::clone(&bank));
-        Some(bank)
+    /// 造一只角色。资产缓存与换算都在 platform/shared.rs,这里只补上「本机的」那几项。
+    fn build_actor(&mut self, form: &Form) -> Result<Actor> {
+        let with_audio = self.audio.is_some();
+        self.assets
+            .build_actor(form, self.px_per_cm, with_audio, self.stages.len() as u64)
     }
 
     /// 把各 stage 攒下的叫声放出去。
@@ -574,77 +508,6 @@ impl App {
                 audio.play(&cue);
             }
         }
-    }
-
-    /// 把 manifest 里的厘米单位换成屏幕像素,算出画布尺寸与脚底位置。
-    fn build_pet_actor(&mut self, form: &Form) -> Result<Actor> {
-        let model = self.load_model(form)?;
-        // 两个包围盒各管一件事:**尺寸**按绑定姿势(站姿高度不能随动作变),
-        // **取景**按动作包围盒(否则伸手/张翅/跳跃会被画布裁掉,见 model.rs 的 motion_bounds)
-        let stand = model.bounds.1 - model.bounds.0;
-        let (frame_min, frame_max) = model.motion_bounds;
-        let frame_extent = frame_max - frame_min;
-        let frame_center = (frame_min + frame_max) * 0.5;
-        let height_px = form.height_cm * form.scale * self.px_per_cm;
-        // 画布是方的,取景按动作包围盒最长边;正交框半径 = 最长边/2 × 余量
-        let longest = frame_extent
-            .x
-            .max(frame_extent.y)
-            .max(frame_extent.z)
-            .max(1e-4);
-        let radius = longest * 0.5 * CANVAS_PADDING;
-        // 画布边长 = 正交框的 2×半径(米),按「站姿高 ↔ height_px」的比例换成像素
-        let side = (height_px * 2.0 * radius / stand.y.max(1e-4))
-            .round()
-            .max(16.0);
-        // 脚底 = 绑定姿势下沿在正交框里的 NDC 位置(框心是动作包围盒中心,不一定等于站姿中心)
-        let ndc_bottom = (model.bounds.0.y - frame_center.y) / radius;
-        let foot_offset = (1.0 - ndc_bottom) * 0.5 * side;
-
-        // 走路速度优先用动画自带位移反推的值(见 spike-s3.md),没有就给个常速
-        let walk_speed_cm = form
-            .clip("Walk")
-            .map(|c| c.speed_cm_s)
-            .filter(|v| *v > 1.0)
-            .unwrap_or(40.0);
-        // 跑速同理,但**必须钳制**:全库反推值中位 417cm/s、p90 563、最高 1125
-        // (魔力猫那只 7.5m/s),照搬会让宠物一瞬间横穿屏幕。按走速的倍数夹 ——
-        // 保留「这只跑起来相对更快」的个性,又不至于离谱。代价是极端值那几只脚会打滑,
-        // 比起「一眨眼跑没影」是划算的。
-        let run_speed_cm = form
-            .clip("Run")
-            .map(|c| c.speed_cm_s)
-            .filter(|v| *v > 1.0)
-            .unwrap_or(walk_speed_cm * 2.0)
-            .clamp(walk_speed_cm * 1.2, walk_speed_cm * 3.0);
-        let seed = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos() as u64)
-            .unwrap_or(0x5eed)
-            ^ (self.stages.len() as u64 * 0x9E3779B97F4A7C15);
-
-        log::info!(
-            "  {} 屏幕高 {:.0}px(画布 {}px,脚底 {:.0}px),走速 {:.0}cm/s,跑速 {:.0}cm/s",
-            form.name,
-            height_px,
-            side as u32,
-            foot_offset,
-            walk_speed_cm,
-            run_speed_cm
-        );
-        let voice = self.voice_bank(form);
-        Ok(Actor::Pet(PetActor::new(PetBuild {
-            model,
-            size: (side as u32, side as u32),
-            foot_offset,
-            // 本体高度(≠ 画布边长:画布带取景余量)。距离阈值按它换算成「身位」
-            body_px: height_px,
-            walk_speed: walk_speed_cm * self.px_per_cm,
-            run_speed: run_speed_cm * self.px_per_cm,
-            form_id: form.id,
-            voice,
-            seed,
-        })))
     }
 
     /// 合成器告知这个表面的精确缩放(单位 1/120)。
@@ -803,14 +666,7 @@ impl App {
 
     /// 托盘菜单要的那份阵容快照。
     fn tray_pets(&self) -> Vec<TrayPet> {
-        self.roster
-            .iter()
-            .map(|m| TrayPet {
-                name: m.pack.forms[m.form].name.clone(),
-                forms: m.pack.forms.iter().map(|f| f.name.clone()).collect(),
-                current_form: m.form,
-            })
-            .collect()
+        shared::tray_pets(&self.roster)
     }
 
     fn refresh_tray(&self) {
@@ -822,39 +678,17 @@ impl App {
     /// 把阵容写回存档。存**包名**而不是路径 —— 包目录整个搬走时阵容还认得出来;
     /// 只有包不在包目录里(`--pack /some/where`)才存绝对路径。
     fn save_roster(&self) {
-        let Some(path) = self.roster_path.as_deref() else {
-            return;
-        };
-        let roster = Roster {
-            pets: self
-                .roster
-                .iter()
-                .map(|m| {
-                    let in_packs_dir = self
-                        .packs_dir
-                        .as_deref()
-                        .is_some_and(|dir| m.pack.dir.parent() == Some(dir));
-                    let pack = match (in_packs_dir, m.pack.dir.file_name()) {
-                        (true, Some(name)) => name.to_string_lossy().into_owned(),
-                        _ => m.pack.dir.to_string_lossy().into_owned(),
-                    };
-                    Slot {
-                        pack,
-                        form: Some(m.pack.forms[m.form].asset.clone()),
-                    }
-                })
-                .collect(),
-        };
-        if let Err(e) = roster.save(path) {
-            log::warn!("阵容没存上({e:#});下次启动会回到上一次的阵容");
-        }
+        shared::save_roster(
+            &self.roster,
+            self.packs_dir.as_deref(),
+            self.roster_path.as_deref(),
+        );
     }
 
     /// 没实体在用的模型与管线丢掉。撤一只/切形态之后不清的话,它的网格与贴图
     /// 会一直占着(单只就有一两百 MB)。
     fn prune_caches(&mut self) {
-        self.models.retain(|_, cached| Arc::strong_count(cached) > 1);
-        self.pet_gpus.retain(|_, cached| Arc::strong_count(cached) > 1);
+        self.assets.prune();
     }
 
     /// 从包目录里加一只。
@@ -876,7 +710,7 @@ impl App {
         // 而插槽错位比「加不上」难查得多
         let mut actors = Vec::with_capacity(self.stages.len());
         for _ in 0..self.stages.len() {
-            match self.build_pet_actor(&form) {
+            match self.build_actor(&form) {
                 Ok(actor) => actors.push(actor),
                 Err(e) => {
                     log::error!("加一只 {} 失败: {e:#}", pack.species_name);
@@ -966,7 +800,7 @@ impl App {
         // 同 `add_pet`:全建出来才提交,免得一半的台换了一半没换
         let mut actors = Vec::with_capacity(self.stages.len());
         for _ in 0..self.stages.len() {
-            match self.build_pet_actor(&form) {
+            match self.build_actor(&form) {
                 Ok(actor) => actors.push(actor),
                 Err(e) => {
                     log::error!("切形态失败: {e:#}");
@@ -1209,15 +1043,8 @@ impl App {
         let Some(gpu) = self.gpu.as_ref() else {
             anyhow::bail!("GPU 还没初始化");
         };
-        if let Some(cached) = self.pet_gpus.get(&model.source) {
-            return Ok(Arc::clone(cached));
-        }
-        let built = Arc::new(PetGpu::new(&gpu.device, &gpu.queue, model, gpu.format())?);
-        // 和 `load_model` 同样的清理:没实体在用的就别占着显存
-        self.pet_gpus.retain(|_, cached| Arc::strong_count(cached) > 1);
-        self.pet_gpus
-            .insert(model.source.clone(), Arc::clone(&built));
-        Ok(built)
+        // `assets` 与 `gpu` 是 App 的两个字段,分开借才不打架
+        self.assets.pet_gpu(gpu, model)
     }
 
     /// (重)建这个 stage 上每只宠物的渲染资源:共享管线 + 每只自己的画布/四边形/掩码回读。

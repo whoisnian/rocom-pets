@@ -308,6 +308,9 @@ impl Form {
 }
 
 /// 包目录里的一项,只带名字与位置(见 [`Pack::list_entries`])。
+///
+/// Windows 后端的托盘还没有「加一只」菜单,所以那边用不到(不是死代码)。
+#[cfg_attr(target_os = "windows", allow(dead_code))]
 pub struct PackEntry {
     pub name: String,
     pub dir: PathBuf,
@@ -321,13 +324,27 @@ pub struct Pack {
     pub dir: PathBuf,
 }
 
+/// 放大件数据的目录(不含 `rocom-pets` 那一层)。
+#[cfg(not(target_os = "windows"))]
+fn data_dir() -> Option<PathBuf> {
+    std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))
+}
+
+#[cfg(target_os = "windows")]
+fn data_dir() -> Option<PathBuf> {
+    std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("USERPROFILE").map(PathBuf::from))
+}
+
 impl Pack {
-    /// 默认包目录:`$XDG_DATA_HOME/rocom-pets/packs`。
+    /// 默认包目录:Linux 是 `$XDG_DATA_HOME/rocom-pets/packs`,
+    /// Windows 是 `%LOCALAPPDATA%\rocom-pets\packs`(包有几 GB,不该跟着漫游配置走)。
+    /// 见 config.rs 的 `config_dir`:Windows 上没有 `HOME`/`XDG_*`。
     pub fn default_dir() -> Option<PathBuf> {
-        let base = std::env::var_os("XDG_DATA_HOME")
-            .map(PathBuf::from)
-            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))?;
-        Some(base.join("rocom-pets").join("packs"))
+        Some(data_dir()?.join("rocom-pets").join("packs"))
     }
 
     /// 列出包目录下所有能读的包(按名字排序)。读不动的只警告,不让一个坏包挡住其他的。
@@ -361,6 +378,7 @@ impl Pack {
     ///
     /// 解析不了的包退用目录名:它多半仍能加载(名字这一节坏了不代表形态坏了),
     /// 真加载失败时再报错也不迟。
+    #[cfg_attr(target_os = "windows", allow(dead_code))]
     pub fn list_entries(dir: &Path) -> Vec<PackEntry> {
         #[derive(Deserialize)]
         struct NameOnly {

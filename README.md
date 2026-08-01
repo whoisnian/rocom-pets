@@ -9,13 +9,46 @@
 宠物之间会互相注意到并打招呼、受惊会跑开,凑近了还会演一段跨宠互动
 (珀尔鼬指挥捕尘长绒清扫)。叫声也接上了:摸头/受惊/召唤/睡醒各一段,
 每只实体的嗓音随机(游戏里那个 −100~100 的 `voice` 属性),默认小声、托盘可静音。
-**九条原始需求只剩 Windows 后端一条没结。**
+**九条原始需求全部结掉**:Windows 后端也在实机上跑通了(2026-08-01)。
 需求对照与后续计划见 [docs/design.md](docs/design.md) §9。
 
-支持矩阵：**Windows 10+** 与 **KDE Plasma Wayland**(开发环境 Plasma 6.7.3 / kwin_wayland)。
+支持矩阵：**Windows 10+**(实机验过:上桌、置顶、点击穿透、拖放、托盘;
+开发机是 Linux,靠交叉编译 + wine 冒烟 + 实机反馈来回磨)与
+**KDE Plasma Wayland**(开发环境 Plasma 6.7.3 / kwin_wayland,日常在跑)。
 GNOME 等不实现 wlr-layer-shell 的合成器不在支持范围，也不做 X11 回退。
 
-- 运行时(`src/`)：Rust + wgpu，自写平台窗口层(wlr-layer-shell / Windows layered + DirectComposition)。
+### 编译 rocom-pets.exe
+
+**在 Windows 上**(最省事):装 [rustup](https://rustup.rs) 与 Visual Studio Build Tools
+的「使用 C++ 的桌面开发」(要 MSVC 链接器与 Windows SDK),然后
+
+```sh
+cargo build --release          # → target\release\rocom-pets.exe
+```
+
+**在 Linux 上交叉编译**(本仓库就是这么出的 exe,不需要 Windows 机器):
+
+```sh
+rustup target add x86_64-pc-windows-msvc
+cargo install cargo-xwin                       # 自动取 MSVC 的 CRT/SDK 头与库
+sudo pacman -S clang                           # 提供 lld-link(Arch;别的发行版装 lld)
+PATH=/usr/lib/llvm*/bin:$PATH cargo xwin build --release --target x86_64-pc-windows-msvc
+```
+
+产物 `target/x86_64-pc-windows-msvc/release/rocom-pets.exe` **不需要 VC++ 运行库**
+(`.cargo/config.toml` 里对这个目标开了 `+crt-static`),拷到 Windows 上双击即可;
+除系统 DLL 外零依赖。只想验代码能不能过编译器的话,`cargo check --target
+x86_64-pc-windows-msvc` 就够(只要 std,连链接器都不用)。
+
+**双击不会有黑窗口**(release 版按 GUI 子系统链接),但**从 cmd/PowerShell 里跑仍然有
+日志** —— 启动时会挂回父进程的控制台。要看日志就 `set RUST_LOG=info` 再从命令行启动;
+挂回去时 shell 已经回到提示符,日志会和提示符交错着刷,这是这类程序的通病。
+debug 版(`cargo build` 不带 `--release`)保持控制台子系统。
+
+宠物包不随 exe 走:把 Linux 上导好的包目录拷到 `%LOCALAPPDATA%\rocom-pets\packs\`,
+或者用 `--packs-dir` 指过去;不给包也能起(调试精灵模式,用来验平台层)。
+
+- 运行时(`src/`)：Rust + wgpu，自写平台窗口层(wlr-layer-shell / Windows `WS_EX_NOREDIRECTIONBITMAP` + DirectComposition)。
   当前进度:KDE Wayland 后端已跑通(透明置顶、轮廓命中、穿透开关,[docs/spike-s1.md](docs/spike-s1.md));
   骨骼动画 + toon 着色已跑通([docs/spike-s2.md](docs/spike-s2.md));
   **宠物已经能站在桌面上待机、走动、睡觉、被摸头与拖放**(Phase 1–4,见 design.md §9)。

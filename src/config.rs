@@ -78,12 +78,13 @@ impl Default for Config {
 }
 
 impl Config {
-    /// 默认路径:`$XDG_CONFIG_HOME/rocom-pets/config.toml`。
+    /// 默认路径:Linux 是 `$XDG_CONFIG_HOME/rocom-pets/config.toml`,
+    /// Windows 是 `%APPDATA%\rocom-pets\config.toml`。
+    ///
+    /// **Windows 上没有 `HOME`/`XDG_*`**(是 `USERPROFILE`/`APPDATA`),照 XDG 那套找会
+    /// 一个都找不到 —— 实测第一版在 wine 里直接「定不出配置文件位置」,配置与阵容全丢。
     pub fn default_path() -> Option<PathBuf> {
-        let base = std::env::var_os("XDG_CONFIG_HOME")
-            .map(PathBuf::from)
-            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))?;
-        Some(base.join("rocom-pets").join("config.toml"))
+        Some(config_dir()?.join("rocom-pets").join("config.toml"))
     }
 
     /// 读配置;文件不存在就写一份模板并返回默认值。读失败(格式错)则报错——
@@ -119,6 +120,22 @@ impl Config {
         }
         PathBuf::from(value)
     }
+}
+
+/// 放配置的目录(不含 `rocom-pets` 那一层)。
+#[cfg(not(target_os = "windows"))]
+fn config_dir() -> Option<PathBuf> {
+    std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
+}
+
+#[cfg(target_os = "windows")]
+fn config_dir() -> Option<PathBuf> {
+    // 漫游配置(小、跟着用户走);拿不到就退回用户目录
+    std::env::var_os("APPDATA")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("USERPROFILE").map(PathBuf::from))
 }
 
 #[cfg(test)]

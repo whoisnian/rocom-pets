@@ -1,41 +1,13 @@
-//! 外部控制入口:托盘菜单、全局热键、信号。三者都把命令送进同一个 calloop 通道,
-//! 事件循环那边只认 [`Control`],不关心命令是哪来的。
+//! Linux(KDE Plasma)的外部控制:ksni 托盘、XDG GlobalShortcuts 热键、D-Bus 接口、信号。
+//! 三者都把命令送进同一个 calloop 通道,事件循环那边只认 [`Control`],不关心命令是哪来的。
 
 use std::collections::HashMap;
 
+use super::{Control, TrayPet};
 use anyhow::{Context, Result};
 use smithay_client_toolkit::reexports::calloop::channel::Sender;
 use zbus::blocking::{Connection, Proxy};
 use zbus::zvariant::{OwnedObjectPath, OwnedValue, Value};
-
-/// 能从外部发起的命令。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Control {
-    /// 切换鼠标穿透。
-    TogglePassthrough,
-    /// 切换叫声静音。
-    ToggleMute,
-    /// 把宠物召回到屏幕中间(它跑到边角或看不见时用)。
-    Recall,
-    /// 把阵容里第 `slot` 只切到进化链上的第 `form` 个形态。
-    SwitchForm { slot: usize, form: usize },
-    /// 从可选包列表里加一只(下标)。
-    AddPet(usize),
-    /// 撤下阵容里的第几只(下标)。
-    RemovePet(usize),
-    /// 退出。
-    Quit,
-}
-
-/// 菜单里的一只宠物。
-#[derive(Debug, Clone)]
-pub struct TrayPet {
-    /// 当前形态名(菜单上显示的那一行)。
-    pub name: String,
-    /// 进化链上的形态名,与 `current_form` 的下标对应。
-    pub forms: Vec<String>,
-    pub current_form: usize,
-}
 
 /// 「加一只」菜单一屏最多列这么多个包;超了就切成一段一段的子菜单。
 /// 全库 539 个包平铺出来根本没法用,而按首字分组的话中文名会分出上百个组。
@@ -462,7 +434,7 @@ pub fn serve_dbus(sender: Sender<Control>) -> Result<()> {
 }
 
 /// 命令行子命令:通知已在运行的实例执行某个命令。
-pub fn send_dbus_command(control: Control) -> Result<()> {
+pub fn send_command(control: Control) -> Result<()> {
     let connection = Connection::session().context("连不上会话总线")?;
     let proxy = Proxy::new(&connection, DBUS_NAME, DBUS_PATH, "org.rocom.Pets1")
         .context("拿不到控制接口")?;

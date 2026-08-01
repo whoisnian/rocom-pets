@@ -3,6 +3,14 @@
 //! 默认起 stage(每个显示器一个透明置顶表面,见 platform/);
 //! `--render` 是离屏模式,不开窗口,把宠物渲成对比图用于验收与回归(见 offscreen.rs)。
 
+// 双击不弹黑窗口:release 版在 Windows 上按 **GUI 子系统**链接。
+// 从命令行跑时仍然要有日志 —— 见 `attach_parent_console`。
+// debug 版保持控制台子系统:开发时日志比「没有黑窗口」重要得多。
+#![cfg_attr(
+    all(target_os = "windows", not(debug_assertions)),
+    windows_subsystem = "windows"
+)]
+
 mod act;
 mod audio;
 mod config;
@@ -27,7 +35,8 @@ const USAGE: &str = "\
   rocom-pets                              起 stage,但用调试精灵(平台层验收模式)
   rocom-pets --render <包目录|glb> [选项]  离屏渲染宠物到 PNG
 
-stage 模式(不给参数时读 ~/.config/rocom-pets/config.toml,首次运行会生成模板):
+stage 模式(不给参数时读配置文件,首次运行会生成模板;
+          Linux 在 ~/.config/rocom-pets/,Windows 在 %APPDATA%/rocom-pets/):
   --pack <目录>      宠物包目录(含 manifest.toml)
   --form <资产名>    选形态,默认包里第一个(链首)
   --px-per-cm <n>    每厘米多少逻辑像素(默认 2.0:80cm 的喵喵 → 160px 高)
@@ -42,8 +51,9 @@ stage 模式(不给参数时读 ~/.config/rocom-pets/config.toml,首次运行会
   (--pack 既接受目录路径,也接受包名/物种名,后者在包目录里找)
 
 在场阵容(同时上几只):
-  托盘菜单里「加一只」/「撤下」,阵容存在 ~/.config/rocom-pets/roster.toml,
+  托盘菜单里「加一只」/「撤下」,阵容存在配置同目录的 roster.toml,
   下次启动自动恢复。给了 --pack 就只上这一只,不读也不动那份存档。
+  (Windows 的托盘还没有加/撤菜单,只能手改 roster.toml 重启)
 
 控制已在运行的实例(走 D-Bus,可绑到 KDE 自定义快捷键):
   --toggle-passthrough  切换鼠标穿透
@@ -63,7 +73,52 @@ stage 模式(不给参数时读 ~/.config/rocom-pets/config.toml,首次运行会
   -h, --help         本帮助
 ";
 
+/// 从命令行启动时,把标准输出挂回父进程的控制台。
+///
+/// GUI 子系统的代价是标准句柄全是空的 —— 从 cmd 里跑也看不到任何日志,而这个后端
+/// 还在磨合期,日志是唯一的排查手段。`AttachConsole(ATTACH_PARENT_PROCESS)` 能挂回去,
+/// 但**必须自己把 `CONOUT$` 设成标准句柄**:AttachConsole 不替进程改这几个句柄。
+///
+/// 双击启动时没有父控制台,attach 会失败,那就什么都不做(也就不会凭空弹一个窗口)。
+/// 已知小别扭:挂回去时 shell 早已回到提示符,日志会和提示符交错着刷 —— 这是所有
+/// 「GUI 子系统 + 附着父控制台」的程序共有的,没法避免。
+#[cfg(target_os = "windows")]
+fn attach_parent_console() {
+    use windows::Win32::Storage::FileSystem::{
+        CreateFileW, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        OPEN_EXISTING,
+    };
+    use windows::Win32::System::Console::{
+        ATTACH_PARENT_PROCESS, AttachConsole, STD_ERROR_HANDLE, STD_OUTPUT_HANDLE, SetStdHandle,
+    };
+    use windows::core::w;
+
+    // SAFETY: 全是标准的「挂回父控制台」流程;失败一律当作「没有控制台」静默跳过。
+    // **必须在任何输出之前调**:Rust 的 stdout 会缓存第一次拿到的句柄。
+    unsafe {
+        if AttachConsole(ATTACH_PARENT_PROCESS).is_err() {
+            return;
+        }
+        let Ok(console) = CreateFileW(
+            w!("CONOUT$"),
+            (FILE_GENERIC_READ | FILE_GENERIC_WRITE).0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            None,
+            OPEN_EXISTING,
+            Default::default(),
+            None,
+        ) else {
+            return;
+        };
+        let _ = SetStdHandle(STD_OUTPUT_HANDLE, console);
+        let _ = SetStdHandle(STD_ERROR_HANDLE, console);
+    }
+}
+
 fn main() -> anyhow::Result<()> {
+    #[cfg(target_os = "windows")]
+    attach_parent_console();
+
     // zbus/tracing 的握手与派发日志是 INFO 级且极啰嗦(一次 D-Bus 调用刷十几行),
     // 一律压到 warn。注意不能只写进 default_filter:RUST_LOG 一设就把默认整条替换掉了,
     // 所以这里是在用户给的过滤器**后面**追加(用户显式点名 zbus/tracing 时不动)。
@@ -125,10 +180,10 @@ fn main() -> anyhow::Result<()> {
             "--no-tray" => no_tray = true,
             "--passthrough" => cli_passthrough = true,
             "--toggle-passthrough" => {
-                return control::send_dbus_command(control::Control::TogglePassthrough);
+                return control::send_command(control::Control::TogglePassthrough);
             }
-            "--recall" => return control::send_dbus_command(control::Control::Recall),
-            "--quit" => return control::send_dbus_command(control::Control::Quit),
+            "--recall" => return control::send_command(control::Control::Recall),
+            "--quit" => return control::send_command(control::Control::Quit),
             // --form 两个模式都用得到
             "--form" if request.is_none() => cli_form = Some(next("--form", &mut args)?),
             other => {

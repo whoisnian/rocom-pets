@@ -12,6 +12,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 /// 写在文件开头的说明。手改的人得知道下一次托盘操作会整份覆盖。
+#[cfg_attr(target_os = "windows", allow(dead_code))]
 const HEADER: &str = "\
 # rocom-pets 的在场阵容 —— 托盘里加一只/撤一只/切形态时自动重写。
 # 手改也认,但下次改动会整份覆盖(注释保不住,这就是它没和 config.toml 放一起的原因)。
@@ -66,6 +67,8 @@ impl Roster {
         }
     }
 
+    /// Windows 后端还不会改阵容(托盘没有加/撤菜单),那边只读不写。
+    #[cfg_attr(target_os = "windows", allow(dead_code))]
     pub fn save(&self, path: &Path) -> Result<()> {
         if let Some(dir) = path.parent() {
             let _ = std::fs::create_dir_all(dir);

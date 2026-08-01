@@ -41,7 +41,8 @@ impl Reaction {
         redraw: true,
         regions_dirty: false,
     };
-    const BOTH: Self = Self {
+    /// 又要重画又要重设输入区。平台层在「位置被外力改了」时用(比如召回)。
+    pub const BOTH: Self = Self {
         redraw: true,
         regions_dirty: true,
     };
@@ -278,6 +279,9 @@ pub struct VoiceBank {
 }
 
 /// 什么时候叫。键与导出器写进 manifest 的一致。
+///
+/// `CallOut` 由「托盘加了一只」触发,而 Windows 的托盘还没有那一项。
+#[cfg_attr(target_os = "windows", allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VoiceKind {
     /// 摸头满意。
@@ -491,7 +495,11 @@ impl PetActor {
                 //    最远也只能走 `max_x/2`,阈值取屏宽的三成五就已经够不着了。
                 // 实测这两版跑动作**一次都不会触发**。四成可走范围 ≈ 两成的目标点会起跑。
                 let running = distance > max_x * 0.4 && self.clips.run.is_some();
-                let clip = if running { self.clips.run } else { self.clips.walk };
+                let clip = if running {
+                    self.clips.run
+                } else {
+                    self.clips.walk
+                };
                 if let (Some(clip), true) = (clip, far_enough) {
                     self.activity = Activity::Walk { target_x, running };
                     self.target_yaw = camera_yaw(target_x > pos_x);
@@ -938,7 +946,8 @@ impl Entity {
         self.actor.hit(lx, ly)
     }
 
-    /// 这只在表面坐标下的输入矩形。
+    /// 这只在表面坐标下的输入矩形。Wayland 交给 `set_input_region`,
+    /// Windows 交给 `SetWindowRgn` —— 两边都是「这些矩形才吃鼠标」。
     fn input_rects(&self) -> impl Iterator<Item = Rect> + '_ {
         let (dx, dy) = (self.pos.0.round() as i32, self.pos.1.round() as i32);
         self.coverage.iter().map(move |r| r.translated(dx, dy))
@@ -1042,6 +1051,7 @@ impl Stage {
     }
 
     /// 让某一只叫一声(平台层在「托盘加了一只」这类外部事件上调)。
+    #[cfg_attr(target_os = "windows", allow(dead_code))]
     pub fn speak(&mut self, id: EntityId, kind: VoiceKind) {
         if let Some(Actor::Pet(pet)) = self.entity_mut(id).map(|e| &mut e.actor) {
             pet.speak(kind);
@@ -1049,6 +1059,7 @@ impl Stage {
     }
 
     /// 撤掉一只。找不到就是 false(标识可能已经失效)。
+    #[cfg_attr(target_os = "windows", allow(dead_code))]
     pub fn despawn(&mut self, id: EntityId) -> bool {
         let before = self.entities.len();
         self.entities.retain(|e| e.id != id);
@@ -1081,16 +1092,13 @@ impl Stage {
         self.entities
             .iter()
             .filter(|e| e.hit_test(x, y))
-            .max_by(|a, b| {
-                a.foot_y()
-                    .total_cmp(&b.foot_y())
-                    .then(a.id.0.cmp(&b.id.0))
-            })
+            .max_by(|a, b| a.foot_y().total_cmp(&b.foot_y()).then(a.id.0.cmp(&b.id.0)))
             .map(|e| e.id)
     }
 
     /// 换掉某一只的角色(切形态):尺寸与轮廓都变了,重算覆盖区并重新落地。
     /// 标识不变 —— 托盘的插槽与掩码回读都还认着它。
+    #[cfg_attr(target_os = "windows", allow(dead_code))]
     pub fn replace_actor(&mut self, id: EntityId, actor: Actor) -> bool {
         let size = self.size;
         let Some(entity) = self.entity_mut(id) else {
@@ -1286,7 +1294,8 @@ impl Stage {
                         // 拎着放下 → 往地面落。**不再瞬移**:原来是直接把 y 设成地面线,
                         // 从半空松手会「啪」地闪下去。有 JumpFall 就播它,没有就用待机姿势落。
                         pet.activity = Activity::Falling { speed: 0.0 };
-                        pet.player.play(pet.clips.jump_fall.unwrap_or(pet.clips.idle));
+                        pet.player
+                            .play(pet.clips.jump_fall.unwrap_or(pet.clips.idle));
                     }
                 }
                 // 已经在地面上(或者本来就不是宠物)就不用落
@@ -2103,8 +2112,7 @@ mod entity_tests {
         stage.spawn(Actor::Pet(PetActor::new(test_build(Arc::clone(&model), 2))));
         // 两只在场,加上这里持有的那份 = 3;网格/动画/贴图只有一份
         assert_eq!(Arc::strong_count(&model), 3);
-        let (Actor::Pet(a), Actor::Pet(b)) =
-            (&stage.entities[0].actor, &stage.entities[1].actor)
+        let (Actor::Pet(a), Actor::Pet(b)) = (&stage.entities[0].actor, &stage.entities[1].actor)
         else {
             panic!("两只都该是宠物");
         };
@@ -2241,7 +2249,10 @@ mod pet_tests {
             }
             assert!(s.actor_pos().1 <= ground, "不该穿过地面");
         }
-        assert!(matches!(activity(&s), Activity::Idle { .. }), "该落地回待机");
+        assert!(
+            matches!(activity(&s), Activity::Idle { .. }),
+            "该落地回待机"
+        );
         assert_eq!(s.actor_pos().1 + 180.0, 600.0 - GROUND_MARGIN);
     }
 
