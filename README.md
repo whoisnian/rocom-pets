@@ -10,6 +10,8 @@
 (珀尔鼬指挥捕尘长绒清扫)。叫声也接上了:摸头/受惊/召唤/睡醒各一段,
 每只实体的嗓音随机(游戏里那个 −100~100 的 `voice` 属性),默认小声、托盘可静音。
 **九条原始需求全部结掉**:Windows 后端也在实机上跑通了(2026-08-01)。
+现在还有**独立的配置窗口**(`--settings`,托盘里也能开):管理宠物包(导入/查找/删除)、
+管理在场宠物(加/撤、形态/大小/性格/表情),以及运行时**直接读 `.rkpet`**(zip)。
 需求对照与后续计划见 [docs/design.md](docs/design.md) §9。
 
 支持矩阵：**Windows 10+**(实机验过:上桌、置顶、点击穿透、拖放、托盘;
@@ -37,7 +39,8 @@ PATH=/usr/lib/llvm*/bin:$PATH cargo xwin build --release --target x86_64-pc-wind
 
 产物 `target/x86_64-pc-windows-msvc/release/rocom-pets.exe` **不需要 VC++ 运行库**
 (`.cargo/config.toml` 里对这个目标开了 `+crt-static`),拷到 Windows 上双击即可;
-除系统 DLL 外零依赖。只想验代码能不能过编译器的话,`cargo check --target
+除系统 DLL 外零依赖(约 19MB —— 配置窗口那套 egui/winit 占了一多半,
+但换来的是不必再单独分发一个配置程序)。只想验代码能不能过编译器的话,`cargo check --target
 x86_64-pc-windows-msvc` 就够(只要 std,连链接器都不用)。
 
 **双击不会有黑窗口**(release 版按 GUI 子系统链接),但**从 cmd/PowerShell 里跑仍然有
@@ -54,6 +57,7 @@ debug 版(`cargo build` 不带 `--release`)保持控制台子系统。
   **宠物已经能站在桌面上待机、走动、睡觉、被摸头与拖放**(Phase 1–4,见 design.md §9)。
 - 导出器(`exporter/`)：C# + CUE4Parse，从自己的游戏 pak 生成宠物包;
   一条进化链一个包(glb 含全部动作 + 贴图 + 叫声 + manifest.toml)，见 [docs/spike-s3.md](docs/spike-s3.md)。
+  `--zip` 额外打一个 `.rkpet`,运行时直接读。
   叫声要 `vgmstream-cli` 与 `ffmpeg`(缺了自动跳过,`--no-voice` 显式关);
   全库 835 个形态里 **499 个有叫声**,合计 31MB。
 - 验证工具(`tools/verify_glb.py`)：按 glTF 规范自采样 + 蒙皮 + 光栅化，渲图肉眼核对动画正确性。
@@ -67,17 +71,45 @@ debug 版(`cargo build` 不带 `--release`)保持控制台子系统。
   宠物资产在手机的**应用私有目录**里,`adb root` 取到之后归属变成精确哈希查表,
   见 [docs/android-device.md](docs/android-device.md)。
 
-配置在 `~/.config/rocom-pets/config.toml`(首次运行生成带注释模板);托盘菜单可加一只/撤下、
-切形态、切穿透、召回、退出。**在场阵容存在同目录的 `roster.toml` 里**(托盘改一次就重写一次,
-所以没和手写的 config.toml 混在一起),下次启动自动恢复;给了 `--pack` 则只上这一只、不动存档。
+### 宠物包:目录或 `.rkpet`
+
+包可以是**解开的目录**,也可以是导出器 `--zip` 打出来的 `.rkpet`(一条链 14MB → 6.9MB)。
+运行时两种都直接读,不解压到临时目录 —— 包内相对路径拼在包的位置后面当「虚拟路径」用,
+真读的时候由 `src/assets.rs` 判断要不要开归档(见那个模块的说明)。
+包目录里两种可以混着放,`--list` 会在归档那几行标 `[rkpet]`。
+
+### 配置
+
+配置在 `~/.config/rocom-pets/config.toml`(首次运行生成带注释模板),
+**在场阵容存在同目录的 `roster.toml` 里**(每改一次就整份重写,所以没和手写的 config.toml
+混在一起),下次启动自动恢复;给了 `--pack` 则只上这一只、不动存档。
+
+**托盘菜单**:穿透/召回/叫声三个开关,加上两个子菜单 ——「常用配置」(整体大小、叫声音量)
+与「宠物配置」(每只的形态/大小/性格、撤下、加一只)。改完立刻生效,并写回上面那两份文件。
+
+**配置窗口**(`rocom-pets --settings`,或托盘里「打开配置窗口…」)是一个独立进程,
+菜单表达不了的东西在这里:
+
+- **宠物包**:列表、查找、导入(`.rkpet` 或包目录,也可以直接拖进窗口)、删除;
+- **活跃宠物**:加/撤,以及每只的形态、大小(连续)、性格、表情池(多选);
+- **常用配置**:整体大小、音量、启动就穿透、全局热键。
+
+点「保存并应用」才落盘,然后给在跑的桌宠发一条 `Reload` —— 两个进程之间**只靠那两份文件**
+对话,桌宠没在跑的话改动下次启动照样生效。手改完文件想立刻生效就 `rocom-pets --reload`。
+
+窗口里的中文字体是**从系统里找的**(Linux 问 fontconfig,Windows 找雅黑/黑体),
+不打进二进制:一份中文字体比整个运行时还大。
+
 全局热键走 XDG GlobalShortcuts portal(KDE 会弹窗确认),或把 KDE 自定义快捷键
 绑到 `rocom-pets --toggle-passthrough`。
 
 ```sh
 cargo run --release -- --pack packs/喵喵                    # 把宠物放到桌面上
+rocom-pets --settings                                      # 打开配置窗口(包管理 / 活跃宠物 / 常用配置)
 rocom-pets --list                                          # 列出 ~/.local/share/rocom-pets/packs 里的包
-rocom-pets --pack 喵喵                                      # 按包名启动(也可给目录路径)
+rocom-pets --pack 喵喵                                      # 按包名启动(目录、.rkpet 路径也行)
 rocom-pets --toggle-passthrough                            # 通知已在跑的实例(可绑快捷键)
+rocom-pets --reload                                        # 手改完 config/roster 后让它重读
 cargo run                                                  # 同上但用调试精灵(平台层验收模式)
 cargo run --release -- --render packs/喵喵 --bench 600      # 离屏渲宠物 + 测出帧耗时
 git -C "$CUE4PARSE_DIR" apply exporter/patches/*.patch      # 导出前必做:修上游把法线写成切线的 bug

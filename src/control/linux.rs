@@ -3,7 +3,9 @@
 
 use std::collections::HashMap;
 
-use super::{Control, TrayPet};
+use super::{
+    Control, PX_PER_CM_STEPS, SCALE_STEPS, TrayPet, VOLUME_STEPS, nearest_step,
+};
 use anyhow::{Context, Result};
 use smithay_client_toolkit::reexports::calloop::channel::Sender;
 use zbus::blocking::{Connection, Proxy};
@@ -23,6 +25,9 @@ pub struct Tray {
     pets: Vec<TrayPet>,
     /// 包目录里能加的包名,下标即 [`Control::AddPet`] 的参数。
     available: Vec<String>,
+    /// 当前的每厘米像素数与音量,菜单里回显选中的那一档。
+    px_per_cm: f32,
+    volume: f32,
 }
 
 impl ksni::Tray for Tray {
@@ -44,7 +49,7 @@ impl ksni::Tray for Tray {
     }
 
     fn menu(&self) -> Vec<ksni::MenuItem<Self>> {
-        use ksni::menu::{CheckmarkItem, RadioGroup, RadioItem, StandardItem, SubMenu};
+        use ksni::menu::{CheckmarkItem, StandardItem, SubMenu};
         let mut items: Vec<ksni::MenuItem<Self>> = vec![
             CheckmarkItem {
                 label: "鼠标穿透".into(),
@@ -74,32 +79,188 @@ impl ksni::Tray for Tray {
         }
 
         items.push(ksni::MenuItem::Separator);
+        items.push(
+            SubMenu {
+                label: "常用配置".into(),
+                icon_name: "configure".into(),
+                submenu: self.common_menu(),
+                ..Default::default()
+            }
+            .into(),
+        );
+        items.push(
+            SubMenu {
+                label: "宠物配置".into(),
+                icon_name: "pets".into(),
+                submenu: self.pets_menu(),
+                ..Default::default()
+            }
+            .into(),
+        );
 
-        // 在场的每一只一个子菜单:换形态 + 撤下。**插槽下标要按值搬进闭包** ——
-        // 菜单是回调,点的时候 `self.pets` 早就可能变了。
+        items.push(ksni::MenuItem::Separator);
+        items.push(
+            StandardItem {
+                label: "退出".into(),
+                icon_name: "application-exit".into(),
+                activate: Box::new(|tray: &mut Self| tray.send(Control::Quit)),
+                ..Default::default()
+            }
+            .into(),
+        );
+        items
+    }
+}
+
+impl Tray {
+    /// 「常用配置」:整体大小与音量各一组单选,末尾一条通往配置窗口。
+    ///
+    /// 只放**改完立刻看得见效果**的两项。快捷键、包目录这类改一次就不动的留给配置窗口 ——
+    /// 托盘菜单每次都要重建一遍,项越多越是负担。
+    fn common_menu(&self) -> Vec<ksni::MenuItem<Self>> {
+        use ksni::menu::{RadioGroup, RadioItem, StandardItem, SubMenu};
+
+        let steps = |steps: &'static [(f32, &'static str)],
+                     current: f32,
+                     make: fn(f32) -> Control|
+         -> ksni::MenuItem<Self> {
+            RadioGroup {
+                selected: nearest_step(steps, current),
+                select: Box::new(move |tray: &mut Self, index| {
+                    if let Some((value, _)) = steps.get(index) {
+                        tray.send(make(*value));
+                    }
+                }),
+                options: steps
+                    .iter()
+                    .map(|(_, label)| RadioItem {
+                        label: (*label).to_string(),
+                        ..Default::default()
+                    })
+                    .collect(),
+            }
+            .into()
+        };
+
+        let mut items: Vec<ksni::MenuItem<Self>> = vec![
+            SubMenu {
+                label: "整体大小".into(),
+                submenu: vec![steps(PX_PER_CM_STEPS, self.px_per_cm, Control::SetPxPerCm)],
+                ..Default::default()
+            }
+            .into(),
+        ];
+        // 没有音频设备时这一项点了也没用
+        if self.voice.is_some() {
+            items.push(
+                SubMenu {
+                    label: "叫声音量".into(),
+                    submenu: vec![steps(VOLUME_STEPS, self.volume, Control::SetVolume)],
+                    ..Default::default()
+                }
+                .into(),
+            );
+        }
+        items.push(ksni::MenuItem::Separator);
+        items.push(
+            StandardItem {
+                label: "打开配置窗口…".into(),
+                icon_name: "configure".into(),
+                activate: Box::new(|tray: &mut Self| tray.send(Control::OpenSettings)),
+                ..Default::default()
+            }
+            .into(),
+        );
+        items
+    }
+
+    /// 「宠物配置」:在场的每一只一个子菜单(形态/大小/性格/撤下),再加「加一只」与配置窗口。
+    fn pets_menu(&self) -> Vec<ksni::MenuItem<Self>> {
+        use ksni::menu::{RadioGroup, RadioItem, StandardItem, SubMenu};
+
+        let mut items: Vec<ksni::MenuItem<Self>> = Vec::new();
+        // **插槽下标要按值搬进闭包** —— 菜单是回调,点的时候 `self.pets` 早就可能变了。
         for (slot, pet) in self.pets.iter().enumerate() {
             let mut submenu: Vec<ksni::MenuItem<Self>> = Vec::new();
             // 单形态的包不必多「形态」这一层
             if pet.forms.len() > 1 {
                 submenu.push(
-                    RadioGroup {
-                        selected: pet.current_form,
-                        select: Box::new(move |tray: &mut Self, form| {
-                            tray.send(Control::SwitchForm { slot, form })
-                        }),
-                        options: pet
-                            .forms
-                            .iter()
-                            .map(|name| RadioItem {
-                                label: name.clone(),
-                                ..Default::default()
-                            })
-                            .collect(),
+                    SubMenu {
+                        label: "形态".into(),
+                        submenu: vec![
+                            RadioGroup {
+                                selected: pet.current_form,
+                                select: Box::new(move |tray: &mut Self, form| {
+                                    tray.send(Control::SwitchForm { slot, form })
+                                }),
+                                options: pet
+                                    .forms
+                                    .iter()
+                                    .map(|name| RadioItem {
+                                        label: name.clone(),
+                                        ..Default::default()
+                                    })
+                                    .collect(),
+                            }
+                            .into(),
+                        ],
+                        ..Default::default()
                     }
                     .into(),
                 );
-                submenu.push(ksni::MenuItem::Separator);
             }
+            submenu.push(
+                SubMenu {
+                    label: "大小".into(),
+                    submenu: vec![
+                        RadioGroup {
+                            selected: nearest_step(SCALE_STEPS, pet.scale),
+                            select: Box::new(move |tray: &mut Self, index| {
+                                if let Some((scale, _)) = SCALE_STEPS.get(index) {
+                                    tray.send(Control::SetPetScale {
+                                        slot,
+                                        scale: *scale,
+                                    });
+                                }
+                            }),
+                            options: SCALE_STEPS
+                                .iter()
+                                .map(|(_, label)| RadioItem {
+                                    label: (*label).to_string(),
+                                    ..Default::default()
+                                })
+                                .collect(),
+                        }
+                        .into(),
+                    ],
+                    ..Default::default()
+                }
+                .into(),
+            );
+            submenu.push(
+                SubMenu {
+                    label: "性格".into(),
+                    submenu: vec![
+                        RadioGroup {
+                            selected: pet.persona,
+                            select: Box::new(move |tray: &mut Self, persona| {
+                                tray.send(Control::SetPetPersona { slot, persona })
+                            }),
+                            options: crate::persona::ALL
+                                .iter()
+                                .map(|p| RadioItem {
+                                    label: p.name.to_string(),
+                                    ..Default::default()
+                                })
+                                .collect(),
+                        }
+                        .into(),
+                    ],
+                    ..Default::default()
+                }
+                .into(),
+            );
+            submenu.push(ksni::MenuItem::Separator);
             submenu.push(
                 StandardItem {
                     label: "撤下".into(),
@@ -119,6 +280,9 @@ impl ksni::Tray for Tray {
             );
         }
 
+        if !items.is_empty() {
+            items.push(ksni::MenuItem::Separator);
+        }
         if !self.available.is_empty() {
             items.push(
                 SubMenu {
@@ -130,22 +294,20 @@ impl ksni::Tray for Tray {
                 .into(),
             );
         }
-
-        items.push(ksni::MenuItem::Separator);
         items.push(
             StandardItem {
-                label: "退出".into(),
-                icon_name: "application-exit".into(),
-                activate: Box::new(|tray: &mut Self| tray.send(Control::Quit)),
+                // 表情池、精确的大小、宠物包的导入/删除都只在窗口里 ——
+                // 那几样要么是多选,要么要打开文件,菜单表达不了
+                label: "管理宠物与包…".into(),
+                icon_name: "configure".into(),
+                activate: Box::new(|tray: &mut Self| tray.send(Control::OpenSettings)),
                 ..Default::default()
             }
             .into(),
         );
         items
     }
-}
 
-impl Tray {
     /// 「加一只」的内容:包少就平铺,包多就按名字切段。段的标签取首尾两个名字,
     /// 于是能像翻通讯录一样找 —— 全库 539 个包平铺是没法用的。
     fn add_menu(&self) -> Vec<ksni::MenuItem<Self>> {
@@ -211,6 +373,20 @@ impl TrayHandle {
     pub fn set_voice(&self, on: bool) {
         self.0.update(move |tray: &mut Tray| tray.voice = Some(on));
     }
+
+    /// 「常用配置」那两组单选要回显真实值(可能是配置窗口改的,不是从这儿点的)。
+    pub fn set_common(&self, px_per_cm: f32, volume: f32) {
+        self.0.update(move |tray: &mut Tray| {
+            tray.px_per_cm = px_per_cm;
+            tray.volume = volume;
+        });
+    }
+
+    /// 包目录变了(配置窗口里导入/删除了包),「加一只」那张表要跟着换。
+    pub fn set_available(&self, available: Vec<String>) {
+        self.0
+            .update(move |tray: &mut Tray| tray.available = available);
+    }
 }
 
 /// 起托盘。失败不致命(没有托盘宿主的桌面照样能跑),调用方只记个日志。
@@ -220,6 +396,8 @@ pub fn spawn_tray(
     pets: Vec<TrayPet>,
     available: Vec<String>,
     voice: Option<bool>,
+    px_per_cm: f32,
+    volume: f32,
 ) -> Result<TrayHandle> {
     use ksni::blocking::TrayMethods;
     let handle = Tray {
@@ -228,6 +406,8 @@ pub fn spawn_tray(
         voice,
         pets,
         available,
+        px_per_cm,
+        volume,
     }
     .spawn()
     .context("注册托盘图标失败(桌面没有 StatusNotifier 宿主?)")?;
@@ -400,6 +580,16 @@ impl DbusControl {
         self.send(Control::Recall);
     }
 
+    /// 重读配置与阵容存档。**配置窗口存完盘就调它**,于是改动立刻落到台上。
+    fn reload(&self) {
+        self.send(Control::Reload);
+    }
+
+    /// 打开配置窗口。
+    fn open_settings(&self) {
+        self.send(Control::OpenSettings);
+    }
+
     /// 退出。
     fn quit(&self) {
         self.send(Control::Quit);
@@ -442,10 +632,18 @@ pub fn send_command(control: Control) -> Result<()> {
         Control::TogglePassthrough => "TogglePassthrough",
         Control::ToggleMute => "ToggleMute",
         Control::Recall => "Recall",
+        Control::Reload => "Reload",
+        Control::OpenSettings => "OpenSettings",
         Control::Quit => "Quit",
-        // 这几个要带下标,命令行没暴露(托盘菜单里选更直观)
-        Control::SwitchForm { .. } | Control::AddPet(_) | Control::RemovePet(_) => {
-            anyhow::bail!("加/撤宠物与换形态请用托盘菜单")
+        // 这几个要带参数,命令行没暴露(托盘菜单或配置窗口里选更直观)
+        Control::SwitchForm { .. }
+        | Control::AddPet(_)
+        | Control::RemovePet(_)
+        | Control::SetPxPerCm(_)
+        | Control::SetVolume(_)
+        | Control::SetPetScale { .. }
+        | Control::SetPetPersona { .. } => {
+            anyhow::bail!("这项请用托盘菜单或 `rocom-pets --settings`")
         }
     };
     proxy

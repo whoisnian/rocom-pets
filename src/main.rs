@@ -12,16 +12,19 @@
 )]
 
 mod act;
+mod assets;
 mod audio;
 mod config;
 mod control;
 mod offscreen;
 mod pack;
 mod pack_list;
+mod persona;
 mod pet;
 mod platform;
 mod render;
 mod roster;
+mod settings;
 mod sprite;
 mod stage;
 
@@ -45,10 +48,14 @@ stage 模式(不给参数时读配置文件,首次运行会生成模板;
   --no-tray          不起托盘图标
   --passthrough      启动就开鼠标穿透
 
+配置窗口:
+  --settings         打开配置窗口(宠物包管理 / 活跃宠物 / 常用配置)
+                     托盘菜单里也能开;改完点「保存并应用」,在跑的桌宠会立刻跟着变
+
 包管理:
   --list             列出包目录里的宠物包(默认 ~/.local/share/rocom-pets/packs)
   --packs-dir <目录> 换个包目录
-  (--pack 既接受目录路径,也接受包名/物种名,后者在包目录里找)
+  (--pack 接受包目录、`.rkpet` 文件,也接受包名/物种名,后者在包目录里找)
 
 在场阵容(同时上几只):
   托盘菜单里「加一只」/「撤下」,阵容存在配置同目录的 roster.toml,
@@ -58,6 +65,8 @@ stage 模式(不给参数时读配置文件,首次运行会生成模板;
 控制已在运行的实例(走 D-Bus,可绑到 KDE 自定义快捷键):
   --toggle-passthrough  切换鼠标穿透
   --recall              把宠物召回屏幕中间
+  --reload              重读配置与阵容存档(手改完那两份文件后不必重启)
+  --settings-window     让它开一个配置窗口
   --quit                让它退出
 
   --render <路径>    宠物包目录(含 forms/)或直接给 model.glb
@@ -119,18 +128,28 @@ fn main() -> anyhow::Result<()> {
     #[cfg(target_os = "windows")]
     attach_parent_console();
 
+    let args: Vec<String> = std::env::args().skip(1).collect();
+
     // zbus/tracing 的握手与派发日志是 INFO 级且极啰嗦(一次 D-Bus 调用刷十几行),
     // 一律压到 warn。注意不能只写进 default_filter:RUST_LOG 一设就把默认整条替换掉了,
     // 所以这里是在用户给的过滤器**后面**追加(用户显式点名 zbus/tracing 时不动)。
+    //
+    // 配置窗口那边再压一档到 error:它上会话总线**只为占一个名字**(单实例锁),
+    // 而 zbus 一看见「要了名字却没挂对象」就警告一句 —— 对我们这个用法不成立,
+    // 但每开一次窗口就刷一行,看着像出了事。
+    let quiet_zbus = args.iter().any(|a| a == "--settings");
     let mut filter = std::env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string());
-    for noisy in ["zbus", "tracing"] {
+    for (noisy, level) in [
+        ("zbus", if quiet_zbus { "error" } else { "warn" }),
+        ("tracing", "warn"),
+    ] {
         if !filter.contains(noisy) {
-            filter.push_str(&format!(",{noisy}=warn"));
+            filter.push_str(&format!(",{noisy}={level}"));
         }
     }
     env_logger::Builder::new().parse_filters(&filter).init();
 
-    let mut args = std::env::args().skip(1);
+    let mut args = args.into_iter();
     let mut request: Option<offscreen::Request> = None;
     // 命令行先收集成 Option,最后再与配置文件合并(命令行优先)
     let mut config_path: Option<PathBuf> = None;
@@ -142,6 +161,7 @@ fn main() -> anyhow::Result<()> {
     let mut cli_pack_name: Option<String> = None;
     let mut cli_packs_dir: Option<PathBuf> = None;
     let mut list_packs = false;
+    let mut open_settings = false;
     let next = |flag: &str, args: &mut dyn Iterator<Item = String>| -> anyhow::Result<String> {
         args.next()
             .ok_or_else(|| anyhow::anyhow!("{flag} 缺少参数值\n{USAGE}"))
@@ -174,6 +194,7 @@ fn main() -> anyhow::Result<()> {
             "--pack" => cli_pack_name = Some(next("--pack", &mut args)?),
             "--packs-dir" => cli_packs_dir = Some(PathBuf::from(next("--packs-dir", &mut args)?)),
             "--list" => list_packs = true,
+            "--settings" => open_settings = true,
             "--px-per-cm" => cli_px_per_cm = Some(next("--px-per-cm", &mut args)?.parse()?),
             "--volume" => cli_volume = Some(next("--volume", &mut args)?.parse()?),
             "--config" => config_path = Some(PathBuf::from(next("--config", &mut args)?)),
@@ -183,6 +204,8 @@ fn main() -> anyhow::Result<()> {
                 return control::send_command(control::Control::TogglePassthrough);
             }
             "--recall" => return control::send_command(control::Control::Recall),
+            "--reload" => return control::send_command(control::Control::Reload),
+            "--settings-window" => return control::send_command(control::Control::OpenSettings),
             "--quit" => return control::send_command(control::Control::Quit),
             // --form 两个模式都用得到
             "--form" if request.is_none() => cli_form = Some(next("--form", &mut args)?),
@@ -222,8 +245,14 @@ fn main() -> anyhow::Result<()> {
         return pack_list::run(packs_dir.as_deref());
     }
 
-    // stage 模式:配置文件打底,命令行覆盖
+    // 配置文件位置:**配置窗口与桌宠必须按同一条规则定**,否则两边看的不是同一份文件
     let path = config_path.or_else(config::Config::default_path);
+
+    if open_settings {
+        return settings::run(path, packs_dir);
+    }
+
+    // stage 模式:配置文件打底,命令行覆盖
     let file = match &path {
         Some(path) => config::Config::load_or_create(path)?,
         None => {
@@ -238,13 +267,7 @@ fn main() -> anyhow::Result<()> {
     // `from_user`:这份名单是用户当场写的(命令行/配置)还是程序自己存的(阵容存档)。
     // 读不动时的处理完全不同,见下面。
     let (slots, from_user) = match cli_pack_name {
-        Some(name) => (
-            vec![roster::Slot {
-                pack: name,
-                form: cli_form.clone(),
-            }],
-            true,
-        ),
+        Some(name) => (vec![roster::Slot::new(name, cli_form.clone())], true),
         None => match roster_path
             .as_deref()
             .and_then(roster::Roster::load)
@@ -255,10 +278,10 @@ fn main() -> anyhow::Result<()> {
                 file.pack
                     .clone()
                     .map(|pack| {
-                        vec![roster::Slot {
+                        vec![roster::Slot::new(
                             pack,
-                            form: cli_form.clone().or_else(|| file.form.clone()),
-                        }]
+                            cli_form.clone().or_else(|| file.form.clone()),
+                        )]
                     })
                     .unwrap_or_default(),
                 true,
@@ -274,6 +297,7 @@ fn main() -> anyhow::Result<()> {
         match pack::Pack::resolve(&slot.pack, packs_dir.as_deref()) {
             Ok(pack) => pets.push(platform::StartupPet {
                 pack,
+                options: platform::PetOptions::from_slot(&slot),
                 form: slot.form,
             }),
             Err(e) if from_user => {
@@ -287,6 +311,7 @@ fn main() -> anyhow::Result<()> {
         pets,
         packs_dir,
         roster_path,
+        config_path: path,
         px_per_cm: cli_px_per_cm.unwrap_or(file.px_per_cm),
         passthrough: cli_passthrough || file.passthrough,
         tray: !no_tray,

@@ -8,23 +8,22 @@ use std::path::PathBuf;
 
 mod shared;
 
+pub use shared::{PetOptions, SCALE_RANGE};
+
 #[cfg(target_os = "linux")]
 mod wayland;
 #[cfg(target_os = "windows")]
 mod windows;
 
-/// 启动阵容里的一只:已经读好的包 + 要用哪个形态。
+/// 启动阵容里的一只:已经读好的包 + 要用哪个形态 + 这一只自己的选项。
 pub struct StartupPet {
     pub pack: crate::pack::Pack,
     /// 形态资产名或中文名;None = 包里第一个(链首)。
     pub form: Option<String>,
+    pub options: PetOptions,
 }
 
 /// 起 stage 时的配置。阵容为空时退回调试精灵(S1 的验收对象)。
-///
-/// `packs_dir` / `roster_path` 只有 Wayland 后端在用:Windows 的托盘还没有加/撤宠物的
-/// 菜单,也就无处改阵容、无需存回去。
-#[cfg_attr(target_os = "windows", allow(dead_code))]
 pub struct Options {
     /// 启动阵容(命令行 / 阵容存档 / 配置,由 main 定优先级);空 = 调试精灵。
     pub pets: Vec<StartupPet>,
@@ -32,6 +31,8 @@ pub struct Options {
     pub packs_dir: Option<PathBuf>,
     /// 阵容存档路径(托盘改动后写回);None = 定不出位置,只在内存里。
     pub roster_path: Option<PathBuf>,
+    /// 配置文件路径。托盘改音量/整体大小时写回它,`Reload` 时重读它。
+    pub config_path: Option<PathBuf>,
     /// 每厘米多少逻辑像素:宠物的屏幕高度 = height_cm × 这个值。
     pub px_per_cm: f32,
     /// 启动就开鼠标穿透。

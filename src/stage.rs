@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::act::{self, Beat, Script, Step};
+use crate::persona::Persona;
 use crate::pet::mask::Mask;
 use crate::pet::target::camera_yaw;
 use crate::pet::{Model, Player};
@@ -85,6 +86,19 @@ const SLEEPY_WAKE_AT: f32 = 0.25;
 const BORED_WALK_AT: f32 = 0.6;
 /// 无聊时不走动而是随手做个表情的概率。
 const EMOTE_CHANCE: f32 = 0.35;
+
+/// 待机时随手做的那几个表情:glb 里的动作名 → 配置窗口上显示的名字。
+///
+/// **这就是「表情池」的全集**。每只可以只开其中几个(见 `PetBuild::emotes`);
+/// 一个都不开或者包里一个都没有,那只就只会站桩,行为上是允许的。
+pub const EMOTES: &[(&str, &str)] = &[
+    ("Happy", "开心"),
+    ("Sad", "难过"),
+    ("Anger", "生气"),
+    ("Show", "得意"),
+    ("Relax", "放松"),
+    ("Alert", "警觉"),
+];
 
 /// 邻近感知:多少**身位**以内算「注意到旁边那只」。
 ///
@@ -182,20 +196,22 @@ impl Needs {
         })
     }
 
-    fn tick(&mut self, dt: f32, activity: &Activity) {
+    /// `persona` 只缩放**攒**的那一侧:睡饱要多久、走一趟消多少无聊是手感,和脾气无关。
+    fn tick(&mut self, dt: f32, activity: &Activity, persona: &Persona) {
         let dt = dt * Self::speed();
+        let sleepy_rate = dt * persona.sleepy / SLEEPY_BUILD_SECS;
         match activity {
             Activity::Sleeping(_) => {
                 self.sleepiness -= dt / SLEEPY_RECOVER_SECS;
                 self.boredom = 0.0;
             }
             Activity::Idle { .. } => {
-                self.sleepiness += dt / SLEEPY_BUILD_SECS;
-                self.boredom += dt / BORED_BUILD_SECS;
+                self.sleepiness += sleepy_rate;
+                self.boredom += dt * persona.bored / BORED_BUILD_SECS;
             }
             // 走动与互动都算「有事做」,消无聊
             _ => {
-                self.sleepiness += dt / SLEEPY_BUILD_SECS;
+                self.sleepiness += sleepy_rate;
                 self.boredom -= dt / BORED_RELIEF_SECS;
             }
         }
@@ -329,6 +345,10 @@ pub struct PetBuild {
     pub form_id: i64,
     /// 叫声库;None = 这个形态没有(或者用户把声音关了)。
     pub voice: Option<Arc<VoiceBank>>,
+    /// 脾气(见 persona.rs);不配就是「乖巧」= 基线行为。
+    pub persona: Persona,
+    /// 允许的表情([`EMOTES`] 里的动作名);None = 全都要。
+    pub emotes: Option<Vec<String>>,
     pub seed: u64,
 }
 
@@ -356,6 +376,8 @@ pub struct PetActor {
     pub body_px: f32,
     /// 形态 id;演出脚本按它选角(见 act.rs)。
     pub form_id: i64,
+    /// 脾气:一组作用在手感常量上的倍率(见 persona.rs)。
+    pub persona: Persona,
     /// 正被演出脚本编排着。**外部打断会把它清掉**(受惊/摸头/被拎起都走 `react`
     /// 或直接设 `Dragged`),演出那边看见就收场 —— 打断语义只此一处,不散在各个分支里。
     acting: bool,
@@ -481,7 +503,8 @@ impl PetActor {
         }
         if self.needs.boredom >= BORED_WALK_AT {
             // 无聊到想动:多数时候换个地方走走,偶尔只是做个表情
-            let emote = !self.clips.emotes.is_empty() && self.rng.next_f32() < EMOTE_CHANCE;
+            let emote_chance = (EMOTE_CHANCE * self.persona.emote).clamp(0.0, 1.0);
+            let emote = !self.clips.emotes.is_empty() && self.rng.next_f32() < emote_chance;
             if !emote {
                 let target_x = self.rng.next_f32() * max_x;
                 let distance = (target_x - pos_x).abs();
@@ -494,7 +517,11 @@ impl PetActor {
                 // ② 按屏幕宽取 —— 可走范围只有 `max_x`(屏宽减画布宽),站在中间时
                 //    最远也只能走 `max_x/2`,阈值取屏宽的三成五就已经够不着了。
                 // 实测这两版跑动作**一次都不会触发**。四成可走范围 ≈ 两成的目标点会起跑。
-                let running = distance > max_x * 0.4 && self.clips.run.is_some();
+                //
+                // 性格在这个门槛上乘一个系数(活泼 0.6 更容易跑,高冷 2.0 基本不跑);
+                // 乘出来超过 1.0 就等于「永远不跑」,那是「高冷」想要的效果,不必钳制。
+                let threshold = max_x * 0.4 * self.persona.run;
+                let running = distance > threshold && self.clips.run.is_some();
                 let clip = if running {
                     self.clips.run
                 } else {
@@ -686,6 +713,8 @@ impl PetActor {
             run_speed,
             form_id,
             voice,
+            persona,
+            emotes: wanted_emotes,
             seed,
         } = build;
         // Idle 一定要有:没有 Idle 的包等于没法待机,退化成用第 0 段动作
@@ -702,10 +731,16 @@ impl PetActor {
         let sleep_start = model.clip("SleepStart");
         let sleep_loop = model.clip("SleepLoop").or_else(|| model.clip("SleepStand"));
         let sleep_end = model.clip("SleepEnd");
-        // 表情池:待机时偶尔来一个,让它看着不是只会站桩
-        let emotes = ["Happy", "Sad", "Anger", "Show", "Relax", "Alert"]
+        // 表情池:待机时偶尔来一个,让它看着不是只会站桩。
+        // 用户可以只留几个(配置窗口里勾),不配就是全都要 —— 和以前的行为一致。
+        let emotes = EMOTES
             .iter()
-            .filter_map(|name| model.clip(name))
+            .filter(|(name, _)| {
+                wanted_emotes
+                    .as_ref()
+                    .is_none_or(|want| want.iter().any(|w| w == name))
+            })
+            .filter_map(|(name, _)| model.clip(name))
             .collect();
         let player = Player::new(&model, idle);
         let mut rng = Rng::new(seed);
@@ -721,6 +756,7 @@ impl PetActor {
             foot_offset,
             body_px: body_px.max(1.0),
             form_id,
+            persona,
             acting: false,
             voice,
             // 均匀取 −1..1:游戏里 voice 是逐只随机的属性,两端各 2% 才算「粗嗓门/婉转声」
@@ -1725,7 +1761,7 @@ impl Stage {
         };
 
         pet.petting.tick(dt);
-        pet.needs.tick(dt, &pet.activity);
+        pet.needs.tick(dt, &pet.activity, &pet.persona);
         // 打招呼的冷却
         for (_, remaining) in pet.notices.iter_mut() {
             *remaining -= dt;
@@ -1777,7 +1813,10 @@ impl Stage {
                         pet.activity = Activity::Idle { remaining: 0.5 };
                     } else if let Some(neighbor) = perception
                         .nearest
-                        .filter(|n| n.distance <= NOTICE_DISTANCE && pet.notice_ready(n.id))
+                        .filter(|n| {
+                            n.distance <= NOTICE_DISTANCE * pet.persona.social
+                                && pet.notice_ready(n.id)
+                        })
                     {
                         // 旁边站了个同伴 → 先打个招呼,再去忙自己的。
                         // 这里**只发意图**,转身与播动作在 `dispatch_intents` 里
@@ -1878,6 +1917,8 @@ fn test_build(model: Arc<Model>, seed: u64) -> PetBuild {
         run_speed: 250.0,
         form_id: 0,
         voice: None,
+        persona: Persona::default(),
+        emotes: None,
         seed,
     }
 }

@@ -55,7 +55,8 @@ impl Pcm {
 
 /// 解一个音频文件(包里是 ogg vorbis)。
 pub fn decode(path: &Path) -> Result<Pcm> {
-    let bytes = std::fs::read(path).with_context(|| format!("读不到 {path:?}"))?;
+    // 走 assets:叫声可能在一个 .rkpet 里(见 assets.rs 的「虚拟路径」)
+    let bytes = crate::assets::read(path)?;
     let decoder = rodio::Decoder::new(std::io::Cursor::new(bytes))
         .with_context(|| format!("{path:?} 解不开"))?;
     let channels = decoder.channels();
@@ -149,6 +150,16 @@ impl Audio {
 
     pub fn set_muted(&mut self, muted: bool) {
         self.muted = muted;
+    }
+
+    pub fn volume(&self) -> f32 {
+        self.volume
+    }
+
+    /// 改音量。**下一声才生效**:已经在混音器里的那段是按当时的音量放大过的,
+    /// 追不回来 —— 叫声都是一两秒的短音,不值得为此维护一条可调的增益链。
+    pub fn set_volume(&mut self, volume: f32) {
+        self.volume = volume.clamp(0.0, 1.0);
     }
 
     /// 放一段。**不排队**:同一只连点几下就该盖过去 —— 混音器会把它们叠在一起,

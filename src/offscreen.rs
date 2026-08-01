@@ -489,18 +489,9 @@ fn locate_glb(pack: &Path, form: Option<&str>) -> Result<PathBuf> {
     if pack.extension().is_some_and(|e| e == "glb") {
         return Ok(pack.to_path_buf());
     }
-    let forms_dir = pack.join("forms");
-    let mut forms: Vec<PathBuf> = std::fs::read_dir(&forms_dir)
-        .with_context(|| format!("{forms_dir:?} 读不到(不是宠物包目录?)"))?
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| p.is_dir())
-        .collect();
-    forms.sort();
-    if let Some(want) = form {
-        forms.retain(|p| p.file_name().is_some_and(|n| n == want));
-    }
-    let form_dir = forms
-        .first()
-        .with_context(|| format!("{forms_dir:?} 里没有匹配的形态"))?;
-    Ok(form_dir.join("model.glb"))
+    // **按 manifest 找,不扫目录**:包可能是一个 `.rkpet`,里面的 `forms/` 在文件系统里
+    // 根本不存在(见 assets.rs)。manifest 那条路两种形态通用。
+    let loaded = crate::pack::Pack::load(pack)?;
+    let index = loaded.form_index(form)?;
+    Ok(loaded.forms[index].model.clone())
 }

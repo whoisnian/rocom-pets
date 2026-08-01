@@ -66,7 +66,7 @@ use crate::render::{Gpu, Quad, QuadDraw, Target};
 use crate::stage::{Actor, EntityId, Reaction, Stage, StageEvent, VoiceKind};
 
 use super::Options;
-use super::shared::{self, Assets, CANVAS_PADDING, Member};
+use super::shared::{self, Assets, CANVAS_PADDING, Member, PetOptions};
 
 /// 定时器起始间隔;之后每次由 `Stage::tick_interval` 决定(待机降频)。
 const TICK_HZ: f32 = 30.0;
@@ -106,24 +106,7 @@ pub fn run(options: Options) -> Result<()> {
     // SAFETY: 进程级设置,只在启动时调一次。
     let _ = unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
 
-    let mut roster: Vec<Member> = Vec::new();
-    for pet in options.pets {
-        let form = pet.pack.form_index(pet.form.as_deref()).unwrap_or(0);
-        let f = &pet.pack.forms[form];
-        log::info!(
-            "宠物包 {}({}):当前 {}({}),高 {:.0}cm,{} 个动作",
-            pet.pack.species_name,
-            pet.pack.species_id,
-            f.name,
-            f.asset,
-            f.height_cm,
-            f.clips.len()
-        );
-        roster.push(Member {
-            pack: pet.pack,
-            form,
-        });
-    }
+    let roster = shared::start_roster(options.pets);
     // 阵容为空就上调试精灵 —— 与 Wayland 后端同义,也是这一层的验收模式(S1):
     // 没有宠物包也能验「置顶 / 逐像素 alpha / 命中 / 穿透」。
     let sprite_mode = roster.is_empty();
@@ -162,6 +145,7 @@ pub fn run(options: Options) -> Result<()> {
         available,
         packs_dir: options.packs_dir,
         roster_path: options.roster_path,
+        config_path: options.config_path,
         sprite: crate::sprite::Sprite::test_pattern(192),
         sprite_mode,
         assets: Assets::default(),
@@ -188,6 +172,8 @@ pub fn run(options: Options) -> Result<()> {
         let voice = guard.audio.as_ref().map(|a| !a.muted());
         let pets = guard.tray_pets();
         let available = guard.available.iter().map(|p| p.name.clone()).collect();
+        let volume = guard.audio.as_ref().map(|a| a.volume()).unwrap_or(0.0);
+        let px_per_cm = guard.px_per_cm;
         match control::spawn_tray(
             control_hwnd,
             control_tx.clone(),
@@ -195,6 +181,8 @@ pub fn run(options: Options) -> Result<()> {
             pets,
             available,
             voice,
+            px_per_cm,
+            volume,
         ) {
             Ok(mut tray) => {
                 tray.set_roster(guard.tray_pets());
@@ -286,6 +274,8 @@ struct App {
     available: Vec<PackEntry>,
     packs_dir: Option<PathBuf>,
     roster_path: Option<PathBuf>,
+    /// 配置文件路径:托盘改音量/整体大小时写回它,`Reload` 时重读它。
+    config_path: Option<PathBuf>,
     /// 阵容为空时的占位(平台层验收模式)。
     sprite: crate::sprite::Sprite,
     sprite_mode: bool,
@@ -309,8 +299,13 @@ impl App {
 
     fn refresh_tray(&mut self) {
         let pets = shared::tray_pets(&self.roster);
+        let px_per_cm = self.px_per_cm;
+        let volume = self.audio.as_ref().map(|a| a.volume()).unwrap_or(0.0);
+        let available: Vec<String> = self.available.iter().map(|p| p.name.clone()).collect();
         if let Some(tray) = self.tray.as_mut() {
             tray.set_roster(pets);
+            tray.set_common(px_per_cm, volume);
+            tray.set_available(available);
         }
     }
 
@@ -366,10 +361,14 @@ impl App {
 
         let surface = self.create_surface(hwnd)?;
         let mut stage = Stage::new(logical);
-        let forms: Vec<Form> = self.roster.iter().map(|m| m.form().clone()).collect();
-        let mut slots = Vec::with_capacity(forms.len());
-        for form in &forms {
-            match self.build_pet_actor(form) {
+        let builds: Vec<(Form, PetOptions)> = self
+            .roster
+            .iter()
+            .map(|m| (m.form().clone(), m.options.clone()))
+            .collect();
+        let mut slots = Vec::with_capacity(builds.len());
+        for (form, options) in &builds {
+            match self.build_pet_actor(form, options) {
                 Ok(actor) => slots.push(stage.spawn(actor)),
                 Err(e) => log::error!("加载宠物失败: {e:#}"),
             }
@@ -460,10 +459,15 @@ impl App {
     }
 
     /// 造一只角色。资产缓存与换算都在 platform/shared.rs。
-    fn build_pet_actor(&mut self, form: &Form) -> Result<Actor> {
+    fn build_pet_actor(&mut self, form: &Form, options: &PetOptions) -> Result<Actor> {
         let with_audio = self.audio.is_some();
-        self.assets
-            .build_actor(form, self.px_per_cm, with_audio, self.stages.len() as u64)
+        self.assets.build_actor(
+            form,
+            self.px_per_cm,
+            options,
+            with_audio,
+            self.stages.len() as u64,
+        )
     }
 
     fn pet_gpu(&mut self, model: &Arc<Model>) -> Result<Arc<PetGpu>> {
@@ -814,6 +818,155 @@ impl App {
             Control::SwitchForm { slot, form } => self.switch_form(slot, form),
             Control::AddPet(index) => self.add_pet(index),
             Control::RemovePet(slot) => self.remove_pet(slot),
+            Control::SetPxPerCm(value) => self.set_px_per_cm(value),
+            Control::SetVolume(value) => self.set_volume(value),
+            Control::SetPetScale { slot, scale } => {
+                let Some(member) = self.roster.get(slot) else {
+                    return;
+                };
+                let options = PetOptions {
+                    scale,
+                    ..member.options.clone()
+                };
+                self.set_pet_options(slot, options);
+            }
+            Control::SetPetPersona { slot, persona } => {
+                let Some(member) = self.roster.get(slot) else {
+                    return;
+                };
+                let options = PetOptions {
+                    persona: crate::persona::Persona::at(persona),
+                    ..member.options.clone()
+                };
+                self.set_pet_options(slot, options);
+            }
+            Control::Reload => self.reload(),
+            Control::OpenSettings => control::open_settings(),
+        }
+    }
+
+    /// 改全局的每厘米像素数:所有宠物一起重建(画布尺寸与走速都是按它算的)。
+    fn set_px_per_cm(&mut self, value: f32) {
+        let value = value.clamp(0.5, 8.0);
+        if (self.px_per_cm - value).abs() < 1e-4 {
+            return;
+        }
+        log::info!("整体大小: {:.1} px/cm", value);
+        self.px_per_cm = value;
+        self.write_config(&[("px_per_cm", crate::config::Setting::Num(value))]);
+        for slot in 0..self.roster.len() {
+            self.rebuild_slot(slot);
+        }
+        self.assets.prune();
+    }
+
+    /// 改叫声音量。0 也只是不出声,**不关设备**(关了再想开就得重新初始化)。
+    fn set_volume(&mut self, value: f32) {
+        let value = value.clamp(0.0, 1.0);
+        if let Some(audio) = self.audio.as_mut() {
+            audio.set_volume(value);
+            log::info!("叫声音量 {:.0}%", value * 100.0);
+        }
+        self.write_config(&[("volume", crate::config::Setting::Num(value))]);
+        self.refresh_tray();
+    }
+
+    /// 写回 config.toml。失败只警告:值在内存里已经生效了。
+    fn write_config(&self, updates: &[(&str, crate::config::Setting<'_>)]) {
+        let Some(path) = self.config_path.as_deref() else {
+            return;
+        };
+        if let Err(e) = crate::config::Config::write_back(path, updates) {
+            log::warn!("配置没写回去({e:#});这次改动重启后会丢");
+        }
+    }
+
+    /// 改这一只的选项(大小/性格/表情)。改完要重建角色 —— 与 Wayland 后端同义。
+    fn set_pet_options(&mut self, slot: usize, options: PetOptions) {
+        let Some(member) = self.roster.get_mut(slot) else {
+            return;
+        };
+        if member.options == options {
+            return;
+        }
+        log::info!(
+            "{} 的选项:大小 ×{:.2},性格 {}",
+            member.pack.species_name,
+            options.scale,
+            options.persona.name
+        );
+        member.options = options;
+        self.rebuild_slot(slot);
+    }
+
+    /// 重新读配置与阵容存档,把台上的一切对齐过去(配置窗口存完盘就发这个)。
+    /// **整个阵容重来**,不做差量 —— 理由见 Wayland 后端同名函数。
+    fn reload(&mut self) {
+        if let Some(path) = self.config_path.as_deref() {
+            match crate::config::Config::load_or_create(path) {
+                Ok(config) => {
+                    self.px_per_cm = config.px_per_cm;
+                    if let Some(audio) = self.audio.as_mut() {
+                        audio.set_volume(config.volume);
+                    }
+                }
+                Err(e) => log::warn!("重读配置失败({e:#}),沿用当前设置"),
+            }
+        }
+        let slots = self
+            .roster_path
+            .as_deref()
+            .and_then(crate::roster::Roster::load)
+            .map(|saved| saved.pets)
+            .unwrap_or_default();
+        self.roster = shared::load_roster(&slots, self.packs_dir.as_deref());
+        if let Some(dir) = self.packs_dir.as_deref() {
+            self.available = Pack::list_entries(dir);
+        }
+        log::info!("已重载:{} 只在台上", self.roster.len());
+        if !self.roster.is_empty() {
+            self.sprite_mode = false;
+        }
+        self.respawn_all();
+        self.assets.prune();
+        self.refresh_tray();
+    }
+
+    /// 把每台上的角色全部推倒重建(reload 用)。
+    fn respawn_all(&mut self) {
+        let builds: Vec<(Form, PetOptions)> = self
+            .roster
+            .iter()
+            .map(|m| (m.form().clone(), m.options.clone()))
+            .collect();
+        for index in 0..self.stages.len() {
+            let old: Vec<EntityId> = self.stages[index]
+                .stage
+                .entities()
+                .iter()
+                .map(|e| e.id())
+                .collect();
+            for id in old {
+                self.stages[index].stage.despawn(id);
+            }
+            self.stages[index].slots.clear();
+            self.stages[index].pets.clear();
+            self.stages[index].sprite_quad = None;
+            for (form, options) in &builds {
+                match self.build_pet_actor(form, options) {
+                    Ok(actor) => {
+                        let id = self.stages[index].stage.spawn(actor);
+                        self.stages[index].slots.push(id);
+                    }
+                    Err(e) => log::error!("重载 {} 失败: {e:#}", form.name),
+                }
+            }
+            if self.sprite_mode {
+                let sprite = self.sprite.clone();
+                self.stages[index].stage.spawn(Actor::Sprite(sprite));
+            }
+            self.rebuild_pet_surfaces(index);
+            self.apply(index, Reaction::BOTH);
         }
     }
 
@@ -872,20 +1025,21 @@ impl App {
             log::warn!("要加的包不在列表里(下标 {index})");
             return;
         };
-        let dir = entry.dir.clone();
-        let pack = match Pack::load(&dir) {
+        let path = entry.path.clone();
+        let pack = match Pack::load(&path) {
             Ok(pack) => pack,
             Err(e) => {
-                log::error!("加一只失败:{dir:?} 读不了: {e:#}");
+                log::error!("加一只失败:{path:?} 读不了: {e:#}");
                 return;
             }
         };
         let form = pack.forms[0].clone();
+        let options = PetOptions::default();
         // **先把每台的角色都建出来再提交**:中途失败会让插槽与实体对不上号,
         // 而插槽错位比「加不上」难查得多
         let mut actors = Vec::with_capacity(self.stages.len());
         for _ in 0..self.stages.len() {
-            match self.build_pet_actor(&form) {
+            match self.build_pet_actor(&form, &options) {
                 Ok(actor) => actors.push(actor),
                 Err(e) => {
                     log::error!("加一只 {} 失败: {e:#}", pack.species_name);
@@ -917,7 +1071,11 @@ impl App {
             self.apply(stage_index, Reaction::BOTH);
         }
         self.sprite_mode = false;
-        self.roster.push(Member { pack, form: 0 });
+        self.roster.push(Member {
+            pack,
+            form: 0,
+            options,
+        });
         self.flush_sounds();
         self.save_roster();
         self.refresh_tray();
@@ -957,20 +1115,30 @@ impl App {
         if index >= member.pack.forms.len() || index == member.form {
             return;
         }
-        let form = member.pack.forms[index].clone();
+        self.roster[slot].form = index;
+        let form = self.roster[slot].form();
+        log::info!("切换形态 → {}({})", form.name, form.asset);
+        self.rebuild_slot(slot);
+    }
+
+    /// 按阵容里现在的形态与选项,把这一只在每台上的角色重建一遍。
+    fn rebuild_slot(&mut self, slot: usize) {
+        let Some(member) = self.roster.get(slot) else {
+            return;
+        };
+        let form = member.form().clone();
+        let options = member.options.clone();
         // 同 `add_pet`:全建出来才提交,免得一半的台换了一半没换
         let mut actors = Vec::with_capacity(self.stages.len());
         for _ in 0..self.stages.len() {
-            match self.build_pet_actor(&form) {
+            match self.build_pet_actor(&form, &options) {
                 Ok(actor) => actors.push(actor),
                 Err(e) => {
-                    log::error!("切形态失败: {e:#}");
+                    log::error!("重建 {} 失败: {e:#}", form.name);
                     return;
                 }
             }
         }
-        log::info!("切换形态 → {}({})", form.name, form.asset);
-        self.roster[slot].form = index;
         for (stage_index, actor) in actors.into_iter().enumerate() {
             let Some(id) = self.stages[stage_index].slots.get(slot).copied() else {
                 continue;

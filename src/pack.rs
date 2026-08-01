@@ -3,6 +3,9 @@
 //! manifest 是导出器与运行时之间唯一的契约(schema 见 docs/design.md §4.3),
 //! 运行时只认里面的**逻辑动作名**与形态元数据,不关心资产原名。
 //! 缺字段就按默认值降级——包是本地生成物,宁可少个动作也不该整只加载不出来。
+//!
+//! 包可以是**解开的目录**,也可以是一个 `.rkpet`(zip)。这一层不关心是哪种:
+//! 位置一律叫 `path`,内容一律走 [`crate::assets`] 读(见那个模块的「虚拟路径」说明)。
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -308,20 +311,18 @@ impl Form {
 }
 
 /// 包目录里的一项,只带名字与位置(见 [`Pack::list_entries`])。
-///
-/// Windows 后端的托盘还没有「加一只」菜单,所以那边用不到(不是死代码)。
-#[cfg_attr(target_os = "windows", allow(dead_code))]
 pub struct PackEntry {
     pub name: String,
-    pub dir: PathBuf,
+    /// 包的位置:目录,或者 `.rkpet` 文件。
+    pub path: PathBuf,
 }
 
 pub struct Pack {
     pub species_id: i64,
     pub species_name: String,
     pub forms: Vec<Form>,
-    /// 包目录,列表显示与相对路径都要用。
-    pub dir: PathBuf,
+    /// 包的位置(目录或 `.rkpet` 文件)。列表显示与包内相对路径都要用。
+    pub path: PathBuf,
 }
 
 /// 放大件数据的目录(不含 `rocom-pets` 那一层)。
@@ -347,12 +348,12 @@ impl Pack {
         Some(data_dir()?.join("rocom-pets").join("packs"))
     }
 
-    /// 列出包目录下所有能读的包(按名字排序)。读不动的只警告,不让一个坏包挡住其他的。
-    pub fn list(dir: &Path) -> Vec<Pack> {
+    /// 包目录里所有**看着像包**的位置(目录含 manifest,或 `.rkpet` 文件),按路径排序。
+    fn candidates(dir: &Path) -> Vec<PathBuf> {
         let mut entries: Vec<PathBuf> = match std::fs::read_dir(dir) {
             Ok(read) => read
                 .filter_map(|e| e.ok().map(|e| e.path()))
-                .filter(|p| p.join("manifest.toml").is_file())
+                .filter(|p| crate::assets::is_pack(p))
                 .collect(),
             Err(e) => {
                 log::debug!("包目录 {dir:?} 读不了: {e}");
@@ -361,6 +362,11 @@ impl Pack {
         };
         entries.sort();
         entries
+    }
+
+    /// 列出包目录下所有能读的包(按名字排序)。读不动的只警告,不让一个坏包挡住其他的。
+    pub fn list(dir: &Path) -> Vec<Pack> {
+        Self::candidates(dir)
             .iter()
             .filter_map(|path| match Pack::load(path) {
                 Ok(pack) => Some(pack),
@@ -378,61 +384,69 @@ impl Pack {
     ///
     /// 解析不了的包退用目录名:它多半仍能加载(名字这一节坏了不代表形态坏了),
     /// 真加载失败时再报错也不迟。
-    #[cfg_attr(target_os = "windows", allow(dead_code))]
     pub fn list_entries(dir: &Path) -> Vec<PackEntry> {
-        #[derive(Deserialize)]
-        struct NameOnly {
-            species: RawSpecies,
-        }
-
-        let mut entries: Vec<PathBuf> = match std::fs::read_dir(dir) {
-            Ok(read) => read
-                .filter_map(|e| e.ok().map(|e| e.path()))
-                .filter(|p| p.join("manifest.toml").is_file())
-                .collect(),
-            Err(e) => {
-                log::debug!("包目录 {dir:?} 读不了: {e}");
-                return Vec::new();
-            }
-        };
-        entries.sort();
-        let mut packs: Vec<PackEntry> = entries
+        let mut packs: Vec<PackEntry> = Self::candidates(dir)
             .into_iter()
-            .map(|dir| {
-                let name = std::fs::read_to_string(dir.join("manifest.toml"))
-                    .ok()
-                    .and_then(|text| toml::from_str::<NameOnly>(&text).ok())
-                    .map(|raw| raw.species.name)
-                    .or_else(|| dir.file_name().map(|n| n.to_string_lossy().into_owned()))
-                    .unwrap_or_else(|| "?".to_string());
-                PackEntry { name, dir }
+            .map(|path| PackEntry {
+                name: Self::peek_name(&path),
+                path,
             })
             .collect();
         packs.sort_by(|a, b| a.name.cmp(&b.name));
         packs
     }
 
-    /// 按「路径」或「包名」定位一个包:优先当路径用,否则在包目录里按物种名/目录名找。
+    /// 只把 manifest 里的物种名抠出来。读不动就退用文件名(去掉 `.rkpet` 后缀)。
+    pub fn peek_name(path: &Path) -> String {
+        #[derive(Deserialize)]
+        struct NameOnly {
+            species: RawSpecies,
+        }
+
+        crate::assets::read_manifest(path)
+            .ok()
+            .and_then(|text| toml::from_str::<NameOnly>(&text).ok())
+            .map(|raw| raw.species.name)
+            .or_else(|| {
+                let stem = if path.is_file() {
+                    path.file_stem()
+                } else {
+                    path.file_name()
+                };
+                stem.map(|n| n.to_string_lossy().into_owned())
+            })
+            .unwrap_or_else(|| "?".to_string())
+    }
+
+    /// 按「路径」或「包名」定位一个包:优先当路径用,否则在包目录里按物种名/文件名找。
+    ///
+    /// 文件名那一条要**连去掉后缀的也认**:阵容存的是 `喵喵.rkpet`,而用户在配置里
+    /// 多半只写 `喵喵` —— 同一个包换成目录形态之后名字还得对得上。
     pub fn resolve(value: &str, packs_dir: Option<&Path>) -> Result<Pack> {
         let as_path = crate::config::Config::expand_path(value);
-        if as_path.join("manifest.toml").is_file() {
+        if crate::assets::is_pack(&as_path) {
             return Pack::load(&as_path);
         }
         if let Some(dir) = packs_dir {
-            for pack in Pack::list(dir) {
-                if pack.species_name == value || pack.dir.file_name().is_some_and(|n| n == value) {
-                    return Ok(pack);
+            for entry in Pack::list_entries(dir) {
+                let file_name = entry.path.file_name().map(|n| n.to_string_lossy());
+                let stem = entry.path.file_stem().map(|n| n.to_string_lossy());
+                let hit = entry.name == value
+                    || file_name.as_deref() == Some(value)
+                    || stem.as_deref() == Some(value);
+                if hit {
+                    return Pack::load(&entry.path);
                 }
             }
         }
-        bail!("找不到宠物包 {value}(既不是包目录,也不在 {packs_dir:?} 里)")
+        bail!("找不到宠物包 {value}(既不是包目录/`.rkpet`,也不在 {packs_dir:?} 里)")
     }
 
-    /// `dir` 是包目录(含 manifest.toml)。
-    pub fn load(dir: &Path) -> Result<Self> {
-        let path = dir.join("manifest.toml");
-        let text = std::fs::read_to_string(&path)
-            .with_context(|| format!("读不到 {path:?}(不是宠物包目录?)"))?;
+    /// `root` 是包目录(含 manifest.toml)或 `.rkpet` 文件。
+    pub fn load(root: &Path) -> Result<Self> {
+        let path = crate::assets::manifest_path(root);
+        let text = crate::assets::read_manifest(root)
+            .with_context(|| format!("读不到 {path:?}(不是宠物包?)"))?;
         let raw: RawManifest =
             toml::from_str(&text).with_context(|| format!("{path:?} 解析失败"))?;
         if raw.schema > SUPPORTED_SCHEMA {
@@ -455,7 +469,7 @@ impl Pack {
                 name: form.name,
                 stage: form.stage,
                 asset: form.asset,
-                model: dir.join(form.model),
+                model: root.join(form.model),
                 scale: form.scale,
                 // 没给高度就按一只猫的量级兜底,免得算出 0 像素
                 height_cm: if form.height_cm > 1.0 {
@@ -474,7 +488,7 @@ impl Pack {
                             (
                                 key,
                                 VoiceClip {
-                                    path: dir.join(clip.path),
+                                    path: root.join(clip.path),
                                     seconds: clip.ms as f32 / 1000.0,
                                 },
                             )
@@ -503,7 +517,7 @@ impl Pack {
                             // (喵呜是 MiaoMiao/Miaomiao、魔力猫反过来),查表必须不区分大小写
                             name.to_ascii_lowercase(),
                             Material {
-                                base_color: mat.base_color.map(|rel| dir.join(rel)),
+                                base_color: mat.base_color.map(|rel| root.join(rel)),
                                 mask_alpha: mat.mask_alpha,
                                 effect: Effect {
                                     // 没给主色就用白,至少形体在
@@ -511,18 +525,18 @@ impl Pack {
                                     opacity: mat.opacity,
                                     glow: mat.glow,
                                     flow: mat.flow.unwrap_or([0.0, 0.0, 1.0, 1.0]),
-                                    mask: mat.mask_tex.map(|rel| dir.join(rel)),
-                                    noise: mat.noise_tex.map(|rel| dir.join(rel)),
+                                    mask: mat.mask_tex.map(|rel| root.join(rel)),
+                                    noise: mat.noise_tex.map(|rel| root.join(rel)),
                                     mask_matcap: mat.mask_matcap,
                                 },
                                 translucent: mat.translucent,
                                 opacity: mat.opacity,
-                                star: mat.star_tex.map(|rel| dir.join(rel)),
+                                star: mat.star_tex.map(|rel| root.join(rel)),
                                 star_fake_trans: mat.star_fake_trans,
                                 star_tiling: mat.star_tiling.unwrap_or([1.0, 1.0]),
                                 star_color: mat.star_color.unwrap_or([1.0; 3]),
                                 stick_intensity: mat.stick_intensity,
-                                matcap: mat.matcap_tex.map(|rel| dir.join(rel)),
+                                matcap: mat.matcap_tex.map(|rel| root.join(rel)),
                                 matcap_color: mat.matcap_color.unwrap_or([1.0; 3]),
                                 rim_color: mat.rim_color.unwrap_or([1.0; 3]),
                                 rim_intensity: mat.rim_intensity,
@@ -531,12 +545,12 @@ impl Pack {
                                 rim_power: mat.rim_power,
                                 noise_uv: mat.noise_uv.unwrap_or([0.0, 0.0, 1.0, 1.0]),
                                 alpha_opacity: mat.alpha_opacity,
-                                flow: mat.flow_tex.map(|rel| dir.join(rel)),
+                                flow: mat.flow_tex.map(|rel| root.join(rel)),
                                 flow_uv: mat.flow.unwrap_or([0.0, 0.0, 1.0, 1.0]),
                                 flow_power: mat.flow_power,
-                                mask_id: mat.mask_id_tex.map(|rel| dir.join(rel)),
+                                mask_id: mat.mask_id_tex.map(|rel| root.join(rel)),
                                 mask_id_range: mat.mask_id_range.unwrap_or([0.0, 1.0]),
-                                interior: mat.interior_tex.map(|rel| dir.join(rel)),
+                                interior: mat.interior_tex.map(|rel| root.join(rel)),
                                 interior_color: mat.interior_color.unwrap_or([1.0; 3]),
                                 refraction: mat.refraction,
                                 refract_depth: mat.refract_depth,
@@ -554,7 +568,7 @@ impl Pack {
             species_id,
             species_name,
             forms,
-            dir: dir.to_path_buf(),
+            path: root.to_path_buf(),
         })
     }
 

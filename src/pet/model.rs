@@ -217,7 +217,8 @@ impl Model {
         if materials_spec.is_empty() {
             bail!("{glb_path:?} 所属的包没有 [forms.materials](旧版导出的包),重导一次");
         }
-        let bytes = std::fs::read(glb_path).with_context(|| format!("读不到 {glb_path:?}"))?;
+        // 走 assets:包可能是解开的目录,也可能是一个 .rkpet(那时这条路径是虚拟的)
+        let bytes = crate::assets::read(glb_path)?;
         let (doc, buffers, _images) =
             gltf::import_slice(&bytes).with_context(|| format!("解析 {glb_path:?} 失败"))?;
         let get = |b: gltf::Buffer| Some(buffers[b.index()].0.as_slice());
@@ -521,10 +522,18 @@ impl Model {
 ///   (水灵身上那一道道竖向浅色条纹就在 alpha 里,白线正好压在纹路上)。
 ///   曾经把它刷成 255「省事」,结果纹路全丢;拿它当不透明度剔像素更糟,身体会被啃掉。
 fn load_texture(path: &Path, _mask_alpha: bool) -> Option<Image> {
-    let img = match image::open(path) {
+    // 不用 `image::open`:包可能是 .rkpet,路径在文件系统里不存在(见 assets.rs)
+    let bytes = match crate::assets::read(path) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            log::warn!("贴图读取失败: {e:#}");
+            return None;
+        }
+    };
+    let img = match image::load_from_memory(&bytes) {
         Ok(img) => img,
         Err(e) => {
-            log::warn!("贴图 {path:?} 读取失败: {e}");
+            log::warn!("贴图 {path:?} 解不开: {e}");
             return None;
         }
     };
