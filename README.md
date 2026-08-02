@@ -5,7 +5,7 @@
 
 **当前状态:多只宠物可同时在场**——上桌待机/走动/奔跑/睡觉、鼠标交互(轮廓命中、受惊、摸头、
 拖放,拎起的只是被点中的那只)、穿透开关、托盘里加一只/撤下/切形态且重启恢复阵容,
-全量宠物包已导完(530 条进化链 / 831 个形态)。
+全量宠物包已导完(539 条进化链 / 835 个形态)。
 宠物之间会互相注意到并打招呼、受惊会跑开,凑近了还会演一段跨宠互动
 (珀尔鼬指挥捕尘长绒清扫)。叫声也接上了:摸头/受惊/召唤/睡醒各一段,
 嗓音可调(游戏里那个 −100~100 的 `voice` 属性),默认小声、托盘可静音。
@@ -20,7 +20,20 @@
 **KDE Plasma Wayland**(开发环境 Plasma 6.7.3 / kwin_wayland,日常在跑)。
 GNOME 等不实现 wlr-layer-shell 的合成器不在支持范围，也不做 X11 回退。
 
-### 编译 rocom-pets.exe
+### 编译 rocom-pets(Linux)
+
+要 [rustup](https://rustup.rs) 与 wgpu 跑 Vulkan 要的驱动(Mesa 或厂商驱动)。
+配置窗口的文件对话框走 XDG portal,KDE 上由 `xdg-desktop-portal-kde` 提供 —— Plasma 自带。
+
+```sh
+cargo build --release          # → target/release/rocom-pets(18.0MB)
+```
+
+`[profile.release]` 开了 fat LTO + `codegen-units = 1` + `strip`:产物 31.7MB → **18.0MB**,
+代价是编译从 1m09s 涨到 2m46s。**去掉符号后崩溃回溯只剩地址** —— 要排查就用不带
+`--release` 的 debug 档,那一档不受影响。
+
+### 编译 rocom-pets.exe(Windows)
 
 **在 Windows 上**(最省事):装 [rustup](https://rustup.rs) 与 Visual Studio Build Tools
 的「使用 C++ 的桌面开发」(要 MSVC 链接器与 Windows SDK),然后
@@ -39,9 +52,11 @@ PATH=/usr/lib/llvm*/bin:$PATH cargo xwin build --release --target x86_64-pc-wind
 ```
 
 产物 `target/x86_64-pc-windows-msvc/release/rocom-pets.exe` **不需要 VC++ 运行库**
-(`.cargo/config.toml` 里对这个目标开了 `+crt-static`),拷到 Windows 上双击即可;
-除系统 DLL 外零依赖(约 19MB —— 配置窗口那套 egui/winit 占了一多半,
-但换来的是不必再单独分发一个配置程序)。只想验代码能不能过编译器的话,`cargo check --target
+(`.cargo/config.toml` 里对这个目标开了 `+crt-static`),拷到 Windows 上双击即可,
+除系统 DLL 外零依赖。体积在开 `[profile.release]` 的 LTO 之前量到约 19MB
+(配置窗口那套 egui/winit 占了一多半,但换来的是不必再单独分发一个配置程序);
+开了之后没在这台机器上重量过 —— 同一份改动让 Linux 的产物从 31.7MB 降到 18.0MB。
+只想验代码能不能过编译器的话,`cargo check --target
 x86_64-pc-windows-msvc` 就够(只要 std,连链接器都不用)。
 
 **双击不会有黑窗口**(release 版按 GUI 子系统链接),但**从 cmd/PowerShell 里跑仍然有
@@ -53,15 +68,19 @@ debug 版(`cargo build` 不带 `--release`)保持控制台子系统。
 或者用 `--packs-dir` 指过去;不给包也能起(调试精灵模式,用来验平台层)。
 
 - 运行时(`src/`)：Rust + wgpu，自写平台窗口层(wlr-layer-shell / Windows `WS_EX_NOREDIRECTIONBITMAP` + DirectComposition)。
-  当前进度:KDE Wayland 后端已跑通(透明置顶、轮廓命中、穿透开关,[docs/spike-s1.md](docs/spike-s1.md));
-  骨骼动画 + toon 着色已跑通([docs/spike-s2.md](docs/spike-s2.md));
-  **宠物已经能站在桌面上待机、走动、睡觉、被摸头与拖放**(Phase 1–4,见 design.md §9)。
+  两个后端都已跑通:平台层(透明置顶、轮廓命中、穿透开关)见 [docs/spike-s1.md](docs/spike-s1.md),
+  骨骼动画 + toon 着色见 [docs/spike-s2.md](docs/spike-s2.md);
+  行为、多实体、音频与配置窗口见 design.md §9 的 Phase 1–8。
 - 导出器(`exporter/`)：C# + CUE4Parse，从自己的游戏 pak 生成宠物包;
   一条进化链一个包(glb 含全部动作 + 贴图 + 叫声 + manifest.toml)，见 [docs/spike-s3.md](docs/spike-s3.md)。
-  `--zip` 额外打一个 `.rkpet`,运行时直接读。
+  `--zip` 额外打一个 `.rkpet`、`--zip-only` 打完就删掉包目录,运行时两种都直接读。
   叫声要 `vgmstream-cli` 与 `ffmpeg`(缺了自动跳过,`--no-voice` 显式关);
   全库 835 个形态里 **499 个有叫声**,合计 31MB。
-- 验证工具(`tools/verify_glb.py`)：按 glTF 规范自采样 + 蒙皮 + 光栅化，渲图肉眼核对动画正确性。
+- 验证工具(`tools/`)：`verify_glb.py` 按 glTF 规范自采样 + 蒙皮 + 光栅化，渲图肉眼核对动画正确性;
+  `sweep.py` 是**回归闸门** —— 全库每个形态渲一格,统计「失败 / 空白 / 过曝」三个数,
+  改着色或改导出器之后跑一遍,三个数都不许变差;`cmp_shots.py` 拿实机截图对照渲图给出差距数字
+  (抠图那步在 `gamemask.py`,取最大连通块)。三个都要素材,而素材不入仓库,
+  路径见各自文件开头的说明。
 - shader 逆向(`scripts/`)：cooked 包里材质图被剥了、只剩参数值与静态开关,而编译产物里公式是全的、
   静态开关也已定死。这批脚本把公式从 shader library 里读出来 ——
   Windows 端走 DXBC(`shaderdump.py` 取码、`dxbcdis.c` 反汇编、`dxbcsig.py` 对语义、
@@ -72,12 +91,27 @@ debug 版(`cargo build` 不带 `--release`)保持控制台子系统。
   宠物资产在手机的**应用私有目录**里,`adb root` 取到之后归属变成精确哈希查表,
   见 [docs/android-device.md](docs/android-device.md)。
 
-### 宠物包:目录或 `.rkpet`
+### 打包:目录或 `.rkpet`
 
-包可以是**解开的目录**,也可以是导出器 `--zip` 打出来的 `.rkpet`(一条链 14MB → 6.9MB)。
+包可以是**解开的目录**,也可以是导出器打出来的 `.rkpet`(zip;喵喵链 13.6MB → 7.1MB)。
 运行时两种都直接读,不解压到临时目录 —— 包内相对路径拼在包的位置后面当「虚拟路径」用,
 真读的时候由 `src/assets.rs` 判断要不要开归档(见那个模块的说明)。
 包目录里两种可以混着放,`--list` 会在归档那几行标 `[rkpet]`。
+
+```sh
+dotnet run --project exporter -- --species 3001 --out packs --zip       # 目录 + .rkpet
+dotnet run --project exporter -- --all --zip-only --skip-existing --out packs  # 全量,只留归档
+```
+
+**全量导出用 `--zip-only`**:`--zip` 会把包目录和归档**两份都留着**,全库就是
+3.3GB + 2.0GB;`--zip-only` 打完即删源目录,只剩 2.0GB(25 条链抽样量的压缩比 0.61)。
+`--skip-existing` **认得 `.rkpet`**,所以只留归档照样能分批续跑。
+
+压缩级别用的是默认档,量过之后**没有调**:换 `SmallestSize` 只小 0.3% 而耗时多 57%;
+把已经压过的 png/ogg 改成仅存储反而更大(deflate 还能从 PNG 里再挤出一点)。
+体积的大头是 glb(全库 2008MB,占 63%),png 1121MB、ogg 31MB —— 真要再小得换
+KTX2 贴图,那是另一件事(见 design.md 横向待办)。
+归档必须是 **deflate 或 store**:运行时的 `zip` crate 只链了 `deflate-flate2`。
 
 ### 配置
 
@@ -177,8 +211,9 @@ cargo run                                                  # 同上但用调试�
 cargo run --release -- --render packs/喵喵 --bench 600      # 离屏渲宠物 + 测出帧耗时
 git -C "$CUE4PARSE_DIR" apply exporter/patches/*.patch      # 导出前必做:修上游把法线写成切线的 bug
 dotnet run --project exporter -- --species 3001 --out packs # 导一条进化链
-dotnet run --project exporter -- --all --skip-existing --out packs  # 全量导(可分批续跑)
+dotnet run --project exporter -- --all --zip-only --skip-existing --out packs  # 全量导(可分批续跑)
 python tools/verify_glb.py packs/喵喵 --clips Idle,Walk     # 渲图验证
+uv run --with numpy --with pillow python tools/sweep.py    # 回归闸门:全库三个数不许变差
 uv run --with lz4 python scripts/glsldump.py <安卓 shader 库> --index   # shader 逆向(见 docs/shader.md)
 ```
 
