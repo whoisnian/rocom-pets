@@ -39,7 +39,10 @@ const string usage = """
       -j <n>            并行度(默认 CPU 核数;每个并行任务会同时持有一个形态的数据,
                         内存吃紧就调小)
       --no-voice        不导叫声(默认导:要 vgmstream-cli 与 ffmpeg,缺了会自动跳过)
-      --zip             额外打成 <链名>.rkpet
+      --zip             额外打成 <链名>.rkpet(包目录仍然留着)
+      --zip-only        同上,但打完就删掉包目录 —— 只要归档时用这个。
+                        全量导出的产物从 3.3GB(目录)+2.0GB(归档)降到只剩 2.0GB;
+                        --skip-existing 认得 .rkpet,所以照样能分批续跑
       -h, --help        本帮助
 
     批量导出会在输出目录写 report.txt:每个形态的动作命中/缺失、体积、警告,末尾是汇总。
@@ -67,6 +70,7 @@ var lodIndex = 0;
 var allClips = false;
 var noVoice = false;
 var zip = false;
+var zipOnly = false;
 var all = false;
 var limit = int.MaxValue;
 var skipExisting = false;
@@ -93,6 +97,7 @@ for (var i = 0; i < args.Length; i++)
         case "--skip-existing": skipExisting = true; break;
         case "-j": jobs = Math.Max(1, int.Parse(Next(ref i))); break;
         case "--zip": zip = true; break;
+        case "--zip-only": zip = zipOnly = true; break;
         case "--probe-material": probeAsset = Next(ref i); break;
         case "-h" or "--help": Console.WriteLine(usage); return 0;
         default:
@@ -334,8 +339,16 @@ ChainResult ExportChain(Chain chain)
         {
             var rkpet = packDir + ".rkpet";
             if (File.Exists(rkpet)) File.Delete(rkpet);
+            // 压缩级别保持默认(Optimal)。量过:换 SmallestSize 只小 0.3%,时间多 57%;
+            // 而把已经压过的 png/ogg 改成仅存储反而**更大**(deflate 还能从 PNG 里挤出一点)。
             System.IO.Compression.ZipFile.CreateFromDirectory(packDir, rkpet);
             detail.AppendLine($"  → {rkpet}({new FileInfo(rkpet).Length / 1024}KB)");
+            if (zipOnly)
+            {
+                // 归档已经落盘(上一行读过它的大小),这才敢删掉源目录
+                Directory.Delete(packDir, true);
+                detail.AppendLine($"  已删掉 {packDir}/(--zip-only)");
+            }
         }
 
         return new ChainResult(
@@ -679,11 +692,17 @@ static string Fingerprint(string paksPath, int fileCount)
 
 /// --skip-existing 用:两种命名(裸名字 / 名字-链首id)任一存在就算导过。
 /// 去重命名依赖全量名字统计,而这个判断发生在统计之前,所以两种都查。
+///
+/// **目录和 `.rkpet` 都要查**:`--zip-only` 导完就没有目录了,只认目录的话
+/// 续跑会把整库重导一遍。
 static bool ChainAlreadyExported(string outDir, Chain chain)
 {
-    var bare = Path.Combine(outDir, SafeName(chain.Name), "manifest.toml");
-    var suffixed = Path.Combine(outDir, $"{SafeName(chain.Name)}-{chain.RootId}", "manifest.toml");
-    return File.Exists(bare) || File.Exists(suffixed);
+    foreach (var name in new[] { SafeName(chain.Name), $"{SafeName(chain.Name)}-{chain.RootId}" })
+    {
+        if (File.Exists(Path.Combine(outDir, name, "manifest.toml"))) return true;
+        if (File.Exists(Path.Combine(outDir, name + ".rkpet"))) return true;
+    }
+    return false;
 }
 
 /// 全部进化链的物种名(按链首去重)。只用来判「这个名字是不是被多条链共用」,
