@@ -3,7 +3,16 @@ name = "rocom-pets"
 version = "0.0.0"
 edition = "2024"
 publish = false
-description = "桌面宠物运行时(Phase 0 spike:平台层验证)"
+description = "桌面宠物运行时:KDE Wayland 与 Windows 10+ 双后端"
+
+# 分发用的档:桌宠是「拷过去双击就跑」的东西,二进制大小值得花这点编译时间。
+# 实测(Linux x86_64):31.7MB → 18.0MB,代价是编译从 1m09s 涨到 2m46s。
+# `strip` 去符号后崩溃回溯只剩地址 —— 要排查就用 `cargo build`(debug 档不受影响)。
+[profile.release]
+lto = "fat"        # 跨 crate 内联 + 死代码消除,占了减重的大头
+codegen-units = 1  # 不切分,换更充分的优化(编译只能单线程,慢在这儿)
+panic = "abort"    # 桌宠没有捕获 panic 再续跑的地方,展开表纯属白带
+strip = "symbols"
 
 [dependencies]
 anyhow = "1.0.104"
