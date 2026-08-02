@@ -26,6 +26,9 @@ impl SettingsApp {
         let form = &pack.forms[form_index];
 
         // ── 标题 + 来源行 + 撤下 ───────────────────────────────
+        // 「撤下」会把这一只从 roster 里删掉,而底下整张表还按 `slot` 索引它 ——
+        // 所以点了之后**这一帧就到此为止**,剩下的下一帧按新的 `self.page` 画。
+        let mut removed = false;
         ui.horizontal(|ui| {
             ui.vertical(|ui| {
                 ui.heading(&form.name);
@@ -55,9 +58,13 @@ impl SettingsApp {
                     };
                     self.apply();
                     self.status.ok("已撤下");
+                    removed = true;
                 }
             });
         });
+        if removed {
+            return;
+        }
         ui.add_space(14.0);
         ui.separator();
         ui.add_space(14.0);
@@ -377,5 +384,70 @@ mod tests {
             let v = reroll(&mut status);
             assert!((-100.0..=100.0).contains(&v), "{v}");
         }
+    }
+
+    /// 撤下**唯一一只**宠物之后,这一帧不能再往下画。
+    ///
+    /// 曾经会 panic:`撤下` 把这一只从 roster 里删掉,而底下那张表接着
+    /// `PetOptions::from_slot(&self.roster[slot])` —— 空 Vec 上取 [0]。
+    /// (报告里的现场:`index out of bounds: the len is 0 but the index is 0`。)
+    #[test]
+    fn dismissing_the_last_pet_does_not_index_an_empty_roster() {
+        use super::super::{Page, SettingsApp};
+        use egui_kittest::Harness;
+        use egui_kittest::kittest::Queryable;
+
+        let dir = std::env::temp_dir().join(format!("rocom-dismiss-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("packs/喵喵")).expect("该能建目录");
+        // 只要 manifest:pet_page 走的是 Pack::load,它不碰 glb
+        std::fs::write(
+            dir.join("packs/喵喵/manifest.toml"),
+            "schema = 1\n\
+             [species]\n\
+             id = 3001\n\
+             name = \"喵喵\"\n\
+             chain = [3001]\n\
+             [[forms]]\n\
+             id = 3001\n\
+             name = \"喵喵\"\n\
+             stage = 1\n\
+             asset = \"Gra_MiaoMiao1_001\"\n\
+             model = \"forms/Gra_MiaoMiao1_001/model.glb\"\n\
+             scale = 1\n\
+             height_cm = 80.0\n\
+             locomotion = \"ground\"\n\
+             [forms.clips]\n\
+             Idle = { clip = \"Idle\", ms = 1000, frames = 30 }\n",
+        )
+        .expect("该能写 manifest");
+        std::fs::write(dir.join("roster.toml"), "[[pet]]\npack = \"喵喵\"\n")
+            .expect("该能写阵容");
+
+        let app = std::rc::Rc::new(std::cell::RefCell::new(SettingsApp::new(
+            Some(dir.join("config.toml")),
+            Some(dir.join("packs")),
+            crate::control::SettingsPage::Pets,
+        )));
+        assert_eq!(app.borrow().roster.len(), 1, "前置条件:台上正好一只");
+        assert!(
+            matches!(app.borrow().page, Page::Pet(0)),
+            "前置条件:停在这一只的页上"
+        );
+
+        let driven = app.clone();
+        let mut harness = Harness::new_ui(move |ui| driven.borrow_mut().pet_page(ui, 0));
+        harness.run();
+        // 点「撤下」—— 修好之前,这一下就是那句 index out of bounds
+        harness.get_by_label("撤下").click();
+        harness.run();
+
+        assert!(app.borrow().roster.is_empty(), "撤下之后台上不该还有宠物");
+        assert!(
+            matches!(app.borrow().page, Page::Packs),
+            "台上空了就该回到宠物包那一页"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
