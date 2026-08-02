@@ -119,7 +119,7 @@ impl SettingsApp {
                 ui,
                 "宠物包不随程序分发,需要用导出器从你自己的游戏安装里生成。",
             );
-            theme::hint(ui, "已经有包的话,把 .rkpet 或包目录拖进这个窗口即可。");
+            theme::hint(ui, "已经有包的话,用下面的「导入包…」或「导入目录…」。");
             ui.add_space(16.0);
             ui.horizontal(|ui| {
                 if ui.button("导入包…").clicked() {
@@ -429,48 +429,6 @@ impl SettingsApp {
             1 => format!("已导入 {}", ok[0]),
             n => format!("已导入 {n} 个包:{}", ok.join("、")),
         });
-    }
-
-    /// 拖放落点。**只盖内容区、不盖侧栏** —— 避免「拖到侧栏某只宠物上」
-    /// 这种没有语义的落点。
-    pub(super) fn drop_overlay(&mut self, ctx: &egui::Context) {
-        let hovering: Vec<PathBuf> = ctx.input(|i| {
-            i.raw
-                .hovered_files
-                .iter()
-                .filter_map(|f| f.path.clone())
-                .collect()
-        });
-        if hovering.is_empty() {
-            return;
-        }
-        let names: Vec<String> = hovering
-            .iter()
-            .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
-            .collect();
-        let screen = ctx.content_rect();
-        let area = egui::Rect::from_min_max(
-            egui::pos2(screen.left() + theme::SIDEBAR_W, screen.top()),
-            screen.max,
-        );
-        let painter = ctx.layer_painter(egui::LayerId::new(
-            egui::Order::Foreground,
-            egui::Id::new("drop"),
-        ));
-        let visuals = ctx.style_of(ctx.theme()).visuals.clone();
-        painter.rect_filled(area, 0.0, visuals.selection.bg_fill.linear_multiply(0.25));
-        let text = format!(
-            "松开以导入 {} 个宠物包\n{}\n会复制到 packs 目录,原文件保持不动",
-            names.len(),
-            names.join(" · ")
-        );
-        painter.text(
-            area.center(),
-            egui::Align2::CENTER_CENTER,
-            text,
-            egui::FontId::proportional(theme::BODY),
-            visuals.strong_text_color(),
-        );
     }
 
     /// 删除确认。**删的是磁盘上的东西**,必须问一句,而且要说清连带后果。

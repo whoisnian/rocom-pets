@@ -1387,8 +1387,28 @@ N 只宠物的性能与内存实测、Windows 安装包 / Linux AppImage、贴�
 
 **配置窗口还没在 Windows 实机上验过**:交叉编译链接通过(rfd 的 COM 对话框、eframe/glow 的
 WGL 导入符号都解析得了),wine 里跑到 GL 上下文为止(配置路径、单实例互斥量都真的走过),
-但 wine 那台没有中文字体、GL 也起不来。要验的是:雅黑找不找得到、
-文件对话框弹不弹得出来、拖放能不能进窗口。
+但 wine 那台没有中文字体、GL 也起不来。要验的是:雅黑找不找得到、文件对话框弹不弹得出来。
+
+**文件拖放整个删掉了**(2026-08-03,用户报「拖 `.rkpet` 进配置窗口没反应」)。
+病因不在我们:winit 0.30.13 的 **Wayland 后端根本没实现文件拖放** ——
+`platform_impl/linux/wayland/` 里一处 `DroppedFile`/`HoveredFile` 都没有,
+而 `linux/x11/` 与 `windows/` 后端都有完整实现。于是 `dropped_files` / `hovered_files`
+在 KDE Wayland 上恒为空,`drop_overlay()` 永远不画,导入那条路也永远不会被触发。
+**代码是对的,只是收不到事件。**
+
+三条路都看过了,选了最后一条:
+
+- **升 winit** —— 不行:winit 0.31 还是 beta,而 egui 0.35 钉在 winit 0.30.x。
+- **配置窗口走 XWayland**(`EventLoopBuilderExtX11::with_x11()`,eframe 的
+  `event_loop_builder` 钩子几行就能挂上)—— 拖放立刻可用,但整个窗口在分数缩放
+  (开发机 1.5×)下可能发虚,而且和「不做 X11 回退」那条拧着。
+- **整个删掉**(采用):`drop_overlay()`、`dropped_files` 那段、空状态里那句提示,
+  全部清掉。**不按平台分版** —— 一个功能在 Windows 上能用、在 Linux 上默默没反应,
+  比两边都没有更难解释,文档和界面也得跟着分叉。导入统一走「导入包…」「导入目录…」
+  那两个按钮,它们两个平台行为一致。
+
+要是哪天 winit 补上了 Wayland 拖放,再加回来是件小事:导入路径(`SettingsApp::import`)
+一直都在,当初拖放也只是往它前面接了一段取路径的代码。
 
 ### 横向待办(不属于某个阶段，随时可插)
 

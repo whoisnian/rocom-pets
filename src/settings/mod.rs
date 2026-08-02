@@ -627,17 +627,6 @@ impl eframe::App for SettingsApp {
             log::info!("桌宠退出了,配置窗口跟着关");
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
-        // 拖进来的文件当「导入」处理 —— 比翻文件对话框快
-        let dropped: Vec<PathBuf> = ctx.input(|i| {
-            i.raw
-                .dropped_files
-                .iter()
-                .filter_map(|f| f.path.clone())
-                .collect()
-        });
-        if !dropped.is_empty() {
-            self.import(&dropped);
-        }
 
         egui::Panel::left("sidebar")
             .exact_size(theme::SIDEBAR_W)
@@ -661,7 +650,6 @@ impl eframe::App for SettingsApp {
 
         self.changes_dialog(&ctx);
         self.delete_dialog(&ctx);
-        self.drop_overlay(&ctx);
     }
 }
 
