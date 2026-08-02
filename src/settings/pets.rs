@@ -1,7 +1,7 @@
 //! 「活跃宠物」逐只编辑。侧栏把每只展开成一项,这里画选中那一只的详情。
 //!
 //! 编辑的就是 `roster.toml` 里那一段 `[[pet]]`。**改完立刻生效**:形态、大小、性格、
-//! 表情池、参与叫声、记住落脚点,每一项都会让桌宠那边重建这只角色。
+//! 参与叫声、记住落脚点,每一项都会让桌宠那边重建这只角色。
 //! 唯一的例外是大小那一行 —— 拖的时候只动数字,松手(或数值框提交)才落盘
 //! (见 mod.rs 的说明)。
 
@@ -118,14 +118,18 @@ impl SettingsApp {
                 label(ui, "性格:");
                 ui.horizontal(|ui| {
                     egui::ComboBox::from_id_salt(("persona", slot))
-                        .width(150.0)
-                        .selected_text(options.persona.name)
+                        .width(168.0)
+                        // 七条一次全露出来。默认上限是 `Spacing::combo_height` = 200px,
+                        // 而七行按这套间距要 232px —— 差这么一点点就得滚,滚起来正好
+                        // 挡住最后一条(实测只露到「胆小」)
+                        .height(f32::INFINITY)
+                        .selected_text(persona_label(&options.persona))
                         .show_ui(ui, |ui| {
                             for candidate in persona::ALL {
                                 if ui
                                     .selectable_label(
                                         options.persona.id == candidate.id,
-                                        candidate.name,
+                                        persona_label(candidate),
                                     )
                                     .clicked()
                                 {
@@ -133,13 +137,7 @@ impl SettingsApp {
                                 }
                             }
                         });
-                    // 表情没有单独一行:它**改不了**(跟着性格走),摆一行只读的字
-                    // 反而像是能点。非「默认」脸的才提一句 —— 那是肉眼看得出来的区别
-                    let face = options.persona.face.name;
-                    match face == crate::persona::DEFAULT_FACE.name {
-                        true => theme::hint(ui, options.persona.about),
-                        false => theme::hint(ui, format!("{} · 眼睛「{face}」", options.persona.about)),
-                    }
+                    theme::hint(ui, options.persona.about);
                 });
                 ui.end_row();
 
@@ -265,6 +263,21 @@ fn label(ui: &mut egui::Ui, text: &str) {
     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
         ui.label(text);
     });
+}
+
+/// 下拉里那一行:性格 + 它带来的那双眼睛。
+///
+/// 表情跟着性格走、单独改不了,所以**不给它一行**(只读的一行反而像是能点),
+/// 把结果直接写进选项里:挑性格的时候多半正是冲着那张脸去的,不该先选一个
+/// 再回头看提示才知道选中了什么。
+///
+/// 「默认眼」不写:那是**没有变化**的那一档,写出来等于给三条各挂一个不说明
+/// 任何事情的后缀;带后缀的四条也就此从「七条里挑」变成「一眼看见的四条」。
+fn persona_label(persona: &persona::Persona) -> String {
+    match persona.face.name == persona::DEFAULT_FACE.name {
+        true => persona.name.to_owned(),
+        false => format!("{}「{}眼」", persona.name, persona.face.name),
+    }
 }
 
 /// 掷一个新嗓音 −100~100。
