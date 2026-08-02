@@ -174,9 +174,9 @@ pub fn render(request: &Request) -> Result<()> {
         pet.update(
             &queue,
             &crate::pet::FrameParams {
-                view_proj: view_proj,
-                light_dir: light_dir,
-                outline_width: outline_width,
+                view_proj,
+                light_dir,
+                outline_width,
                 time: request.time,
                 face_uv: face,
             },
@@ -199,9 +199,9 @@ pub fn render(request: &Request) -> Result<()> {
         pet.update(
             &queue,
             &crate::pet::FrameParams {
-                view_proj: view_proj,
-                light_dir: light_dir,
-                outline_width: outline_width,
+                view_proj,
+                light_dir,
+                outline_width,
                 time: request.time,
                 // 这段动作自带的表情。离屏渲染不带性格,所以「没意见」就是默认那张脸 ——
                 // 于是这张图也顺带成了「换动作换眼睛」的验收图
@@ -230,38 +230,39 @@ pub fn render(request: &Request) -> Result<()> {
     }
 
     // 淡化探针:从第一段切到第二段,停在淡化中点,应当是两个姿势的平滑中间态
-    if request.fade_probe && request.clips.len() >= 2 {
-        if let (Some(a), Some(b)) = (model.clip(&request.clips[0]), model.clip(&request.clips[1])) {
-            let mut player = Player::new(&model, a);
-            player.seek(model.clips[a].duration * request.at);
-            player.play(b);
-            player.advance(&model, 0.09); // 淡化时长 0.18s,取中点
-            player.update(&model);
-            pet.update(
-                &queue,
-                &crate::pet::FrameParams {
-                    view_proj: view_proj,
-                    light_dir: light_dir,
-                    outline_width: outline_width,
-                    time: request.time,
-                    face_uv: crate::persona::DEFAULT_FACE.uv_offset(),
-                },
-                &player.matrices,
-            );
-            let pixels = draw_and_read(
-                &device,
-                &queue,
-                &pet,
-                &color,
-                &color_view,
-                &depth_view,
-                &readback,
-                size,
-                padded_row,
-            )?;
-            log::info!("  淡化中点: {} → {}", request.clips[0], request.clips[1]);
-            tiles.push((format!("{}→{}", request.clips[0], request.clips[1]), pixels));
-        }
+    if request.fade_probe
+        && request.clips.len() >= 2
+        && let (Some(a), Some(b)) = (model.clip(&request.clips[0]), model.clip(&request.clips[1]))
+    {
+        let mut player = Player::new(&model, a);
+        player.seek(model.clips[a].duration * request.at);
+        player.play(b);
+        player.advance(&model, 0.09); // 淡化时长 0.18s,取中点
+        player.update(&model);
+        pet.update(
+            &queue,
+            &crate::pet::FrameParams {
+                view_proj,
+                light_dir,
+                outline_width,
+                time: request.time,
+                face_uv: crate::persona::DEFAULT_FACE.uv_offset(),
+            },
+            &player.matrices,
+        );
+        let pixels = draw_and_read(
+            &device,
+            &queue,
+            &pet,
+            &color,
+            &color_view,
+            &depth_view,
+            &readback,
+            size,
+            padded_row,
+        )?;
+        log::info!("  淡化中点: {} → {}", request.clips[0], request.clips[1]);
+        tiles.push((format!("{}→{}", request.clips[0], request.clips[1]), pixels));
     }
 
     if request.bench > 0 {
@@ -318,7 +319,7 @@ fn benchmark(
         pet.update(
             queue,
             &crate::pet::FrameParams {
-                view_proj: view_proj,
+                view_proj,
                 light_dir: light,
                 outline_width: 0.004,
                 time: frame_time,

@@ -851,6 +851,10 @@ impl PetActor {
 }
 
 /// 舞台上的角色:调试用的测试精灵,或真宠物。
+///
+/// 两个变体差着 600 多字节,但**不给 `Pet` 装箱**:每个实体只有一个 `Actor`,
+/// 而它在每帧的 tick 与渲染里都要访问 —— 省下的那点内存换来的是一次堆间接。
+#[allow(clippy::large_enum_variant)]
 pub enum Actor {
     /// `--sprite` 调试模式:平台层的验收(S1)只需要一张软边贴图。
     Sprite(Sprite),
@@ -1512,10 +1516,10 @@ impl Stage {
             self.pick(x, y)
         };
         for entity in &mut self.entities {
-            if Some(entity.id) != picked {
-                if let Actor::Pet(pet) = &mut entity.actor {
-                    pet.petting.reset();
-                }
+            if Some(entity.id) != picked
+                && let Actor::Pet(pet) = &mut entity.actor
+            {
+                pet.petting.reset();
             }
         }
         let Some(picked) = picked else {

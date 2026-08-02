@@ -779,8 +779,8 @@ fn topological_order(parents: &[i32]) -> Vec<usize> {
         }
         if order.len() == before {
             // 有环(不该发生):剩下的按原序补上,免得死循环
-            for i in 0..parents.len() {
-                if !done[i] {
+            for (i, settled) in done.iter().enumerate() {
+                if !settled {
                     order.push(i);
                 }
             }

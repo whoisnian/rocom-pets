@@ -177,10 +177,10 @@ impl Config {
 
     /// 展开开头的 `~`(配置文件里手写路径时常用)。
     pub fn expand_path(value: &str) -> PathBuf {
-        if let Some(rest) = value.strip_prefix("~/") {
-            if let Some(home) = std::env::var_os("HOME") {
-                return PathBuf::from(home).join(rest);
-            }
+        if let Some(rest) = value.strip_prefix("~/")
+            && let Some(home) = std::env::var_os("HOME")
+        {
+            return PathBuf::from(home).join(rest);
         }
         PathBuf::from(value)
     }

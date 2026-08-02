@@ -290,6 +290,10 @@ struct StageWindow {
 
 /// 一只宠物在某个 stage 上的渲染资源。
 ///
+/// `rebuild_pet_surfaces` 先收后建时的中转:(实体 id, 模型 —— 精灵没有, 画布尺寸)。
+/// 单独起个名字是因为它同时出现在局部变量与循环里,写全两遍读不出重点。
+type WantedSurface = (EntityId, Option<Arc<Model>>, (u32, u32));
+
 /// **管线/网格/贴图(`PetGpu`)是共享的**,按 (包, 形态) 缓存在 `App.pet_gpus` 上 ——
 /// 多实体、多显示器都只有一份。**每实体独立的是画布**(各自渲各自)与它的掩码回读。
 struct PetSurfaces {
@@ -1013,7 +1017,7 @@ impl App {
         if stage.target.is_none() {
             return;
         }
-        let scale = stage.scale as f32;
+        let scale = stage.scale;
 
         // 每只宠物先画进**自己的**离屏画布(管线是共享的,画布不是);
         // 逐只 update + render + submit,所以共享那份 camera/joints 缓冲不会串。
@@ -1146,13 +1150,15 @@ impl App {
 
     /// (重)建这个 stage 上每只宠物的渲染资源:共享管线 + 每只自己的画布/四边形/掩码回读。
     /// 首次 configure、切形态、以及上/下实体之后都走这里。
+    ///
+    /// [`WantedSurface`] 那份快照是先收后建的中转:见函数里那条注释。
     fn rebuild_pet_surfaces(&mut self, index: usize) {
         if self.gpu.is_none() {
             return;
         }
         let scale = self.stages[index].scale;
         // 先收齐这一台上的实体(id, 模型/精灵),免得后面借用打架
-        let mut wanted: Vec<(EntityId, Option<Arc<Model>>, (u32, u32))> = Vec::new();
+        let mut wanted: Vec<WantedSurface> = Vec::new();
         for entity in self.stages[index].stage.entities() {
             let size = entity.actor().size();
             let model = match entity.actor() {
@@ -1405,10 +1411,10 @@ impl SeatHandler for App {
         _: wl_seat::WlSeat,
         capability: Capability,
     ) {
-        if capability == Capability::Pointer {
-            if let Some(pointer) = self.pointer.take() {
-                pointer.release();
-            }
+        if capability == Capability::Pointer
+            && let Some(pointer) = self.pointer.take()
+        {
+            pointer.release();
         }
     }
 

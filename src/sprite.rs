@@ -27,7 +27,7 @@ impl Sprite {
                 // 边缘 1.5px 内做线性过渡,得到抗锯齿软边
                 let edge = ((r - d) / 1.5).clamp(0.0, 1.0);
                 // 棋盘格:亮格不透明,暗格半透(用来看穿到底下窗口)
-                let checker = ((x / cell) + (y / cell)) % 2 == 0;
+                let checker = ((x / cell) + (y / cell)).is_multiple_of(2);
                 let alpha = edge * if checker { 1.0 } else { 0.45 };
 
                 // 颜色:径向渐变的绿(取自宠物主色调),外圈略深便于看边界
