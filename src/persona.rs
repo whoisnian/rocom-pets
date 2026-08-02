@@ -53,6 +53,58 @@ pub const DEFAULT_FACE: Expression = Expression {
     cell: (0, 0),
 };
 
+/// 图集里另外那几格。名字取自 `NATURE_CONF.emotion_desc` 的用词;
+/// 括号里那两个(惊讶/大笑)配置表里没有名字,是照着格子里画的东西起的。
+pub const SMILE: Expression = Expression {
+    name: "微笑",
+    cell: (1, 0),
+};
+pub const SURPRISED: Expression = Expression {
+    name: "惊讶",
+    cell: (0, 1),
+};
+pub const ANGRY: Expression = Expression {
+    name: "生气",
+    cell: (1, 1),
+};
+pub const SLEEPY: Expression = Expression {
+    name: "困倦",
+    cell: (0, 2),
+};
+pub const CRYING: Expression = Expression {
+    name: "哭哭",
+    cell: (1, 2),
+};
+pub const LAUGHING: Expression = Expression {
+    name: "大笑",
+    cell: (0, 3),
+};
+
+/// 这段动作自带的表情。**换动作眼睛也跟着换** —— 游戏里一只「哭哭眼」的幽星光
+/// 生气时是生气眼、睡着时是困倦眼,性格给的那张脸只是它**平时**的样子。
+/// 返回 None = 这段动作不改脸,还用性格那张。
+///
+/// 这张对照表**是按语义挑的,不是从配置表里查的**:游戏那边换脸是行为逻辑直接设
+/// 材质参数(31 条性格的 `emotion_desc` 之外,没有第二张「动作 → 表情」的表),
+/// 而动作名本身已经把意思写清楚了。挑的时候优先用 `emotion_desc` 里出现过的名字,
+/// 剩下两格(惊讶/大笑)只给意思实在对得上的那两段。
+pub fn face_for_clip(clip: &str) -> Option<Expression> {
+    Some(match clip {
+        "Anger" => ANGRY,
+        // 难过与害怕都是这张八字垂眼:游戏的 emotion_desc 里也只有「哭哭」这一档
+        "Sad" | "Fear" => CRYING,
+        // 受惊是圆睁眼那格 —— 吓一跳,不是难过
+        "Shock" => SURPRISED,
+        "Happy" | "Relax" | "Show" => SMILE,
+        // 张着大嘴喊,正好是「大张嘴」那格
+        "CallOut" => LAUGHING,
+        // 睡的四段(含只有 SleepStand 的那批)全是困倦眼
+        "SleepStart" | "SleepLoop" | "SleepStand" | "SleepEnd" => SLEEPY,
+        // 待机/走/跑/落地/警觉不改脸:平时什么样就什么样
+        _ => return None,
+    })
+}
+
 impl Expression {
     /// 贴图 UV 要偏多少(整格)。
     pub fn uv_offset(&self) -> [f32; 2] {
@@ -119,10 +171,7 @@ pub const ALL: &[Persona] = &[
         run: 1.0,
         social: 1.0,
         // 游戏里 emotion_desc = 默认,行为表里也没给它单独的动作 —— 正好当基线
-        face: Expression {
-            name: "默认",
-            cell: (0, 0),
-        },
+        face: DEFAULT_FACE,
         default_emote: None,
         likes: &[],
     },
@@ -137,10 +186,7 @@ pub const ALL: &[Persona] = &[
         emote: 0.6,
         run: 0.6,
         social: 1.4,
-        face: Expression {
-            name: "默认",
-            cell: (0, 0),
-        },
+        face: DEFAULT_FACE,
         default_emote: None,
         likes: &["Happy"],
     },
@@ -155,10 +201,7 @@ pub const ALL: &[Persona] = &[
         emote: 1.6,
         run: 1.0,
         social: 1.3,
-        face: Expression {
-            name: "微笑",
-            cell: (1, 0),
-        },
+        face: SMILE,
         default_emote: Some("Happy"),
         likes: &["Show", "Anger"],
     },
@@ -173,10 +216,7 @@ pub const ALL: &[Persona] = &[
         emote: 1.4,
         run: 1.8,
         social: 0.8,
-        face: Expression {
-            name: "困倦",
-            cell: (0, 2),
-        },
+        face: SLEEPY,
         default_emote: Some("Relax"),
         likes: &["Fear"],
     },
@@ -191,10 +231,7 @@ pub const ALL: &[Persona] = &[
         emote: 0.5,
         run: 1.6,
         social: 0.6,
-        face: Expression {
-            name: "默认",
-            cell: (0, 0),
-        },
+        face: DEFAULT_FACE,
         default_emote: None,
         likes: &["Relax"],
     },
@@ -209,10 +246,7 @@ pub const ALL: &[Persona] = &[
         emote: 1.2,
         run: 0.7,
         social: 0.4,
-        face: Expression {
-            name: "哭哭",
-            cell: (1, 2),
-        },
+        face: CRYING,
         default_emote: Some("Sad"),
         likes: &["Fear"],
     },
@@ -227,10 +261,7 @@ pub const ALL: &[Persona] = &[
         emote: 1.4,
         run: 0.5,
         social: 1.1,
-        face: Expression {
-            name: "生气",
-            cell: (1, 1),
-        },
+        face: ANGRY,
         default_emote: Some("Anger"),
         likes: &["Anger"],
     },
@@ -382,5 +413,43 @@ mod tests {
         }
         // 默认那张脸必须是左上角那一格 —— 网格 UV 本来就落在那儿,偏移 0 就是原样
         assert_eq!(DEFAULT_FACE.uv_offset(), [0.0, 0.0]);
+        // 动作带来的那几张也一样(它们和性格用的是同一批常量)
+        for face in [SMILE, SURPRISED, ANGRY, SLEEPY, CRYING, LAUGHING] {
+            let (col, row) = face.cell;
+            assert!(
+                (col as f32) < FACE_COLS && (row as f32) < FACE_ROWS,
+                "「{}」的格子 {:?} 越界",
+                face.name,
+                face.cell
+            );
+        }
+    }
+
+    /// 会换脸的动作与不换脸的动作,两边都点名核一遍 —— 这张表是手挑的,
+    /// 加动作时很容易漏掉一半(比如加了 Sad 忘了 Fear)。
+    #[test]
+    fn actions_map_to_the_faces_they_say_they_do() {
+        for (clip, want) in [
+            ("Anger", ANGRY),
+            ("Sad", CRYING),
+            ("Fear", CRYING),
+            ("Shock", SURPRISED),
+            ("Happy", SMILE),
+            ("Relax", SMILE),
+            ("Show", SMILE),
+            ("CallOut", LAUGHING),
+            ("SleepStart", SLEEPY),
+            ("SleepLoop", SLEEPY),
+            ("SleepEnd", SLEEPY),
+            // 降级用的那段也得认:幽星光那批只有它
+            ("SleepStand", SLEEPY),
+        ] {
+            let got = face_for_clip(clip);
+            assert_eq!(got, Some(want), "{clip} 该是「{}」", want.name);
+        }
+        // 日常那几段不改脸,否则性格给的那张脸基本没机会露面
+        for clip in ["Idle", "Walk", "Run", "JumpFall", "Alert"] {
+            assert_eq!(face_for_clip(clip), None, "{clip} 不该改脸");
+        }
     }
 }

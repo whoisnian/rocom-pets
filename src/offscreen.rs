@@ -203,7 +203,11 @@ pub fn render(request: &Request) -> Result<()> {
                 light_dir: light_dir,
                 outline_width: outline_width,
                 time: request.time,
-                face_uv: crate::persona::DEFAULT_FACE.uv_offset(),
+                // 这段动作自带的表情。离屏渲染不带性格,所以「没意见」就是默认那张脸 ——
+                // 于是这张图也顺带成了「换动作换眼睛」的验收图
+                face_uv: crate::persona::face_for_clip(name)
+                    .unwrap_or(crate::persona::DEFAULT_FACE)
+                    .uv_offset(),
             },
             &player.matrices,
         );

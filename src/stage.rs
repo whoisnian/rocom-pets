@@ -125,18 +125,32 @@ pub const RUNTIME_CLIPS: &[(&str, &str)] = &[
     ("CallOut", "召唤"),
 ];
 
-/// 这个形态做不做得了某段动作。**降级也算有**:`PetActor::new` 里那几条 `or_else`
-/// 是行为的一部分 —— 幽星光没有 `SleepLoop` 但有 `SleepStand`,它照样睡得着,
-/// 不该记成缺。这里的 `fallback` 必须与那边一一对应,改了一边就要改另一边。
-pub fn has_clip(form: &crate::pack::Form, name: &str) -> bool {
-    let fallback: &[&str] = match name {
+/// 找不到这段就退而求其次 —— **降级是行为的一部分**,不是补救:幽星光没有
+/// `SleepLoop` 但有 `SleepStand`,它照样睡得着,不该记成「不会睡」。
+///
+/// 只此一份。以前 `PetActor::new`、`has_clip`、`play_clip` 各写各的,
+/// 于是配置窗口的动作表说「睡着」能点(它按 `has_clip` 算),点下去运行时却报
+/// 「这只没有这段」(它按 `model.clip` 找)。
+fn fallbacks(name: &str) -> &'static [&'static str] {
+    match name {
         "Shock" => &["Alert"],
         "Happy" => &["Show"],
         "Fear" => &["Shock", "Alert"],
         "SleepLoop" => &["SleepStand"],
         _ => &[],
-    };
-    form.clip(name).is_some() || fallback.iter().any(|alt| form.clip(alt).is_some())
+    }
+}
+
+/// 这个形态做不做得了某段动作(降级也算有)。
+pub fn has_clip(form: &crate::pack::Form, name: &str) -> bool {
+    form.clip(name).is_some() || fallbacks(name).iter().any(|alt| form.clip(alt).is_some())
+}
+
+/// 在模型里找一段动作,找不到就按降级表退。
+fn find_clip(model: &Model, name: &str) -> Option<usize> {
+    model
+        .clip(name)
+        .or_else(|| fallbacks(name).iter().find_map(|alt| model.clip(alt)))
 }
 
 /// 邻近感知:多少**身位**以内算「注意到旁边那只」。
@@ -499,9 +513,17 @@ struct Clips {
 }
 
 impl PetActor {
-    /// 这只脸上那张图集要偏多少 —— 性格定的(见 persona.rs 的 `Expression`)。
+    /// 这只脸上那张图集要偏多少(见 persona.rs 的 `Expression`)。
+    ///
+    /// **正在播的那段动作说了算**,它没意见才用性格那张脸 —— 游戏里也是这样:
+    /// 一只「哭哭眼」的幽星光生气时是生气眼、睡着时是困倦眼,性格给的只是它平时的样子。
+    /// 按当前动作现算,不另存一份状态:换脸和换动作本来就是同一件事,
+    /// 存两份就会有对不上的时候。
     pub fn face_uv(&self) -> [f32; 2] {
-        self.persona.face.uv_offset()
+        let clip = &self.model.clips[self.player.current()].name;
+        crate::persona::face_for_clip(clip)
+            .unwrap_or(self.persona.face)
+            .uv_offset()
     }
 
     /// 播一次性反应动作,播完回待机。缺对应动作就只改状态(至少行为语义还在)。
@@ -765,11 +787,11 @@ impl PetActor {
         // 反应动作:游戏里「摸头」在 INTERACTIONTREE_CONF 有对应动作键,但键→动作表的映射
         // 还没核实(见 design.md §5),所以先按语义挑:受惊 Shock、开心 Happy、害怕 Fear,
         // 缺哪个就退到 Alert / Show / Shock
-        let startled = model.clip("Shock").or_else(|| model.clip("Alert"));
-        let happy = model.clip("Happy").or_else(|| model.clip("Show"));
-        let afraid = model.clip("Fear").or(startled);
+        let startled = find_clip(&model, "Shock");
+        let happy = find_clip(&model, "Happy");
+        let afraid = find_clip(&model, "Fear");
         let sleep_start = model.clip("SleepStart");
-        let sleep_loop = model.clip("SleepLoop").or_else(|| model.clip("SleepStand"));
+        let sleep_loop = find_clip(&model, "SleepLoop");
         let sleep_end = model.clip("SleepEnd");
         // 表情池**由性格定**(见 persona.rs:游戏的 NATURE_CONF + LLM_PET_BEHAVIOR_CONF)。
         // 包里没有的那几段自然就掉出去了。
@@ -1182,7 +1204,8 @@ impl Stage {
         let Some(Actor::Pet(pet)) = self.entity_mut(id).map(|e| &mut e.actor) else {
             return false;
         };
-        let Some(clip) = pet.model.clip(name) else {
+        // 降级也算数,与配置窗口那张动作表的判断(`has_clip`)对齐
+        let Some(clip) = find_clip(&pet.model, name) else {
             return false;
         };
         // 睡着的时候点一下动作,它该醒过来做 —— 不然看着像没反应
@@ -2119,6 +2142,46 @@ mod home_tests {
         // 真没有的照样要报出来
         assert!(!has_clip(&form, "Run"));
         assert!(!has_clip(&form, "CallOut"));
+    }
+
+    /// 动作表说能点的,点下去就得真播出来。
+    ///
+    /// 幽星光只有 `SleepStand`:表格按 `has_clip` 算「睡着」能点,而 `play_clip`
+    /// 以前拿 `model.clip` 直接找,于是点了只在日志里留一句「这只没有这段」。
+    #[test]
+    fn every_clip_the_table_offers_can_actually_be_played() {
+        // 与上面那个形态同一套动作,只是换成运行时的模型
+        let clips = ["Idle", "Walk", "SleepStand", "Alert", "Show"];
+        let model = Arc::new(Model::for_test(&clips));
+        let mut stage = Stage::new((1000, 600));
+        let id = stage.spawn(Actor::Pet(PetActor::new(test_build(model, 3))));
+        for name in ["SleepLoop", "Shock", "Happy", "Fear"] {
+            assert!(stage.play_clip(id, name), "{name} 该按降级播得出来");
+        }
+        assert!(!stage.play_clip(id, "Run"), "真没有的还是得返回 false");
+    }
+
+    /// 眼睛跟着动作走:生气时是生气眼,睡着时是困倦眼,平时才是性格那张脸。
+    #[test]
+    fn the_face_follows_the_clip_being_played() {
+        let model = Arc::new(Model::for_test(&["Idle", "Anger", "SleepStand"]));
+        let mut stage = Stage::new((1000, 600));
+        // 胆小 = 哭哭眼,拿它当「平时那张脸」才看得出被盖掉
+        let timid = crate::persona::Persona::by_id("timid");
+        let id = stage.spawn(Actor::Pet(PetActor::new(PetBuild {
+            persona: timid,
+            ..test_build(model, 5)
+        })));
+        let face = |stage: &Stage| match stage.entity(id).map(|e| e.actor()) {
+            Some(Actor::Pet(pet)) => pet.face_uv(),
+            _ => panic!("不是宠物"),
+        };
+        assert_eq!(face(&stage), timid.face.uv_offset(), "待机时是性格那张脸");
+        assert!(stage.play_clip(id, "Anger"));
+        assert_eq!(face(&stage), crate::persona::ANGRY.uv_offset());
+        // 睡的那段只有 SleepStand,降级过去之后眼睛也得跟着变困
+        assert!(stage.play_clip(id, "SleepLoop"));
+        assert_eq!(face(&stage), crate::persona::SLEEPY.uv_offset());
     }
 }
 
