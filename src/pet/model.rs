@@ -428,6 +428,8 @@ impl Model {
 
         // ── 动画 ────────────────────────────────────────────────────
         let mut clips = Vec::new();
+        // 被 `clamp_scale` 削掉的缩放关键帧数,整份模型统计一次(见那个函数的说明)
+        let mut clamped = 0usize;
         for animation in doc.animations() {
             let mut channels = Vec::new();
             let mut duration = 0.0f32;
@@ -454,7 +456,12 @@ impl Model {
                     }
                     ReadOutputs::Scales(it) => (
                         Property::Scale,
-                        it.map(|v| [v[0], v[1], v[2], 0.0]).collect::<Vec<_>>(),
+                        it.map(|v| {
+                            let (key, hit) = clamp_scale(v);
+                            clamped += usize::from(hit);
+                            key
+                        })
+                        .collect::<Vec<_>>(),
                     ),
                     ReadOutputs::MorphTargetWeights(_) => continue, // 形变目标先不做
                 };
@@ -498,6 +505,10 @@ impl Model {
             );
         }
 
+        if clamped > 0 {
+            log::debug!("{glb_path:?}:削掉 {clamped} 个过大的缩放关键帧");
+        }
+
         let bounds = bind_pose_bounds(&vertices, &skeleton);
         let motion_bounds = animated_bounds(&vertices, &skeleton, &clips, bounds);
         Ok(Self {
@@ -518,7 +529,36 @@ impl Model {
     }
 }
 
-/// 按材质表给的路径读基色贴图。**alpha 原样保留**,怎么解释交给 shader:
+/// 单根骨骼的缩放上限。
+///
+/// 这些骨架真的会「拉伸」——卡通挤压是动画的一部分,不能一律按 1.0 处理。但**孤立的
+/// 坏帧**也真的有:喵喵 `Shock` 里脊椎的 X 缩放有一帧冲到 **4.90**(前后是 1.26 与 2.91),
+/// 脖子同一段冲到 2.99。那不是画出来的 —— 同一条通道其余每一帧都满足 Y≡Z
+/// (沿骨轴拉伸、径向等比挤压),偏偏这几帧不等,是压缩动画解出来的坏值。
+///
+/// 后果是看得见的:被点一下受惊时,喵喵的头会瞬间蹿出画布(取景盒按
+/// [`MAX_POSE_GROWTH`] 筛过姿势,本来就装不下这种),用户报的就是这个。
+///
+/// 阈值 2.0 是量出来的:本地全部包(24 个形态、约 63 万个缩放分量)里 **99.35%**
+/// 落在 [0.5, 2.0] 内,越界的集中在 Shock / CallOut / Relax 这几段的孤立帧上;
+/// Idle 1.09、Alert 1.49、Sad 1.61、Anger 1.95 这些正常挤压全在阈值内,不受影响。
+///
+/// **只夹上限。** 往小了缩是有意义的 —— 动画师会把骨骼缩到接近 0 来藏部件,
+/// 夹下限反而会让本该藏起来的东西冒出来。
+const MAX_BONE_SCALE: f32 = 2.0;
+
+/// 把一帧缩放夹进上限,返回(关键帧, 有没有动过)。第四个分量是填充,通道只用前三个。
+fn clamp_scale(v: [f32; 3]) -> ([f32; 4], bool) {
+    let key = [
+        v[0].min(MAX_BONE_SCALE),
+        v[1].min(MAX_BONE_SCALE),
+        v[2].min(MAX_BONE_SCALE),
+        0.0,
+    ];
+    (key, key[..3] != v[..])
+}
+
+/// 按材质表给的路径读基色贴图。/// 按材质表给的路径读基色贴图。**alpha 原样保留**,怎么解释交给 shader:
 ///
 /// - 眼/嘴的表情图集:alpha 是真遮罩,按阈值剔(`mask_alpha = true`);
 /// - 本体:alpha 是**线条/细节遮罩**——RGB 是完整的固有色图集,alpha 里画着身上的纹路
@@ -959,5 +999,35 @@ impl Model {
             // 合成模型没有顶点,动作包围盒就等于绑定姿势
             motion_bounds: (Vec3::new(-0.5, 0.0, -0.5), Vec3::new(0.5, 1.0, 0.5)),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 孤立的坏帧要削掉,正常的挤压要留着。
+    ///
+    /// 喵喵 `Shock` 里那一帧(脊椎 X = 4.90)会把头拉出画布 —— 那是压缩动画解出来的
+    /// 坏值,不是动画师画的(同一条通道其余帧都满足 Y≡Z,偏这几帧不等)。
+    #[test]
+    fn only_runaway_scale_keys_are_clamped() {
+        // 那一帧的真实数值,来自 packs/喵喵 的 Shock
+        let (key, hit) = clamp_scale([4.90, 0.98, 0.43]);
+        assert!(hit);
+        assert_eq!(key[0], MAX_BONE_SCALE);
+        assert_eq!([key[1], key[2]], [0.98, 0.43], "只削大的那一头");
+
+        // 正常的挤压(Anger 最大 1.95、Sad 1.61)一个字都不该改
+        for v in [[1.95, 0.71, 0.71], [1.0, 1.0, 1.0], [0.63, 1.61, 1.61]] {
+            let (key, hit) = clamp_scale(v);
+            assert!(!hit, "{v:?} 不该被动");
+            assert_eq!([key[0], key[1], key[2]], v);
+        }
+
+        // **下限不夹**:缩到接近 0 是动画师藏部件的手法,夹回去会让它冒出来
+        let (key, hit) = clamp_scale([0.001, 0.001, 0.001]);
+        assert!(!hit);
+        assert_eq!(key[0], 0.001);
     }
 }
