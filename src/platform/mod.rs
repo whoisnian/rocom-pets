@@ -8,7 +8,7 @@ use std::path::PathBuf;
 
 mod shared;
 
-pub use shared::{PetOptions, SCALE_RANGE};
+pub use shared::{PetOptions, SCALE_RANGE, VOICE_RANGE};
 
 #[cfg(target_os = "linux")]
 mod wayland;

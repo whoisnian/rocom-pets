@@ -48,6 +48,10 @@ pub struct PetOptions {
 /// 大小倍数的上下限。太小看不清,太大挡住半个屏幕 —— 两头都不是「桌宠」了。
 pub const SCALE_RANGE: std::ops::RangeInclusive<f32> = 0.5..=2.0;
 
+/// 嗓音的上下限,照搬游戏里那个 `voice` 属性的取值范围。
+/// 再往外调出来的速率离谱到听不出是叫声。
+pub const VOICE_RANGE: std::ops::RangeInclusive<f32> = -100.0..=100.0;
+
 impl Default for PetOptions {
     fn default() -> Self {
         Self {
@@ -81,7 +85,7 @@ impl PetOptions {
             voice_value: slot
                 .voice_value
                 .filter(|v| v.is_finite())
-                .map(|v| v.clamp(-100.0, 100.0)),
+                .map(|v| v.clamp(*VOICE_RANGE.start(), *VOICE_RANGE.end())),
             remember: slot.remember.unwrap_or(false),
             home_x: slot.home_x.filter(|v| v.is_finite()).map(|v| v.clamp(0.0, 1.0)),
         }

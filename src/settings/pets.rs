@@ -2,7 +2,7 @@
 //!
 //! 编辑的就是 `roster.toml` 里那一段 `[[pet]]`。**改完立刻生效**:形态、大小、性格、
 //! 参与叫声、记住落脚点,每一项都会让桌宠那边重建这只角色。
-//! 唯一的例外是大小那一行 —— 拖的时候只动数字,松手(或数值框提交)才落盘
+//! 例外是大小与嗓音那两个数 —— 拖的时候只动数字,松手(或输入框提交)才落盘
 //! (见 mod.rs 的说明)。
 
 use eframe::egui;
@@ -10,7 +10,7 @@ use eframe::egui;
 use super::common::percent_slider;
 use super::{Page, SettingsApp, theme};
 use crate::persona;
-use crate::platform::{PetOptions, SCALE_RANGE};
+use crate::platform::{PetOptions, SCALE_RANGE, VOICE_RANGE};
 
 impl SettingsApp {
     pub(super) fn pet_page(&mut self, ui: &mut egui::Ui, slot: usize) {
@@ -145,12 +145,32 @@ impl SettingsApp {
                 ui.horizontal(|ui| {
                     ui.checkbox(&mut options.voice, "参与叫声");
                     theme::hint(ui, "嗓音");
-                    ui.label(theme::value(format!("{:+.0}", options.voice_value.unwrap_or(0.0))));
-                    // 0 = 原调。**不再自动掷**:同一个包的两只听着一样是正常的,
-                    // 想要不一样就自己按一下
-                    theme::hint(ui, "0 = 原调");
+                    let mut voice_value = options.voice_value.unwrap_or(0.0);
+                    // 定宽:数字从 +0 变成 −100 时框子不该跟着长,
+                    // 否则右边那句提示和「重掷」会横着跳
+                    let edit = ui
+                        .add_enabled_ui(options.voice, |ui| {
+                            ui.add_sized(
+                                [58.0, theme::CONTROL_H],
+                                egui::DragValue::new(&mut voice_value)
+                                    .range(VOICE_RANGE)
+                                    .custom_formatter(|v, _| format!("{v:+.0}"))
+                                    .fixed_decimals(0)
+                                    .speed(1.0),
+                            )
+                        })
+                        .inner;
+                    // 0 = 原调,**不落盘**(默认值一律不写进 roster.toml)。上下限交给
+                    // 输入框自己夹,不另写一句提示 —— 打个超范围的数进去立刻就看见了。
+                    // **不再自动掷**:同一个包的两只听着一样是正常的,想要不一样就自己按一下
                     if ui.add_enabled(options.voice, egui::Button::new("重掷")).clicked() {
-                        options.voice_value = Some(reroll(&mut self.status));
+                        voice_value = reroll(&mut self.status);
+                        commit = true;
+                    }
+                    options.voice_value = (voice_value != 0.0).then_some(voice_value);
+                    // 跟大小那根滑杆同一个道理:数值框自己也能拖,拖的过程中别落盘
+                    if edit.drag_stopped() || (edit.changed() && !edit.dragged()) {
+                        commit = true;
                     }
                 });
                 ui.end_row();
@@ -176,8 +196,11 @@ impl SettingsApp {
 
         if options != before {
             options.write_into(&mut self.roster[slot]);
-            // 滑杆还在拖的时候不落盘;其余改动立刻生效
-            if commit || options.scale == before.scale {
+            // 滑杆/数值框还在拖的时候不落盘;其余改动立刻生效。
+            // 「变了但没提交」= 正拖着 —— 松手那一帧值已经不再变,走下面 commit 那条
+            let dragging =
+                options.scale != before.scale || options.voice_value != before.voice_value;
+            if commit || !dragging {
                 self.apply();
             }
         } else if form_changed || commit {
@@ -332,6 +355,19 @@ mod tests {
             ..Slot::new("喵喵".into(), None)
         };
         assert_eq!(PetOptions::from_slot(&slot).scale, *SCALE_RANGE.end());
+    }
+
+    #[test]
+    fn a_hand_edited_voice_is_clamped() {
+        // 同上:存档是文本文件,写个 999 进去调出来的速率听不出是叫声
+        let slot = Slot {
+            voice_value: Some(999.0),
+            ..Slot::new("喵喵".into(), None)
+        };
+        assert_eq!(
+            PetOptions::from_slot(&slot).voice_value,
+            Some(*VOICE_RANGE.end())
+        );
     }
 
     #[test]
