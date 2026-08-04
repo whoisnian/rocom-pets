@@ -450,16 +450,30 @@ fn stick_layer(uv0: vec2<f32>, ndc: vec2<f32>) -> StickLayer {
     }
     // 遮罩:`× 25` 造出很硬很细的边。**减的是 tex.r 不是 sin θ** ——
     // 汇编里 sample 的目标寄存器把 sincos 的结果覆盖掉了,踩过一次
-    // **形状固定,时间只调亮度。** 原来是 `saturate((tex.b*(k − tex.r) − 0.01)*25)` ——
-    // 一个随时间移动的阈值:`tex.r < k` 把亮的星芯排除在外、只留外圈辉光,几何上必然出
-    // **空心环**(实机报的"星点周围一圈光晕闪烁")。贴图本身就是成品星场,不该再去切。
-    // **遮罩要收到只剩星芯。** 颜色是 `c·m·gain`(幽星光 15 × 0.05 = 0.75·m),
-    // 而 cover 用裸 m —— 若把星芒外围那圈暗辉光(m ≈ 0.3)也算进 cover,
-    // 就会往身体上混一层比底色更暗的**灰**:星芯亮不起来、暗区反而发灰(用户实测)。
-    // 只保留 `c·m·gain` 能压过底色的那一段。
-    let m = smoothstep(0.5, 1.0, max(tex.r, max(tex.g, tex.b)));
-    // **强度用读出来的 `Mat_NoiseIntensity`(0.05),不是 `Stick_Intensity`(1.5)** —— 差三十倍。
-    let gain = material.noise_uv.z;
+    //
+    // **两族的遮罩读法也不一样,和着色一样得分开** —— 分不开的代价见下面 `StarStickTex` 那支。
+    var m: f32;
+    if material.noise_uv.w > 0.5 {
+        // **`StarStickTex` 族:照汇编算。** 这一族的贴图(全库 31 个材质都是
+        // `Tex_PetGlassyStar_004`)**不是成品星场,是张噪声图** —— 三通道按汇编分工
+        // (r = 每颗星的阈值、g = 相位、b = 幅度),星形是这条公式**算出来**的。
+        // 实测那张 512²:r 均值 0.855(92% 亮过一半)、b 均值 0.121。
+        let x = saturate((tex.b * (k - tex.r) - 0.01) * 25.0);
+        m = x * x * (3.0 - 2.0 * x);
+    } else {
+        // **`NoiseTex`(假半透)族:贴图本身就是成品星场,不该再去切。**
+        // 拿上面那条公式切它必出**空心环**:`tex.r < k` 是个随时间移动的阈值,
+        // 会把亮的星芯排除在外、只留外圈辉光(实机报的"星点周围一圈光晕闪烁")。
+        // **遮罩要收到只剩星芯。** 颜色是 `c·m·gain`(幽星光 15 × 0.05 = 0.75·m),
+        // 而 cover 用裸 m —— 若把星芒外围那圈暗辉光(m ≈ 0.3)也算进 cover,
+        // 就会往身体上混一层比底色更暗的**灰**:星芯亮不起来、暗区反而发灰(用户实测)。
+        // 只保留 `c·m·gain` 能压过底色的那一段。
+        m = smoothstep(0.5, 1.0, max(tex.r, max(tex.g, tex.b)));
+    }
+    // **增益也分族**:假半透族是 `Mat_NoiseIntensity`(0.05,与 HDR 的 `Color02` 配对,
+    // 用 `Stick_Intensity` 会差三十倍);`StarStickTex` 族的汇编里乘的就是
+    // `Stick_Intensity`(1.5),而它那条 `noise_uv.z` 是默认值 1、不是读出来的。
+    let gain = select(material.star_color.w, material.noise_uv.z, material.noise_uv.w < 0.5);
     // **强度只进颜色,不进混合系数。** 汇编那条是
     //     lerp(底, Stick_Intensity × m × c, saturate(m + GlassyMainColorOpacity))
     // —— cover 用的是**裸的 m**。把 gain 也乘进 cover(0.05·m)会让这一层几乎不参与
@@ -578,10 +592,16 @@ fn interior_star(start: vec3<f32>, n: vec3<f32>, forward: vec3<f32>) -> f32 {
 /// 之前那版「减掉 0.35 的底再归一化」是**猜的**,把整张图的暗区削成 0 →
 /// 球大部分时间不吃 matcap、高光块扫过来时又猛地一亮,反而放大了闪烁。
 fn matcap_light(n: vec3<f32>) -> vec3<f32> {
+    return material.matcap_color.rgb * matcap_strength(n);
+}
+
+/// MatCap 那一路的**标量**强度(汇编里它就是单通道 × `MatCapColor`,见 docs/shader.md
+/// 「采样取了哪个通道」)。颜色与不透明度两处都要它,所以单拎出来。
+fn matcap_strength(n: vec3<f32>) -> f32 {
     if material.flags.w < 0.5 {
-        return vec3<f32>(0.0);
+        return 0.0;
     }
-    return material.matcap_color.rgb * textureSample(matcap_tex, base_sampler, matcap_uv(n)).r;
+    return textureSample(matcap_tex, base_sampler, matcap_uv(n)).r;
 }
 
 @fragment
@@ -711,9 +731,17 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         // **加上去的几层光是 `max` 合的,不是相加。** 汇编里连着两条:
         // `max r2.yzw, matcap*MatCapColor, spec*SpecColor` 再 `max r2.xyz, 上一步, rim`。
         // 相加会让高光与边缘光在轮廓处叠成一圈白边;取 max 则是「哪层亮听哪层」。
+        let rim_strength = saturate(pow(facing, material.extra.x) * material.star.z);
         glow += max(matcap_light(n) * GLASS_MATCAP_GAIN,
-                    material.rim_color.rgb * pow(facing, material.extra.x) * material.star.z
-                        * GLASS_RIM_GAIN);
+                    material.rim_color.rgb * rim_strength * GLASS_RIM_GAIN);
+        // **这两层光也顶不透明度。** 汇编(`MI_P_Object_Trans_MatCap` 37998)里输出 alpha 是
+        //     lerp(max(基色a重映射, 高光, 菲涅尔), 基色a重映射, ForceUseDefOpacity = 0)
+        // 也就是 **`max`**:高光那一路是 `smoothstep(pow(N·H, HighLightSpecPow)) × HighLight SpecInt`,
+        // 菲涅尔那一路是 `1 − N·V` 的两段 smoothstep —— 两者都只出标量,只进 alpha 不带颜色。
+        // **不接这一条的代价是球会整个消失**:幽星光那两颗球的基色 alpha 实测中位 0.000、
+        // p90 也是 0.000(形状压根不在基色里),导出器一度只能把 `Trans_MatCap` 整支排除在
+        // 「基色 alpha = 不透明度」之外来绕开(见 Materials.AlphaIsOpacity 的旧注释)。
+        alpha = max(alpha, max(rim_strength, saturate(matcap_strength(n))));
         // **球内那颗星是「混进固有色」,不是加在上面。** 汇编最后一步是
         // `out = lerp(基色 × 明暗色, 发光层色, 混合系数)`(fx1/34529.asm ⑥,见 design.md §1),
         // 而发光层色 = `星点底色 + 星点强度 × 星点亮色`,再与「按物体空间高度 lerp 的那对颜色」混。
@@ -768,7 +796,14 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     // 拿一个比底色暗的星点色替上去 ⇒ **身上一片黑斑**(用户实测)。
     // `noise_uv.w < 0.5` 表示"这个材质用相机空间的噪声坐标",与加光是同一族。
     let fake_trans = material.noise_uv.w < 0.5;
-    let body = select(mix(albedo * shade, stick.color, stick.cover),
+    // **星贴层混的是固有色,不是已经着色的颜色。** 汇编(`M_P_Object_Trans` 51670)里
+    // 那条 lerp 作用在 `r0` 上,而 `r0` 一路攒到第 690 行才 `mul r1.xzw, r0.xxyz, r1.xxzw`
+    // **乘上光照** —— 也就是星点色要跟着这一点的明暗一起变。原来写在 `albedo * shade`
+    // **之后**,等于把一块不受光的平色贴上去:亮处不亮、暗处不暗,实机看不见的这一层
+    // 在我们这儿成了一身灰紫斑(实机报的「果冻…看不到星点」)。
+    // **`else` 那支的位置本来就是对的**:`mov r0.xyz, r9.xyzx`(第 511 行)—— 不开这层时
+    // `r0` 就是干净的固有色,同样在乘光照之前。
+    let body = select(mix(albedo, stick.color, stick.cover) * shade,
                       albedo * shade, fake_trans);
     let stick_add = select(vec3<f32>(0.0), stick.color, fake_trans);
     // **末尾统一编码到显示空间**:`sqrt(色 × 曝光)`,照汇编尾部那条

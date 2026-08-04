@@ -126,10 +126,13 @@ pub struct PetGpu {
     effect_pipeline: wgpu::RenderPipeline,
     glass_pipeline: wgpu::RenderPipeline,
     /// (首索引, 数量, 材质序号)。分三批,后两批要在不透明层之后画:
-    /// `draws` 不透明、`glass_draws` 有基色的半透(玻璃/纱)、`effect_draws` 纯特效层。
+    /// `draws` 不透明、`inner_draws` 包在里面的非加色特效层、`glass_draws` 有基色的半透
+    /// (玻璃/纱)、`effect_draws` 加色特效层。**混合通道按这个顺序画**,见 `Self::new` 里
+    /// 拆分处的注释。
     draws: Vec<(u32, u32, usize)>,
     effect_draws: Vec<(u32, u32, usize)>,
     glass_draws: Vec<(u32, u32, usize)>,
+    inner_draws: Vec<(u32, u32, usize)>,
 }
 
 impl PetGpu {
@@ -661,6 +664,18 @@ impl PetGpu {
         let (glass_draws, effect_draws): (Vec<_>, Vec<_>) = blended
             .into_iter()
             .partition(|&(_, _, m)| model.materials[m].effect.is_none());
+        // **非加色的特效层要画在玻璃层前面。** 混合通道只测深度不写,顺序就是遮挡关系;
+        // 原来「玻璃层 → 特效层」把果冻的**内胆盖到了外壳上**,于是那颗深绿的内胆糊住整个
+        // 上半身、外壳的圆顶反而看不见(实机报的「果冻少了上半身」)。
+        // 全库同时有这两种层的**只有 2 个形态**(果冻:外壳 + 内胆;春兔:耳膜 + 里面那泡液体),
+        // 而且两次都是**特效层在里面** —— 所以「非加色特效层先画」就够,不必按深度排序。
+        // **加色层仍然留在最后**:它是打在最上面的光(火花的火焰),而且加色本来就与顺序无关,
+        // 挪到玻璃层前面反而会被玻璃的 alpha 衰减一道。
+        let (inner_draws, effect_draws): (Vec<_>, Vec<_>) = effect_draws
+            .into_iter()
+            .partition(|&(_, _, m)| {
+                model.materials[m].effect.as_ref().is_some_and(|e| !e.additive)
+            });
         Ok(Self {
             vertices,
             indices,
@@ -676,6 +691,7 @@ impl PetGpu {
             draws,
             effect_draws,
             glass_draws,
+            inner_draws,
         })
     }
 
@@ -718,6 +734,7 @@ impl PetGpu {
         }
         // 混合层放最后:本体的深度已经写好,这里只测不写,叠在上面
         for (pipeline, batch) in [
+            (&self.effect_pipeline, &self.inner_draws),
             (&self.glass_pipeline, &self.glass_draws),
             (&self.effect_pipeline, &self.effect_draws),
         ] {
