@@ -33,7 +33,8 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 
-PACKS = Path.home() / "Downloads/rocom/packs-all"
+# 同 `cmp_shots.py`:`SWEEP_PACKS` 指到别处就能扫另一批包(改完导出器重导一份再扫)
+PACKS = Path(os.environ.get("SWEEP_PACKS", Path.home() / "Downloads/rocom/packs-all"))
 BIN = Path(__file__).resolve().parent.parent / "target/release/rocom-pets"
 
 BLANK_COVER = 0.005
