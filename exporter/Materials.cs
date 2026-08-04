@@ -80,8 +80,42 @@ public record MaterialInfo(
     /// (`M_ShuiMu_ByIn`)同时有 `MainColor = (1,1,1,1)` 与 `BaseColor = (0.117,0.283,0.054)`,
     /// 按名字顺序取会拿到白色 —— 内胆于是渲成一颗白球(外壳不透明时看不见,一做成半透就露出来)。
     /// 所以先挑非白的,全白才退回白色。
-    public float[]? Tint => FirstColor("Color01", "MainColor", "BaseColor", "BaseColor1",
-        "Emitter Color", "FresnelColor", "PatternColor", "BackColor");
+    ///
+    /// **`OverAllColor`/`InColor` 是「一只一份」的定制材质留的口子。** 春兔耳朵里那泡粉色
+    /// 液体走的是 `M_Gra_Yutu_Ear_Lighting` —— 一个只给这只宠物写的材质,整套参数名
+    /// (`Bubble Color` / `InColor` / `OverAllColor` / `TopColor` / 「小球大小」…)都不在
+    /// 上面那批通用名里,于是 `Tint` 拿到 null、耳朵渲成一泡白的(实机报的第二条)。
+    /// 这两个名字**语义明确**(「整体颜色」/「内部颜色」,实测都是 (1, 0.343, 0.733) 粉),
+    /// 补进来就够把颜色接对;泡泡、液面高度、折射那些还没做,见 docs/design.md §1.1。
+    ///
+    /// **`M_ShuiMu_ByIn`(果冻的内胆)那一支要单挑,因为 `BaseColor` 压根不参与着色。**
+    /// 反汇编(shader 71636,5 个 ub ⇒ 材质 cb4,401 行)里它的固有色链是:
+    ///
+    /// ```text
+    /// 噪声 = 三次采 GlassyNoiseTex(带时间卷动)的组合
+    /// 色   = lerp(cb4[9], cb4[8], 噪声)        ← 两个 GlassyFlowColor 之间按噪声混
+    /// 色   = lerp(色, cb4[11], 菲涅尔)          ← 再按 pow(1−N·V) 混向 GlassyFresnelColor
+    /// ```
+    ///
+    /// 整条链只有这三个颜色槽,而材质里带 `Glassy` 的颜色也正好三个
+    /// (`GlassyFlowColor01` (0.362,1,0.085) / `02` (0.048,0.299,0.01) / `GlassyFresnelColor`),
+    /// **`BaseColor` 一次都没被读**。我们照名字顺序挑中的偏偏就是它,于是内胆画成一颗
+    /// 深绿的实心球,把外壳的圆顶整个糊住 —— 实机报的「果冻少了上半身」有一半是这么来的
+    /// (另一半是绘制顺序,见 pet/gpu.rs)。
+    ///
+    /// 运行时没有那层噪声流动,所以取**两个 flow 色的均值**当平的替身
+    /// (菲涅尔那一步正好落在 `fs_effect` 已有的 `rim` 上)。**只取读出来的值、不编新颜色**;
+    /// 真要还原得实现「两色按噪声混 + 菲涅尔」,而全库走这个父族的**只有 1 个材质**。
+    public float[]? Tint =>
+        // 这两个是**根默认**(实例没覆盖过),所以要连根一起查
+        (FirstVector("GlassyFlowColor01")
+            ?? RootDefaults?.Vectors.GetValueOrDefault("GlassyFlowColor01")) is { } g1
+        && (FirstVector("GlassyFlowColor02")
+            ?? RootDefaults?.Vectors.GetValueOrDefault("GlassyFlowColor02")) is { } g2
+            ? [(g1[0] + g2[0]) / 2f, (g1[1] + g2[1]) / 2f, (g1[2] + g2[2]) / 2f, 1f]
+            : FirstColor("Color01", "MainColor", "OverAllColor", "InColor",
+                "BaseColor", "BaseColor1", "Emitter Color", "FresnelColor", "PatternColor",
+                "BackColor");
 
     /// 半透强度;没写就当全不透明。
     public float Opacity => Scalars.TryGetValue("Opacity", out var v) ? v : 1f;
@@ -92,8 +126,41 @@ public record MaterialInfo(
     /// 开着的那 11 个材质(蜜蜂/小甲虫的翅膀、果冻、暮星辰的裙子…)里,它就是不透明度。
     /// 两处独立测量对上了:暮星辰裙子那块 UV 的基色 alpha 中位 0.537,经汇编里那个重映射
     /// `saturate((a - 0.04) * 1.1111)` → 0.55;而拿实机截图的**水印对比度衰减**反推出来的
-    /// 单层区 α ≈ 0.50。所以这个开关就是「区分两种 alpha」的判据,不必再找启发式。
-    public bool AlphaIsOpacity => Switch("Opacity or OpacityMask");
+    /// 单层区 α ≈ 0.50。
+    ///
+    /// **但只看那个开关是不够的 —— `M_P_Object_Trans` 族无条件就这么干**(2026-08-04,
+    /// 实机报「春花兔的耳朵也是半透明」)。春花兔的 `_Fx` 没设这个开关,于是被我们当不透明画,
+    /// 耳朵渲成一坨实心白;实机是透的。汇编说了话:
+    ///
+    /// - `M_P_Object_Trans` 的三个排列(51670 / 8752 / 21938)**每一条**都有
+    ///   `add r1.z, r8.w, l(-0.04)` + `mul_sat r1.z, r1.z, l(1.1111)` 接在基色采样之后 ——
+    ///   **没有「alpha 当纹路遮罩」的那条分支**;
+    /// - `MI_P_Object_Trans_MatCap`(幽星光的玻璃球)那三条(37998 / 20284 / 70710)也都有;
+    /// - 春兔 `_Fx`(开关**开**)与春花兔 `_Fx`(开关**没设**)**命中的是同一批 24 个
+    ///   shader map、同一批 shader**(51670 打头)—— 静态排列一模一样,也就是说这个开关
+    ///   的根默认本来就是开的,那 11 个只是把它又写了一遍。
+    ///
+    /// 数据也对得上:春花兔 `_Fx` 那块 UV 的基色 alpha 中位 **0.378**(它的 `_By` 是 1.000),
+    /// 是张画出来的不透明度图。所以判据改成「开关开着 **或** 父链走 `M_P_Object_Trans`」。
+    ///
+    /// **`Trans_MatCap` 那一支要排除掉。** 汇编里最终 alpha 不是那个重映射值本身,而是
+    /// `lerp(max(重映射, 高光, 菲涅尔), 重映射, ForceUseDefOpacity = 0)` —— 要和
+    /// matcap / 菲涅尔那两层取 max。那两层**已经接进 alpha 了**(见 pet.wgsl 玻璃分支里的
+    /// `alpha = max(alpha, max(rim_strength, matcap_strength))`),可这一支仍然不能放进来:
+    /// 幽星光那两颗球的基色 alpha 实测**中位 0.000、p90 也是 0.000**,球的形状压根不在
+    /// 基色里,放进来球就从实心变成**空心玻璃泡**(实机截图里它是一颗实心红球),
+    /// 调色板 0.088 → 0.095。
+    ///
+    /// **也别拿「静态排列相同」去推这个开关的根默认是开的** —— 那条推理对这一支不成立:
+    /// `MI_Ill_XingGuang1_001_Fx1`(开关**没设**)命中 24 个 shader map、
+    /// `MI_Ill_XingGuang3_001_Fx1`(开关**开**)命中 36 个,**两套不一样**。
+    /// 春兔/春花兔那两个之所以一样,多半是别的原因(父材质那份被原样带下来了)。
+    /// 结论:这个开关到底怎么默认还没查实,现在的判据是「开关 + 父链(排除 MatCap)」这条
+    /// **经验规则**,靠 17 只对照守着。
+    public bool AlphaIsOpacity =>
+        Switch("Opacity or OpacityMask")
+        || (ParentChain.Any(p => p.Contains("Object_Trans", StringComparison.OrdinalIgnoreCase))
+            && !ParentChain.Any(p => p.Contains("Trans_MatCap", StringComparison.OrdinalIgnoreCase)));
 
     /// 遮罩/噪声贴图:特效的形状与流动来源。没有就当常量 1。
     public string? MaskTexture =>
@@ -227,18 +294,50 @@ public record MaterialInfo(
     public bool IsTranslucent =>
         BlendMode is EBlendMode.BLEND_Translucent or EBlendMode.BLEND_AlphaComposite;
 
+    /// 半透族(`M_P_Object_Trans`)的星点层门:**`RampID >= 0.4`,这条是从汇编读出来的**。
+    ///
+    /// shader 51670(`M_P_Object_Trans` 的世界 base pass、`Opacity or OpacityMask` 那个排列,
+    /// 7 个 uniform buffer ⇒ 材质 cb6):
+    ///
+    /// ```text
+    /// ge  r2.y, cb6[84].z, l(0.4)          ← 门
+    /// and r5.w, r2.y, l(1065353216)        ← 门 → 1.0f / 0.0f
+    /// mad r4.xyw, r5.w, r9.xyxz, r4.xyxw   ← 高光层按门混
+    /// …
+    /// max r1.z, r1.z, r8.w                 ← r8.w = 星点遮罩 m
+    /// mad r1.z, r5.w, r1.z, r1.w           ← **星点对不透明度的贡献也按同一个门混**
+    /// ```
+    ///
+    /// `cb6[84].z` 的名字是查出来的不是猜的:按 `uniexpr.py` 的两条判据(V = 83、
+    /// V + ⌈S/4⌉ + 1 = 120 ≥ 声明的 cb6[119])这条 shader 唯一配到冻结块 9,块 9 里
+    /// `cb[84].z = 标量 6 = RampID`(根默认 0)。**交叉验证**:同块 `cb[88].z = StarStickTiling = 4`,
+    /// 而汇编里星点的 UV 正是 `mul r3.yw, v2.xxxy, cb6[88].z` —— 槽位对得上。
+    ///
+    /// 实机两张截图也对得上:春兔 `_Fx`(耳膜,`RampID` = 0)看不到星点,
+    /// 果冻 `_By`(`RampID` = **0.5**,实例显式开的)那层是开着的 —— 而它在这一族里
+    /// **只改不透明度、不画彩色星星**(见上面汇编:`m` 只进 `r1.z` 那条 alpha 链),
+    /// 所以实机看着也只是「果冻更实了一点」,不是一身四角星。
+    /// **这条「只改 alpha」运行时还没实现**(见 docs/design.md §1.1),现在只做门。
+    private bool TransStarGate =>
+        !ParentChain.Any(p => p.Contains("Object_Trans", StringComparison.OrdinalIgnoreCase))
+        || RootScalar("RampID", 0f) >= 0.4f;
+
     /// 星点贴图:游戏里身上那些细碎星光。共享图 `Tex_PetGlassyStar_004` 一类。
     ///
     /// **几乎每个宠物材质都挂着这张图,但绝大多数并没有真的启用它**——游戏靠静态开关
-    /// 与遮罩通道决定要不要叠,那套我们复刻不了。判据取「美术是否显式设了 `StarStickTiling`」:
-    /// 设了(暮星辰的裙子 = 4×4)才当启用。一开始无条件叠,结果整只宠物被星点冲白。
+    /// 与遮罩通道决定要不要叠。半透族那道门现在**读出来了**(见 `TransStarGate`);
+    /// 不透明族(`M_P_Object`)那道是**逐像素**的 —— shader 51377 里整段星点包在
+    /// `if (法线贴图.a >= 0.4)` 里(`sample_l r3.xyzw, v2.xyxx, t3` 之后 `mad r3.xy, r3.xy, 2, -1`
+    /// 再 `nz = sqrt(1-x²-y²)`,是标准切空间法线,所以 t3 就是法线图、`.w` 是塞在里面的遮罩),
+    /// 运行时还没实现,所以那一族仍然退回下面这条启发式:
+    /// 「美术是否显式设了向量 `StarStickTiling`」——设了(暮星辰的裙子 = 4×4)才当启用。
+    /// 一开始无条件叠,结果整只宠物被星点冲白。
     ///
-    /// **这个门是启发式,不是查实的**:真正决定要不要画的是静态开关 + 遮罩通道。它是照
-    /// 「全量只有 10 / 16 个形态真的启用星点 / matcap」这个观察定的,别当成读出来的语义。
     /// 这里**故意只查向量**那份 `StarStickTiling`:平铺该读标量(见 `StarTiling`),但把标量
     /// 也算进这个门会让更多材质新启用这一层 —— 那是未经验证的行为改动,没做。
     public string? StarTexture =>
-        Vectors.ContainsKey("StarStickTiling") ? FirstTexture("StarStickTex", "ShinyStarTex", "StarTex")
+        !TransStarGate ? null
+        : Vectors.ContainsKey("StarStickTiling") ? FirstTexture("StarStickTex", "ShinyStarTex", "StarTex")
         : IsFakeTrans ? FirstTexture("NoiseTex", "Noise")
         : null;
 

@@ -564,14 +564,20 @@ FormReport ExportForm(
     // 贴图与颜色跟「假半透」那份走(它是宠物自己的星点图);**平铺数单独挑**,跟着实例里
     // 显式覆盖过的那份走 —— 两者不一定在同一个材质上(见上面 `explicitTiling`)。
     //
-    // **但不是所有材质都刷**:只刷「图里有这一层」的(`GraphHasStickLayer`,判据见那儿)。
-    // 眼睛与嘴走 `M_P_Eyes`,它的完整参数表里一个 `Star*`/`Stick*` 都没有 —— 原来连它们
-    // 一起刷,眼睛上也有一层脉动的星点。
+    // **但不是所有材质都刷**:只刷**自己就开着这一层**的(`StarTexture is not null`,
+    // 判据见 `Materials.StarTexture`:美术显式设了向量 `StarStickTiling`,或者是假半透族)。
+    //
+    // ~~原来的判据是「图里有这一层」(`GraphHasStickLayer`)~~ —— **那道门太松,是个 bug**:
+    // 根默认里就有 `Stick_Intensity`,于是 `M_P_Object` 族的每个材质都过,包括从来没开过
+    // 这一层的白身体。春兔实机报的「身上几乎看不到星点」就是这么来的:它只有 `_Fx`
+    // (半透的耳朵/披风)显式写了 `StarStickTiling = (4,4)`,`_By` 一个星点参数都没覆盖过
+    // (探针:全是「根num」),却被这里刷上了整层星点,渲出来一身四角星。
+    // 统一的本意是「一只宠物别出现两种星点两种密度」,不是「给没开的材质开一层」。
     if (starLayer is { } star)
     {
         var tiling = explicitTiling ?? star.Tiling;
         var hasLayer = resolved
-            .Where(kv => kv.Value.Resolved && kv.Value.GraphHasStickLayer)
+            .Where(kv => kv.Value.Resolved && kv.Value.StarTexture is not null)
             .Select(kv => kv.Key)
             .ToHashSet(StringComparer.OrdinalIgnoreCase);
         for (var i = 0; i < materials.Count; i++)
