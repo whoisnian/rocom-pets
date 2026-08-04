@@ -18,6 +18,11 @@
 //!   窗口之间往下转发,穿不到别的进程去(实机第一次跑就栽在这:铺满工作区的窗口把整屏
 //!   点击全吃了,除了任务栏哪儿都点不动)。区域的代价是**它同时裁剪渲染**,Wayland 那边
 //!   不裁;好在矩形本来就是按掩码算的,裁掉的只是边缘那圈近乎全透明的像素。
+//! - **全局穿透也只是「区域照旧 + 加 `WS_EX_TRANSPARENT`」**,别去清区域。Wayland 那边
+//!   穿透是交个空输入区(不影响渲染),Win32 照搬不了 —— 区域清成整窗,上面那个「除了
+//!   任务栏哪儿都点不动」就原样回来了(实机第二次栽在这);清成空区域倒是全屏都能穿,
+//!   可宠物也一起被裁没了。所以形状始终按掩码来,`WS_EX_TRANSPARENT` 只负责宠物身上
+//!   那几十个格子。
 //! - **窗口铺满「工作区」**(`MONITORINFO::rcWork`,已经去掉任务栏),对应 Wayland 那边
 //!   `exclusive_zone(0)` 拿到的区域:宠物踩在任务栏上沿,而不是藏到它后面。
 
@@ -48,7 +53,8 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DispatchMessageW, GWL_EXSTYLE, GetMessageW, HTCLIENT,
     HTTRANSPARENT, HWND_MESSAGE, HWND_TOPMOST, IDC_ARROW, KillTimer, LoadCursorW, MSG,
-    PostQuitMessage, RegisterClassW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SetTimer,
+    PostQuitMessage, RegisterClassW, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+    SetTimer,
     SetWindowLongPtrW, SetWindowPos, TranslateMessage, WM_DISPLAYCHANGE, WM_DPICHANGED,
     WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCHITTEST, WM_TIMER, WNDCLASSW,
     WS_EX_NOACTIVATE, WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
@@ -765,7 +771,7 @@ impl App {
         self.render(index);
     }
 
-    /// 把「输入区」交给系统。Win32 的对应物是**窗口区域**,不是 `WM_NCHITTEST`。
+    /// 把窗口的形状交给系统。Win32 的对应物是**窗口区域**,不是 `WM_NCHITTEST`。
     ///
     /// **`HTTRANSPARENT` 不够**:它只在**同一线程**的窗口之间往下转发命中,穿不到别的
     /// 进程去。一个铺满工作区的窗口只靠它的话,整屏的点击都会被我们吃掉 —— 实机第一次
@@ -774,18 +780,17 @@ impl App {
     ///
     /// 代价是**区域同时也裁剪渲染**(Wayland 的输入区只管输入)。好在这些矩形本来就是
     /// 按掩码生成的、覆盖了所有不透明像素,裁掉的只是边缘那圈低于阈值、近乎全透明的部分。
+    ///
+    /// **穿透时也照设不误**(用 `shape_regions`,它不看穿透开关)。这里曾经改成
+    /// `SetWindowRgn(None)`「恢复整窗免得画面被裁」,只靠 `WS_EX_TRANSPARENT` 穿透 ——
+    /// 实机上那个样式并没能把点击放过去,于是整窗又把整屏点击吃了个干净,还是只剩任务栏
+    /// 能点(和上面那次一模一样的症状)。形状留着,最坏也就是宠物身上那几十个格子点不穿,
+    /// 屏幕其余部分照常;`WS_EX_TRANSPARENT` 生效的话连宠物身上也穿。
     fn update_window_region(&mut self, index: usize) {
         let stage = &self.stages[index];
         let hwnd = stage.hwnd;
-        if self.passthrough {
-            // 全局穿透靠 `WS_EX_TRANSPARENT`(那个是真能穿到别的进程的);
-            // 区域恢复成整窗,免得画面被裁掉
-            // SAFETY: hwnd 有效;传 None = 清掉区域。
-            unsafe { SetWindowRgn(hwnd, None, false) };
-            return;
-        }
         let scale = stage.scale;
-        let rects = stage.stage.input_regions();
+        let rects = stage.stage.shape_regions();
         // SAFETY: 下面是 GDI 区域的标准用法;临时区域用完即删,合并出来的那个交给
         // `SetWindowRgn` 之后**归系统所有**,不能再删。
         unsafe {
@@ -1015,9 +1020,9 @@ impl App {
                 .stage
                 .handle(StageEvent::TogglePassthrough);
             let hwnd = self.stages[index].hwnd;
-            // 全局穿透靠 `WS_EX_TRANSPARENT` —— **这个才是真能穿到别的进程的那一个**,
-            // `WM_NCHITTEST` 返回 HTTRANSPARENT 只在同线程窗口之间转发(见
-            // `update_window_region`)。
+            // `WS_EX_TRANSPARENT` 管的只是**宠物身上**那几十个格子穿不穿得过去;屏幕
+            // 其余部分靠窗口区域(见 `update_window_region`)。别指望这个样式包办全屏 ——
+            // 实机上它没把点击放过去。
             // SAFETY: hwnd 有效;改的是自己窗口的扩展样式。
             unsafe {
                 SetWindowLongPtrW(
@@ -1025,6 +1030,8 @@ impl App {
                     GWL_EXSTYLE,
                     stage_ex_style(self.passthrough).0 as isize,
                 );
+                // `SWP_FRAMECHANGED`:样式是拿 `SetWindowLongPtr` 直接改的,得让系统
+                // 重算一遍缓存才作数(文档明写了这条)
                 let _ = SetWindowPos(
                     hwnd,
                     Some(HWND_TOPMOST),
@@ -1032,10 +1039,11 @@ impl App {
                     0,
                     0,
                     0,
-                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED,
                 );
             }
-            // 开穿透时把区域清掉(整窗渲染),关穿透时按掩码重设
+            // 形状不随穿透变(`shape_regions` 不看开关),但 TogglePassthrough 清了拖动
+            // 状态,顺手重设一次
             self.update_window_region(index);
             self.render(index);
         }

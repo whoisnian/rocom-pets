@@ -1330,10 +1330,21 @@ impl Stage {
     ///
     /// **取各实体的并集**。这里不做去重/合并:合成器接受重叠矩形,而实体之间本来
     /// 就很少叠在一起;真要压条目数,该压的是单只那 60~87 个格子。
+    #[allow(dead_code)] // 只有 Wayland 后端要;Windows 那边走 `shape_regions`
     pub fn input_regions(&self) -> Vec<Rect> {
         if self.passthrough {
             return Vec::new();
         }
+        self.shape_regions()
+    }
+
+    /// 同样的矩形并集,但**不看穿透开关**。
+    ///
+    /// 给 Win32 的「窗口区域」用:那东西同时裁剪渲染,穿透时不能像 Wayland 的输入区
+    /// 那样交空集 —— 交空集画面会跟着一起没。窗口的形状照旧按这些矩形来,「点不点得动」
+    /// 交给 `WS_EX_TRANSPARENT`(见 platform/windows.rs 的 `update_window_region`)。
+    #[allow(dead_code)] // 只有 Windows 后端要
+    pub fn shape_regions(&self) -> Vec<Rect> {
         self.entities.iter().flat_map(Entity::input_rects).collect()
     }
 
@@ -2251,6 +2262,8 @@ mod tests {
         assert_eq!(s.handle(StageEvent::TogglePassthrough), Reaction::BOTH);
         assert!(s.passthrough());
         assert!(s.input_regions().is_empty());
+        // 形状不跟着空:Win32 的窗口区域要拿它当形状用(见 platform/windows.rs)
+        assert!(!s.shape_regions().is_empty());
         s.handle(StageEvent::PointerPressed { x: 400.0, y: 300.0 });
         assert!(!s.is_dragging());
     }
