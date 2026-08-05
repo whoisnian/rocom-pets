@@ -45,7 +45,7 @@
 
     02 <16 字节>   Constant(float4)
     03 <uint16>    Parameter(下标)
-    04/05/06/0b/18/1a …  运算(Add/Sub/Div/Max/… 具体对应还没逐个定)
+    05 Add / 06 Sub / 07 Mul / 08 Div / 0b Max；18/1a … 其余运算尚未逐个定
 
 判据不是猜的:某个槽位解出来是 `Constant(65503.86×4) Parameter(12) Constant(1e-5×4) 0b 06`
 = `65503.86 / max(参数12, 1e-5)` —— 65503.86 是 half 的最大值、1e-5 是 epsilon,
@@ -499,7 +499,8 @@ PARAMETER_OPCODE = 3
 #   04 <uint16>    **向量**参数(下标)
 #   23 <n> <i0..i3>  ComponentSwizzle:n = 分量数(1..4),后 4 字节是下标(0xff = 不用)
 #   24 <n>           AppendVector(n = 已累积的分量数)
-#   05/06/0b/18/1a …  其余运算(具体对应还没逐个定)
+#   05 Add、06 Sub、07 Mul、08 Div、0b Max
+#   18/1a … 其余运算仍未逐个定
 #
 # 23/24 也是查实的:块内所有 `23` 后面 5 字节**无一例外**都是「分量数 1..4 + 下标 0..3 或 0xff」,
 # 实测取值只有 xyz / w / xy / zw 四种;`24` 的操作数只有 1 和 2。
@@ -597,6 +598,13 @@ APPEND_OPCODE = 0x24
 # 操作数字节数(不含 opcode 本身);没列的当 0 字节
 OPERAND_BYTES = {CONSTANT_OPCODE: 16, SCALAR_PARAM_OPCODE: 2, VECTOR_PARAM_OPCODE: 2,
                  SWIZZLE_OPCODE: 5, APPEND_OPCODE: 1}
+OPCODE_NAMES = {
+    0x05: "Add",
+    0x06: "Sub",
+    0x07: "Mul",
+    0x08: "Div",
+    0x0B: "Max",
+}
 
 
 def decode_expr(d: bytes, base: int, off: int, size: int, ctx) -> str:
@@ -642,6 +650,8 @@ def decode_expr(d: bytes, base: int, off: int, size: int, ctx) -> str:
             out.append("." + "".join("xyzw"[c] for c in arg[1:1 + arg[0]] if c < 4))
         elif op == APPEND_OPCODE and n == len(arg):
             out.append(f"append{arg[0]}")
+        elif op in OPCODE_NAMES:
+            out.append(OPCODE_NAMES[op])
         else:
             out.append(f"op{op:#04x}")
         i += 1 + n

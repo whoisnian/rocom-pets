@@ -10,10 +10,20 @@ shader map 的同一串哈希 —— 逐条 memmem 材质的 `.uexp`,命中的�
         --filter "NRC/Content/ArtRes/AnimSequence/Pets/<资产>/Mat"
     uv run python scripts/matshader.py <archive> <dir>/…/MI_<材质>.uexp --out /tmp/s
 
-一个材质会命中几十个 shader map(同一材质的不同排列:光照/雾/lightmap 组合),
-去重后仍有上百条 shader。**要读公式就挑对排列**:按 uniform buffer 组合分组
-(`--groups` 看分布),宠物在世界里跑的是带 `MobileDirectionalLight`、不带
-`ClusteredForwardShading` 那组;同组里取解压后最大的那条,指令最全。
+一个材质会命中几十个 shader map(同一材质的不同排列:质量/静态开关/光照/雾组合),
+去重后仍有上百条 shader。`--groups` 与「取最大一条」只适合探索,**不能据此认定实机排列**:
+果冻就是反例 —— 实机那条比同组最大的短,而且没有 StarStick。
+
+**精确定位排列的完整链路**(两端是接上的,别再手工猜序号):
+
+    dotnet run --project exporter -- --probe-material <资产>   # PROBE_SHADERS=1
+      → 每条 cooked resource 打印 quality / feature / map= / resource=
+      → 取 quality=Low 那些(偶数下标),把 **resource=** 那一栏填给下面
+    uv run python scripts/matshader.py <archive> <材质>.uexp --resource <ResourceHash>
+
+**坑**:探针的 `map=`(`CookedShaderMapIdHash`)在存档里**查不到** ——
+能对上存档 map 哈希的是 `resource=`(`ResourceHash`)。这两个都是 SHA1、长得一样,
+填错了只会得到「不在这份存档里」。
 """
 
 from __future__ import annotations
@@ -48,6 +58,17 @@ def main() -> None:
     ap.add_argument("--freq", type=int, default=3, help="3=pixel(默认)、0=vertex")
     ap.add_argument("--groups", action="store_true", help="只按 uniform buffer 组合列出分布")
     ap.add_argument("--any-group", action="store_true", help="不限于世界 base pass 那组")
+    ap.add_argument(
+        "--map",
+        type=int,
+        help="只读指定的 shader-map 序号(存档内下标)",
+    )
+    ap.add_argument(
+        "--resource",
+        help="按 cooked resource 的 **ResourceHash** 精确定位排列 —— 导出器探针"
+        "(`PROBE_SHADERS=1`)打印的 `resource=` 那一栏。**不是 `map=` 那一栏**:"
+        "`CookedShaderMapIdHash` 在存档里查不到,能对上存档 map 哈希的是 `ResourceHash`",
+    )
     ap.add_argument("--out", type=Path, help="导出目录(取该组最大的几条)")
     ap.add_argument("--limit", type=int, default=3, help="配合 --out")
     args = ap.parse_args()
@@ -60,11 +81,27 @@ def main() -> None:
         raise SystemExit(
             "一条都没命中。材质是不是没用 --raw 导?(属性 JSON 里没有那段哈希)"
         )
+    selected_maps = hits
+    if args.resource is not None:
+        want = args.resource.strip().lower()
+        by_hash = {arc.map_hash(i).lower(): i for i in range(arc.n_maps)}
+        if want not in by_hash:
+            raise SystemExit(
+                f"ResourceHash {args.resource} 不在这份存档里。"
+                "注意要填探针的 `resource=` 那一栏,不是 `map=`"
+            )
+        args.map = by_hash[want]
+        print(f"ResourceHash {args.resource} → shader map {args.map}")
+    if args.map is not None:
+        if args.map not in hits:
+            raise SystemExit(f"shader map {args.map} 不在这个材质命中的 cooked resource 中")
+        selected_maps = [args.map]
+        print(f"按 cooked resource 精确限制到 shader map {args.map}")
 
     # 同一条 shader 会被多个 map 共用,按 shader 哈希去重
     seen: set[str] = set()
     rows: list[tuple[int, int, tuple[str, ...]]] = []
-    for m in hits:
+    for m in selected_maps:
         for s in arc.shaders_of_map(m):
             h = arc.shader_hash(s)
             if h in seen:
