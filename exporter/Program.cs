@@ -151,6 +151,9 @@ else
     Console.Error.WriteLine($"--paks 路径不存在: {paksPath}");
     return 1;
 }
+// 材质探针需要读取 cooked material resource，才能把质量档/FeatureLevel 精确对到
+// shader archive 里的 map hash。正常导包不读这块（体积大，而且与素材导出无关）。
+provider.ReadShaderMaps = probeAsset is not null;
 provider.Initialize();
 provider.SubmitKey(new FGuid(), new FAesKey(hex));
 if (provider.Files.Count == 0)
@@ -521,14 +524,25 @@ FormReport ExportForm(
             info.IsFakeTrans,
             info.MaskIsMatcap ? null : ExportEffectTexture(info.MatcapTexture), info.MatcapColor,
             info.RimColor, info.RimIntensity, info.EmissiveColor, info.EmissiveIntensity,
-            info.RimPower, info.AlphaIsOpacity,
+            info.RimPower, info.RimSoftEdge,
+            info.HighlightOffset, info.HighlightSpecColor,
+            info.HighlightSpecPower, info.HighlightSpecIntensity, info.ForceUseDefaultOpacity,
+            info.OpacityDepthDistance, info.OpenDepthDistance,
+            info.IsObjectTransLow,
+            ExportEffectTexture(info.ObjectTransLightMaskTexture),
+            ExportEffectTexture(info.ObjectTransRampTexture),
+            info.ObjectTransSoftEdge, info.ObjectTransMainColor, info.ObjectTransMainBright,
+            info.AlphaIsOpacity,
             ExportEffectTexture(info.FlowTexture), info.FlowPower,
             ExportEffectTexture(info.MaskIdTexture), info.MaskIdRange,
             info.WaterColor1, info.WaterColor2, info.WaterMain,
             info.WaterCaustics, info.WaterShape,
             ExportEffectTexture(info.InteriorTexture), info.InteriorColor,
             info.Refraction, info.RefractDepth, info.FlickerSpeed, info.FlickerPower,
-            info.NoiseUv));
+            info.NoiseUv,
+            info.IsGlassyInner,
+            info.GlassyFlowColor01, info.GlassyFlowColor02, info.GlassyFresnelColor,
+            info.GlassyNoiseParams, info.GlassyMaskParams));
 
         if (info.StarTexture is not null && ExportEffectTexture(info.StarTexture) is { } starTex
             && (starLayer is null || (info.IsFakeTrans && !starFromFakeTrans)))

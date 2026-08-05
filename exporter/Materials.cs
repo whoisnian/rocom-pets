@@ -88,34 +88,11 @@ public record MaterialInfo(
     /// 这两个名字**语义明确**(「整体颜色」/「内部颜色」,实测都是 (1, 0.343, 0.733) 粉),
     /// 补进来就够把颜色接对;泡泡、液面高度、折射那些还没做,见 docs/design.md §1.1。
     ///
-    /// **`M_ShuiMu_ByIn`(果冻的内胆)那一支要单挑,因为 `BaseColor` 压根不参与着色。**
-    /// 反汇编(shader 71636,5 个 ub ⇒ 材质 cb4,401 行)里它的固有色链是:
-    ///
-    /// ```text
-    /// 噪声 = 三次采 GlassyNoiseTex(带时间卷动)的组合
-    /// 色   = lerp(cb4[9], cb4[8], 噪声)        ← 两个 GlassyFlowColor 之间按噪声混
-    /// 色   = lerp(色, cb4[11], 菲涅尔)          ← 再按 pow(1−N·V) 混向 GlassyFresnelColor
-    /// ```
-    ///
-    /// 整条链只有这三个颜色槽,而材质里带 `Glassy` 的颜色也正好三个
-    /// (`GlassyFlowColor01` (0.362,1,0.085) / `02` (0.048,0.299,0.01) / `GlassyFresnelColor`),
-    /// **`BaseColor` 一次都没被读**。我们照名字顺序挑中的偏偏就是它,于是内胆画成一颗
-    /// 深绿的实心球,把外壳的圆顶整个糊住 —— 实机报的「果冻少了上半身」有一半是这么来的
-    /// (另一半是绘制顺序,见 pet/gpu.rs)。
-    ///
-    /// 运行时没有那层噪声流动,所以取**两个 flow 色的均值**当平的替身
-    /// (菲涅尔那一步正好落在 `fs_effect` 已有的 `rim` 上)。**只取读出来的值、不编新颜色**;
-    /// 真要还原得实现「两色按噪声混 + 菲涅尔」,而全库走这个父族的**只有 1 个材质**。
-    public float[]? Tint =>
-        // 这两个是**根默认**(实例没覆盖过),所以要连根一起查
-        (FirstVector("GlassyFlowColor01")
-            ?? RootDefaults?.Vectors.GetValueOrDefault("GlassyFlowColor01")) is { } g1
-        && (FirstVector("GlassyFlowColor02")
-            ?? RootDefaults?.Vectors.GetValueOrDefault("GlassyFlowColor02")) is { } g2
-            ? [(g1[0] + g2[0]) / 2f, (g1[1] + g2[1]) / 2f, (g1[2] + g2[2]) / 2f, 1f]
-            : FirstColor("Color01", "MainColor", "OverAllColor", "InColor",
-                "BaseColor", "BaseColor1", "Emitter Color", "FresnelColor", "PatternColor",
-                "BackColor");
+    /// `M_ShuiMu_ByIn` 不读这里挑出的通用主色；它由下方 `Glassy*` 字段把原 shader 的
+    /// 两个 flow 端点、噪声与 Fresnel 完整传给专用管线。这里不再用两色均值冒充流动结果。
+    public float[]? Tint => FirstColor("Color01", "MainColor", "OverAllColor", "InColor",
+        "BaseColor", "BaseColor1", "Emitter Color", "FresnelColor", "PatternColor",
+        "BackColor");
 
     /// 半透强度;没写就当全不透明。
     public float Opacity => Scalars.TryGetValue("Opacity", out var v) ? v : 1f;
@@ -173,7 +150,48 @@ public record MaterialInfo(
         && !Textures.ContainsKey("BaseMap") && !Textures.ContainsKey("Base Color")
         && (Textures.ContainsKey("MatCap") || Textures.ContainsKey("MatCapTex"));
 
-    public string? NoiseTexture => FirstTexture("Noise", "NoiseTex", "FlowTexture");
+    /// 果冻内胆使用的独立材质图。它不是通用“纯特效层”:原 shader 71636 输出 alpha=1,
+    /// 用物体空间折射坐标三向采 `GlassyNoiseTex`,再做 flow 两色与 Fresnel 色的两次 lerp。
+    public bool IsGlassyInner =>
+        ParentChain.Any(p => p.Equals("M_ShuiMu_ByIn", StringComparison.OrdinalIgnoreCase));
+
+    public string? NoiseTexture => FirstTexture("Noise", "NoiseTex", "FlowTexture", "GlassyNoiseTex")
+        ?? (IsGlassyInner ? RootDefaults?.Textures.GetValueOrDefault("GlassyNoiseTex") : null);
+
+    public float[] GlassyFlowColor01 =>
+        FirstVector("GlassyFlowColor01")
+        ?? RootDefaults?.Vectors.GetValueOrDefault("GlassyFlowColor01")
+        ?? [1f, 1f, 1f, 1f];
+
+    public float[] GlassyFlowColor02 =>
+        FirstVector("GlassyFlowColor02")
+        ?? RootDefaults?.Vectors.GetValueOrDefault("GlassyFlowColor02")
+        ?? [1f, 1f, 1f, 1f];
+
+    public float[] GlassyFresnelColor =>
+        FirstVector("GlassyFresnelColor")
+        ?? RootDefaults?.Vectors.GetValueOrDefault("GlassyFresnelColor")
+        ?? [1f, 1f, 1f, 1f];
+
+    /// [速度, UV 尺度, GlassyNoiseRefract 原参数, 深度]。四个槽逐一对应 71636 的
+    /// cb4[7]/[18]；其中 shader 实际读取的折射 eta 是 preshader 求出的
+    /// `1 / (1 + GlassyNoiseRefract)`，运行时保留原参数是为了兼容已经导出的包。
+    public float[] GlassyNoiseParams =>
+    [
+        RootScalar("GlassyNoiseSpeed", -0.1f),
+        RootScalar("GlassyNoiseUVScale", 1f),
+        RootScalar("GlassyNoiseRefract", 0.2f),
+        RootScalar("GlassyNoiseDepth", 30f),
+    ];
+
+    /// [Fresnel 次数,阈值起点,过渡宽度,三向混合强度]。
+    public float[] GlassyMaskParams =>
+    [
+        RootScalar("GlassyNoiseFresnelMaskPow", 1f),
+        RootScalar("GlassyNoiseFresnelMaskOffset", 0.7f),
+        RootScalar("GlassyNoiseFresnelMaskSmooth", 0.1f),
+        RootScalar("GlassyNoiseTriPlannarBlendInt", 0f),
+    ];
 
     /// UV 卷动:速度与平铺。火焰靠它动起来。
     public float[] Flow =>
@@ -253,6 +271,7 @@ public record MaterialInfo(
         ParentChain.Any(p => p.Contains("Water", StringComparison.OrdinalIgnoreCase));
 
     public float EmissiveIntensity => IsWater ? 0f : Scalar("Emitter Intensity", 0f);
+
 
     /// 水体预设(`ML_P_StylizedWater` 图层)。整条链是从 shader 35663 读出来的,
     /// 公式见 rocom-capture/docs/shader.md「水体预设」;这里只把参数搬出来。
@@ -475,9 +494,91 @@ public record MaterialInfo(
         : RootDefaults?.Scalars.TryGetValue(name, out var r) == true ? r
         : fallback;
 
-    /// 边缘光的衰减次数:`pow(1 - N·V, RimPower)`。**小于 1 就不是「一圈边」而是整片泛色**——
-    /// 幽星光那两个球是 0.35,整颗都透着红,只写 RimColor 不写这个会画成一圈细红边。
-    public float RimPower => Scalar("Rim Power", Scalar("RimPower", 3f));
+    /// 半透族的颜色边缘参数。根材质默认是 0.4 / 0.3,实例会逐只覆盖
+    /// (果冻 = 1.4 / 0.2)。目标实机选中的 Low alpha 链不读取这层；它只用于颜色。
+    public float RimPower => RootScalar("Rim Power", RootScalar("RimPower", 0.4f));
+
+    public float RimSoftEdge => RootScalar("Rim Soft Edge", 0.3f);
+
+    /// 半透族高光覆盖率。公式来自 `M_P_Object_Trans` 的有/无方向光两个排列:
+    /// `smoothstep(.4, .5, pow(max(N·H, 0), HighLightSpecPow)) × HighLight SpecInt`。
+    /// Offset 是 UE 的 Z-up 向量,导出时换成运行时 glTF 的 Y-up `(x,z,y)`。
+    public float[] HighlightOffset
+    {
+        get
+        {
+            var v = FirstVector("HighLight Offset")
+                    ?? RootDefaults?.Vectors.GetValueOrDefault("HighLight Offset")
+                    ?? [0f, 0f, 0f, 1f];
+            return [v[0], v[2], v[1]];
+        }
+    }
+
+    public float[] HighlightSpecColor
+    {
+        get
+        {
+            var v = FirstVector("HighLight SpecCol")
+                    ?? RootDefaults?.Vectors.GetValueOrDefault("HighLight SpecCol")
+                    ?? [1f, 1f, 1f, 0f];
+            return [v[0], v[1], v[2]];
+        }
+    }
+
+    public float HighlightSpecPower => RootScalar("HighLightSpecPow", 10f);
+
+    public float HighlightSpecIntensity => RootScalar("HighLight SpecInt", 1f);
+
+    /// 0 = 使用 max(基础 alpha,高光覆盖),1 = 强制退回基础 alpha。
+    public float ForceUseDefaultOpacity => RootScalar("ForceUseDefOpacity", 0f);
+
+    /// `M_P_Object_Trans` 场景深度淡化的距离(UE 厘米)。实机 ES3.1/Low 的 LOD0
+    /// shader 在基础 alpha / 高光覆盖之后计算
+    /// `saturate((sceneDepth - pixelDepth) / OpacityDepthDistance)`。
+    public float OpacityDepthDistance => RootScalar("OpacityDepthDistance", 40f);
+
+    /// 是否把上面的深度淡化加进 alpha；果冻实例明确覆盖为 1。
+    public float OpenDepthDistance => RootScalar("OpenDepthDistance", 0f);
+
+    /// 目标设备的 ES3.1/Low 基础半透明排列。只认**经由 `MI_P_Object_Trans` 这个共同中间父**
+    /// 的那一支:果冻外壳、春兔耳膜与同类 `_WPO` 变体。
+    ///
+    /// **`_XingGuang_*` 与 `_Trans_MatCap` 必须挡掉。** 它们的父链里**也有**
+    /// `MI_P_Object_Trans`(例如 `MI_Ill_XingGuang3_001_Fx1` 是
+    /// `[_Trans_XingGuang_WPO, _Trans_WPO, MI_P_Object_Trans, M_P_Object_Trans]`),
+    /// 所以只写 `ParentChain.Any(== "MI_P_Object_Trans")` 拦不住 —— 得按名字排除。
+    /// 而「只认直接父」也不行:**果冻自己的直接父就是 `_WPO`**。
+    ///
+    /// 挡不住的代价量过:暮星辰的裙子会走上这条为果冻反汇编出来的短链,
+    /// 调色板距离 0.068 → 0.082。这条 shader map(`ACB16DBC…`)只对果冻外壳验过,
+    /// 别往没验过的分支上摊。
+    public bool IsObjectTransLow =>
+        IsTranslucent
+        && BaseColorTexture is not null
+        && ParentChain.Any(p => p.Equals("MI_P_Object_Trans", StringComparison.OrdinalIgnoreCase))
+        && !ParentChain.Any(p => p.Contains("XingGuang", StringComparison.OrdinalIgnoreCase)
+                                 || p.Contains("MatCap", StringComparison.OrdinalIgnoreCase));
+
+    /// Low shader 2109/55790 的 t3/t4；绑定顺序由 cooked
+    /// `UniformTextureParameters` 明确给出，而不是按文件名猜。
+    public string? ObjectTransLightMaskTexture =>
+        IsObjectTransLow ? FirstTexture("MaskTex") : null;
+
+    public string? ObjectTransRampTexture =>
+        IsObjectTransLow
+            ? FirstTexture("RampTex") ?? RootDefaults?.Textures.GetValueOrDefault("RampTex")
+            : null;
+
+    /// `cb6[26].y`，原图中以 `0.1 * SoftEdge` 作为明暗过渡宽度。
+    public float ObjectTransSoftEdge => RootScalar("SoftEdge", 0.5f);
+
+    /// 原 shader 尾部 `cb6[29].xyz = MainColor.rgb * MainBright`。
+    public float[] ObjectTransMainColor =>
+        FirstVector("MainColor")
+        ?? RootDefaults?.Vectors.GetValueOrDefault("MainColor")
+        ?? [1f, 1f, 1f, 1f];
+
+    public float ObjectTransMainBright => RootScalar("MainBright", 1f);
 
     /// **假半透族那层星点不走网格 UV0。** 材质图里有个明写的开关 `UseNoiseUV0`,根默认 **0**;
     /// 配套 `Mat_NoiseTilingX/Y = 5 / 2.5`、`Mat_NoiseSpeedX/Y = 0.1 / -0.1`、

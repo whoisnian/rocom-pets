@@ -53,6 +53,23 @@ public record MaterialEntry(
     float[]? EmissiveColor,
     float EmissiveIntensity,
     float RimPower,
+    float RimSoftEdge,
+    /// `M_P_Object_Trans` 的高光/alpha 覆盖参数,全部来自材质实例或根默认。
+    float[] HighlightOffset,
+    float[] HighlightSpecColor,
+    float HighlightSpecPower,
+    float HighlightSpecIntensity,
+    float ForceUseDefaultOpacity,
+    /// `M_P_Object_Trans` 的场景深度淡化:距离(cm)与开启强度。
+    float OpacityDepthDistance,
+    float OpenDepthDistance,
+    /// 目标设备 ES3.1/Low 的基础 `MI_P_Object_Trans` 局部链。
+    bool ObjectTransLow,
+    string? ObjectTransLightMaskTexture,
+    string? ObjectTransRampTexture,
+    float ObjectTransSoftEdge,
+    float[] ObjectTransMainColor,
+    float ObjectTransMainBright,
     /// 基色贴图的 alpha 是不透明度(而不是纹路遮罩)。
     bool AlphaIsOpacity,
     /// 卷动色带:渐变图 + 混入强度(暮星辰的环带靠它出青↔粉渐变)。
@@ -79,7 +96,14 @@ public record MaterialEntry(
     float FlickerSpeed,
     float FlickerPower,
     /// 假半透族星点层的 [速度X, 速度Y, 强度, 是否用UV0]。见 Materials.cs 的 NoiseUv。
-    float[] NoiseUv);
+    float[] NoiseUv,
+    /// `M_ShuiMu_ByIn` 的原始流动内胆分支。
+    bool GlassyInner,
+    float[] GlassyFlowColor01,
+    float[] GlassyFlowColor02,
+    float[] GlassyFresnelColor,
+    float[] GlassyNoiseParams,
+    float[] GlassyMaskParams);
 
 public record FormReport(
     Form Form,
@@ -219,7 +243,32 @@ public static class Manifest
                     {
                         parts.Add($"rim_color = [{Num(rc[0])}, {Num(rc[1])}, {Num(rc[2])}]");
                         parts.Add($"rim_intensity = {Num(mat.RimIntensity)}");
+                    }
+                    // 半透族的输出覆盖率不是贴图 alpha 一项:实机的 ES3.1/Low shader
+                    // 还会与高光取 max，再按场景深度差补一层 depth-fade。距离是 UE 厘米。
+                    if (mat.Translucent)
+                    {
                         parts.Add($"rim_power = {Num(mat.RimPower)}");
+                        parts.Add($"rim_soft_edge = {Num(mat.RimSoftEdge)}");
+                        parts.Add($"highlight_offset = [{string.Join(", ", mat.HighlightOffset.Select(Num))}]");
+                        parts.Add($"highlight_color = [{string.Join(", ", mat.HighlightSpecColor.Select(Num))}]");
+                        parts.Add($"highlight_power = {Num(mat.HighlightSpecPower)}");
+                        parts.Add($"highlight_intensity = {Num(mat.HighlightSpecIntensity)}");
+                        parts.Add($"force_default_opacity = {Num(mat.ForceUseDefaultOpacity)}");
+                        parts.Add($"opacity_depth_distance = {Num(mat.OpacityDepthDistance)}");
+                        parts.Add($"open_depth_distance = {Num(mat.OpenDepthDistance)}");
+                    }
+                    if (mat.ObjectTransLow)
+                    {
+                        parts.Add("object_trans_low = true");
+                        if (mat.ObjectTransLightMaskTexture is not null)
+                            parts.Add($"light_mask_tex = {Quote(mat.ObjectTransLightMaskTexture)}");
+                        if (mat.ObjectTransRampTexture is not null)
+                            parts.Add($"ramp_tex = {Quote(mat.ObjectTransRampTexture)}");
+                        parts.Add($"object_trans_soft_edge = {Num(mat.ObjectTransSoftEdge)}");
+                        parts.Add($"main_color = [{Num(mat.ObjectTransMainColor[0])}, " +
+                                  $"{Num(mat.ObjectTransMainColor[1])}, {Num(mat.ObjectTransMainColor[2])}]");
+                        parts.Add($"main_bright = {Num(mat.ObjectTransMainBright)}");
                     }
                     if (mat.WaterColor1 is { } w1)
                     {
@@ -254,6 +303,15 @@ public static class Manifest
                         parts.Add($"refraction = {Num(mat.Refraction)}");
                         parts.Add($"refract_depth = {Num(mat.RefractDepth)}");
                         parts.Add($"flicker = [{Num(mat.FlickerSpeed)}, {Num(mat.FlickerPower)}]");
+                    }
+                    if (mat.GlassyInner)
+                    {
+                        parts.Add("glassy_inner = true");
+                        parts.Add($"glassy_flow1 = [{string.Join(", ", mat.GlassyFlowColor01.Select(Num))}]");
+                        parts.Add($"glassy_flow2 = [{string.Join(", ", mat.GlassyFlowColor02.Select(Num))}]");
+                        parts.Add($"glassy_fresnel = [{string.Join(", ", mat.GlassyFresnelColor.Select(Num))}]");
+                        parts.Add($"glassy_noise = [{string.Join(", ", mat.GlassyNoiseParams.Select(Num))}]");
+                        parts.Add($"glassy_mask = [{string.Join(", ", mat.GlassyMaskParams.Select(Num))}]");
                     }
                     // 每个键只许出现一次:重复键 TOML 直接解析失败(opacity/flow 都踩过)
                     parts.Add($"opacity = {Num(mat.Opacity)}");

@@ -237,6 +237,42 @@ public static class MaterialProbe
 
     public static void Run(AbstractVfsFileProvider provider, string asset)
     {
+        // 材质 shader 里的 MaterialCollection0/1 只保留缓冲名，不保留资产名。
+        // 把 pak 中所有 MPC 资产连同原始属性顺序列出来，才能用 cb 槽位反向确认是哪一份
+        // collection；这也能区分“资产默认值”和“运行时由蓝图写入”的参数。
+        if (asset.Equals("COLLECTIONS", StringComparison.OrdinalIgnoreCase))
+        {
+            var collections = provider.Files.Values
+                .Select(file => file.Path)
+                .Where(path => path.EndsWith(".uasset", StringComparison.OrdinalIgnoreCase))
+                .Where(path =>
+                {
+                    var name = Path.GetFileNameWithoutExtension(path);
+                    return name.StartsWith("MPC_", StringComparison.OrdinalIgnoreCase)
+                           || name.Equals("Buzhuo_Transfom", StringComparison.OrdinalIgnoreCase)
+                           || name.Equals("EnvParamCollection", StringComparison.OrdinalIgnoreCase);
+                })
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .OrderBy(path => path, StringComparer.OrdinalIgnoreCase)
+                .ToList();
+            Console.WriteLine($"=== Material parameter collections: {collections.Count}");
+            foreach (var path in collections)
+            {
+                var objectPath = path[..path.LastIndexOf('.')];
+                try
+                {
+                    var obj = provider.LoadPackageObject(objectPath);
+                    Console.WriteLine($"\n──── {objectPath} ({obj.ExportType})");
+                    DumpProperties(obj, "  ");
+                }
+                catch (Exception e)
+                {
+                    Console.WriteLine($"\n──── {objectPath}: {e.GetType().Name}: {e.Message}");
+                }
+            }
+            return;
+        }
+
         if (asset == "ALL")
         {
             Survey(provider, int.MaxValue);
@@ -276,6 +312,50 @@ public static class MaterialProbe
             Console.WriteLine("  " + path);
         Console.WriteLine($"  (共 {files.Count} 个文件,其中 Animation/ 下 " +
                           $"{files.Count(p => p.Contains("/Animation/", StringComparison.OrdinalIgnoreCase))} 个)");
+
+        // 名字含 `SKM_` 的资产不一定是几何；例如 `LOD_SKM_*` 实际是
+        // `SkeletalMeshLODSettings`。探针先打印真实导出类型，避免把 LOD 配置误认成
+        // 第二套宠物网格，再把真正的 USkeletalMesh 各内部 LOD 并排列出。
+        if (Environment.GetEnvironmentVariable("PROBE_MESHES") is not null)
+        {
+            Console.WriteLine("\n=== 蒙皮网格候选");
+            foreach (var path in files
+                         .Where(p => p.EndsWith(".uasset", StringComparison.OrdinalIgnoreCase))
+                         .Where(p => Path.GetFileNameWithoutExtension(p)
+                             .Contains("SKM_", StringComparison.OrdinalIgnoreCase))
+                         .Distinct(StringComparer.OrdinalIgnoreCase))
+            {
+                var objectPath = path[..path.LastIndexOf('.')];
+                try
+                {
+                    var obj = provider.LoadPackageObject(objectPath);
+                    if (obj is not USkeletalMesh candidate)
+                    {
+                        Console.WriteLine($"  {Path.GetFileName(objectPath)}: {obj.ExportType}（不是几何）");
+                        continue;
+                    }
+                    Console.WriteLine($"  {candidate.Name}: 材质 {candidate.Materials.Length}, " +
+                                      $"LOD {candidate.LODModels?.Length ?? 0}, " +
+                                      $"bounds={candidate.ImportedBounds.BoxExtent}");
+                    Console.WriteLine("    slots: " + string.Join(", ",
+                        candidate.Materials.Select((m, i) => $"{i}:{m?.Name.Text ?? "(null)"}")));
+                    if (candidate.LODModels is null) continue;
+                    for (var i = 0; i < candidate.LODModels.Length; i++)
+                    {
+                        var lod = candidate.LODModels[i];
+                        Console.WriteLine($"    LOD{i}: vertices={lod.NumVertices} " +
+                                          $"triangles={lod.Sections.Sum(s => s.NumTriangles)} " +
+                                          $"sections=[{string.Join(", ", lod.Sections.Select(s =>
+                                              $"mat{s.MaterialIndex}:{s.NumTriangles}"))}]");
+                    }
+                }
+                catch (Exception e)
+                {
+                    Console.WriteLine($"  {Path.GetFileName(objectPath)}: 读取失败 " +
+                                      $"{e.GetType().Name}: {e.Message}");
+                }
+            }
+        }
 
         // 材质候选:名字含 MI_ 或放在 Mat/ 目录下的 uasset
         var materials = files
@@ -337,6 +417,155 @@ public static class MaterialProbe
             }
         }
         foreach (var w in warnings) Console.WriteLine($"  [warn] {w}");
+
+        // `uexp` 里会同时出现当前实例与父材质的 shader-map 哈希，单纯 memmem 会把它们
+        // 全算成候选。cooked resource 本身保存着 (Quality, FeatureLevel, map hash)，这里把
+        // 真正属于各材质资源的表打印出来，供 matshader.py 精确选排列。
+        if (Environment.GetEnvironmentVariable("PROBE_SHADERS") is not null)
+        {
+            Console.WriteLine("\n=== Cooked shader resources");
+            foreach (var path in materials)
+            {
+                var trimmed = path[..path.LastIndexOf('.')];
+                try
+                {
+                    if (provider.LoadPackageObject(trimmed) is not UMaterialInterface material)
+                        continue;
+                    Console.WriteLine($"  {material.Name}: {material.LoadedMaterialResources.Count} resources");
+                    for (var i = 0; i < material.LoadedMaterialResources.Count; i++)
+                    {
+                        var map = material.LoadedMaterialResources[i].LoadedShaderMap;
+                        if (map is null)
+                        {
+                            Console.WriteLine($"    [{i}] (invalid)");
+                            continue;
+                        }
+                        // `LayoutParams` 紧跟在 (Quality, Feature) 之后读。它是**判偏移对不对的
+                        // 探针**:`MaxFieldAlignment` 该是 0xffffffff 或 4/8,`Flags` 该是个 1..31 的
+                        // 小位掩码。这两个不合理 ⇒ 前面那两个枚举也读错了位置。
+                        // `PROBE_RAWMAP=1`:回到 uexp 的原始字节,把 SHA 之前那几个 int 挖出来。
+                        // **这是核对 (Quality, Feature) 偏移的唯一硬办法** —— CUE4Parse 对
+                        // `GAME_RocoKingdomWorld` 有一步「把两者对调、再跳 16 字节」的特判,
+                        // 而对调之后 FeatureLevel 会解成 SM6,与「整个项目只有一份
+                        // `ShaderArchive-NRC-PCD3D_ES31`」矛盾。
+                        if (Environment.GetEnvironmentVariable("PROBE_RAWMAP") is not null
+                            && map.ShaderMapId.CookedShaderMapIdHash is { } sha)
+                        {
+                            var raw = provider.SaveAsset(trimmed + ".uexp");
+                            var needle = Convert.FromHexString(sha.ToString());
+                            for (var at = 0; at + needle.Length <= raw.Length; at++)
+                            {
+                                var hit = true;
+                                for (var k = 0; k < needle.Length && hit; k++)
+                                    if (raw[at + k] != needle[k]) hit = false;
+                                if (!hit) continue;
+                                var from = Math.Max(0, at - 24);
+                                Console.WriteLine($"      raw@{at}: 前 24 字节 = " +
+                                                  Convert.ToHexString(raw.AsSpan(from, at - from)) +
+                                                  "  后 8 字节 = " +
+                                                  Convert.ToHexString(raw.AsSpan(at + needle.Length,
+                                                      Math.Min(8, raw.Length - at - needle.Length))));
+                                break;
+                            }
+                        }
+                        // **CUE4Parse 的 `GAME_RocoKingdomWorld` 特判会把这两个字段对调,
+                        // 而对我们这份包来说那是反的 —— 这里换回来。** 核对过程见
+                        // docs/design.md §1.1「排列标签」那节:SHA 之前的 24 字节是 6 个 uint32,
+                        //     [第一个 int: 0 或 4 交替] [第二个 int: 恒 1] [1] [0xFFFFFFFF] [每两条 +1] [0]
+                        // 而 SHA 之后紧跟 `08000000 29000000`(= MaxFieldAlignment 8 / Flags 0x29),
+                        // 说明偏移本身没错。不对调 ⇒ quality ∈ {Low(0), Num(4)}、feature = 1 = ES3_1,
+                        // 与「整个项目只有一份 `ShaderArchive-NRC-PCD3D_ES31`」一致;
+                        // 对调 ⇒ feature 会解成 SM6,一个跑 ES3.1 的手游不会 cook 那个。
+                        var quality = (EMaterialQualityLevel) (int) map.ShaderMapId.FeatureLevel;
+                        var feature = (ERHIFeatureLevel) (int) map.ShaderMapId.QualityLevel;
+                        var layout = map.ShaderMapId.LayoutParams;
+                        Console.WriteLine(
+                            $"    [{i}] quality={quality} feature={feature} " +
+                            $"align=0x{layout?.MaxFieldAlignment:X} flags={layout?.Flags} " +
+                            $"map={map.ShaderMapId.CookedShaderMapIdHash} " +
+                            $"resource={map.ResourceHash}");
+                        var detailIndexText = Environment.GetEnvironmentVariable("PROBE_SHADER_INDEX");
+                        var wantsDetails = Environment.GetEnvironmentVariable("PROBE_SHADER_DETAILS") is not null
+                                           && (detailIndexText is null
+                                               || int.TryParse(detailIndexText, out var detailIndex)
+                                               && detailIndex == i);
+                        if (wantsDetails)
+                        {
+                            // 贴图参数数组的顺序就是材质 uniform-expression 的绑定顺序。
+                            // 配合 DXBC 的 t 槽可以区分 BaseTex / MaskTex / RampTex；只按
+                            // CachedReferencedTextures 猜顺序会把引擎纹理与材质纹理混在一起。
+                            if (map.Content is not FMaterialShaderMapContent materialContent)
+                                continue;
+                            var expressions = materialContent.MaterialCompilationOutput.UniformExpressionSet;
+                            Console.WriteLine(
+                                $"      uniforms: vector={expressions.UniformVectorPreshaders.Length} " +
+                                $"scalar={expressions.UniformScalarPreshaders.Length}");
+                            Console.WriteLine("      collections: " + string.Join(", ",
+                                expressions.ParameterCollections.Select(guid => guid.ToString())));
+                            foreach (var (parameter, parameterIndex) in
+                                     expressions.UniformVectorParameters.Select((value, index) => (value, index)))
+                            {
+                                var name = parameter.ParameterInfo?.Name.Text
+                                           ?? parameter.ParameterName
+                                           ?? "(unnamed)";
+                                var value = parameter.DefaultValue;
+                                Console.WriteLine(
+                                    $"      vector-param[{parameterIndex}] {name}=" +
+                                    $"({value.R:0.######},{value.G:0.######}," +
+                                    $"{value.B:0.######},{value.A:0.######})");
+                            }
+                            foreach (var (parameter, parameterIndex) in
+                                     expressions.UniformScalarParameters.Select((value, index) => (value, index)))
+                            {
+                                var name = parameter.ParameterInfo?.Name.Text
+                                           ?? parameter.ParameterName
+                                           ?? "(unnamed)";
+                                Console.WriteLine(
+                                    $"      scalar-param[{parameterIndex}] {name}={parameter.DefaultValue:0.######}");
+                            }
+                            var preshaderData = expressions.UniformPreshaderData.Data;
+                            foreach (var (header, slot) in
+                                     expressions.UniformVectorPreshaders.Select((value, index) => (value, index)))
+                            {
+                                Console.WriteLine(
+                                    $"      vector-slot[{slot}] off={header.OpcodeOffset} " +
+                                    $"size={header.OpcodeSize} code=" +
+                                    Convert.ToHexString(preshaderData.AsSpan(
+                                        checked((int) header.OpcodeOffset), checked((int) header.OpcodeSize))));
+                            }
+                            foreach (var (header, scalarIndex) in
+                                     expressions.UniformScalarPreshaders.Select((value, index) => (value, index)))
+                            {
+                                Console.WriteLine(
+                                    $"      scalar-slot[{scalarIndex}] off={header.OpcodeOffset} " +
+                                    $"size={header.OpcodeSize} code=" +
+                                    Convert.ToHexString(preshaderData.AsSpan(
+                                        checked((int) header.OpcodeOffset), checked((int) header.OpcodeSize))));
+                            }
+                            for (var textureType = 0;
+                                 textureType < expressions.UniformTextureParameters.Length;
+                                 textureType++)
+                            {
+                                foreach (var texture in expressions.UniformTextureParameters[textureType])
+                                {
+                                    var parameter = texture.ParameterInfo?.Name.Text
+                                                    ?? texture.ParameterName
+                                                    ?? "(unnamed)";
+                                    Console.WriteLine(
+                                        $"      tex[{textureType}] {parameter}: " +
+                                        $"index={texture.TextureIndex} sampler={texture.SamplerSource}");
+                                }
+                            }
+                        }
+                    }
+                }
+                catch (Exception e)
+                {
+                    Console.WriteLine($"  {Path.GetFileName(trimmed)}: shader resource 读取失败: " +
+                                      $"{e.GetType().Name}: {e.Message}");
+                }
+            }
+        }
 
         if (Environment.GetEnvironmentVariable("PROBE_RAW") is null)
         {
@@ -423,6 +652,10 @@ public static class MaterialProbe
         {
             case FStructFallback fallback:
                 DumpTags(fallback.Properties, indent, depth);
+                break;
+            case FLinearColor color:
+                Console.WriteLine($"{indent}({color.R:0.######}, {color.G:0.######}, " +
+                                  $"{color.B:0.######}, {color.A:0.######})");
                 break;
             case null:
                 Console.WriteLine($"{indent}(null)");
