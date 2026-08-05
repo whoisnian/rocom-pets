@@ -43,6 +43,50 @@ Engine/GlobalShaderCache-PCD3D_ES31.bin
 | ③ 反汇编 | `scripts/dxbcdis.c`(winegcc + wine) | DXBC → `ps_5_0` 汇编 |
 | ④ 对语义 | `scripts/dxbcsig.py` | 汇编里的 `vN`/`oN` → `TEXCOORD3` 这种语义名 |
 
+**精确定位「实机跑的是哪条排列」—— 链路两端已经接上(2026-08-06)**
+
+    # ① 探针列出这个材质的全部 cooked resource
+    PROBE_SHADERS=1 dotnet run --project exporter -c Release -- --probe-material <资产>
+    #    每条打印 quality / feature / map= / resource=
+    #    36 条 = 18 个排列 × {Low, Num},**偶数下标恒为 quality=Low**
+    # ② 把 quality=Low 那条的 `resource=` 填给 matshader
+    uv run python scripts/matshader.py <archive> <材质>.uexp --resource <ResourceHash>
+
+**这里有个必踩一次的坑**:探针的 `map=`(`CookedShaderMapIdHash`)在存档里**查不到**;
+能对上存档 map 哈希的是 `resource=`(`ResourceHash`)。两个都是 SHA1、长得一模一样。
+(实测:矮脚爬爬 `_By` 的 12 条 Low,按 `ResourceHash` 全部命中存档序号
+160/1207/2439/4673/1622/2265/5447/3908/692/3972/3193/3945,按 `CookedShaderMapIdHash` 一条都对不上。)
+
+**探针的 quality/feature 标签曾经是反的**,已修:CUE4Parse 对 `GAME_RocoKingdomWorld`
+会把这两个字段对调,而对我们这份包是反的 —— 详见 design.md §1.1「排列标签」那节,
+`PROBE_RAWMAP=1` 能随时回到原始字节复核。
+
+**cb 槽位 ↔ 参数名:直接从 cooked resource 拿,不用再捞冻结块(2026-08-06)**
+
+    PROBE_SHADERS=1 PROBE_SHADER_DETAILS=1 PROBE_SHADER_INDEX=<偶数下标> \
+      dotnet run --project exporter -c Release -- --probe-material <资产>
+
+打印三样按 resource 分开的东西:`vector-param[i]` / `scalar-param[i]`(名字 + 默认值)、
+以及 `vector-slot[N]`(= **`cb6[N]` 的表达式字节码**)。字节码里的 `03 <u16>` / `04 <u16>`
+就是上面两张表的下标,opcode 表见 `scripts/uniexpr.py`。
+
+验证过:矮脚爬爬 `_By` 的 `vector-slot[7]` 解出来是 `Glow Color × Glow Intensity`,
+与当年靠冻结块 + 配对规则啃出来的 `cb6[7]` 一致。**`uniexpr.py`/`matparams.py` 那套
+「冻结块 + V = 1 + 最后一个 ≥3 分量的 cb 槽」经验规则,对能定位到 resource 的材质不再需要。**
+
+⚠ **先选对排列再看槽位** —— 表达式集是**按 resource 分开的**。当年「`FUniformExpressionSet`
+不在包里」那条结论是错的:要的是 V=89(那条 High 的 68869),而目标 Low resource 只有
+`vector=30`,自然对不上。
+
+**还没通的是贴图槽**:`UniformTextureParameters` 是空的,DXBC 又被剥了 `RDEF` ——
+「t 槽 ↔ 贴图参数名」两条路都断着。
+
+**反汇编那一步**(`winegcc -o dxbcdis.exe scripts/dxbcdis.c` + `wine ./dxbcdis.exe *.dxbc`)
+对本作导出的 shader **拿不到贴图名** —— 存档里的 DXBC 只剩 `ISGN` / `OSGN` / `SHEX` 三段,
+`RDEF`(资源绑定表,带参数名)被剥掉了。所以「t 槽 ↔ 参数名」只能靠
+`UniformTextureParameters` 的绑定顺序(探针的 `PROBE_SHADER_DETAILS`)去配,不能指望反汇编。
+
+
 ### ① 取 shader
 
 ```sh

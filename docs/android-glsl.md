@@ -660,7 +660,7 @@ mul r7.xyz, r7.xyzx, cb6[15].xyzx
 | `0x05` | **Add** | 由 0x06/0x07 夹出 |
 | `0x06` | **Sub** | `t ⊖ 1` 不能是 Mul/Div(否则冗余) |
 | `0x07` | **Mul** | 标量 × 向量那处 |
-| `0x08` | Div | 顺位(未单独验证) |
+| `0x08` | **Div** | `M_ShuiMu_ByIn` 的 preshader 槽为 `1, 1, GlassyNoiseRefract, Add, Div`，结果作为 `refract` 的 eta；代实例值 0.2 得到 `1/1.2=0.833333`，与 71636 的折射式一致 |
 
 ⇒ `cb6[118].z = CustomColorORMatcapColor + PointLightIntLocal = 0 + 1 = **1**`,
 即 `lerp(1, filmic_inv(c), 1) = filmic_inv(c)` —— **这一项是全开的,不是空操作**。
