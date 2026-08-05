@@ -14,17 +14,25 @@ pub struct PetTarget {
     color: wgpu::Texture,
     color_view: wgpu::TextureView,
     depth_view: wgpu::TextureView,
+    depth_bind: wgpu::BindGroup,
     format: wgpu::TextureFormat,
 }
 
 impl PetTarget {
-    pub fn new(device: &wgpu::Device, format: wgpu::TextureFormat, size: (u32, u32)) -> Self {
+    pub fn new(
+        device: &wgpu::Device,
+        format: wgpu::TextureFormat,
+        size: (u32, u32),
+        pet: &PetGpu,
+    ) -> Self {
         let (color, color_view, depth_view) = create(device, format, size);
+        let depth_bind = pet.bind_scene_depth(device, &depth_view);
         Self {
             size,
             color,
             color_view,
             depth_view,
+            depth_bind,
             format,
         }
     }
@@ -43,16 +51,18 @@ impl PetTarget {
     }
 
     /// 宠物在屏幕上的显示尺寸变了(缩放/换形态)就重建。
-    pub fn resize(&mut self, device: &wgpu::Device, size: (u32, u32)) -> bool {
+    pub fn resize(&mut self, device: &wgpu::Device, size: (u32, u32), pet: &PetGpu) -> bool {
         let size = (size.0.max(1), size.1.max(1));
         if size == self.size {
             return false;
         }
         let (color, color_view, depth_view) = create(device, self.format, size);
+        let depth_bind = pet.bind_scene_depth(device, &depth_view);
         self.size = size;
         self.color = color;
         self.color_view = color_view;
         self.depth_view = depth_view;
+        self.depth_bind = depth_bind;
         true
     }
 
@@ -84,7 +94,31 @@ impl PetTarget {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            pet.draw(&mut pass, true);
+            pet.draw_opaque(&mut pass, true);
+        }
+        {
+            // 深度不再写，只作为 attachment 做遮挡测试并由 shader 采样做 depth-fade。
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("pet-translucent"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &self.color_view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &self.depth_view,
+                    depth_ops: None,
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pet.draw_translucent(&mut pass, &self.depth_bind);
         }
         queue.submit(Some(encoder.finish()));
     }
@@ -120,7 +154,7 @@ fn create(
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
         format: DEPTH_FORMAT,
-        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
         view_formats: &[],
     });
     let color_view = color.create_view(&wgpu::TextureViewDescriptor::default());

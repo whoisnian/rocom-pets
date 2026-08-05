@@ -132,8 +132,39 @@ struct RawMaterial {
     emissive: Option<[f32; 3]>,
     #[serde(default)]
     emissive_intensity: f32,
-    #[serde(default = "three")]
+    #[serde(default = "default_rim_power")]
     rim_power: f32,
+    #[serde(default = "default_rim_soft_edge")]
+    rim_soft_edge: f32,
+    /// `M_P_Object_Trans` 的高光/alpha 覆盖参数。旧包缺字段时退回根材质默认值。
+    #[serde(default)]
+    highlight_offset: Option<[f32; 3]>,
+    #[serde(default)]
+    highlight_color: Option<[f32; 3]>,
+    #[serde(default = "default_highlight_power")]
+    highlight_power: f32,
+    #[serde(default = "one")]
+    highlight_intensity: f32,
+    #[serde(default)]
+    force_default_opacity: f32,
+    /// `M_P_Object_Trans` 场景深度淡化距离(UE 厘米)与开启强度。
+    #[serde(default)]
+    opacity_depth_distance: f32,
+    #[serde(default)]
+    open_depth_distance: f32,
+    /// 精确父材质 `MI_P_Object_Trans` 在目标 ES3.1/Low 排列中的局部着色链。
+    #[serde(default)]
+    object_trans_low: bool,
+    #[serde(default)]
+    light_mask_tex: Option<String>,
+    #[serde(default)]
+    ramp_tex: Option<String>,
+    #[serde(default = "default_object_trans_soft_edge")]
+    object_trans_soft_edge: f32,
+    #[serde(default)]
+    main_color: Option<[f32; 3]>,
+    #[serde(default = "one")]
+    main_bright: f32,
     #[serde(default)]
     noise_uv: Option<[f32; 4]>,
     /// 基色 alpha 是不透明度(而不是纹路遮罩)——静态开关 `Opacity or OpacityMask` 开着的那批
@@ -157,6 +188,21 @@ struct RawMaterial {
     refraction: f32,
     #[serde(default)]
     refract_depth: f32,
+    /// `M_ShuiMu_ByIn` 的独立材质分支。参数来自 shader 71636 对应的根材质默认/实例覆盖。
+    #[serde(default)]
+    glassy_inner: bool,
+    #[serde(default)]
+    glassy_flow1: Option<[f32; 4]>,
+    #[serde(default)]
+    glassy_flow2: Option<[f32; 4]>,
+    #[serde(default)]
+    glassy_fresnel: Option<[f32; 4]>,
+    /// [GlassyNoiseSpeed, UVScale, Refract, Depth]
+    #[serde(default)]
+    glassy_noise: Option<[f32; 4]>,
+    /// [FresnelMaskPow, Offset, Smooth, TriPlannarBlendInt]
+    #[serde(default)]
+    glassy_mask: Option<[f32; 4]>,
 }
 
 #[derive(Deserialize)]
@@ -172,9 +218,21 @@ fn one() -> f32 {
     1.0
 }
 
-/// 边缘光衰减次数的缺省:pow(1-N·V, 3) 是我们原来写死的那圈细边。
-fn three() -> f32 {
-    3.0
+/// `M_P_Object_Trans` 根材质的原始默认值。
+fn default_rim_power() -> f32 {
+    0.4
+}
+
+fn default_rim_soft_edge() -> f32 {
+    0.3
+}
+
+fn default_highlight_power() -> f32 {
+    10.0
+}
+
+fn default_object_trans_soft_edge() -> f32 {
+    0.5
 }
 
 // manifest 是契约的一部分:这些字段现在还没人读(形态切换/行为要用),但照着 schema
@@ -224,6 +282,24 @@ pub struct Material {
     pub emissive_intensity: f32,
     /// 边缘光的衰减次数。**小于 1 = 整片泛色**(幽星光的球 0.35),不是一圈细边。
     pub rim_power: f32,
+    pub rim_soft_edge: f32,
+    /// 高光方向偏移(xyz,已由 UE Z-up 换成 glTF Y-up)、颜色、次数与强度。
+    pub highlight_offset: [f32; 3],
+    pub highlight_color: [f32; 3],
+    pub highlight_power: f32,
+    pub highlight_intensity: f32,
+    /// `ForceUseDefOpacity`:1 时强制只用基色 alpha,0 时保留高光覆盖。
+    pub force_default_opacity: f32,
+    /// 场景深度淡化距离(UE 厘米)与开启强度；原材质参数原样保留。
+    pub opacity_depth_distance: f32,
+    pub open_depth_distance: f32,
+    /// 目标实机 Low `MI_P_Object_Trans` 的 BaseTex/MaskTex/RampTex 局部链。
+    pub object_trans_low: bool,
+    pub light_mask: Option<PathBuf>,
+    pub ramp: Option<PathBuf>,
+    pub object_trans_soft_edge: f32,
+    pub main_color: [f32; 3],
+    pub main_bright: f32,
     /// 假半透族星点层:[速度X, 速度Y, 强度, 是否用 UV0]。见 pet.wgsl 的 stick_layer。
     pub noise_uv: [f32; 4],
     /// **基色贴图的 alpha 是不透明度**(不是纹路遮罩)。判据是静态开关 `Opacity or OpacityMask`,
@@ -251,6 +327,19 @@ pub struct Material {
     pub refract_depth: f32,
     /// 球内那颗星的闪烁:[速度, 次数](`FlickerSpeed`/`FlickerPower`)。
     pub flicker: [f32; 2],
+    /// `M_ShuiMu_ByIn` 的原始流动内胆；`None` 表示走普通纯特效/基色路径。
+    pub glassy_inner: Option<GlassyInner>,
+}
+
+/// `M_ShuiMu_ByIn` 的材质局部链。字段顺序对应 71636 的原始参数；`noise.z` 是
+/// `GlassyNoiseRefract`，shader 再按 preshader 原式求 `1 / (1 + noise.z)`。
+#[derive(Clone)]
+pub struct GlassyInner {
+    pub flow1: [f32; 4],
+    pub flow2: [f32; 4],
+    pub fresnel: [f32; 4],
+    pub noise: [f32; 4],
+    pub mask: [f32; 4],
 }
 
 /// 特效层(火焰/水壳/光晕)的画法参数,全部来自游戏材质。
@@ -595,10 +684,7 @@ impl Pack {
                             Material {
                                 base_color: mat.base_color.map(|rel| root.join(rel)),
                                 mask_alpha: mat.mask_alpha,
-                                face: mat
-                                    .parents
-                                    .iter()
-                                    .any(|p| p.contains("P_Eyes")),
+                                face: mat.parents.iter().any(|p| p.contains("P_Eyes")),
                                 effect: Effect {
                                     // 没给主色就用白,至少形体在
                                     tint: mat.tint.unwrap_or([1.0; 4]),
@@ -623,6 +709,20 @@ impl Pack {
                                 emissive: mat.emissive.unwrap_or([0.0; 3]),
                                 emissive_intensity: mat.emissive_intensity,
                                 rim_power: mat.rim_power,
+                                rim_soft_edge: mat.rim_soft_edge,
+                                highlight_offset: mat.highlight_offset.unwrap_or([0.0; 3]),
+                                highlight_color: mat.highlight_color.unwrap_or([1.0; 3]),
+                                highlight_power: mat.highlight_power,
+                                highlight_intensity: mat.highlight_intensity,
+                                force_default_opacity: mat.force_default_opacity,
+                                opacity_depth_distance: mat.opacity_depth_distance,
+                                open_depth_distance: mat.open_depth_distance,
+                                object_trans_low: mat.object_trans_low,
+                                light_mask: mat.light_mask_tex.map(|rel| root.join(rel)),
+                                ramp: mat.ramp_tex.map(|rel| root.join(rel)),
+                                object_trans_soft_edge: mat.object_trans_soft_edge,
+                                main_color: mat.main_color.unwrap_or([1.0; 3]),
+                                main_bright: mat.main_bright,
                                 noise_uv: mat.noise_uv.unwrap_or([0.0, 0.0, 1.0, 1.0]),
                                 alpha_opacity: mat.alpha_opacity,
                                 flow: mat.flow_tex.map(|rel| root.join(rel)),
@@ -635,6 +735,14 @@ impl Pack {
                                 refraction: mat.refraction,
                                 refract_depth: mat.refract_depth,
                                 flicker: mat.flicker.unwrap_or([0.3, 5.0]),
+                                glassy_inner: mat.glassy_inner.then(|| GlassyInner {
+                                    flow1: mat.glassy_flow1.unwrap_or([1.0; 4]),
+                                    flow2: mat.glassy_flow2.unwrap_or([1.0; 4]),
+                                    fresnel: mat.glassy_fresnel.unwrap_or([1.0; 4]),
+                                    // 旧包若只带开关而缺数组,退回游戏根材质的原始默认值。
+                                    noise: mat.glassy_noise.unwrap_or([-0.1, 1.0, 0.2, 30.0]),
+                                    mask: mat.glassy_mask.unwrap_or([1.0, 0.7, 0.1, 0.0]),
+                                }),
                             },
                         )
                     })

@@ -23,18 +23,17 @@ pub struct Vertex {
     pub uv: [f32; 2],
     pub joints: [u16; 4],
     pub weights: [f32; 4],
-    /// 玻璃内部层的采样起点 `(UV1.x, UV1.y, UV2.x)`。
+    /// 预蒙皮局部位置。玻璃内部/果冻内胆的折射起点都取它。
     ///
-    /// **这三个分量是从 shader 里查出来的,不是挑的**:反汇编 `MI_P_Object_Trans_MatCap` 的
-    /// 片元着色器,内部层的起点是 `r4.xy = v2.zw; r4.z = v3.x`;再解 DXBC 的 `ISGN` 签名段,
-    /// `v2` = TEXCOORD0、`v3` = TEXCOORD1,而 UE 把材质的 UV 两两打包进插值器
-    /// (TEXCOORD0 = UV0.xy + UV1.xy,TEXCOORD1 = UV2.xy + UV3.xy)—— 于是就是这三个。
+    /// 这里有配套顶点 shader 的直接证据，不再靠 `TEXCOORDn` 名字猜 UV 集：
+    /// `M_ShuiMu_ByIn` 的 VS 21175 把解码后的局部位置写到 `o2.xy/o3.x`，PS 71636
+    /// 原样读成起点；果冻外壳的 VS 31053 与 PS 68869 也是同一组写入/读取。
+    /// 后三项才是输入法线 `ATTRIBUTE2.xyz`。旧代码把这些打包插值槽误认成 UV1/UV2。
     ///
-    /// 实测幽星光那两颗球 UV1 恒为 0、UV2.x 每颗球一个区间,所以起点几乎是**每颗球一个常量**,
-    /// 空间变化全来自「折射方向 × 深度」。这正好解释实机为什么每颗球都稳定居中一颗星、
-    /// 而且两颗球各是星和圆点(起点不同 → 落在星场的不同格)。
-    /// 之前我拿模型空间位置当起点,画出来就是「一颗被拉伸的星贴在表面」。
-    pub interior_pos: [f32; 3],
+    /// **注意这一层离对上实机还很远**:幽星光那两颗球实机是「红球 + 居中的大号黄色四角星
+    /// /圆点」,而我们两种起点画出来都只是几点很淡的紫色斑 —— 换回 UV1/UV2 那版连斑都没有。
+    /// 见 docs/design.md 的待办表。
+    pub local_pos: [f32; 3],
 }
 
 /// 一段网格:对应一个材质槽(宠物一般 2–3 个:本体/眼/嘴)。
@@ -78,6 +77,21 @@ pub struct Material {
     pub emissive: [f32; 3],
     pub emissive_intensity: f32,
     pub rim_power: f32,
+    pub rim_soft_edge: f32,
+    pub highlight_offset: [f32; 3],
+    pub highlight_color: [f32; 3],
+    pub highlight_power: f32,
+    pub highlight_intensity: f32,
+    pub force_default_opacity: f32,
+    /// `M_P_Object_Trans` 的场景深度淡化:[距离(米),开启强度]。
+    pub depth_fade: [f32; 2],
+    /// 目标实机 ES3.1/Low、精确父材质 `MI_P_Object_Trans` 的局部着色输入。
+    pub object_trans_low: bool,
+    pub light_mask: Option<Image>,
+    pub ramp: Option<Image>,
+    pub object_trans_soft_edge: f32,
+    pub main_color: [f32; 3],
+    pub main_bright: f32,
     /// 假半透族星点层:[速度X, 速度Y, 强度, 是否用 UV0]。
     pub noise_uv: [f32; 4],
     /// 基色 alpha 是不透明度(见 `pack::Material::alpha_opacity`)。
@@ -96,6 +110,9 @@ pub struct Material {
     /// march 深度(`GlobalDepth`)与闪烁 [速度, 次数];量纲见 `pack::Material`。
     pub refract_depth: f32,
     pub flicker: [f32; 2],
+    /// `M_ShuiMu_ByIn` 的专用局部材质链；`noise.z` 保留资源中的
+    /// `GlassyNoiseRefract` 原值，GPU 按 uniform preshader 求折射 eta。
+    pub glassy_inner: Option<GlassyInner>,
     /// 特效层的画法(火焰/水壳/光晕)。`None` = 普通不透明材质,走主通道。
     pub effect: Option<EffectMaterial>,
 }
@@ -121,6 +138,17 @@ pub struct EffectMaterial {
     pub mask_matcap: bool,
     pub mask: Option<Image>,
     pub noise: Option<Image>,
+}
+
+#[derive(Clone, Copy)]
+pub struct GlassyInner {
+    pub flow1: [f32; 4],
+    pub flow2: [f32; 4],
+    pub fresnel: [f32; 4],
+    /// [速度, UV 尺度, 折射率, 深度]
+    pub noise: [f32; 4],
+    /// [Fresnel 次数, 阈值起点, 过渡宽度, 三向混合强度]
+    pub mask: [f32; 4],
 }
 
 pub struct Image {
@@ -316,15 +344,6 @@ impl Model {
                 .read_tex_coords(0)
                 .map(|it| it.into_f32().collect())
                 .unwrap_or_else(|| vec![[0.0, 0.0]; positions.len()]);
-            // UV1 / UV2:玻璃内部层的采样起点(见 `Vertex::interior_pos`)
-            let uv1: Vec<[f32; 2]> = reader
-                .read_tex_coords(1)
-                .map(|it| it.into_f32().collect())
-                .unwrap_or_else(|| vec![[0.0, 0.0]; positions.len()]);
-            let uv2: Vec<[f32; 2]> = reader
-                .read_tex_coords(2)
-                .map(|it| it.into_f32().collect())
-                .unwrap_or_else(|| vec![[0.0, 0.0]; positions.len()]);
             let joint_ids: Vec<[u16; 4]> = reader
                 .read_joints(0)
                 .context("缺 JOINTS_0")?
@@ -344,7 +363,7 @@ impl Model {
                     uv: uvs[i],
                     joints: joint_ids[i],
                     weights: weights[i],
-                    interior_pos: [uv1[i][0], uv1[i][1], uv2[i][0]],
+                    local_pos: positions[i],
                 });
             }
             let first_index = indices.len() as u32;
@@ -403,6 +422,24 @@ impl Model {
                     emissive: spec.emissive,
                     emissive_intensity: spec.emissive_intensity,
                     rim_power: spec.rim_power,
+                    rim_soft_edge: spec.rim_soft_edge,
+                    highlight_offset: spec.highlight_offset,
+                    highlight_color: spec.highlight_color,
+                    highlight_power: spec.highlight_power,
+                    highlight_intensity: spec.highlight_intensity,
+                    force_default_opacity: spec.force_default_opacity,
+                    depth_fade: [spec.opacity_depth_distance * 0.01, spec.open_depth_distance],
+                    object_trans_low: spec.object_trans_low,
+                    // MaskTex 是数据贴图，保持线性字节；RampTex/BaseTex 是颜色贴图，
+                    // shader 会按游戏原采样链显式做 sRGB 解码。
+                    light_mask: spec
+                        .light_mask
+                        .as_deref()
+                        .and_then(|p| load_texture(p, true)),
+                    ramp: spec.ramp.as_deref().and_then(|p| load_texture(p, true)),
+                    object_trans_soft_edge: spec.object_trans_soft_edge,
+                    main_color: spec.main_color,
+                    main_bright: spec.main_bright,
                     noise_uv: spec.noise_uv,
                     alpha_opacity: spec.alpha_opacity,
                     flow: spec.flow.as_deref().and_then(|p| load_texture(p, true)),
@@ -415,6 +452,13 @@ impl Model {
                     refraction: spec.refraction,
                     refract_depth: spec.refract_depth,
                     flicker: spec.flicker,
+                    glassy_inner: spec.glassy_inner.as_ref().map(|g| GlassyInner {
+                        flow1: g.flow1,
+                        flow2: g.flow2,
+                        fresnel: g.fresnel,
+                        noise: g.noise,
+                        mask: g.mask,
+                    }),
                     effect,
                 });
                 materials.len() - 1
@@ -873,7 +917,7 @@ fn animated_bounds(
         }
     }
     if sampled.is_empty() {
-        return bind;    // 零动画形态:渲的就是绑定姿势
+        return bind; // 零动画形态:渲的就是绑定姿势
     }
 
     // **基准按「每段动作各自的姿势中心中位数」取,不是绑定盒中心、也不是全局中位数。**
@@ -906,7 +950,13 @@ fn animated_bounds(
     }
     let base_of: Vec<Vec3> = per_clip
         .iter()
-        .map(|idx| if idx.is_empty() { Vec3::ZERO } else { median3(idx) })
+        .map(|idx| {
+            if idx.is_empty() {
+                Vec3::ZERO
+            } else {
+                median3(idx)
+            }
+        })
         .collect();
 
     // **取景盒不拿绑定盒当种子。** 运行时显示的永远是某个动作的姿势,绑定姿势只在

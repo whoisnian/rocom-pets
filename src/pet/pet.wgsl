@@ -16,8 +16,10 @@ struct Camera {
     outline_width: f32,
     // 秒;特效层的 UV 卷动靠它推进
     time: f32,
-    // ⚠ `vec2<f32>` 按 8 字节对齐:这里它落在 88 而不是紧挨着 time 的 84。
-    // Rust 那边必须留一个 f32 的填充,否则两侧错开一个字段(见 gpu.rs 的说明)。
+    // 是否选择高材质质量排列。目标实机为 Low；它实际绑定了 MobileDirectionalLight，
+    // 但所选 `M_P_Object_Trans` shader map 仍没有 StarStick 采样块。
+    high_material_quality: f32,
+    // ⚠ `vec2<f32>` 按 8 字节对齐:这里落在 88。
     // 表情:脸那两个材质的 UV 偏移(整格)。**每只一份**,所以放在这儿而不是材质里 ——
     // 材质是按形态共享的,同一个形态的两只可以是两种表情。
     face_uv: vec2<f32>,
@@ -46,7 +48,11 @@ struct MaterialParams {
     // 自发光:`Emitter Color`(rgb,线性)+ `Emitter Intensity`(a);a = 0 时整层不画
     emissive: vec4<f32>,
     rim_color: vec4<f32>,
-    // [边缘光衰减次数, 色带混入强度, -, 有没有色带]
+    // HighLight Offset(xyz,已换成 glTF Y-up)+ HighLightSpecPow
+    highlight: vec4<f32>,
+    // HighLight SpecCol(rgb)+ HighLight SpecInt
+    highlight_color: vec4<f32>,
+    // [Rim Power, 色带混入强度, Rim Soft Edge, 有没有色带]
     extra: vec4<f32>,
     // 玻璃内部那层:[折射率, GlobalDepth, 闪烁速度, 有没有内部层]
     interior: vec4<f32>,
@@ -59,6 +65,16 @@ struct MaterialParams {
     mask_id: vec4<f32>,
     /// 假半透族星点层:[速度X, 速度Y, 强度, 是否用 UV0]
     noise_uv: vec4<f32>,
+    // `M_ShuiMu_ByIn` 专用参数；顺序与 Rust 的 MaterialUniform 完全一致。
+    glassy_flow1: vec4<f32>,
+    glassy_flow2: vec4<f32>,
+    glassy_fresnel: vec4<f32>,
+    // [GlassyNoiseSpeed, UVScale, GlassyNoiseRefract 原参数, Depth]
+    glassy_noise: vec4<f32>,
+    // [FresnelMaskPow, Offset, Smooth, TriPlannarBlendInt]
+    glassy_mask: vec4<f32>,
+    // `M_P_Object_Trans`:[场景深度距离(米),开启强度,走目标 Low 局部链,SoftEdge]
+    depth_fade: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> camera: Camera;
@@ -77,6 +93,14 @@ struct MaterialParams {
 @group(1) @binding(6) var interior_tex: texture_2d<f32>;
 // 色带的 ID 遮罩(`MaskTex`,ID 在 alpha 里);没有就是 1×1 白图
 @group(1) @binding(7) var mask_id_tex: texture_2d<f32>;
+// 目标 ES3.1/Low `MI_P_Object_Trans` 的 t3/t4。RampTex 在 cooked uniform
+// expression 中明确使用 clamp sampler，不能复用其它贴图的 repeat sampler。
+@group(1) @binding(8) var light_mask_tex: texture_2d<f32>;
+@group(1) @binding(9) var ramp_tex: texture_2d<f32>;
+@group(1) @binding(10) var ramp_sampler: sampler;
+// 第一遍不透明材质留下的场景深度；半透明材质按原 shader 的
+// `OpacityDepthDistance` 计算与后方实体/背景的距离。
+@group(2) @binding(0) var scene_depth: texture_depth_2d;
 
 struct VsIn {
     @location(0) pos: vec3<f32>,
@@ -84,16 +108,16 @@ struct VsIn {
     @location(2) uv: vec2<f32>,
     @location(3) joint_ids: vec4<u32>,
     @location(4) weights: vec4<f32>,
-    // 玻璃内部层的采样起点 (UV1.x, UV1.y, UV2.x),见 model.rs 的 `interior_pos`
-    @location(5) interior_pos: vec3<f32>,
+    // 预蒙皮局部位置。原 VS 21175/31053 明确把它传给折射材质。
+    @location(5) local_pos: vec3<f32>,
 };
 
 struct VsOut {
     @builtin(position) clip: vec4<f32>,
     @location(0) uv: vec2<f32>,
     @location(1) normal: vec3<f32>,
-    // 玻璃内部层的采样起点(直接透传顶点属性)
-    @location(2) interior_pos: vec3<f32>,
+    // 折射材质的预蒙皮局部起点。
+    @location(2) local_pos: vec3<f32>,
     // **物体空间**的法线与视线:玻璃内部层的折射必须在这个空间里算(见 `interior_star`)
     @location(3) local_normal: vec3<f32>,
     @location(4) local_view: vec3<f32>,
@@ -121,7 +145,7 @@ fn skin(input: VsIn) -> VsOut {
     out.ndc = out.clip.xy / max(out.clip.w, 1e-6);
     out.uv = input.uv;
     out.normal = normal;
-    out.interior_pos = input.interior_pos;
+    out.local_pos = input.local_pos;
     // **物体空间**:法线取**未蒙皮**的顶点法线(它是烘死在网格里的,不随动画变),
     // 视线取模型空间的那份。
     //
@@ -153,7 +177,7 @@ fn vs_outline(input: VsIn) -> VsOut {
     out.ndc = out.clip.xy / max(out.clip.w, 1e-6);
     out.uv = input.uv;
     out.normal = normal;
-    out.interior_pos = input.interior_pos;
+    out.local_pos = input.local_pos;
     out.local_normal = normalize(input.normal);
     out.local_view = vec3<f32>(0.0, 0.0, 1.0);
     return out;
@@ -269,6 +293,7 @@ const EMISSIVE_FRESNEL: f32 = 1.0;
 /// 注意 **W = 1 是恒等**(extended Reinhard 在白点 1 时不压缩),别拿它当「开启」。
 const SHOULDER_WHITE: f32 = 1.5;
 
+
 /// **曝光**:整条固有色链路改到线性空间后唯一的自由标量。
 ///
 /// 汇编尾部是 `min(色, 100)` → `× View 预曝光(cb0[145].y)` → `× 材质整体色(cb6[84])`
@@ -343,9 +368,29 @@ fn camera_basis() -> mat2x3<f32> {
 /// 写死 +Z 时凡是背对世界 +Z 的面都会被判成「完全侧对」→ 平白吃一层 0.25 的白,
 /// 幽星光整只被冲淡成粉白就是这么来的。取第三行(深度行)归一化即得视线轴,
 /// 用 `abs` 所以不必关心它的正负号。
+/// 相机射向场景的入射方向。正交投影下每个像素相同；`local_view` 的折射用这一支。
+fn camera_forward_direction() -> vec3<f32> {
+    return normalize(vec3<f32>(camera.view_proj[0][2], camera.view_proj[1][2], camera.view_proj[2][2]));
+}
+
+/// 表面指向相机的观察方向。原材质的 N·V、Fresnel 与半角高光用这一支。
+fn view_direction() -> vec3<f32> {
+    return -camera_forward_direction();
+}
+
 fn facing_ratio(n: vec3<f32>) -> f32 {
-    let forward = normalize(vec3<f32>(camera.view_proj[0][2], camera.view_proj[1][2], camera.view_proj[2][2]));
-    return 1.0 - abs(dot(n, forward));
+    return 1.0 - abs(dot(n, view_direction()));
+}
+
+/// 目标实机 ES3.1/Low、LOD0 `M_P_Object_Trans` 的原始高光覆盖项：
+/// `smoothstep(.4,.5,pow(max(N·H,0),HighLightSpecPow)) × HighLight SpecInt`。
+/// 这个选中排列的 alpha 链没有 Fresnel/rim 覆盖，不能拿别的排列补进来。
+fn trans_spec_coverage(n: vec3<f32>) -> f32 {
+    let view = view_direction();
+    let half_dir = normalize(view + normalize(camera.light_dir) + material.highlight.xyz);
+    let spec_base = pow(max(dot(n, half_dir), 0.0), max(material.highlight.w, 1e-4));
+    let spec_t = saturate((spec_base - 0.4) * 10.0);
+    return spec_t * spec_t * (3.0 - 2.0 * spec_t) * material.highlight_color.w;
 }
 
 /// MatCap 的采样坐标:视空间法线映射到 [0,1](球面查找表的标准做法)。
@@ -414,6 +459,13 @@ struct StickLayer {
 
 fn stick_layer(uv0: vec2<f32>, ndc: vec2<f32>) -> StickLayer {
     if material.flags.z < 0.5 {
+        return StickLayer(vec3<f32>(0.0), 0.0);
+    }
+    // 这是原 shader-map 的质量排列差异,不是宠物特判。目标实机的 ES3.1/Low
+    // `M_P_Object_Trans` 资源只声明 4 张纹理、没有 StarStick；它即使绑定了
+    // MobileDirectionalLight 也一样。假半透族走另一张材质图,不受这个分支影响。
+    let trans_star_stick = material.flags.y > 0.5 && material.noise_uv.w > 0.5;
+    if trans_star_stick && camera.high_material_quality < 0.5 {
         return StickLayer(vec3<f32>(0.0), 0.0);
     }
     let theta = fract(camera.time * STAR_PHASE_SPEED) * 6.2831855;
@@ -517,6 +569,21 @@ fn flow_band(uv: vec2<f32>, albedo: vec3<f32>) -> vec3<f32> {
     return mix(albedo, band, material.extra.y * step(0.05, band_lit));
 }
 
+/// glTF 导出把 UE `(X,Y,Z)` 换成运行时 `(X,Z,Y)`；材质里的三平面采样仍须按 UE 轴序。
+fn runtime_to_ue(v: vec3<f32>) -> vec3<f32> {
+    return vec3<f32>(v.x, v.z, v.y);
+}
+
+/// HLSL/WGSL `refract(I,N,eta)` 展开式。显式写出是为了和两条 DXBC 的 k<0 清零分支一致。
+fn refract_direction(incident: vec3<f32>, n: vec3<f32>, eta: f32) -> vec3<f32> {
+    let ni = dot(n, incident);
+    let k = 1.0 - eta * eta * (1.0 - ni * ni);
+    if k < 0.0 {
+        return vec3<f32>(0.0);
+    }
+    return eta * incident - (eta * ni + sqrt(k)) * n;
+}
+
 /// **玻璃内部那颗星。** 实机是这么做的(读 `MI_P_Object_Trans_MatCap` 的 pixel shader 汇编,
 /// 见 docs/design.md §1):把视线按 `GlobalRefraction`(=1.3)折射进物体内部,沿折射光线
 /// march 一段(`GlobalDepth`),在**模型空间**按三向投影采 `StarTex`(= `T_EMeng003`,
@@ -536,14 +603,18 @@ fn interior_star(start: vec3<f32>, n: vec3<f32>, forward: vec3<f32>) -> f32 {
     if material.interior.w < 0.5 {
         return 0.0;
     }
-    // refract():WGSL 没有内建,照 Snell 写。eta 取 1/折射率(空气 → 介质)
+    // 顶点 shader 的配套写入已经查实：start 是预蒙皮局部位置，不是 UV1/UV2。
+    // 换回 UE 轴序后再执行原材质的折射与三平面采样。
+    //
+    // **这一层离对上实机还很远**:实机那两颗球是「红球 + 居中的大号黄色四角星/圆点」,
+    // 我们画出来只有几点很淡的紫斑(换成 UV1/UV2 起点那版连斑都没有)。
+    // 起点之外,着色那一路缺的槽位更多 —— 见 docs/design.md 的待办表。
+    let start_ue = runtime_to_ue(start);
+    let n_ue = normalize(runtime_to_ue(n));
+    let forward_ue = normalize(runtime_to_ue(forward));
+    // eta 取 1/折射率(空气 → 介质)
     let eta = 1.0 / max(material.interior.x, 0.001);
-    let cosi = dot(n, forward);
-    let k = 1.0 - eta * eta * (1.0 - cosi * cosi);
-    if k < 0.0 {
-        return 0.0;   // 全内反射
-    }
-    let dir = eta * forward - (eta * cosi + sqrt(k)) * n;
+    let dir = refract_direction(forward_ue, n_ue, eta);
 
     // **march 距离与平铺照汇编算,不再手挑。** 汇编(fx1/34529.asm 63..78):
     //   halfExtent = 0.5 * |包围盒尺寸|
@@ -554,7 +625,7 @@ fn interior_star(start: vec3<f32>, n: vec3<f32>, forward: vec3<f32>) -> f32 {
     // 星场里以某点为心、约一格大小的一块,这正是「每颗球稳定居中一颗星」的机制。
     let half_extent = 0.5 * length(material.bounds_size.xyz);
     let march = half_extent * 0.01 * INTERIOR_DEPTH;
-    let p = (start + dir * march) * (INTERIOR_UV_SCALE / max(half_extent, 0.0001));
+    let p = (start_ue + dir * march) * (INTERIOR_UV_SCALE / max(half_extent, 0.0001));
 
     // **三向投影不是「归一化权重加权和」,是两次嵌套 lerp。** 汇编(34529,83..88):
     //   k    = saturate(|n| * (2*StarTriPlannarBlendInt + 1) - StarTriPlannarBlendInt)
@@ -562,7 +633,7 @@ fn interior_star(start: vec3<f32>, n: vec3<f32>, forward: vec3<f32>) -> f32 {
     //   s    = lerp(s,            sample(p.xy), k.w)
     // 原来那版是 `pow(|n|, B)` 再归一化 —— 结构就不对(而且更早还写死次数 8,
     // 那让权重几乎完全偏向单一轴)。
-    let blend = saturate(abs(n) * (2.0 * STAR_TRIPLANAR_BLEND + 1.0) - STAR_TRIPLANAR_BLEND);
+    let blend = saturate(abs(n_ue) * (2.0 * STAR_TRIPLANAR_BLEND + 1.0) - STAR_TRIPLANAR_BLEND);
     let s0 = textureSample(interior_tex, base_sampler, p.xz);
     let s1 = textureSample(interior_tex, base_sampler, p.yz);
     let s2 = textureSample(interior_tex, base_sampler, p.xy);
@@ -604,8 +675,89 @@ fn matcap_strength(n: vec3<f32>) -> f32 {
     return textureSample(matcap_tex, base_sampler, matcap_uv(n)).r;
 }
 
-@fragment
-fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
+/// 已逐指令还原材质的原始输出尾段。两份目标 PS 都是
+/// `clamp(color, 0, 100) → ViewPreExposure × MobileExposure → sqrt`；没有通用 toon
+/// 分支为弥补 LDR 余量而加的 extended-Reinhard 软肩。`EXPOSURE` 是两个运行时场景量的
+/// 合并值（资产里不存在、离线不能分别取得），运算结构仍与原 shader 一致。
+fn encode_linear_color(color: vec3<f32>) -> vec3<f32> {
+    let clamped = clamp(color, vec3<f32>(0.0), vec3<f32>(100.0));
+    return sqrt(clamped * EXPOSURE);
+}
+
+/// UE 颜色贴图由硬件做 sRGB→线性；本项目为了让数据遮罩与颜色贴图共用上传格式，
+/// 纹理本身是 Rgba8Unorm，所以在需要逐指令对齐的 Low 分支显式补回同一转换。
+fn srgb_to_linear(c: vec3<f32>) -> vec3<f32> {
+    let lo = c / 12.92;
+    let hi = pow((c + vec3<f32>(0.055)) / 1.055, vec3<f32>(2.4));
+    return select(lo, hi, c > vec3<f32>(0.04045));
+}
+
+/// 游戏材质函数 `MF_ToneMapInverse`。常数与 Low PS 2109/55790 第 103–114 行逐项相同：
+/// 贴图的 filmic 显示值先反解回 HDR 线性值，再参与材质光照。
+fn game_tonemap_inverse(c: vec3<f32>) -> vec3<f32> {
+    let root = sqrt(max(c * c * -0.2072 + c * 0.70896 + vec3<f32>(0.002209),
+                        vec3<f32>(0.0)));
+    let numerator = c * -0.56 + vec3<f32>(0.047) - root;
+    let denominator = (c * 0.93 - vec3<f32>(1.36)) * 2.0;
+    return numerator / denominator;
+}
+
+/// 目标设备选中的 ES3.1/Low `MI_P_Object_Trans` 基色链。
+///
+/// 对应 PS 2109/55790 第 36–126 行：MaskTex.r 与 N·L 合成 ramp 横坐标，
+/// SoftEdge 控制阈值上方的过渡；RampTex 固定采第一行；再按 `MPC_S_Global` 的资产默认
+/// `C_CharacterEnvSkyInt=.8`、`C_CharacterMainLightInfInt=1` 和
+/// `C_ML_Sat_For_SS.y=0` 合成环境/直射项。桌宠场景没有 UE SkyLight，故 View.SkyLightColor
+/// 这一**场景输入**为 0；不是为某只宠物补的颜色。
+fn object_trans_low_light(uv: vec2<f32>, n: vec3<f32>, base: vec3<f32>) -> vec3<f32> {
+    let mask = saturate(textureSample(light_mask_tex, base_sampler, uv).r);
+    var ramp_coord = dot(n, normalize(camera.light_dir)) * 0.25 + mask * 0.5 + 0.25;
+    if mask > 0.95 {
+        ramp_coord = 1.0;
+    }
+    if mask < 0.05 {
+        ramp_coord = 0.0;
+    }
+
+    // cb6[26] = (0.4, SoftEdge, 0, 0)。保留汇编里阈值下方那条
+    // `1-saturate(.4-q)`，而不是擅自改成普通 smoothstep。
+    let below = 1.0 - saturate(0.4 - ramp_coord);
+    let upper = saturate((ramp_coord - 0.4) /
+                         max(0.1 * material.depth_fade.w, 1e-6));
+    let ramp_u = mix(below, 1.0, upper);
+
+    var ramp = srgb_to_linear(textureSample(
+        ramp_tex, ramp_sampler, vec2<f32>(ramp_u, 1.0 / 256.0)).rgb);
+    // Env_GameTime 的资产默认是 0，原式因而是 ramp * (.85 + .15 * 0)。
+    ramp *= 0.85;
+    ramp = mix(ramp, vec3<f32>(1.0), upper);
+
+    // C_EnvColor.a=0 ⇒ 使用 View.SkyLightColor；本渲染器没有 UE 天光，取 0。
+    let environment = ramp * 0.8;
+    // C_ML_Sat_For_SS 的原始浮点是 (1,0,.1,.8)，所以 `.y=0`，汇编中的
+    // `lerp(base, luma(base), .y)` 保留完整基色。不能用属性树的颜色十六进制显示去猜分量。
+    // C_CharacterMainLightInfInt=1，且无 UE 动态阴影纹理时直射权重就是 upper。
+    return base * (environment + vec3<f32>(upper));
+}
+
+/// 把硬件深度差换算成正交相机下的世界距离，再照原材质的
+/// `OpenDepthDistance * saturate(gap / OpacityDepthDistance)` 求 alpha 增量。
+fn trans_depth_coverage(in: VsOut) -> f32 {
+    if material.depth_fade.y <= 0.0 || material.depth_fade.x <= 0.0 {
+        return 0.0;
+    }
+    let dimensions = vec2<i32>(textureDimensions(scene_depth));
+    let pixel = clamp(vec2<i32>(in.clip.xy), vec2<i32>(0), dimensions - vec2<i32>(1));
+    let opaque_depth = textureLoad(scene_depth, pixel, 0);
+    // clip.z = dot(VP 的深度行, world)+常量；正交投影下除以该行长度就是米。
+    let depth_row = vec3<f32>(
+        camera.view_proj[0][2], camera.view_proj[1][2], camera.view_proj[2][2]
+    );
+    let gap_m = max(opaque_depth - in.clip.z, 0.0) / max(length(depth_row), 1e-6);
+    return material.depth_fade.y * saturate(gap_m / material.depth_fade.x);
+}
+
+fn shade_main(in: VsOut, depth_coverage: f32) -> vec4<f32> {
     // 表情:脸那两个槽的贴图是 2×4 的图集,网格 UV 落在左上那一格,
     // 换表情就是整格地偏一下(flags.x = 这是脸)。其余材质偏移量恒为 0。
     let uv = in.uv + camera.face_uv * step(0.5, material.flags.x);
@@ -621,6 +773,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         discard;
     }
     let alpha_is_opacity = material.params.z > 0.5;
+    let exact_object_trans = material.depth_fade.z > 0.5;
     let line = select(select(tex.a, 0.0, alpha_is_opacity), 0.0, cutout);
 
     let n = normalize(in.normal);
@@ -685,7 +838,11 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     // **平方 = gamma 2.0 解码**,把基色贴图从显示空间搬进线性(见 `EXPOSURE`)。
     // 卷动色带那张也是显示空间的成品颜色,所以在 `flow_band` 里混完再一起平方。
     var albedo = flow_band(in.uv, tex.rgb);
-    albedo = pow(albedo, vec3<f32>(DECODE_GAMMA));
+    if exact_object_trans {
+        albedo = game_tonemap_inverse(srgb_to_linear(albedo));
+    } else {
+        albedo = pow(albedo, vec3<f32>(DECODE_GAMMA));
+    }
     // **线条遮罩是「往固有色里加一个颜色」,不是「乘一个亮度倍数」。** 查实于罗隐(阿米亚特)
     // 的 body shader 51377 第 99~103 行:
     //     r1.w = saturate((基色.a − 0.04) × 1.1111)     ← 和不透明度用的是同一个重映射
@@ -728,19 +885,33 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     // 那片平色圆盘。导出器只把「`Rim Intensity` 真的大于 1」的边缘光写进来(见 Manifest.cs)——
     // 曜星光那两颗球写着强度 1 + 绿色 `Rim LightColor`,而实机里它们是橙的和紫的。
     if material.flags.y > 0.5 {
+        let spec_coverage = trans_spec_coverage(n);
         // **加上去的几层光是 `max` 合的,不是相加。** 汇编里连着两条:
         // `max r2.yzw, matcap*MatCapColor, spec*SpecColor` 再 `max r2.xyz, 上一步, rim`。
         // 相加会让高光与边缘光在轮廓处叠成一圈白边;取 max 则是「哪层亮听哪层」。
         let rim_strength = saturate(pow(facing, material.extra.x) * material.star.z);
-        glow += max(matcap_light(n) * GLASS_MATCAP_GAIN,
-                    material.rim_color.rgb * rim_strength * GLASS_RIM_GAIN);
-        // **这两层光也顶不透明度。** 汇编(`MI_P_Object_Trans_MatCap` 37998)里输出 alpha 是
-        //     lerp(max(基色a重映射, 高光, 菲涅尔), 基色a重映射, ForceUseDefOpacity = 0)
-        // 也就是 **`max`**:高光那一路是 `smoothstep(pow(N·H, HighLightSpecPow)) × HighLight SpecInt`,
-        // 菲涅尔那一路是 `1 − N·V` 的两段 smoothstep —— 两者都只出标量,只进 alpha 不带颜色。
-        // **不接这一条的代价是球会整个消失**:幽星光那两颗球的基色 alpha 实测中位 0.000、
-        // p90 也是 0.000(形状压根不在基色里),导出器一度只能把 `Trans_MatCap` 整支排除在
-        // 「基色 alpha = 不透明度」之外来绕开(见 Materials.AlphaIsOpacity 的旧注释)。
+        // 这组 SpecCol 属于 `M_P_Object_Trans` 的 alpha-opacity 排列；MatCap 族是另一张
+        // 材质图，继续只走自己的查找表，不能被这一组根默认高光改色。
+        let spec_light = select(vec3<f32>(0.0),
+                                material.highlight_color.rgb * max(spec_coverage, 0.0),
+                                alpha_is_opacity);
+        glow += max(spec_light,
+                    max(matcap_light(n) * GLASS_MATCAP_GAIN,
+                        material.rim_color.rgb * rim_strength * GLASS_RIM_GAIN));
+        // 目标实机实际选中的 Low 排列先做
+        // `lerp(max(基色 alpha, spec), 基色 alpha, ForceUseDefOpacity)`，再加场景深度淡化。
+        // 这里没有别的排列里的 rim/Fresnel alpha，也没有 MatCap 采样值。
+        if alpha_is_opacity {
+            let covered = max(alpha, spec_coverage);
+            alpha = mix(covered, alpha, saturate(material.rim_color.w));
+            alpha = saturate(alpha + depth_coverage);
+        }
+        // **rim 与 MatCap 那两层也顶不透明度,这一条不能省。** 汇编
+        // (`MI_P_Object_Trans_MatCap` 37998)里输出 alpha 是 `max(基色a, 高光, 菲涅尔)` ——
+        // 上面那段只补了「高光」那一路(而且只在 alpha 是不透明度时),菲涅尔/MatCap 那一路
+        // 仍要在这儿取 max。**不接的代价**:幽星光那两颗球的基色 alpha 中位 0.000、p90 也是
+        // 0.000(形状压根不在基色里),球会整个消失;暮星辰的裙子会薄掉一档
+        // (量过:去掉这行 0.074 → 0.091,再叠上 Low 分支是 0.084)。
         alpha = max(alpha, max(rim_strength, saturate(matcap_strength(n))));
         // **球内那颗星是「混进固有色」,不是加在上面。** 汇编最后一步是
         // `out = lerp(基色 × 明暗色, 发光层色, 混合系数)`(fx1/34529.asm ⑥,见 design.md §1),
@@ -755,7 +926,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         // **折射必须在物体空间算**(见 `interior_star`),所以这里传物体空间的法线与视线,
         // 不是世界空间的 `n`。
         albedo = mix(albedo, star_color,
-                     saturate(interior_star(in.interior_pos,
+                     saturate(interior_star(in.local_pos,
                                             normalize(in.local_normal),
                                             normalize(in.local_view))));
         // 玻璃族自身的整体不透明度;`alpha_is_opacity` 的材质已经从基色 alpha 拿到了,别覆盖
@@ -796,6 +967,12 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     // 拿一个比底色暗的星点色替上去 ⇒ **身上一片黑斑**(用户实测)。
     // `noise_uv.w < 0.5` 表示"这个材质用相机空间的噪声坐标",与加光是同一族。
     let fake_trans = material.noise_uv.w < 0.5;
+    // 高质量 `M_P_Object_Trans` 排列还会在 ForceUseDefOpacity 之后
+    // `alpha = max(alpha, starMask)`；目标实机的 Low 排列在 `stick_layer` 已返回空层。
+    if alpha_is_opacity && material.flags.y > 0.5 && !fake_trans
+        && camera.high_material_quality > 0.5 {
+        alpha = max(alpha, stick.cover);
+    }
     // **星贴层混的是固有色,不是已经着色的颜色。** 汇编(`M_P_Object_Trans` 51670)里
     // 那条 lerp 作用在 `r0` 上,而 `r0` 一路攒到第 690 行才 `mul r1.xzw, r0.xxyz, r1.xxzw`
     // **乘上光照** —— 也就是星点色要跟着这一点的明暗一起变。原来写在 `albedo * shade`
@@ -803,8 +980,11 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     // 在我们这儿成了一身灰紫斑(实机报的「果冻…看不到星点」)。
     // **`else` 那支的位置本来就是对的**:`mov r0.xyz, r9.xyzx`(第 511 行)—— 不开这层时
     // `r0` 就是干净的固有色,同样在乘光照之前。
-    let body = select(mix(albedo, stick.color, stick.cover) * shade,
-                      albedo * shade, fake_trans);
+    let surface_albedo = select(mix(albedo, stick.color, stick.cover), albedo, fake_trans);
+    var body = surface_albedo * shade;
+    if exact_object_trans {
+        body = object_trans_low_light(in.uv, n, surface_albedo);
+    }
     let stick_add = select(vec3<f32>(0.0), stick.color, fake_trans);
     // **末尾统一编码到显示空间**:`sqrt(色 × 曝光)`,照汇编尾部那条
     // `movc o0.xyz, (曝光 < 1), sqrt(色 × 曝光), 色`。
@@ -814,19 +994,43 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     // (`sqrt` 会放大小值:0.25 → 0.418),几层叠起来偏亮。
     // 四个系数按 `旧² / EXPOSURE` 换算过,保持观感等值(见各自的定义处)。
     //
-    // 输出预乘 alpha(见 render.rs)。**固有色乘 alpha、加上去的光不乘**:高光/星点/边缘光
-    // 是打在表面上的光,半透表面照样该有,乘进去会随着变透明一起消失。
-    var lin = max(body * alpha + glow + stick_add, vec3<f32>(0.0)) * EXPOSURE;
-    // **软肩**:游戏那条链在 HDR 里算完再由曝光压回来,削顶发生在有余量的地方;
-    // 我们的贴图是 LDR,硬削顶意味着「一提亮就大片糊白」——实测把亮度比从 0.83 提到 0.92
-    // 需要 `AMBIENT` 1.0,而那时全库过曝从 1 涨到 34。
-    // 这里用 extended Reinhard(白点 `SHOULDER_WHITE`)近似那份余量:低值几乎不变,
-    // 高值平滑压向 1,于是能在不糊白的前提下把整体抬亮。`SHOULDER_WHITE <= 0` 关闭。
-    if SHOULDER_WHITE > 0.0 {
-        let w2 = SHOULDER_WHITE * SHOULDER_WHITE;
-        lin = lin * (1.0 + lin / w2) / (1.0 + lin);
+    // UE 的 BLEND_Translucent 在 pixel shader **完成颜色输出以后**才由固定功能混合器执行
+    // `SrcColor * SrcAlpha + DstColor * (1-SrcAlpha)`。我们的管线使用等价的预乘混合，
+    // 因而必须先把整条直色链（包括高光/星点/边缘光）编码到输出空间，最后才预乘 alpha。
+    //
+    // 旧代码在这里先在线性空间做 `body * alpha`、随后再 sqrt：半透明贡献实际变成
+    // `sqrt(alpha)`，例如 alpha=.2 会按约 .45 的强度盖住内层；同时 glow 又完全没乘
+    // alpha。两处都与游戏的 BLEND_Translucent 顺序相反，会系统性冲亮所有透明壳。
+    var combined = body + glow + stick_add;
+    if exact_object_trans {
+        // PS 尾部 cb6[29].xyz，覆盖基色与高光在内的整条材质颜色。
+        combined *= material.tint.rgb;
     }
-    return vec4<f32>(sqrt(lin), alpha);
+    var encoded: vec3<f32>;
+    if exact_object_trans {
+        // 2109/55790 的真实尾段；精确分支不能再经过项目为通用 toon 增补的软肩。
+        encoded = encode_linear_color(combined);
+    } else {
+        var lin = max(combined, vec3<f32>(0.0)) * EXPOSURE;
+        // **软肩**:尚未逐材质还原的通用 toon 分支仍用它补 LDR 余量。目标 Low
+        // ObjectTrans 与 M_ShuiMu_ByIn 已有原 PS，均不走这里。
+        if SHOULDER_WHITE > 0.0 {
+            let w2 = SHOULDER_WHITE * SHOULDER_WHITE;
+            lin = lin * (1.0 + lin / w2) / (1.0 + lin);
+        }
+        encoded = sqrt(lin);
+    }
+    return vec4<f32>(encoded * alpha, alpha);
+}
+
+@fragment
+fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
+    return shade_main(in, 0.0);
+}
+
+@fragment
+fn fs_glass(in: VsOut) -> @location(0) vec4<f32> {
+    return shade_main(in, trans_depth_coverage(in));
 }
 
 @fragment
@@ -855,6 +1059,64 @@ fn fs_outline(in: VsOut) -> @location(0) vec4<f32> {
     // 背景是带花纹的卡片,会把大片背景算成宠物(菊花梨的「色偏」因此虚高到 1.46,
     // 修正后只有 0.16)。判据要加两道:**取最大连通块**、面积占比 > 55% 视为抠图失败。
     return vec4<f32>(tex.rgb * 0.80, 1.0);
+}
+
+/// `M_ShuiMu_ByIn` 的原始材质局部链（pixel shader 71636）。这不是通用特效近似：
+///
+/// 1. 用预蒙皮局部位置/法线和 `GlassyNoiseRefract` 求折射方向；
+/// 2. 按组件包围盒、Depth、UVScale 与 Speed 构造三平面坐标；
+/// 3. 三次采 `GlassyNoiseTex` 的 R/A，并按原来的两次 lerp 合成 `saturate(R*A)`；
+/// 4. 在 FlowColor02→01 之间混色，再按 Schlick 修正后的 Fresnel mask 混向 FresnelColor。
+///
+/// 原 shader 是 BLEND_Opaque 且 `o0.w = 1`；GPU 侧因此给这一入口独立的写深度管线。
+/// 71636 第 104–387 行还有 UE clustered local-light 循环，但它的最终贡献全乘在
+/// `lerp(Flat_EmissiveColor * FlatRatio, SelectionColor, SelectionColor.a)` 上。该实例的
+/// `FlatRatio=0`、`SelectionColor=(0,0,0,0)`，uniform preshader 因而把这项精确求成 0；
+/// 这里不凭空补一层 N·L 或环境光。
+@fragment
+fn fs_glassy_inner(in: VsOut) -> @location(0) vec4<f32> {
+    let start = runtime_to_ue(in.local_pos);
+    let local_n = normalize(runtime_to_ue(in.local_normal));
+    let incident = normalize(runtime_to_ue(in.local_view));
+    // 71636 读取的不是原参数本身，而是 uniform preshader 的 scalar-slot[5]：
+    //     Constant(1), Constant(1), GlassyNoiseRefract, Add, Div
+    // 即 eta = 1 / (1 + GlassyNoiseRefract)。果冻的 0.2 因而得到 0.833333；旧实现把
+    // 0.2 直接交给 refract，会把三平面噪声投射到完全不同的位置。
+    let eta = 1.0 / (1.0 + material.glassy_noise.z);
+    let refracted = refract_direction(incident, local_n, eta);
+
+    // 71636: halfExtent = length(.5*(boundsMax-boundsMin));
+    // p = (start + refracted*(halfExtent*.01*Depth))*(UVScale/halfExtent)
+    //     + frac(Time*Speed)。
+    let half_extent = 0.5 * length(material.bounds_size.xyz);
+    let march = half_extent * 0.01 * material.glassy_noise.w;
+    let scale = material.glassy_noise.y / max(half_extent, 1e-4);
+    let scroll = fract(camera.time * material.glassy_noise.x);
+    let p = (start + refracted * march) * scale + vec3<f32>(scroll);
+
+    let sample_xz = textureSample(noise_tex, base_sampler, p.xz);
+    let sample_yz = textureSample(noise_tex, base_sampler, p.yz);
+    let sample_xy = textureSample(noise_tex, base_sampler, p.xy);
+    let tri = material.glassy_mask.w;
+    let weight = saturate(abs(local_n) * (1.0 + 2.0 * tri) - tri);
+    // 汇编先按 localNormal.x 混 xz→yz，再按 localNormal.z 混向 xy；每次只保留 R/A。
+    let ra_xz = vec2<f32>(sample_xz.r, sample_xz.a);
+    let ra_yz = vec2<f32>(sample_yz.r, sample_yz.a);
+    let ra_xy = vec2<f32>(sample_xy.r, sample_xy.a);
+    let ra = mix(mix(ra_xz, ra_yz, weight.x), ra_xy, weight.z);
+    let noise = saturate(ra.x * ra.y);
+    let flow_color = mix(material.glassy_flow2.rgb, material.glassy_flow1.rgb, noise);
+
+    let n = normalize(in.normal);
+    let ndv = max(dot(n, view_direction()), 0.0);
+    var fresnel = pow(max(abs(1.0 - ndv), 1e-4), material.glassy_mask.x);
+    fresnel = 0.96 * fresnel + 0.04;
+    let mask_t = saturate(
+        (fresnel - material.glassy_mask.y) / max(material.glassy_mask.z, 1e-6)
+    );
+    let fresnel_mask = mask_t * mask_t * (3.0 - 2.0 * mask_t);
+    let color = mix(flow_color, material.glassy_fresnel.rgb, fresnel_mask);
+    return vec4<f32>(encode_linear_color(color), 1.0);
 }
 
 // 纯特效层(火焰 / 水壳 / 光晕):材质里没有 BaseTex/EyeTex,固有色是 shader 算的。
@@ -899,7 +1161,15 @@ fn fs_effect(in: VsOut) -> @location(0) vec4<f32> {
         // 加色:alpha=0,只往目标上加光
         return vec4<f32>(color, 0.0);
     }
-    let alpha = clamp(strength * opacity * material.tint.a, 0.0, 1.0);
+    // **不透明度不含 `tint.a`。** `tint` 来自 `Color01` / `MainColor` / `Emitter Color`
+    // 这类**颜色**参数,它们的 alpha 是 UE `FLinearColor` 里美术随手留下的分量,不是不透明度
+    // —— 真正的不透明度是 `Opacity` 那个标量,已经在 `opacity` 里了。
+    // **判据**:全库 65 个纯特效层里 `tint.a` 只取 0(17 个)与 1(31 个)两种值,
+    // **一个中间值都没有**;真是不透明度不会长这样。
+    // 代价实测:那 17 个里非加色的会被整层乘成 0 —— 克莱因龙那只半透明的气泡身体
+    // (`MI_P_FakeFulid`,tint = (0.22, 0.22, 0.375, **0**))就是这么**整个消失**的。
+    // 指标对它是盲的(调色板一位不动),验收靠裁图对着实机看。
+    let alpha = clamp(strength * opacity, 0.0, 1.0);
     // 预乘
     return vec4<f32>(material.tint.rgb * alpha, alpha);
 }

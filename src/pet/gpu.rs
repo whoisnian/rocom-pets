@@ -19,11 +19,9 @@ struct CameraUniform {
     outline_width: f32,
     /// 秒。特效层的 UV 卷动靠它推进(火焰在流动)。
     time: f32,
-    /// **必须留着这 4 字节。** WGSL 里 `vec2<f32>` 按 8 字节对齐,`time` 之后是 84,
-    /// 不是 8 的倍数 —— 着色器那边会把 `face_uv` 放到 88。这里不补,两侧就错开一个
-    /// `f32`:着色器读到的 `face_uv.x` 其实是 Rust 这边的 `.y`,而 `.y` 读到填充的 0。
-    /// (踩过:表情的 u 偏移完全没反应,v 偏移却在**横向**换格子。)
-    _pad: f32,
+    /// 是否选择原游戏的高材质质量排列。目标实机配置为 Low；对应的
+    /// `M_P_Object_Trans` shader map 不含 StarStick 采样块。
+    high_material_quality: f32,
     /// 表情:脸那两个材质的 UV 偏移(整格,见 persona.rs 的 `Expression`)。
     /// **放在相机这份 uniform 里**是因为它是**每只**的(同一个形态的两只可以不同表情),
     /// 而材质那份是按形态共享的 —— 那边只存「这是不是脸」。
@@ -38,6 +36,8 @@ pub struct FrameParams {
     pub outline_width: f32,
     /// 秒;特效层的 UV 卷动靠它推进。
     pub time: f32,
+    /// 是否选择原游戏的高材质质量排列；桌面与离屏默认复现实机的 Low。
+    pub high_material_quality: bool,
     /// 表情:脸那两个材质的 UV 偏移(见 persona.rs 的 `Expression`)。
     pub face_uv: [f32; 2],
 }
@@ -67,7 +67,11 @@ struct MaterialUniform {
     // 顺序错了不会报错,只会静默取到旁边那个字段的值(rim/main 曾经就是这么对调的)。
     /// 边缘光颜色
     rim_color: [f32; 4],
-    /// [边缘光衰减次数, 色带混入强度, -, 有色带(0/1)]
+    /// 高光方向偏移(xyz,glTF Y-up)+ `HighLightSpecPow`
+    highlight: [f32; 4],
+    /// `HighLight SpecCol`(rgb)+ `HighLight SpecInt`
+    highlight_color: [f32; 4],
+    /// [边缘光衰减次数, 色带混入强度, Rim Soft Edge, 有色带(0/1)]
     extra: [f32; 4],
     /// 玻璃内部那层:[折射率, GlobalDepth, 闪烁速度, 有内部层(0/1)]
     interior: [f32; 4],
@@ -80,6 +84,16 @@ struct MaterialUniform {
     mask_id: [f32; 4],
     /// 假半透族星点层:[速度X, 速度Y, 强度, 是否用 UV0]
     noise_uv: [f32; 4],
+    /// `M_ShuiMu_ByIn` 专用参数，逐项对应原 shader 71636。
+    glassy_flow1: [f32; 4],
+    glassy_flow2: [f32; 4],
+    glassy_fresnel: [f32; 4],
+    /// [GlassyNoiseSpeed, UVScale, Refract, Depth]
+    glassy_noise: [f32; 4],
+    /// [FresnelMaskPow, Offset, Smooth, TriPlannarBlendInt]
+    glassy_mask: [f32; 4],
+    /// `M_P_Object_Trans` 场景深度淡化:[距离(米),开启强度,-,-]
+    depth_fade: [f32; 4],
 }
 
 /// 本体贴图 alpha 里那层线条遮罩的**加性**强度。游戏里那些纹路(水灵身上的竖条、
@@ -120,19 +134,20 @@ pub struct PetGpu {
     joint_capacity: usize,
     camera: wgpu::Buffer,
     frame_bind: wgpu::BindGroup,
+    depth_layout: wgpu::BindGroupLayout,
     material_binds: Vec<wgpu::BindGroup>,
     pipeline: wgpu::RenderPipeline,
     outline_pipeline: wgpu::RenderPipeline,
     effect_pipeline: wgpu::RenderPipeline,
     glass_pipeline: wgpu::RenderPipeline,
-    /// (首索引, 数量, 材质序号)。分三批,后两批要在不透明层之后画:
-    /// `draws` 不透明、`inner_draws` 包在里面的非加色特效层、`glass_draws` 有基色的半透
-    /// (玻璃/纱)、`effect_draws` 加色特效层。**混合通道按这个顺序画**,见 `Self::new` 里
-    /// 拆分处的注释。
+    glassy_inner_pipeline: wgpu::RenderPipeline,
+    /// (首索引, 数量, 材质序号)。`glassy_inner_draws` 是原材质本来就不透明、写深度的
+    /// 流动内胆；其余批次的先后见 `Self::new` 的拆分说明。
     draws: Vec<(u32, u32, usize)>,
     effect_draws: Vec<(u32, u32, usize)>,
     glass_draws: Vec<(u32, u32, usize)>,
     inner_draws: Vec<(u32, u32, usize)>,
+    glassy_inner_draws: Vec<(u32, u32, usize)>,
 }
 
 impl PetGpu {
@@ -252,7 +267,9 @@ impl PetGpu {
                     },
                     count: None,
                 },
-                // 6 = 玻璃内部那颗星的四角星场;7 = 色带的 ID 遮罩
+                // 6 = 玻璃内部那颗星的四角星场;7 = 色带的 ID 遮罩;
+                // 8/9 = Low `MI_P_Object_Trans` 的 MaskTex / RampTex；10 是 RampTex
+                // 在 cooked uniform expression 中声明的 clamp sampler。
                 wgpu::BindGroupLayoutEntry {
                     binding: 7,
                     visibility: wgpu::ShaderStages::FRAGMENT,
@@ -273,7 +290,48 @@ impl PetGpu {
                     },
                     count: None,
                 },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 8,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 9,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 10,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
             ],
+        });
+        // 半透明通道读取第一遍不透明几何留下的场景深度。原
+        // `M_P_Object_Trans` 的 OpacityDepthDistance 就采这张纹理；不是果冻专用遮罩。
+        let depth_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("pet-scene-depth"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Depth,
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            }],
         });
 
         let frame_bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -305,6 +363,16 @@ impl PetGpu {
             address_mode_w: wgpu::AddressMode::Repeat,
             ..Default::default()
         });
+        let clamp_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("pet-ramp-clamp-sampler"),
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::MipmapFilterMode::Linear,
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            ..Default::default()
+        });
         let white = super::model::Image {
             width: 1,
             height: 1,
@@ -334,7 +402,8 @@ impl PetGpu {
                 Some(effect) => effect.noise.as_ref(),
                 None => material.flow.as_ref(),
             };
-            let noise_view = upload_texture(device, queue, &material.name, second.unwrap_or(&white));
+            let noise_view =
+                upload_texture(device, queue, &material.name, second.unwrap_or(&white));
             let star_view = upload_texture(
                 device,
                 queue,
@@ -359,6 +428,18 @@ impl PetGpu {
                 &material.name,
                 material.mask_id.as_ref().unwrap_or(&white),
             );
+            let light_mask_view = upload_texture(
+                device,
+                queue,
+                &material.name,
+                material.light_mask.as_ref().unwrap_or(&white),
+            );
+            let ramp_view = upload_texture(
+                device,
+                queue,
+                &material.name,
+                material.ramp.as_ref().unwrap_or(&white),
+            );
             let has = |v: bool| if v { 1.0 } else { 0.0 };
             let rgb = |c: [f32; 3]| [c[0], c[1], c[2], 0.0];
             let mask_id = |m: &super::model::Material| {
@@ -382,8 +463,54 @@ impl PetGpu {
                 ]
             };
             let extra = |m: &super::model::Material| {
-                [m.rim_power, m.flow_power, 0.0, has(m.flow.is_some())]
+                [
+                    m.rim_power,
+                    m.flow_power,
+                    m.rim_soft_edge,
+                    has(m.flow.is_some()),
+                ]
             };
+            let rim_color = |m: &super::model::Material| {
+                [
+                    m.rim_color[0],
+                    m.rim_color[1],
+                    m.rim_color[2],
+                    m.force_default_opacity,
+                ]
+            };
+            let highlight = |m: &super::model::Material| {
+                [
+                    m.highlight_offset[0],
+                    m.highlight_offset[1],
+                    m.highlight_offset[2],
+                    m.highlight_power,
+                ]
+            };
+            let highlight_color = |m: &super::model::Material| {
+                [
+                    m.highlight_color[0],
+                    m.highlight_color[1],
+                    m.highlight_color[2],
+                    m.highlight_intensity,
+                ]
+            };
+            let glassy_flow1 = material.glassy_inner.as_ref().map_or([0.0; 4], |g| g.flow1);
+            let glassy_flow2 = material.glassy_inner.as_ref().map_or([0.0; 4], |g| g.flow2);
+            let glassy_fresnel = material
+                .glassy_inner
+                .as_ref()
+                .map_or([0.0; 4], |g| g.fresnel);
+            let glassy_noise = material.glassy_inner.as_ref().map_or([0.0; 4], |g| g.noise);
+            let glassy_mask = material.glassy_inner.as_ref().map_or([0.0; 4], |g| g.mask);
+            let exact_object_trans = material.object_trans_low
+                && material.light_mask.is_some()
+                && material.ramp.is_some();
+            let depth_fade = [
+                material.depth_fade[0],
+                material.depth_fade[1],
+                has(exact_object_trans),
+                material.object_trans_soft_edge,
+            ];
             let uniform = match &material.effect {
                 Some(effect) => MaterialUniform {
                     tint: effect.tint,
@@ -401,7 +528,7 @@ impl PetGpu {
                         has(material.star.is_some()),
                         has(material.matcap.is_some()),
                     ],
-                    emissive: [0.0, 0.0, 0.0, 0.0],   // 纯特效层不走这一层
+                    emissive: [0.0, 0.0, 0.0, 0.0], // 纯特效层不走这一层
                     star: [
                         material.star_tiling[0],
                         material.star_tiling[1],
@@ -415,7 +542,9 @@ impl PetGpu {
                         material.stick_intensity,
                     ],
                     matcap_color: rgb(material.matcap_color),
-                    rim_color: rgb(material.rim_color),
+                    rim_color: rim_color(material),
+                    highlight: highlight(material),
+                    highlight_color: highlight_color(material),
                     extra: extra(material),
                     interior: interior(material),
                     interior_color: [
@@ -428,11 +557,24 @@ impl PetGpu {
                     bounds_size: bsize,
                     mask_id: mask_id(material),
                     noise_uv: material.noise_uv,
+                    glassy_flow1,
+                    glassy_flow2,
+                    glassy_fresnel,
+                    glassy_noise,
+                    glassy_mask,
+                    depth_fade,
                 },
                 // 有基色的材质:params.x/.z 说明 alpha 怎么解释
                 // (x=1 镂空遮罩、z=1 不透明度,都为 0 则是线条遮罩)
                 None => MaterialUniform {
-                    tint: [1.0; 4],
+                    // Low ObjectTrans 的尾部原样乘 `MainColor * MainBright`；普通基色
+                    // 材质不读取 tint，因此可安全共用这个已有的 vec4。
+                    tint: [
+                        material.main_color[0] * material.main_bright,
+                        material.main_color[1] * material.main_bright,
+                        material.main_color[2] * material.main_bright,
+                        1.0,
+                    ],
                     flow: material.flow_uv,
                     params: [
                         has(material.cutout),
@@ -477,7 +619,9 @@ impl PetGpu {
                         material.stick_intensity,
                     ],
                     matcap_color: rgb(material.matcap_color),
-                    rim_color: rgb(material.rim_color),
+                    rim_color: rim_color(material),
+                    highlight: highlight(material),
+                    highlight_color: highlight_color(material),
                     extra: extra(material),
                     interior: interior(material),
                     interior_color: [
@@ -490,6 +634,12 @@ impl PetGpu {
                     bounds_size: bsize,
                     mask_id: mask_id(material),
                     noise_uv: material.noise_uv,
+                    glassy_flow1,
+                    glassy_flow2,
+                    glassy_fresnel,
+                    glassy_noise,
+                    glassy_mask,
+                    depth_fade,
                 },
             };
             let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -533,6 +683,18 @@ impl PetGpu {
                         binding: 7,
                         resource: wgpu::BindingResource::TextureView(&mask_id_view),
                     },
+                    wgpu::BindGroupEntry {
+                        binding: 8,
+                        resource: wgpu::BindingResource::TextureView(&light_mask_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 9,
+                        resource: wgpu::BindingResource::TextureView(&ramp_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 10,
+                        resource: wgpu::BindingResource::Sampler(&clamp_sampler),
+                    },
                 ],
             }));
         }
@@ -546,6 +708,16 @@ impl PetGpu {
             bind_group_layouts: &[Some(&frame_layout), Some(&material_layout)],
             immediate_size: 0,
         });
+        let translucent_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("pet-translucent"),
+                bind_group_layouts: &[
+                    Some(&frame_layout),
+                    Some(&material_layout),
+                    Some(&depth_layout),
+                ],
+                immediate_size: 0,
+            });
 
         let vertex_layout = wgpu::VertexBufferLayout {
             array_stride: size_of::<Vertex>() as u64,
@@ -576,7 +748,7 @@ impl PetGpu {
                     shader_location: 4,
                     format: wgpu::VertexFormat::Float32x4,
                 },
-                // 玻璃内部层的采样起点 (UV1.x, UV1.y, UV2.x),见 model.rs 的 `interior_pos`
+                // 预蒙皮局部位置；原 VS 21175/31053 直接把解码位置传给折射材质。
                 wgpu::VertexAttribute {
                     offset: 56,
                     shader_location: 5,
@@ -585,45 +757,60 @@ impl PetGpu {
             ],
         };
         // depth_write:主通道写深度,特效通道只测不写(半透层之间不该互相挡)
-        let make_pipeline =
-            |label: &str, vs: &str, fs: &str, cull: Option<wgpu::Face>, depth_write: bool| {
-                device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                    label: Some(label),
-                    layout: Some(&pipeline_layout),
-                    vertex: wgpu::VertexState {
-                        module: &shader,
-                        entry_point: Some(vs),
-                        compilation_options: Default::default(),
-                        buffers: &[Some(vertex_layout.clone())],
-                    },
-                    primitive: wgpu::PrimitiveState {
-                        topology: wgpu::PrimitiveTopology::TriangleList,
-                        cull_mode: cull,
-                        ..Default::default()
-                    },
-                    depth_stencil: Some(wgpu::DepthStencilState {
-                        format: DEPTH_FORMAT,
-                        depth_write_enabled: Some(depth_write),
-                        depth_compare: Some(wgpu::CompareFunction::Less),
-                        stencil: Default::default(),
-                        bias: Default::default(),
-                    }),
-                    multisample: wgpu::MultisampleState::default(),
-                    fragment: Some(wgpu::FragmentState {
-                        module: &shader,
-                        entry_point: Some(fs),
-                        compilation_options: Default::default(),
-                        targets: &[Some(wgpu::ColorTargetState {
-                            format: target_format,
-                            blend: Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
-                            write_mask: wgpu::ColorWrites::ALL,
-                        })],
-                    }),
-                    multiview_mask: None,
-                    cache: None,
-                })
-            };
-        let pipeline = make_pipeline("pet", "vs_main", "fs_main", Some(wgpu::Face::Back), true);
+        let make_pipeline = |label: &str,
+                             vs: &str,
+                             fs: &str,
+                             cull: Option<wgpu::Face>,
+                             depth_write: bool,
+                             reads_scene_depth: bool| {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(label),
+                layout: Some(if reads_scene_depth {
+                    &translucent_pipeline_layout
+                } else {
+                    &pipeline_layout
+                }),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: Some(vs),
+                    compilation_options: Default::default(),
+                    buffers: &[Some(vertex_layout.clone())],
+                },
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    cull_mode: cull,
+                    ..Default::default()
+                },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: DEPTH_FORMAT,
+                    depth_write_enabled: Some(depth_write),
+                    depth_compare: Some(wgpu::CompareFunction::Less),
+                    stencil: Default::default(),
+                    bias: Default::default(),
+                }),
+                multisample: wgpu::MultisampleState::default(),
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: Some(fs),
+                    compilation_options: Default::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: target_format,
+                        blend: Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                multiview_mask: None,
+                cache: None,
+            })
+        };
+        let pipeline = make_pipeline(
+            "pet",
+            "vs_main",
+            "fs_main",
+            Some(wgpu::Face::Back),
+            true,
+            false,
+        );
         // 描边画背面:外扩后的壳只有背面能露在本体之外
         let outline_pipeline = make_pipeline(
             "pet-outline",
@@ -631,6 +818,7 @@ impl PetGpu {
             "fs_outline",
             Some(wgpu::Face::Front),
             true,
+            false,
         );
         // 混合通道:只测深度不写(半透层之间不该互相挡),**剔背面**——不剔的话闭合壳
         // 正反两面都参与混合,转身时可见组合不断变化 → 看着在闪。薄片状的火焰/水膜
@@ -642,39 +830,57 @@ impl PetGpu {
             "fs_effect",
             Some(wgpu::Face::Back),
             false,
+            true,
         );
         // 有基色的半透(暮星辰那两个球)和不透明本体是同一个片元函数,只是走混合通道
         let glass_pipeline = make_pipeline(
             "pet-glass",
             "vs_main",
-            "fs_main",
+            "fs_glass",
             Some(wgpu::Face::Back),
+            false,
+            true,
+        );
+        // `M_ShuiMu_ByIn` 在原资产里是 BLEND_Opaque、alpha 恒 1。它必须写深度，且用自己
+        // 的折射/三平面噪声片元函数；把它塞进通用半透 fs_effect 会同时改错颜色与遮挡。
+        let glassy_inner_pipeline = make_pipeline(
+            "pet-glassy-inner",
+            "vs_main",
+            "fs_glassy_inner",
+            Some(wgpu::Face::Back),
+            true,
             false,
         );
 
+        let all_draws = model
+            .primitives
+            .iter()
+            .map(|p| (p.first_index, p.index_count, p.material));
+        // 专用不透明内胆先从普通/混合两路里拿走；否则 `base_color=None` 会让它按纯特效层
+        // 自动落进混合通道，与原材质的 BLEND_Opaque 相反。
+        let (glassy_inner_draws, remaining): (Vec<_>, Vec<_>) =
+            all_draws.partition(|&(_, _, m)| model.materials[m].glassy_inner.is_some());
         // 需要混合的最后画(叠在本体之上)。判据是 `blended()` 而不是 `translucent`:
         // 标着 BLEND_Translucent 但不透明度就是 1 的(幽星光那两个球)输出和不透明一样,
         // 放进混合通道只会因为不写深度而互相盖不住 —— 两颗球绕着转就闪。
-        let (blended, draws): (Vec<_>, Vec<_>) = model
-            .primitives
-            .iter()
-            .map(|p| (p.first_index, p.index_count, p.material))
+        let (blended, draws): (Vec<_>, Vec<_>) = remaining
+            .into_iter()
             .partition(|&(_, _, m)| model.materials[m].blended());
         // 混合通道里再分两种片元函数:有基色的走 fs_main,纯特效层走 fs_effect
         let (glass_draws, effect_draws): (Vec<_>, Vec<_>) = blended
             .into_iter()
             .partition(|&(_, _, m)| model.materials[m].effect.is_none());
-        // **非加色的特效层要画在玻璃层前面。** 混合通道只测深度不写,顺序就是遮挡关系;
-        // 原来「玻璃层 → 特效层」把果冻的**内胆盖到了外壳上**,于是那颗深绿的内胆糊住整个
-        // 上半身、外壳的圆顶反而看不见(实机报的「果冻少了上半身」)。
-        // 全库同时有这两种层的**只有 2 个形态**(果冻:外壳 + 内胆;春兔:耳膜 + 里面那泡液体),
-        // 而且两次都是**特效层在里面** —— 所以「非加色特效层先画」就够,不必按深度排序。
+        // **非加色的特效层要画在玻璃层前面。** 混合通道只测深度不写,顺序就是遮挡关系；
+        // 这批几何是内层(如春兔耳膜里的液体),外层玻璃应在它之后混合。果冻的内胆已由
+        // `glassy_inner_draws` 按原 BLEND_Opaque 单独写深度，不再依赖这条经验排序。
         // **加色层仍然留在最后**:它是打在最上面的光(火花的火焰),而且加色本来就与顺序无关,
         // 挪到玻璃层前面反而会被玻璃的 alpha 衰减一道。
-        let (inner_draws, effect_draws): (Vec<_>, Vec<_>) = effect_draws
-            .into_iter()
-            .partition(|&(_, _, m)| {
-                model.materials[m].effect.as_ref().is_some_and(|e| !e.additive)
+        let (inner_draws, effect_draws): (Vec<_>, Vec<_>) =
+            effect_draws.into_iter().partition(|&(_, _, m)| {
+                model.materials[m]
+                    .effect
+                    .as_ref()
+                    .is_some_and(|e| !e.additive)
             });
         Ok(Self {
             vertices,
@@ -683,15 +889,18 @@ impl PetGpu {
             joint_capacity,
             camera,
             frame_bind,
+            depth_layout,
             material_binds,
             pipeline,
             outline_pipeline,
             effect_pipeline,
             glass_pipeline,
+            glassy_inner_pipeline,
             draws,
             effect_draws,
             glass_draws,
             inner_draws,
+            glassy_inner_draws,
         })
     }
 
@@ -705,7 +914,11 @@ impl PetGpu {
                 light_dir: frame.light_dir.normalize().to_array(),
                 outline_width: frame.outline_width,
                 time: frame.time,
-                _pad: 0.0,
+                high_material_quality: if frame.high_material_quality {
+                    1.0
+                } else {
+                    0.0
+                },
                 face_uv: frame.face_uv,
             }),
         );
@@ -717,7 +930,24 @@ impl PetGpu {
         queue.write_buffer(&self.joints, 0, bytemuck::cast_slice(&flat));
     }
 
-    pub fn draw(&self, pass: &mut wgpu::RenderPass<'_>, outline: bool) {
+    /// 给半透明第二遍绑定第一遍生成的场景深度。
+    pub fn bind_scene_depth(
+        &self,
+        device: &wgpu::Device,
+        view: &wgpu::TextureView,
+    ) -> wgpu::BindGroup {
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("pet-scene-depth"),
+            layout: &self.depth_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(view),
+            }],
+        })
+    }
+
+    /// 第一遍：只画会写深度的材质。半透明外壳随后要采这份场景深度。
+    pub fn draw_opaque(&self, pass: &mut wgpu::RenderPass<'_>, outline: bool) {
         pass.set_vertex_buffer(0, self.vertices.slice(..));
         pass.set_index_buffer(self.indices.slice(..), wgpu::IndexFormat::Uint32);
         pass.set_bind_group(0, &self.frame_bind, &[]);
@@ -732,7 +962,21 @@ impl PetGpu {
                 pass.draw_indexed(first..first + count, 0, 0..1);
             }
         }
-        // 混合层放最后:本体的深度已经写好,这里只测不写,叠在上面
+        if !self.glassy_inner_draws.is_empty() {
+            pass.set_pipeline(&self.glassy_inner_pipeline);
+            for &(first, count, material) in &self.glassy_inner_draws {
+                pass.set_bind_group(1, &self.material_binds[material], &[]);
+                pass.draw_indexed(first..first + count, 0, 0..1);
+            }
+        }
+    }
+
+    /// 第二遍：读取场景深度，画只测不写的半透明/加色层。
+    pub fn draw_translucent(&self, pass: &mut wgpu::RenderPass<'_>, scene_depth: &wgpu::BindGroup) {
+        pass.set_vertex_buffer(0, self.vertices.slice(..));
+        pass.set_index_buffer(self.indices.slice(..), wgpu::IndexFormat::Uint32);
+        pass.set_bind_group(0, &self.frame_bind, &[]);
+        pass.set_bind_group(2, scene_depth, &[]);
         for (pipeline, batch) in [
             (&self.effect_pipeline, &self.inner_draws),
             (&self.glass_pipeline, &self.glass_draws),

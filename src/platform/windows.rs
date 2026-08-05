@@ -54,8 +54,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DispatchMessageW, GWL_EXSTYLE, GetMessageW, HTCLIENT,
     HTTRANSPARENT, HWND_MESSAGE, HWND_TOPMOST, IDC_ARROW, KillTimer, LoadCursorW, MSG,
     PostQuitMessage, RegisterClassW, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
-    SetTimer,
-    SetWindowLongPtrW, SetWindowPos, TranslateMessage, WM_DISPLAYCHANGE, WM_DPICHANGED,
+    SetTimer, SetWindowLongPtrW, SetWindowPos, TranslateMessage, WM_DISPLAYCHANGE, WM_DPICHANGED,
     WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCHITTEST, WM_TIMER, WNDCLASSW,
     WS_EX_NOACTIVATE, WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
     WS_EX_TRANSPARENT, WS_POPUP, WS_VISIBLE,
@@ -535,7 +534,7 @@ impl App {
                 }
             };
             let gpu = self.gpu.as_ref().expect("上面判过");
-            let canvas = PetTarget::new(&gpu.device, gpu.format(), canvas_size);
+            let canvas = PetTarget::new(&gpu.device, gpu.format(), canvas_size, &pet_gpu);
             let quad = gpu.create_quad(canvas.view());
             let readback = MaskReadback::new(&gpu.device, canvas_size);
             self.stages[index].pets.push(PetSurfaces {
@@ -574,7 +573,10 @@ impl App {
             let Some(surfaces) = stage.pets.iter_mut().find(|s| s.id == *id) else {
                 continue;
             };
-            if surfaces.canvas.resize(&gpu.device, canvas_size) {
+            if surfaces
+                .canvas
+                .resize(&gpu.device, canvas_size, &surfaces.gpu)
+            {
                 surfaces.quad = gpu.create_quad(surfaces.canvas.view());
             }
             surfaces.gpu.update(
@@ -584,6 +586,8 @@ impl App {
                     light_dir: Vec3::new(-0.4, 0.8, 0.6),
                     outline_width: outline,
                     time: effect_time(),
+                    // 复现目标实机的 MaterialQualityLevel=Low shader map。
+                    high_material_quality: false,
                     face_uv,
                 },
                 &matrices,
@@ -760,7 +764,7 @@ impl App {
                 let Some(surfaces) = self.stages[index].pets.iter_mut().find(|s| s.id == id) else {
                     continue;
                 };
-                if surfaces.canvas.resize(&gpu.device, canvas) {
+                if surfaces.canvas.resize(&gpu.device, canvas, &surfaces.gpu) {
                     surfaces.quad = gpu.create_quad(surfaces.canvas.view());
                 }
                 surfaces.readback.resize(&gpu.device, canvas);
@@ -856,7 +860,10 @@ impl App {
                 played |= stage.stage.play_clip(*id, name);
             }
         }
-        log::info!("手动播 {label}{}", if played { "" } else { "(这只没有这段)" });
+        log::info!(
+            "手动播 {label}{}",
+            if played { "" } else { "(这只没有这段)" }
+        );
         for index in 0..self.stages.len() {
             self.apply(index, Reaction::BOTH);
         }

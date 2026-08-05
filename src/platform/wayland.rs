@@ -555,7 +555,7 @@ impl App {
             let Some(surfaces) = self.stages[index].pets.iter_mut().find(|s| s.id == id) else {
                 continue;
             };
-            if surfaces.canvas.resize(&gpu.device, canvas) {
+            if surfaces.canvas.resize(&gpu.device, canvas, &surfaces.gpu) {
                 surfaces.quad = gpu.create_quad(surfaces.canvas.view());
             }
             surfaces.readback.resize(&gpu.device, canvas);
@@ -665,7 +665,10 @@ impl App {
                 played |= stage.stage.play_clip(*id, name);
             }
         }
-        log::info!("手动播 {label}{}", if played { "" } else { "(这只没有这段)" });
+        log::info!(
+            "手动播 {label}{}",
+            if played { "" } else { "(这只没有这段)" }
+        );
         for index in 0..self.stages.len() {
             self.apply(index, Reaction::BOTH);
         }
@@ -1042,7 +1045,10 @@ impl App {
             let Some(surfaces) = stage.pets.iter_mut().find(|s| s.id == *id) else {
                 continue;
             };
-            if surfaces.canvas.resize(&gpu.device, canvas_size) {
+            if surfaces
+                .canvas
+                .resize(&gpu.device, canvas_size, &surfaces.gpu)
+            {
                 // 画布重建了,合成用的四边形绑的是旧纹理,要重绑
                 surfaces.quad = gpu.create_quad(surfaces.canvas.view());
             }
@@ -1053,6 +1059,8 @@ impl App {
                     light_dir: Vec3::new(-0.4, 0.8, 0.6),
                     outline_width: outline,
                     time: effect_time(),
+                    // 复现目标实机的 MaterialQualityLevel=Low shader map。
+                    high_material_quality: false,
                     face_uv,
                 },
                 &matrices,
@@ -1203,7 +1211,7 @@ impl App {
                 }
             };
             let gpu = self.gpu.as_ref().expect("上面判过");
-            let canvas = PetTarget::new(&gpu.device, gpu.format(), canvas_size);
+            let canvas = PetTarget::new(&gpu.device, gpu.format(), canvas_size, &pet_gpu);
             let quad = gpu.create_quad(canvas.view());
             let readback = MaskReadback::new(&gpu.device, canvas_size);
             self.stages[index].pets.push(PetSurfaces {

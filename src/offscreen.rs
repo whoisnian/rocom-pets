@@ -104,10 +104,11 @@ pub fn render(request: &Request) -> Result<()> {
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
         format: DEPTH_FORMAT,
-        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
         view_formats: &[],
     });
     let depth_view = depth.create_view(&wgpu::TextureViewDescriptor::default());
+    let depth_bind = pet.bind_scene_depth(&device, &depth_view);
 
     // 回读缓冲:WebGPU 要求每行按 256 字节对齐
     let row_bytes = size * 4;
@@ -178,12 +179,23 @@ pub fn render(request: &Request) -> Result<()> {
                 light_dir,
                 outline_width,
                 time: request.time,
+                // 目标实机配置是 MaterialQualityLevel=Low。
+                high_material_quality: false,
                 face_uv: face,
             },
             &identity,
         );
         let pixels = draw_and_read(
-            &device, &queue, &pet, &color, &color_view, &depth_view, &readback, size, padded_row,
+            &device,
+            &queue,
+            &pet,
+            &color,
+            &color_view,
+            &depth_view,
+            &depth_bind,
+            &readback,
+            size,
+            padded_row,
         )?;
         tiles.push(("BindPose".into(), pixels));
     }
@@ -203,6 +215,7 @@ pub fn render(request: &Request) -> Result<()> {
                 light_dir,
                 outline_width,
                 time: request.time,
+                high_material_quality: false,
                 // 这段动作自带的表情。离屏渲染不带性格,所以「没意见」就是默认那张脸 ——
                 // 于是这张图也顺带成了「换动作换眼睛」的验收图
                 face_uv: crate::persona::face_for_clip(name)
@@ -218,6 +231,7 @@ pub fn render(request: &Request) -> Result<()> {
             &color,
             &color_view,
             &depth_view,
+            &depth_bind,
             &readback,
             size,
             padded_row,
@@ -246,6 +260,7 @@ pub fn render(request: &Request) -> Result<()> {
                 light_dir,
                 outline_width,
                 time: request.time,
+                high_material_quality: false,
                 face_uv: crate::persona::DEFAULT_FACE.uv_offset(),
             },
             &player.matrices,
@@ -257,6 +272,7 @@ pub fn render(request: &Request) -> Result<()> {
             &color,
             &color_view,
             &depth_view,
+            &depth_bind,
             &readback,
             size,
             padded_row,
@@ -272,6 +288,7 @@ pub fn render(request: &Request) -> Result<()> {
             &pet,
             &color_view,
             &depth_view,
+            &depth_bind,
             &model,
             request.bench,
         );
@@ -296,12 +313,14 @@ pub fn render(request: &Request) -> Result<()> {
 
 /// 走完整的「采样动画 → 上传 → 绘制」循环,量单只宠物一帧要多少时间。
 /// 不做回读:回读会等 GPU 排空,量出来的是同步开销而不是出帧开销。
+#[allow(clippy::too_many_arguments)] // 同 `draw_and_read`:两遍渲染要带上场景深度那份绑定
 fn benchmark(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     pet: &PetGpu,
     color_view: &wgpu::TextureView,
     depth_view: &wgpu::TextureView,
+    depth_bind: &wgpu::BindGroup,
     model: &Model,
     frames: u32,
 ) {
@@ -323,6 +342,7 @@ fn benchmark(
                 light_dir: light,
                 outline_width: 0.004,
                 time: frame_time,
+                high_material_quality: false,
                 face_uv: crate::persona::DEFAULT_FACE.uv_offset(),
             },
             &player.matrices,
@@ -354,7 +374,30 @@ fn benchmark(
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            pet.draw(&mut pass, true);
+            pet.draw_opaque(&mut pass, true);
+        }
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("bench-translucent"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: color_view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: depth_view,
+                    depth_ops: None,
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pet.draw_translucent(&mut pass, depth_bind);
         }
         queue.submit(Some(encoder.finish()));
     }
@@ -377,6 +420,7 @@ fn draw_and_read(
     color: &wgpu::Texture,
     color_view: &wgpu::TextureView,
     depth_view: &wgpu::TextureView,
+    depth_bind: &wgpu::BindGroup,
     readback: &wgpu::Buffer,
     size: u32,
     padded_row: u32,
@@ -408,7 +452,30 @@ fn draw_and_read(
             occlusion_query_set: None,
             multiview_mask: None,
         });
-        pet.draw(&mut pass, true);
+        pet.draw_opaque(&mut pass, true);
+    }
+    {
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("pet-translucent"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: color_view,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Load,
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                view: depth_view,
+                depth_ops: None,
+                stencil_ops: None,
+            }),
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        pet.draw_translucent(&mut pass, depth_bind);
     }
     encoder.copy_texture_to_buffer(
         wgpu::TexelCopyTextureInfo {
@@ -521,4 +588,3 @@ fn locate_glb(pack: &Path, form: Option<&str>) -> Result<PathBuf> {
     let index = loaded.form_index(form)?;
     Ok(loaded.forms[index].model.clone())
 }
-
