@@ -7,7 +7,8 @@
 // 不再是「不追」。但**基础 toon 那几个数仍然是猜的**,而且是在上游法线 bug 修好**之前**
 // 调出来的、之后没复核过 —— 逐个标在下面各自的定义处:
 //   `mix(0.72, 1.0, lit)` 的 0.72(已换成汇编的 0.5/1.5)、
-//   `rim = pow(facing, 3.0) * 0.25`、`gpu.rs` 的 `LINE_BOOST = 1.55`。
+//   `rim = pow(facing, 3.0) * 0.25`。旧的全局 `LINE_BOOST = 1.55` 已按原材质的
+//   `Glow Color * Glow Intensity` 恢复为默认 0，避免给所有高 alpha 身体覆一层白膜。
 
 struct Camera {
     view_proj: mat4x4<f32>,
@@ -23,9 +24,8 @@ struct Camera {
     // 表情:脸那两个材质的 UV 偏移(整格)。**每只一份**,所以放在这儿而不是材质里 ——
     // 材质是按形态共享的,同一个形态的两只可以是两种表情。
     face_uv: vec2<f32>,
-    // 不要在这儿补 vec3 占位:WGSL 里 vec3 要 16 字节对齐,会把结构体从 96 撑到 112,
-    // 和 Rust 侧的对不上(wgpu 会报 "bound with size 96 where the shader expects 112")。
-    // mat4x4 已经让整个结构按 16 对齐,尾部的填充由规则自动补上。
+    // 当前蒙皮姿势的 PrimitiveSceneData bounds：[中心.xyz,最长边]。
+    object_bounds: vec4<f32>,
 };
 
 /// 每材质一份。普通材质也有(tint 全 1、params.z=0),两条通道共用布局。
@@ -75,6 +75,31 @@ struct MaterialParams {
     glassy_mask: vec4<f32>,
     // `M_P_Object_Trans`:[场景深度距离(米),开启强度,走目标 Low 局部链,SoftEdge]
     depth_fade: vec4<f32>,
+    // [MI_P_Object_XiaoYou, M_Gra_Yutu_Ear_Lighting, MI_P_FakeFulid, M_P_MatCap_Masked]
+    family_flags: vec4<f32>,
+    xiaoyou_base1: vec4<f32>,
+    xiaoyou_base2: vec4<f32>,
+    xiaoyou_flow1: vec4<f32>,
+    xiaoyou_flow2: vec4<f32>,
+    xiaoyou_star_color: vec4<f32>,
+    // [USpeedTex01,VSpeedTex01,USpeedTex02,VSpeedTex02]
+    xiaoyou_noise_flow: vec4<f32>,
+    // [FlowNoseInt1,FlowNoiseInt2,Star_RG_Int,Star_RG_TwinkleSpeed]
+    xiaoyou_shape: vec4<f32>,
+    xiaoyou_star_uv: vec4<f32>,
+    // YutuEar / FakeFulid / MatCapMasked 互斥复用的原始参数区。
+    family0: vec4<f32>,
+    family1: vec4<f32>,
+    family2: vec4<f32>,
+    family3: vec4<f32>,
+    family4: vec4<f32>,
+    family5: vec4<f32>,
+    family6: vec4<f32>,
+    family7: vec4<f32>,
+    family8: vec4<f32>,
+    family9: vec4<f32>,
+    family10: vec4<f32>,
+    family11: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> camera: Camera;
@@ -110,6 +135,8 @@ struct VsIn {
     @location(4) weights: vec4<f32>,
     // 预蒙皮局部位置。原 VS 21175/31053 明确把它传给折射材质。
     @location(5) local_pos: vec3<f32>,
+    // glTF `COLOR_0`。XiaoYou / YutuEar / FakeFluid 的目标 Low PS 都直接读取。
+    @location(6) color: vec4<f32>,
 };
 
 struct VsOut {
@@ -125,6 +152,10 @@ struct VsOut {
     /// 明写了"不走网格 UV0",实机观感正是"蒙在镜头前、拖动旋转时星点不随着转"。
     /// 用 NDC 而非 `@builtin(position)`,是为了不依赖视口尺寸。
     @location(5) ndc: vec2<f32>,
+    @location(6) color: vec4<f32>,
+    /// 蒙皮后世界位置。FakeFulid 的目标 PS 42877 从 v7 读取 AbsoluteWorldPosition；
+    /// 未蒙皮 local_pos 只用于它自己的局部纹理坐标，不能拿来切液面。
+    @location(7) world_pos: vec3<f32>,
 };
 
 // 线性混合蒙皮:权重和不为 1 的顶点(导出误差)按权重和归一化,否则会缩水
@@ -158,6 +189,8 @@ fn skin(input: VsIn) -> VsOut {
     // 球面的世界法线分布本身是旋转不变的,图案会钉在屏幕上不动(那就是「像屏幕投影」)。
     out.local_normal = normalize(input.normal);
     out.local_view = normalize(vec3<f32>(camera.view_proj[0][2], camera.view_proj[1][2], camera.view_proj[2][2]));
+    out.color = input.color;
+    out.world_pos = world.xyz;
     return out;
 }
 
@@ -180,6 +213,8 @@ fn vs_outline(input: VsIn) -> VsOut {
     out.local_pos = input.local_pos;
     out.local_normal = normalize(input.normal);
     out.local_view = vec3<f32>(0.0, 0.0, 1.0);
+    out.color = input.color;
+    out.world_pos = world.xyz;
     return out;
 }
 
@@ -743,7 +778,8 @@ fn object_trans_low_light(uv: vec2<f32>, n: vec3<f32>, base: vec3<f32>) -> vec3<
 /// 把硬件深度差换算成正交相机下的世界距离，再照原材质的
 /// `OpenDepthDistance * saturate(gap / OpacityDepthDistance)` 求 alpha 增量。
 fn trans_depth_coverage(in: VsOut) -> f32 {
-    if material.depth_fade.y <= 0.0 || material.depth_fade.x <= 0.0 {
+    let fake_fluid = material.family_flags.z > 0.5;
+    if !fake_fluid && (material.depth_fade.y <= 0.0 || material.depth_fade.x <= 0.0) {
         return 0.0;
     }
     let dimensions = vec2<i32>(textureDimensions(scene_depth));
@@ -754,10 +790,259 @@ fn trans_depth_coverage(in: VsOut) -> f32 {
         camera.view_proj[0][2], camera.view_proj[1][2], camera.view_proj[2][2]
     );
     let gap_m = max(opaque_depth - in.clip.z, 0.0) / max(length(depth_row), 1e-6);
+    if fake_fluid {
+        // PS 42877 的 cb3[27].x 是 FadeDistance，资产单位为厘米。
+        return saturate(gap_m / max(material.family10.w * 0.01, 1e-5));
+    }
     return material.depth_fade.y * saturate(gap_m / material.depth_fade.x);
 }
 
+/// `MI_P_Object_XiaoYou` 的目标 ES3.1/Low PS 32511 主干。
+///
+/// 这条材质过去被误判为“没有 BaseTex 的纯特效”，导致整个 By1 身体进入半透明近似通道。
+/// 原 PS 实际声明 MainTex(t2)、NoiseTex(t3)、StarTex(t4)，并且 `o0.w = 1`。其核心合成是：
+///
+/// - NoiseTex 在 FlowNoiseColor1/2 间混色；
+/// - StarTex.r 提供闪烁相位、g 提供星形强度；
+/// - `COLOR_0.r * COLOR_0.g * (1-COLOR_0.a)` 是逐顶点覆盖遮罩；
+/// - `lerp(MF_ToneMapInverse(MainTex), lerp(BaseColor1,BaseColor2,flow.g), flow.r)`
+///   与 flow/星光按上述遮罩合成。
+///
+/// 这里的 0.1、0.02 与 2π 都是 32511 第 70–75 行的字面量；其余数值来自材质参数，
+/// 没有按宠物名称调色或手写星点。
+fn shade_xiaoyou(in: VsOut) -> vec4<f32> {
+    let main_sample = textureSample(base_color, base_sampler, in.uv);
+    // 原资产元数据：MainTex sRGB=0、NoiseTex sRGB=1、StarTex sRGB=0。
+    // PNG 不携带 UE 的采样色彩空间，故在专用链里显式还原硬件视图转换。
+    let main_linear = game_tonemap_inverse(main_sample.rgb);
+
+    let flow_uv = in.uv
+        + material.xiaoyou_noise_flow.xy * camera.time
+        + vec2<f32>(0.0, sin(fract(camera.time * 0.1) * 6.28318548) * 0.02);
+    // `sample ... r2.z, ..., t3.xzyw`：目标寄存器写 z，而资源 z 被 swizzle 到 y，
+    // 因而这里取的是 NoiseTex.g，不是视觉上最显眼的红通道。
+    let noise = srgb_to_linear(textureSample(noise_tex, base_sampler, flow_uv).rgb).g;
+    let flow1 = material.xiaoyou_flow1.rgb * material.xiaoyou_shape.x;
+    let flow2 = material.xiaoyou_flow2.rgb * material.xiaoyou_shape.y;
+    let flow_color = mix(flow1, flow2, noise);
+
+    // preshader 把 UV_Control 的 Y/W 与 TwinkleSpeed 都除以 100 后再送入 cb。
+    let star_uv = in.uv * material.xiaoyou_star_uv.xz
+        + material.xiaoyou_star_uv.yw * (camera.time * 0.01);
+    let star = textureSample(star_tex, base_sampler, star_uv);
+    let phase = fract(camera.time * material.xiaoyou_shape.w * 0.01 + star.r) * 6.28318548;
+    let wave = sin(phase) * 0.5 + 0.5;
+    // cb6[52].x/y 分别是 `Star_RG_DarkTime` / `Star_RG_Int`。前者在
+    // ML_P_Flow_XiaoYou 的冻结默认值中为 0，且三只实例均未覆盖；不是由 Int 反推阈值。
+    let star_gain = max(material.xiaoyou_shape.z, 1.0);
+    let star_pulse = saturate(wave) * star_gain;
+    let star_amount = star.g * star_pulse;
+
+    let vertex_mask = saturate(
+        (1.0 + star_amount) * in.color.r * in.color.g * saturate(1.0 - in.color.a)
+    );
+    let custom_base = mix(material.xiaoyou_base1.rgb,
+                          material.xiaoyou_base2.rgb,
+                          saturate(flow_color.g));
+    let base = mix(main_linear, custom_base, saturate(flow_color.r));
+    let effect = flow_color + material.xiaoyou_star_color.rgb * star_amount;
+    // r5(flow + star) 在原 PS 中加到 emissive 分支，绕过 mobile 直接/间接光；
+    // 只有 `(1-mask) * base` 进入受光照的 base-color 分支。
+    let ndl = dot(normalize(in.normal), normalize(camera.light_dir));
+    let lit = smoothstep(SHADE_TERM_LO, SHADE_TERM_HI, ndl);
+    let shade = mix(0.5, 1.5, lit) + AMBIENT;
+    let surface = base * (1.0 - vertex_mask) * shade + effect * vertex_mask;
+    return vec4<f32>(encode_linear_color(max(surface, vec3<f32>(0.0))), 1.0);
+}
+
+/// `M_Gra_Yutu_Ear_Lighting` 的目标 Low PS 6037 材质主干。原 PS 的 t2/t3/t4
+/// 分别是 Bubble Texture、DistortTex、FlowTex；局部坐标先乘 -0.01，是因为 UE 顶点
+/// 插值量以厘米传入，而 glTF 顶点已经换成米，所以这里直接取负的 local_pos。
+fn shade_yutu_ear(in: VsOut) -> vec4<f32> {
+    let n = normalize(in.normal);
+    let ndv = max(dot(n, view_direction()), 0.0);
+
+    // 6037 用两组正交局部坐标、两档速度采同一张泡泡图，再取均值。
+    let bubble_scale = material.family7.z;
+    let bubble_uv1 = -vec2<f32>(in.local_pos.x, in.local_pos.y) * bubble_scale
+        + vec2<f32>(0.0, camera.time * material.family7.x);
+    let bubble_uv2 = -vec2<f32>(in.local_pos.z, in.local_pos.y) * bubble_scale
+        + vec2<f32>(0.0, camera.time * material.family7.y);
+    // `sample r0.w, ..., t2.xzwy`：目标 w 对应资源 swizzle 的 w 项，即源绿色通道。
+    let bubble1 = srgb_to_linear(textureSample(base_color, base_sampler, bubble_uv1).rgb).g;
+    let bubble2 = srgb_to_linear(textureSample(base_color, base_sampler, bubble_uv2).rgb).g;
+    let bubble = (bubble1 + bubble2) * 0.5;
+
+    // `sample t3` 的 xy 扰动随后以 0.5×FlowDistort 加到 t4 的 panner 坐标。
+    let planar = -vec2<f32>(in.local_pos.x, in.local_pos.y);
+    let distort = textureSample(noise_tex, base_sampler, planar).rg;
+    let flow_uv = planar * material.family8.zw
+        + camera.time * material.family8.xy
+        + distort * (0.5 * material.family7.w);
+    let flow_sample = textureSample(star_tex, base_sampler, flow_uv).rgb;
+    let flow = flow_sample * material.family1.rgb * material.family9.x;
+
+    let fresnel = pow(max(1.0 - ndv, 1e-4), max(material.family9.y, 1e-4))
+        * material.family9.z;
+
+    // 原式用朝上的法线分出 TopColor 区，TopColor Size 是幂次；Contrast Soft 只控制
+    // 阈值附近的过渡宽度。没有按模型高度或宠物名称另造液面。
+    let up = pow(max(n.y, 0.0), max(material.family10.y, 1e-4));
+    let top_width = max(material.family10.w, 0.01);
+    let top = smoothstep(0.5 - top_width, 0.5 + top_width, up);
+    let ramped_inner = mix(material.family3.rgb * material.family5.rgb,
+                           material.family6.rgb,
+                           top);
+    let bubbles = material.family0.rgb * bubble;
+    let surface = (ramped_inner + bubbles + flow) * material.family4.rgb
+        + material.family2.rgb * fresnel;
+
+    // 目标材质最终仍进入 mobile 光照；颜色参数中的 Flow/Fresnel 是材质内的加光项。
+    let ndl = dot(n, normalize(camera.light_dir));
+    let lit = smoothstep(SHADE_TERM_LO, SHADE_TERM_HI, ndl);
+    let shade = mix(0.5, 1.5, lit) + AMBIENT;
+    let color = ramped_inner * material.family4.rgb * shade
+        + (surface - ramped_inner * material.family4.rgb);
+    return vec4<f32>(encode_linear_color(max(color * in.color.r, vec3<f32>(0.0))), 1.0);
+}
+
+/// `M_P_FakeFulid` 的目标 Low PS 42877 局部链。原 shader 从 PrimitiveSceneData 读取
+/// 当前蒙皮盒中心/尺度，以 AbsoluteWorldPosition 对水平虚拟平面求交，再合成场景深度、
+/// FuildMask、MatCap、边缘/渐变色；最终覆盖率明确为
+/// `saturate(matcap_luma + fluid_coverage) * COLOR_0.g`。
+fn shade_fake_fluid(in: VsOut, depth_coverage: f32) -> vec4<f32> {
+    let n = normalize(in.normal);
+    let view = view_direction();
+    let ndv = saturate(dot(n, view));
+
+    // UE Z-up 参数换到 glTF Y-up，与导出器处理法线/位置的轴变换一致。
+    let axis = normalize(vec3<f32>(material.family6.x, material.family6.z, material.family6.y));
+    let plane_offset = vec3<f32>(material.family7.x, material.family7.z, material.family7.y) * 0.01;
+    let center = camera.object_bounds.xyz + plane_offset;
+
+    // 42877 第 63–70 行以像素世界位置相对 ObjectWorldPosition 的平面坐标采样，
+    // 不是网格 UV。UE 的水平 XY 平面换到 glTF 后是 XZ；除最长边保持原组件缩放语义。
+    let plane_uv = (in.world_pos.xz - center.xz) / max(camera.object_bounds.w, 1e-5);
+    let height_uv = plane_uv * material.family5.xy
+        + camera.time * material.family5.zw;
+    let mask_sample = srgb_to_linear(textureSample(base_color, base_sampler, height_uv).rgb);
+    let height_noise = (mask_sample.r * 2.0 - 1.0) * material.family8.w * 0.01;
+    let signed_height = dot(in.world_pos - center, axis) - height_noise;
+    let plane_soft = max(material.family10.y * 0.01, 1e-4);
+    // 原 PS 的 r0.z 是世界位置位于噪声液面下方的比较结果；场景深度差随后按
+    // FadeDistance 衰减成 r0.w。用 smoothstep 只复现 TopEdgeSmooth 的连续边界。
+    let below_plane = 1.0 - smoothstep(-plane_soft, plane_soft, signed_height);
+    let fluid = below_plane * depth_coverage;
+
+    let depth = saturate(-signed_height / max(material.family9.x, 1e-4));
+    let gradient_t = smoothstep(
+        material.family9.x - material.family9.y,
+        material.family9.x + material.family9.y,
+        depth
+    );
+    let gradient = mix(material.family4.rgb, material.family3.rgb, gradient_t);
+    let top_edge = depth_coverage * (1.0 - smoothstep(
+        material.family10.x * 0.01,
+        material.family10.x * 0.01 + plane_soft,
+        abs(signed_height)
+    ));
+    var fluid_color = gradient;
+
+    let matcap = srgb_to_linear(textureSample(matcap_tex, base_sampler, matcap_uv(n)).rgb)
+        * material.matcap_color.rgb;
+    let fresnel = smoothstep(material.family9.z,
+                             material.family9.z + max(material.family9.w, 1e-4),
+                             ndv);
+    // 42877 第 178–185 行用“液面以下的世界距离 / BodyEdgeArea”构造边缘色，
+    // 不是普通的视角 Fresnel。实例参数的 5/0.8/0.1 分别就是厘米范围与重映射阈值。
+    let body_distance = max(-signed_height, 0.0);
+    let body_proximity = 1.0 - saturate(
+        body_distance / max(material.family8.x * 0.01, 1e-5)
+    );
+    let body_edge = smoothstep(material.family8.y,
+                               material.family8.y + max(material.family8.z, 1e-4),
+                               below_plane * body_proximity);
+    fluid_color = mix(fluid_color, material.family2.rgb, saturate(top_edge));
+    fluid_color = mix(fluid_color, material.family0.rgb, body_edge);
+    let glass = matcap + material.family1.rgb * fresnel;
+    let linear = glass + fluid_color * fluid;
+
+    let matcap_luma = dot(matcap, vec3<f32>(0.3, 0.59, 0.11));
+    let alpha = saturate(matcap_luma + fresnel + fluid) * in.color.g;
+    let encoded = encode_linear_color(max(linear, vec3<f32>(0.0)));
+    return vec4<f32>(encoded * alpha, alpha);
+}
+
+/// `M_P_MatCap_Masked` 的目标 ES3.1/Low PS 19654 材质局部链。
+///
+/// Color PS 最终 `o0.w` 明确写 1；基础遮罩在同 resource 的 Early-Z depth PS 15293
+/// 中执行（函数末尾合并回来）。它也不是加色 VFX：19654 的 55–56 行是
+/// `BaseColor * LightRamp + MatCap`，115–121 行依次接 Rim、Flat_Emissive、
+/// MainColor/MainBright 与 SelectionColor。把 BaseColor=1.5 误当成“HDR tint ⇒ additive”
+/// 会让这一层最后画且不写深度，正好把 FakeFulid 液面盖掉。
+fn shade_matcap_masked(in: VsOut) -> vec4<f32> {
+    let n = normalize(in.normal);
+    let view = view_direction();
+    let ndl = dot(n, normalize(camera.light_dir));
+
+    // PS 19654 第 33–38 行：saturate((((N·L)+1)*.5-.3)*10)，再从
+    // LightRampColor 混到白。MatCapTex 的资产标记 sRGB=1，显式恢复硬件解码。
+    let ramp_t = saturate(((ndl + 1.0) * 0.5 - 0.3) * 10.0);
+    let light_ramp = mix(material.family1.rgb, vec3<f32>(1.0), ramp_t);
+    let matcap = srgb_to_linear(
+        textureSample(base_color, base_sampler, matcap_uv(n)).rgb
+    );
+    var surface = material.family0.rgb * light_ramp + matcap;
+
+    // cb3[5].xy / cb3[13].z：Rim Power、Rim Soft Edge、Rim Intensity。
+    // 98–114 行先按观察方向 Z 缩窄轮廓区，再 pow、减 .5、除 SoftEdge。
+    let ndv = saturate(dot(n, view));
+    let rim_width = max((1.0 - abs(view.y)) * 0.4, 1e-4); // UE Z-up → glTF Y-up
+    let rim_gate = 1.0 - saturate((ndv - 0.05) / rim_width);
+    let rim_base = max((1.0 - ndv) * rim_gate, 1e-6);
+    let rim = saturate(
+        (pow(rim_base, max(material.family5.x, 1e-4)) - 0.5)
+        / max(material.family5.y, 1e-4)
+    ) * material.family5.z;
+    // 原 r5 是 MobileBasePass 提供的中性环境/主光颜色；本渲染器的灯色同样为白。
+    surface = mix(surface, vec3<f32>(1.0), saturate(rim));
+
+    // 117–121 行。family6 = [FlatIntensity, FlatRatio, MainBright, XrayGate]。
+    surface = mix(surface,
+                  material.family2.rgb * material.family6.x,
+                  saturate(material.family6.y));
+    surface *= material.family3.rgb * material.family6.z;
+    surface = mix(surface,
+                  material.family4.rgb,
+                  saturate(material.family4.a));
+
+    // 基础 OpacityMask 不在上面的 color PS 里重复算：目标 resource 开着 masked
+    // Early-Z，它由同资源的 depth PS 15293 第 30–45 行先写深度。那条链无条件采
+    // MatCap、取亮度，与 pow(1-N·V,FresnelPow) 取 max，再减 cooked clip 0.3333。
+    // 本渲染器是单遍，必须在这里合并同一条 depth-PS discard；只照抄 color PS 会让
+    // 深度预通过滤凭空消失，整个闭合外壳写满深度并挡住内部 FakeFulid。
+    let matcap_luma = dot(matcap, vec3<f32>(0.3, 0.59, 0.11));
+    let fresnel = pow(max(1.0 - ndv, 1e-4), max(material.family5.w, 1e-4));
+    if max(matcap_luma, fresnel) < 0.3333 {
+        discard;
+    }
+
+    return vec4<f32>(encode_linear_color(max(surface, vec3<f32>(0.0))), 1.0);
+}
+
 fn shade_main(in: VsOut, depth_coverage: f32) -> vec4<f32> {
+    if material.family_flags.x > 0.5 {
+        return shade_xiaoyou(in);
+    }
+    if material.family_flags.y > 0.5 {
+        return shade_yutu_ear(in);
+    }
+    if material.family_flags.z > 0.5 {
+        return shade_fake_fluid(in, depth_coverage);
+    }
+    if material.family_flags.w > 0.5 {
+        return shade_matcap_masked(in);
+    }
     // 表情:脸那两个槽的贴图是 2×4 的图集,网格 UV 落在左上那一格,
     // 换表情就是整格地偏一下(flags.x = 这是脸)。其余材质偏移量恒为 0。
     let uv = in.uv + camera.face_uv * step(0.5, material.flags.x);

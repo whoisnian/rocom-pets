@@ -26,6 +26,10 @@ struct CameraUniform {
     /// **放在相机这份 uniform 里**是因为它是**每只**的(同一个形态的两只可以不同表情),
     /// 而材质那份是按形态共享的 —— 那边只存「这是不是脸」。
     face_uv: [f32; 2],
+    /// 当前蒙皮姿势的物体包围盒中心(xyz)与最长边(w)。FakeFulid 的目标 PS 从
+    /// PrimitiveSceneData 读取的正是 ObjectWorldPositionAndRadius / ObjectBounds；
+    /// 不能拿未蒙皮 POSITION 或绑定姿势盒替代，否则液面会跟着身体弯曲。
+    object_bounds: [f32; 4],
 }
 
 /// 画一帧要给的东西。**打包传**:拆成参数的话 `update` 要排到第八个,而它们
@@ -94,10 +98,32 @@ struct MaterialUniform {
     glassy_mask: [f32; 4],
     /// `M_P_Object_Trans` 场景深度淡化:[距离(米),开启强度,-,-]
     depth_fade: [f32; 4],
+    /// [XiaoYou, YutuEar, FakeFluid, MatcapMasked]；每项对应一个原生材质分支。
+    family_flags: [f32; 4],
+    xiaoyou_base1: [f32; 4],
+    xiaoyou_base2: [f32; 4],
+    xiaoyou_flow1: [f32; 4],
+    xiaoyou_flow2: [f32; 4],
+    xiaoyou_star_color: [f32; 4],
+    xiaoyou_noise_flow: [f32; 4],
+    xiaoyou_shape: [f32; 4],
+    xiaoyou_star_uv: [f32; 4],
+    /// 三套互斥的原生材质族共用参数区；解释由 family_flags.y/z/w 决定。
+    family0: [f32; 4],
+    family1: [f32; 4],
+    family2: [f32; 4],
+    family3: [f32; 4],
+    family4: [f32; 4],
+    family5: [f32; 4],
+    family6: [f32; 4],
+    family7: [f32; 4],
+    family8: [f32; 4],
+    family9: [f32; 4],
+    family10: [f32; 4],
+    family11: [f32; 4],
 }
 
-/// 本体贴图 alpha 里那层线条遮罩的**加性**强度。游戏里那些纹路(水灵身上的竖条、
-/// 多数宠物的身体分块线)比底色亮一档。
+/// 本体贴图 alpha 里那层曾经使用的加性白色补偿。
 ///
 /// **形状已经按汇编改对了**(罗隐 body shader 51377 第 99~103 行):
 ///     r1.w = saturate((基色.a − 0.04) × 1.1111)     ← 和不透明度用的是同一个重映射
@@ -105,26 +131,15 @@ struct MaterialUniform {
 /// 原来这里是 `× mix(1.0, 1.55, alpha)`(乘法、且用生 alpha),形状就不对 —— 那个 1.55
 /// 还是在上游法线 bug 修好前对着截图挑的。
 ///
-/// **只剩强度是标定的**:`cb6[7]` 那个颜色的名字还没解出来(这条 shader 的 V=112,
-/// 全库没有材质带这个块),所以先取中性白 × 这个标量。17 只对照对它很不敏感
-/// (0.0~0.35 之间四项指标几乎不动),取中间值。
-/// **`cb6[7]` 已经定名,但它解释不了这一项 —— 别照着改。**
-///
 /// 把 51377(罗隐 body,cb6、`dcl cb6[148]`、V=112)配到 `MI_P_Object` 块 14
 /// (V=112 / S=142 ⇒ 总槽 149 ≥ 148),`cb6[7]` 解出来是 **`Glow Color × Glow Intensity`**,
 /// 也就是那一步是**发光层**:`Glow Color × Glow Intensity × saturate((基色.a − 0.04) × 1.1111)`。
 /// 而 `Glow Intensity` 在采样过的每只宠物上都是根默认 **0**(罗隐/鸭吉吉/点点/暮星辰/
 /// 水灵/火神全查过),全库只有 2 处实例覆盖 ⇒ **这一层实机基本不画**。
 ///
-/// **但把这里归零反而更差**:15 只对照的调色板中位 0.077 → **0.090**,而且退步**只落在
-/// 星光族与水系**(暮星辰 0.058 → **0.162**、水灵 0.097 → 0.115、幽星光 0.081 → 0.095),
-/// 罗隐 / 鸭吉吉 / 点点 / 迪莫 / 魔力猫 这些走基础路径的**一个数都没变**。
-/// (顺带:全库过曝 4 → 3。)
-///
-/// ⇒ **`LINE_BOOST` 补的不是发光层**,而是那几族「我们只做了近似的额外层」欠下的量。
-/// 它的真实身份仍未查明。**注意配对没通过判据**:罗隐自己的材质 0 个冻结块,
-/// 只能借父材质的布局,而「块的槽位里要有这个材质覆盖过的参数」这条验证不了。
-const LINE_BOOST: f32 = 0.2;
+/// 因而通用路径必须保持为 0；星光族、水体缺失的亮度要在各自的原始材质分支中补齐，
+/// 不能用一层全局白膜代偿。矮脚爬爬的低对比正是这层代偿在高 alpha 纹理上的副作用。
+const LINE_BOOST: f32 = 0.0;
 
 /// 一只宠物的 GPU 资源(网格与贴图按形态共享,实例状态另说)。
 pub struct PetGpu {
@@ -133,6 +148,10 @@ pub struct PetGpu {
     joints: wgpu::Buffer,
     joint_capacity: usize,
     camera: wgpu::Buffer,
+    /// 只在模型含 FakeFulid 时保留一份 CPU 顶点，用当前关节矩阵复原 UE 每帧更新的
+    /// PrimitiveSceneData bounds。其他宠物不承担逐帧蒙皮包围盒的开销。
+    bounds_vertices: Option<Vec<Vertex>>,
+    bind_bounds: [f32; 4],
     frame_bind: wgpu::BindGroup,
     depth_layout: wgpu::BindGroupLayout,
     material_binds: Vec<wgpu::BindGroup>,
@@ -148,6 +167,8 @@ pub struct PetGpu {
     glass_draws: Vec<(u32, u32, usize)>,
     inner_draws: Vec<(u32, u32, usize)>,
     glassy_inner_draws: Vec<(u32, u32, usize)>,
+    /// 原材质为不透明、但不应套桌宠统一描边的专用内层（当前为 YutuEar）。
+    special_opaque_draws: Vec<(u32, u32, usize)>,
 }
 
 impl PetGpu {
@@ -162,6 +183,19 @@ impl PetGpu {
             contents: bytemuck::cast_slice(&model.vertices),
             usage: wgpu::BufferUsages::VERTEX,
         });
+        let bind_center = (model.bounds.0 + model.bounds.1) * 0.5;
+        let bind_extent = model.bounds.1 - model.bounds.0;
+        let bind_bounds = [
+            bind_center.x,
+            bind_center.y,
+            bind_center.z,
+            bind_extent.max_element(),
+        ];
+        let bounds_vertices = model
+            .materials
+            .iter()
+            .any(|material| material.fake_fluid.is_some())
+            .then(|| model.vertices.clone());
         let indices = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("pet-indices"),
             contents: bytemuck::cast_slice(&model.indices),
@@ -390,25 +424,47 @@ impl PetGpu {
         let mut material_binds = Vec::new();
         for material in &model.materials {
             // 主贴图:普通材质是基色;特效层是遮罩(形状来源),缺了就用白图 = 常量 1
-            let main = match (&material.base_color, &material.effect) {
-                (Some(image), _) => image,
-                (None, Some(effect)) => effect.mask.as_ref().unwrap_or(&white),
-                (None, None) => &white,
-            };
+            let main = material
+                .yutu_ear
+                .as_ref()
+                .and_then(|y| y.bubble.as_ref())
+                .or_else(|| material.fake_fluid.as_ref().and_then(|f| f.mask.as_ref()))
+                .or_else(|| {
+                    material
+                        .matcap_masked
+                        .as_ref()
+                        .and_then(|m| m.matcap.as_ref())
+                })
+                .unwrap_or_else(|| match (&material.base_color, &material.effect) {
+                    (Some(image), _) => image,
+                    (None, Some(effect)) => effect.mask.as_ref().unwrap_or(&white),
+                    (None, None) => &white,
+                });
             let main_view = upload_texture(device, queue, &material.name, main);
             // 第二张贴图两种用途共用一个 binding(一个材质只会是其中一种):
             // 特效层是噪声(火焰的流动),有基色的是卷动色带(暮星辰环带的渐变)
-            let second = match &material.effect {
-                Some(effect) => effect.noise.as_ref(),
-                None => material.flow.as_ref(),
-            };
+            let second = material
+                .yutu_ear
+                .as_ref()
+                .and_then(|y| y.distort.as_ref())
+                .or_else(|| material.fake_fluid.as_ref().and_then(|f| f.lut.as_ref()))
+                .or_else(|| material.xiaoyou.as_ref().and_then(|x| x.noise.as_ref()))
+                .or_else(|| match &material.effect {
+                    Some(effect) => effect.noise.as_ref(),
+                    None => material.flow.as_ref(),
+                });
             let noise_view =
                 upload_texture(device, queue, &material.name, second.unwrap_or(&white));
             let star_view = upload_texture(
                 device,
                 queue,
                 &material.name,
-                material.star.as_ref().unwrap_or(&white),
+                material
+                    .yutu_ear
+                    .as_ref()
+                    .and_then(|y| y.flow.as_ref())
+                    .or(material.star.as_ref())
+                    .unwrap_or(&white),
             );
             let matcap_view = upload_texture(
                 device,
@@ -511,6 +567,54 @@ impl PetGpu {
                 has(exact_object_trans),
                 material.object_trans_soft_edge,
             ];
+            let family_flags = [
+                has(material.xiaoyou.is_some()),
+                has(material.yutu_ear.is_some()),
+                has(material.fake_fluid.is_some()),
+                has(material.matcap_masked.is_some()),
+            ];
+            let xiaoyou_base1 = material.xiaoyou.as_ref().map_or([0.0; 4], |x| x.base1);
+            let xiaoyou_base2 = material.xiaoyou.as_ref().map_or([0.0; 4], |x| x.base2);
+            let xiaoyou_flow1 = material.xiaoyou.as_ref().map_or([0.0; 4], |x| x.flow1);
+            let xiaoyou_flow2 = material.xiaoyou.as_ref().map_or([0.0; 4], |x| x.flow2);
+            let xiaoyou_star_color = material.xiaoyou.as_ref().map_or([0.0; 4], |x| x.star_color);
+            let xiaoyou_noise_flow = material.xiaoyou.as_ref().map_or([0.0; 4], |x| x.noise_flow);
+            let xiaoyou_shape = material.xiaoyou.as_ref().map_or([0.0; 4], |x| x.shape);
+            let xiaoyou_star_uv = material.xiaoyou.as_ref().map_or([0.0; 4], |x| x.star_uv);
+            let mut family = [[0.0; 4]; 12];
+            if let Some(y) = &material.yutu_ear {
+                family[0] = y.bubble_color;
+                family[1] = y.flow_color;
+                family[2] = y.fresnel_color;
+                family[3] = y.inner_color;
+                family[4] = y.overall_color;
+                family[5] = y.ramp_color;
+                family[6] = y.top_color;
+                family[7] = y.bubble_shape;
+                family[8] = y.flow_shape;
+                family[9] = y.light_shape;
+                family[10] = y.top_shape;
+            } else if let Some(f) = &material.fake_fluid {
+                family[0] = f.edge_color;
+                family[1] = f.fresnel_color;
+                family[2] = f.plane_color;
+                family[3] = f.gradient1;
+                family[4] = f.gradient2;
+                family[5] = f.height_tiling;
+                family[6] = f.plane_axis;
+                family[7] = f.plane_center;
+                family[8] = f.body_shape;
+                family[9] = f.gradient_shape;
+                family[10] = f.top_shape;
+            } else if let Some(m) = &material.matcap_masked {
+                family[0] = m.base_color;
+                family[1] = m.light_ramp;
+                family[2] = m.flat_emissive;
+                family[3] = m.main_color;
+                family[4] = m.selection_color;
+                family[5] = m.rim_shape;
+                family[6] = m.surface_shape;
+            }
             let uniform = match &material.effect {
                 Some(effect) => MaterialUniform {
                     tint: effect.tint,
@@ -563,6 +667,27 @@ impl PetGpu {
                     glassy_noise,
                     glassy_mask,
                     depth_fade,
+                    family_flags,
+                    xiaoyou_base1,
+                    xiaoyou_base2,
+                    xiaoyou_flow1,
+                    xiaoyou_flow2,
+                    xiaoyou_star_color,
+                    xiaoyou_noise_flow,
+                    xiaoyou_shape,
+                    xiaoyou_star_uv,
+                    family0: family[0],
+                    family1: family[1],
+                    family2: family[2],
+                    family3: family[3],
+                    family4: family[4],
+                    family5: family[5],
+                    family6: family[6],
+                    family7: family[7],
+                    family8: family[8],
+                    family9: family[9],
+                    family10: family[10],
+                    family11: family[11],
                 },
                 // 有基色的材质:params.x/.z 说明 alpha 怎么解释
                 // (x=1 镂空遮罩、z=1 不透明度,都为 0 则是线条遮罩)
@@ -640,6 +765,27 @@ impl PetGpu {
                     glassy_noise,
                     glassy_mask,
                     depth_fade,
+                    family_flags,
+                    xiaoyou_base1,
+                    xiaoyou_base2,
+                    xiaoyou_flow1,
+                    xiaoyou_flow2,
+                    xiaoyou_star_color,
+                    xiaoyou_noise_flow,
+                    xiaoyou_shape,
+                    xiaoyou_star_uv,
+                    family0: family[0],
+                    family1: family[1],
+                    family2: family[2],
+                    family3: family[3],
+                    family4: family[4],
+                    family5: family[5],
+                    family6: family[6],
+                    family7: family[7],
+                    family8: family[8],
+                    family9: family[9],
+                    family10: family[10],
+                    family11: family[11],
                 },
             };
             let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -754,6 +900,12 @@ impl PetGpu {
                     shader_location: 5,
                     format: wgpu::VertexFormat::Float32x3,
                 },
+                // glTF `COLOR_0`；三套目标材质的目标 Low PS 都直接读取它。
+                wgpu::VertexAttribute {
+                    offset: 68,
+                    shader_location: 6,
+                    format: wgpu::VertexFormat::Float32x4,
+                },
             ],
         };
         // depth_write:主通道写深度,特效通道只测不写(半透层之间不该互相挡)
@@ -860,6 +1012,9 @@ impl PetGpu {
         // 自动落进混合通道，与原材质的 BLEND_Opaque 相反。
         let (glassy_inner_draws, remaining): (Vec<_>, Vec<_>) =
             all_draws.partition(|&(_, _, m)| model.materials[m].glassy_inner.is_some());
+        let (special_opaque_draws, remaining): (Vec<_>, Vec<_>) = remaining
+            .into_iter()
+            .partition(|&(_, _, m)| model.materials[m].yutu_ear.is_some());
         // 需要混合的最后画(叠在本体之上)。判据是 `blended()` 而不是 `translucent`:
         // 标着 BLEND_Translucent 但不透明度就是 1 的(幽星光那两个球)输出和不透明一样,
         // 放进混合通道只会因为不写深度而互相盖不住 —— 两颗球绕着转就闪。
@@ -888,6 +1043,8 @@ impl PetGpu {
             joints,
             joint_capacity,
             camera,
+            bounds_vertices,
+            bind_bounds,
             frame_bind,
             depth_layout,
             material_binds,
@@ -901,11 +1058,17 @@ impl PetGpu {
             glass_draws,
             inner_draws,
             glassy_inner_draws,
+            special_opaque_draws,
         })
     }
 
     /// 上传本帧的相机与蒙皮矩阵。
     pub fn update(&self, queue: &wgpu::Queue, frame: &FrameParams, matrices: &[Mat4]) {
+        let object_bounds = self
+            .bounds_vertices
+            .as_deref()
+            .and_then(|vertices| posed_object_bounds(vertices, matrices))
+            .unwrap_or(self.bind_bounds);
         queue.write_buffer(
             &self.camera,
             0,
@@ -920,6 +1083,7 @@ impl PetGpu {
                     0.0
                 },
                 face_uv: frame.face_uv,
+                object_bounds,
             }),
         );
         let count = matrices.len().min(self.joint_capacity);
@@ -969,6 +1133,13 @@ impl PetGpu {
                 pass.draw_indexed(first..first + count, 0, 0..1);
             }
         }
+        if !self.special_opaque_draws.is_empty() {
+            pass.set_pipeline(&self.pipeline);
+            for &(first, count, material) in &self.special_opaque_draws {
+                pass.set_bind_group(1, &self.material_binds[material], &[]);
+                pass.draw_indexed(first..first + count, 0, 0..1);
+            }
+        }
     }
 
     /// 第二遍：读取场景深度，画只测不写的半透明/加色层。
@@ -991,6 +1162,77 @@ impl PetGpu {
                 pass.draw_indexed(first..first + count, 0, 0..1);
             }
         }
+    }
+}
+
+/// 用与顶点着色器完全相同的线性混合蒙皮计算本帧物体盒。FakeFulid 的 cooked PS
+/// 通过 PrimitiveSceneData 读取当前 `ObjectWorldPositionAndRadius/ObjectBounds`，液面
+/// 平面以那个中心为原点；这是材质输入，不是为某个模型拟合液位。
+fn posed_object_bounds(vertices: &[Vertex], matrices: &[Mat4]) -> Option<[f32; 4]> {
+    if vertices.is_empty() || matrices.is_empty() {
+        return None;
+    }
+    let mut min = Vec3::splat(f32::INFINITY);
+    let mut max = Vec3::splat(f32::NEG_INFINITY);
+    for vertex in vertices {
+        let total: f32 = vertex.weights.iter().sum();
+        let weights = if total > 0.0001 {
+            vertex.weights.map(|weight| weight / total)
+        } else {
+            vertex.weights
+        };
+        let mut skin = Mat4::ZERO;
+        for (slot, weight) in weights.into_iter().enumerate() {
+            if weight > 0.0 {
+                let joint = vertex.joints[slot] as usize;
+                if joint < matrices.len() {
+                    skin += matrices[joint] * weight;
+                }
+            }
+        }
+        let position = skin.transform_point3(Vec3::from_array(vertex.pos));
+        min = min.min(position);
+        max = max.max(position);
+    }
+    if !min.is_finite() || !max.is_finite() {
+        return None;
+    }
+    let center = (min + max) * 0.5;
+    Some([center.x, center.y, center.z, (max - min).max_element()])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn skinned_vertex(pos: [f32; 3], joint: u16) -> Vertex {
+        Vertex {
+            pos,
+            normal: [0.0, 1.0, 0.0],
+            uv: [0.0; 2],
+            joints: [joint, 0, 0, 0],
+            weights: [1.0, 0.0, 0.0, 0.0],
+            local_pos: pos,
+            color: [1.0; 4],
+        }
+    }
+
+    #[test]
+    fn posed_bounds_follow_skin_matrices() {
+        let vertices = [
+            skinned_vertex([-1.0, -2.0, -3.0], 0),
+            skinned_vertex([1.0, 2.0, 3.0], 1),
+        ];
+        let matrices = [
+            Mat4::from_translation(Vec3::new(2.0, 3.0, 4.0)),
+            Mat4::from_translation(Vec3::new(-2.0, -1.0, 0.0)),
+        ];
+
+        assert_eq!(
+            posed_object_bounds(&vertices, &matrices),
+            Some([0.0, 1.0, 2.0, 2.0])
+        );
+        assert_eq!(posed_object_bounds(&[], &matrices), None);
     }
 }
 

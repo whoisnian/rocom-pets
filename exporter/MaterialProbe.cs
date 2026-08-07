@@ -12,6 +12,7 @@ using CUE4Parse.FileProvider.Vfs;
 using CUE4Parse.UE4.Assets.Exports;
 using CUE4Parse.UE4.Assets.Exports.Material;
 using CUE4Parse.UE4.Assets.Exports.SkeletalMesh;
+using CUE4Parse.UE4.Assets.Exports.Texture;
 using CUE4Parse.UE4.Assets.Objects;
 using CUE4Parse.UE4.Assets.Objects.Properties;
 using CUE4Parse.UE4.Objects.Core.Math;
@@ -237,6 +238,16 @@ public static class MaterialProbe
 
     public static void Run(AbstractVfsFileProvider provider, string asset)
     {
+        if (asset.StartsWith("FIND:", StringComparison.OrdinalIgnoreCase))
+        {
+            var needle = asset[5..];
+            foreach (var path in provider.Files.Values.Select(f => f.Path)
+                         .Where(p => p.Contains(needle, StringComparison.OrdinalIgnoreCase))
+                         .Distinct(StringComparer.OrdinalIgnoreCase)
+                         .OrderBy(p => p, StringComparer.OrdinalIgnoreCase))
+                Console.WriteLine(path);
+            return;
+        }
         // 材质 shader 里的 MaterialCollection0/1 只保留缓冲名，不保留资产名。
         // 把 pak 中所有 MPC 资产连同原始属性顺序列出来，才能用 cb 槽位反向确认是哪一份
         // collection；这也能区分“资产默认值”和“运行时由蓝图写入”的参数。
@@ -383,7 +394,13 @@ public static class MaterialProbe
                 Console.WriteLine("    开关 " + string.Join("  ",
                     info.Switches.OrderBy(kv => kv.Key).Select(kv => $"{kv.Key}={(kv.Value ? "开" : "关")}")));
             foreach (var (param, tex) in info.Textures.OrderBy(kv => kv.Key))
-                Console.WriteLine($"    tex {param,-20} → {tex}");
+            {
+                var objectPath = tex.Contains('.') ? tex[..tex.LastIndexOf('.')] : tex;
+                var colorSpace = provider.LoadPackageObject(objectPath) is UTexture texture
+                    ? $"  sRGB={(texture.SRGB ? 1 : 0)}"
+                    : "";
+                Console.WriteLine($"    tex {param,-20} → {tex}{colorSpace}");
+            }
             foreach (var (param, c) in info.Vectors.OrderBy(kv => kv.Key))
                 Console.WriteLine($"    col {param,-20} = ({c[0]:0.###}, {c[1]:0.###}, {c[2]:0.###}, {c[3]:0.###})");
             foreach (var (param, v) in info.Scalars.OrderBy(kv => kv.Key))

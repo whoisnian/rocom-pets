@@ -203,6 +203,98 @@ struct RawMaterial {
     /// [FresnelMaskPow, Offset, Smooth, TriPlannarBlendInt]
     #[serde(default)]
     glassy_mask: Option<[f32; 4]>,
+    /// `MI_P_Object_XiaoYou` 的目标 Low 专用分支。
+    #[serde(default)]
+    xiaoyou: bool,
+    #[serde(default)]
+    xiaoyou_base1: Option<[f32; 4]>,
+    #[serde(default)]
+    xiaoyou_base2: Option<[f32; 4]>,
+    #[serde(default)]
+    xiaoyou_flow1: Option<[f32; 4]>,
+    #[serde(default)]
+    xiaoyou_flow2: Option<[f32; 4]>,
+    #[serde(default)]
+    xiaoyou_star_color: Option<[f32; 4]>,
+    #[serde(default)]
+    xiaoyou_noise_flow: Option<[f32; 4]>,
+    #[serde(default)]
+    xiaoyou_shape: Option<[f32; 4]>,
+    #[serde(default)]
+    xiaoyou_star_uv: Option<[f32; 4]>,
+    /// `M_Gra_Yutu_Ear_Lighting` 的目标 Low 专用分支。
+    #[serde(default)]
+    yutu_ear: bool,
+    #[serde(default)]
+    yutu_bubble_tex: Option<String>,
+    #[serde(default)]
+    yutu_distort_tex: Option<String>,
+    #[serde(default)]
+    yutu_flow_tex: Option<String>,
+    #[serde(default)]
+    yutu_bubble_color: Option<[f32; 4]>,
+    #[serde(default)]
+    yutu_flow_color: Option<[f32; 4]>,
+    #[serde(default)]
+    yutu_fresnel_color: Option<[f32; 4]>,
+    #[serde(default)]
+    yutu_inner_color: Option<[f32; 4]>,
+    #[serde(default)]
+    yutu_overall_color: Option<[f32; 4]>,
+    #[serde(default)]
+    yutu_ramp_color: Option<[f32; 4]>,
+    #[serde(default)]
+    yutu_top_color: Option<[f32; 4]>,
+    #[serde(default)]
+    yutu_bubble_shape: Option<[f32; 4]>,
+    #[serde(default)]
+    yutu_flow_shape: Option<[f32; 4]>,
+    #[serde(default)]
+    yutu_light_shape: Option<[f32; 4]>,
+    #[serde(default)]
+    yutu_top_shape: Option<[f32; 4]>,
+    /// `M_P_FakeFulid`（资产原拼写）的液面/玻璃分支。
+    #[serde(default)]
+    fake_fluid: bool,
+    #[serde(default)]
+    fluid_edge_color: Option<[f32; 4]>,
+    #[serde(default)]
+    fluid_fresnel_color: Option<[f32; 4]>,
+    #[serde(default)]
+    fluid_plane_color: Option<[f32; 4]>,
+    #[serde(default)]
+    fluid_gradient1: Option<[f32; 4]>,
+    #[serde(default)]
+    fluid_gradient2: Option<[f32; 4]>,
+    #[serde(default)]
+    fluid_height_tiling: Option<[f32; 4]>,
+    #[serde(default)]
+    fluid_plane_axis: Option<[f32; 4]>,
+    #[serde(default)]
+    fluid_plane_center: Option<[f32; 4]>,
+    #[serde(default)]
+    fluid_body_shape: Option<[f32; 4]>,
+    #[serde(default)]
+    fluid_gradient_shape: Option<[f32; 4]>,
+    #[serde(default)]
+    fluid_top_shape: Option<[f32; 4]>,
+    /// `M_P_MatCap_Masked` 的目标 Low PS 19654 分支。
+    #[serde(default)]
+    matcap_masked: bool,
+    #[serde(default)]
+    matcap_masked_base: Option<[f32; 4]>,
+    #[serde(default)]
+    matcap_masked_light_ramp: Option<[f32; 4]>,
+    #[serde(default)]
+    matcap_masked_flat: Option<[f32; 4]>,
+    #[serde(default)]
+    matcap_masked_main: Option<[f32; 4]>,
+    #[serde(default)]
+    matcap_masked_selection: Option<[f32; 4]>,
+    #[serde(default)]
+    matcap_masked_rim: Option<[f32; 4]>,
+    #[serde(default)]
+    matcap_masked_surface: Option<[f32; 4]>,
 }
 
 #[derive(Deserialize)]
@@ -329,6 +421,14 @@ pub struct Material {
     pub flicker: [f32; 2],
     /// `M_ShuiMu_ByIn` 的原始流动内胆；`None` 表示走普通纯特效/基色路径。
     pub glassy_inner: Option<GlassyInner>,
+    /// `MI_P_Object_XiaoYou` 的不透明 MainTex/NoiseTex/StarTex 合成链。
+    pub xiaoyou: Option<XiaoYou>,
+    /// 莫比乌乌内层的原生不透明液体材质。
+    pub yutu_ear: Option<YutuEar>,
+    /// 克莱因龙的原生 FakeFulid 玻璃/液面材质。
+    pub fake_fluid: Option<FakeFluid>,
+    /// `M_P_MatCap_Masked` 的不透明 MatCap 外壳。
+    pub matcap_masked: Option<MatcapMasked>,
 }
 
 /// `M_ShuiMu_ByIn` 的材质局部链。字段顺序对应 71636 的原始参数；`noise.z` 是
@@ -340,6 +440,68 @@ pub struct GlassyInner {
     pub fresnel: [f32; 4],
     pub noise: [f32; 4],
     pub mask: [f32; 4],
+}
+
+/// 小灵面家族目标 ES3.1/Low PS 32511 的材质参数。贴图分别沿用 Material 的
+/// `base_color` / Effect.noise 对应的第二槽 / `star`，这里不重复存路径。
+#[derive(Clone)]
+pub struct XiaoYou {
+    pub base1: [f32; 4],
+    pub base2: [f32; 4],
+    pub flow1: [f32; 4],
+    pub flow2: [f32; 4],
+    pub star_color: [f32; 4],
+    pub noise_flow: [f32; 4],
+    pub shape: [f32; 4],
+    pub star_uv: [f32; 4],
+}
+
+#[derive(Clone)]
+pub struct YutuEar {
+    pub bubble: Option<PathBuf>,
+    pub distort: Option<PathBuf>,
+    pub flow: Option<PathBuf>,
+    pub bubble_color: [f32; 4],
+    pub flow_color: [f32; 4],
+    pub fresnel_color: [f32; 4],
+    pub inner_color: [f32; 4],
+    pub overall_color: [f32; 4],
+    pub ramp_color: [f32; 4],
+    pub top_color: [f32; 4],
+    pub bubble_shape: [f32; 4],
+    pub flow_shape: [f32; 4],
+    pub light_shape: [f32; 4],
+    pub top_shape: [f32; 4],
+}
+
+#[derive(Clone)]
+pub struct FakeFluid {
+    pub edge_color: [f32; 4],
+    pub fresnel_color: [f32; 4],
+    pub plane_color: [f32; 4],
+    pub gradient1: [f32; 4],
+    pub gradient2: [f32; 4],
+    pub height_tiling: [f32; 4],
+    pub plane_axis: [f32; 4],
+    pub plane_center: [f32; 4],
+    pub body_shape: [f32; 4],
+    pub gradient_shape: [f32; 4],
+    pub top_shape: [f32; 4],
+}
+
+#[derive(Clone)]
+pub struct MatcapMasked {
+    /// MatCapTex；路径复用 Effect.mask，避免 manifest 重复记录同一张贴图。
+    pub matcap: Option<PathBuf>,
+    pub base_color: [f32; 4],
+    pub light_ramp: [f32; 4],
+    pub flat_emissive: [f32; 4],
+    pub main_color: [f32; 4],
+    pub selection_color: [f32; 4],
+    /// [Rim Power, Rim Soft Edge, Rim Intensity, FresnelPow]
+    pub rim_shape: [f32; 4],
+    /// [Flat intensity, Flat ratio, MainBright, max(Xray,Common_Xray)]
+    pub surface_shape: [f32; 4],
 }
 
 /// 特效层(火焰/水壳/光晕)的画法参数,全部来自游戏材质。
@@ -691,7 +853,7 @@ impl Pack {
                                     opacity: mat.opacity,
                                     glow: mat.glow,
                                     flow: mat.flow.unwrap_or([0.0, 0.0, 1.0, 1.0]),
-                                    mask: mat.mask_tex.map(|rel| root.join(rel)),
+                                    mask: mat.mask_tex.clone().map(|rel| root.join(rel)),
                                     noise: mat.noise_tex.map(|rel| root.join(rel)),
                                     mask_matcap: mat.mask_matcap,
                                 },
@@ -742,6 +904,89 @@ impl Pack {
                                     // 旧包若只带开关而缺数组,退回游戏根材质的原始默认值。
                                     noise: mat.glassy_noise.unwrap_or([-0.1, 1.0, 0.2, 30.0]),
                                     mask: mat.glassy_mask.unwrap_or([1.0, 0.7, 0.1, 0.0]),
+                                }),
+                                xiaoyou: mat.xiaoyou.then(|| XiaoYou {
+                                    base1: mat.xiaoyou_base1.unwrap_or([0.0, 0.0, 0.0, 1.0]),
+                                    base2: mat.xiaoyou_base2.unwrap_or([0.0, 0.0, 0.0, 1.0]),
+                                    flow1: mat.xiaoyou_flow1.unwrap_or([0.0, 0.0, 0.0, 1.0]),
+                                    flow2: mat.xiaoyou_flow2.unwrap_or([0.0, 0.0, 0.0, 1.0]),
+                                    star_color: mat.xiaoyou_star_color.unwrap_or([0.0; 4]),
+                                    noise_flow: mat.xiaoyou_noise_flow.unwrap_or([0.0; 4]),
+                                    shape: mat.xiaoyou_shape.unwrap_or([1.0, 1.0, 1.0, 0.0]),
+                                    star_uv: mat.xiaoyou_star_uv.unwrap_or([1.0, 0.0, 1.0, 0.0]),
+                                }),
+                                yutu_ear: mat.yutu_ear.then(|| YutuEar {
+                                    bubble: mat.yutu_bubble_tex.map(|rel| root.join(rel)),
+                                    distort: mat.yutu_distort_tex.map(|rel| root.join(rel)),
+                                    flow: mat.yutu_flow_tex.map(|rel| root.join(rel)),
+                                    bubble_color: mat
+                                        .yutu_bubble_color
+                                        .unwrap_or([0.0, 0.508735, 1.0, 1.0]),
+                                    flow_color: mat.yutu_flow_color.unwrap_or([1.0, 1.0, 1.0, 0.0]),
+                                    fresnel_color: mat
+                                        .yutu_fresnel_color
+                                        .unwrap_or([1.0, 1.0, 1.0, 0.0]),
+                                    inner_color: mat.yutu_inner_color.unwrap_or([1.0; 4]),
+                                    overall_color: mat
+                                        .yutu_overall_color
+                                        .unwrap_or([1.0, 1.0, 1.0, 0.0]),
+                                    ramp_color: mat.yutu_ramp_color.unwrap_or([1.0, 1.0, 1.0, 0.0]),
+                                    top_color: mat.yutu_top_color.unwrap_or([0.0; 4]),
+                                    bubble_shape: mat
+                                        .yutu_bubble_shape
+                                        .unwrap_or([0.05, 0.05, 5.0, 0.2]),
+                                    flow_shape: mat
+                                        .yutu_flow_shape
+                                        .unwrap_or([0.1, -0.5, 1.0, 0.8]),
+                                    light_shape: mat
+                                        .yutu_light_shape
+                                        .unwrap_or([0.3, 1.0, 1.0, 0.0]),
+                                    top_shape: mat.yutu_top_shape.unwrap_or([0.0, 0.0, 1.0, 0.0]),
+                                }),
+                                fake_fluid: mat.fake_fluid.then(|| FakeFluid {
+                                    edge_color: mat.fluid_edge_color.unwrap_or([1.0; 4]),
+                                    fresnel_color: mat
+                                        .fluid_fresnel_color
+                                        .unwrap_or([1.0, 1.0, 1.0, 0.0]),
+                                    plane_color: mat.fluid_plane_color.unwrap_or([1.0; 4]),
+                                    gradient1: mat.fluid_gradient1.unwrap_or([1.0; 4]),
+                                    gradient2: mat.fluid_gradient2.unwrap_or([1.0; 4]),
+                                    height_tiling: mat
+                                        .fluid_height_tiling
+                                        .unwrap_or([1.0, 1.0, 0.0, 0.0]),
+                                    plane_axis: mat
+                                        .fluid_plane_axis
+                                        .unwrap_or([0.0, 0.0, 1.0, 1.0]),
+                                    plane_center: mat.fluid_plane_center.unwrap_or([0.0; 4]),
+                                    body_shape: mat
+                                        .fluid_body_shape
+                                        .unwrap_or([5.0, 0.8, 0.1, 5.0]),
+                                    gradient_shape: mat
+                                        .fluid_gradient_shape
+                                        .unwrap_or([0.5, 0.01, 0.3, 0.2]),
+                                    top_shape: mat
+                                        .fluid_top_shape
+                                        .unwrap_or([0.3, 0.05, 1.0, 30.0]),
+                                }),
+                                matcap_masked: mat.matcap_masked.then(|| MatcapMasked {
+                                    matcap: mat.mask_tex.map(|rel| root.join(rel)),
+                                    base_color: mat
+                                        .matcap_masked_base
+                                        .unwrap_or([1.0, 1.0, 1.0, 0.0]),
+                                    light_ramp: mat
+                                        .matcap_masked_light_ramp
+                                        .unwrap_or([1.0, 1.0, 1.0, 0.0]),
+                                    flat_emissive: mat.matcap_masked_flat.unwrap_or([1.0; 4]),
+                                    main_color: mat.matcap_masked_main.unwrap_or([1.0; 4]),
+                                    selection_color: mat
+                                        .matcap_masked_selection
+                                        .unwrap_or([0.0; 4]),
+                                    rim_shape: mat
+                                        .matcap_masked_rim
+                                        .unwrap_or([0.4, 0.3, 0.0, 3.0]),
+                                    surface_shape: mat
+                                        .matcap_masked_surface
+                                        .unwrap_or([1.0, 0.0, 1.0, 0.0]),
                                 }),
                             },
                         )

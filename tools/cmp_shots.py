@@ -55,7 +55,8 @@ SHOTS = Path.home() / "Downloads/rocom/screenshot-pets"
 # `CMP_PACKS` 指到别处就能比**另一批包**(改完导出器只重导几只、和旧包对着看用)。
 # 那个目录里没有的形态会当「找不到同名形态」跳过,所以只重导几只也能跑。
 PACKS = Path(os.environ.get("CMP_PACKS", Path.home() / "Downloads/rocom/packs-all"))
-BIN = Path(__file__).parent.parent / "target/release/rocom-pets"
+BIN = Path(os.environ.get(
+    "CMP_BIN", Path(__file__).parent.parent / "target/release/rocom-pets"))
 # 采样的姿势(占 Idle 时长的比例)。**取多个再取中位** —— 见模块头第 7 条。
 POSES = (0.25, 0.4, 0.6)
 

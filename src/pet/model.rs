@@ -14,7 +14,7 @@ use glam::{Mat4, Quat, Vec3};
 use super::anim::Pose;
 use crate::pack::Material as PackMaterial;
 
-/// 顶点布局:位置/法线/UV/关节索引/权重。与 pet.wgsl 的 `@location` 一一对应。
+/// 顶点布局:位置/法线/UV/关节索引/权重/顶点色。与 pet.wgsl 的 `@location` 一一对应。
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct Vertex {
@@ -34,6 +34,10 @@ pub struct Vertex {
     /// /圆点」,而我们两种起点画出来都只是几点很淡的紫色斑 —— 换回 UV1/UV2 那版连斑都没有。
     /// 见 docs/design.md 的待办表。
     pub local_pos: [f32; 3],
+    /// 游戏材质直接读取的 `COLOR_0`。小灵面 `M_P_Object_XiaoYou` 用
+    /// `R*G*(1-A)` 控制流光/星点覆盖；兔耳液体用 R、FakeFluid 用 G。
+    /// 以前加载器完全丢弃它，三个独立材质族都会因此失去身体或液面。
+    pub color: [f32; 4],
 }
 
 /// 一段网格:对应一个材质槽(宠物一般 2–3 个:本体/眼/嘴)。
@@ -53,12 +57,9 @@ pub struct Material {
     pub cutout: bool,
     /// alpha 里是否真的有线条信息(见 `alpha_has_detail`);否则提亮要关掉。
     pub line_detail: bool,
-    /// 材质标了 `BLEND_Translucent`:要叠 MatCap 高光、边缘光按混色算。
-    ///
-    /// **注意不等于「要混合」**:本作有一批材质标着 `BLEND_Translucent` 但不透明度就是 1
-    /// (幽星光那两个球),它们的输出与不透明完全一样,却因为不写深度而互相盖不住 ——
-    /// 两颗球绕着转、谁在前只由索引序决定,于是转身时前后关系突然对调,看着就是在闪。
-    /// 真正需要混合的判据是 `blended()`。
+    /// 材质标了 `BLEND_Translucent`:要叠 MatCap 高光、边缘光按混色算，且和 UE 一样
+    /// 留在不写深度的混合通道。即使参数 Opacity 恰好为 1，也不能据此改成不透明材质：
+    /// 莫比乌乌的外壳会挡住先画的内层液体。
     pub translucent: bool,
     pub opacity: f32,
     /// 星点 / MatCap 两张附加贴图与它们的着色,以及边缘光。
@@ -113,18 +114,26 @@ pub struct Material {
     /// `M_ShuiMu_ByIn` 的专用局部材质链；`noise.z` 保留资源中的
     /// `GlassyNoiseRefract` 原值，GPU 按 uniform preshader 求折射 eta。
     pub glassy_inner: Option<GlassyInner>,
+    /// `MI_P_Object_XiaoYou` 的不透明专用材质链。
+    pub xiaoyou: Option<XiaoYou>,
+    /// `M_Gra_Yutu_Ear_Lighting` 的不透明内层液体。
+    pub yutu_ear: Option<YutuEar>,
+    /// `M_P_FakeFulid` 的半透明玻璃/液面。
+    pub fake_fluid: Option<FakeFluid>,
+    /// `M_P_MatCap_Masked` 的不透明 MatCap 外壳。
+    pub matcap_masked: Option<MatcapMasked>,
     /// 特效层的画法(火焰/水壳/光晕)。`None` = 普通不透明材质,走主通道。
     pub effect: Option<EffectMaterial>,
 }
 
 impl Material {
-    /// 这一片是否真的需要混合(→ 在不透明层之后画、不写深度)。纯特效层永远要;
-    /// 有基色的两种情况要:不透明度真的小于 1,或者**基色 alpha 就是不透明度**
-    /// (`alpha_opacity`,静态开关 `Opacity or OpacityMask` 点名的那 11 个)。
-    /// 标着半透、不透明度是 1、alpha 又只是纹路遮罩的,当不透明画 ——
-    /// 输出一模一样却不会闪(见 `translucent`)。
+    /// 这一片是否需要在不透明层之后混合（并保持不写深度）。纯特效层、UE 标记为
+    /// `BLEND_Translucent` 的材质、以基色 alpha 为不透明度的材质，以及 FakeFluid 都要。
     pub fn blended(&self) -> bool {
-        self.effect.is_some() || (self.translucent && self.opacity < 1.0) || self.alpha_opacity
+        // UE 的 BLEND_Translucent 无论材质参数里的 Opacity 是否恰好为 1，都不写深度。
+        // 内层液体必须先画、外层玻璃随后混合；把 opacity=1 的玻璃改进不透明通道会直接
+        // 挡掉莫比乌乌的 Fx1。这是混合模式语义，不是按宠物做排序特判。
+        self.effect.is_some() || self.translucent || self.alpha_opacity || self.fake_fluid.is_some()
     }
 }
 
@@ -149,6 +158,64 @@ pub struct GlassyInner {
     pub noise: [f32; 4],
     /// [Fresnel 次数, 阈值起点, 过渡宽度, 三向混合强度]
     pub mask: [f32; 4],
+}
+
+pub struct XiaoYou {
+    /// 目标 PS 的 t3；MainTex 与 StarTex 分别复用材质的 base_color / star。
+    pub noise: Option<Image>,
+    pub base1: [f32; 4],
+    pub base2: [f32; 4],
+    pub flow1: [f32; 4],
+    pub flow2: [f32; 4],
+    pub star_color: [f32; 4],
+    pub noise_flow: [f32; 4],
+    pub shape: [f32; 4],
+    pub star_uv: [f32; 4],
+}
+
+pub struct YutuEar {
+    pub bubble: Option<Image>,
+    pub distort: Option<Image>,
+    pub flow: Option<Image>,
+    pub bubble_color: [f32; 4],
+    pub flow_color: [f32; 4],
+    pub fresnel_color: [f32; 4],
+    pub inner_color: [f32; 4],
+    pub overall_color: [f32; 4],
+    pub ramp_color: [f32; 4],
+    pub top_color: [f32; 4],
+    pub bubble_shape: [f32; 4],
+    pub flow_shape: [f32; 4],
+    pub light_shape: [f32; 4],
+    pub top_shape: [f32; 4],
+}
+
+pub struct FakeFluid {
+    /// 目标 PS 的 t2/t3；FuildMask 是 sRGB 颜色资源，LUT 是线性数据资源。
+    pub mask: Option<Image>,
+    pub lut: Option<Image>,
+    pub edge_color: [f32; 4],
+    pub fresnel_color: [f32; 4],
+    pub plane_color: [f32; 4],
+    pub gradient1: [f32; 4],
+    pub gradient2: [f32; 4],
+    pub height_tiling: [f32; 4],
+    pub plane_axis: [f32; 4],
+    pub plane_center: [f32; 4],
+    pub body_shape: [f32; 4],
+    pub gradient_shape: [f32; 4],
+    pub top_shape: [f32; 4],
+}
+
+pub struct MatcapMasked {
+    pub matcap: Option<Image>,
+    pub base_color: [f32; 4],
+    pub light_ramp: [f32; 4],
+    pub flat_emissive: [f32; 4],
+    pub main_color: [f32; 4],
+    pub selection_color: [f32; 4],
+    pub rim_shape: [f32; 4],
+    pub surface_shape: [f32; 4],
 }
 
 pub struct Image {
@@ -344,6 +411,34 @@ impl Model {
                 .read_tex_coords(0)
                 .map(|it| it.into_f32().collect())
                 .unwrap_or_else(|| vec![[0.0, 0.0]; positions.len()]);
+            let source_colors = reader.read_colors(0);
+            let has_source_colors = source_colors.is_some();
+            let mut colors: Vec<[f32; 4]> = source_colors
+                .map(|it| it.into_rgba_f32().collect())
+                // UE 顶点工厂在网格没有颜色缓冲时提供白色常量；这也是目标 PS 实际读到的值。
+                .unwrap_or_else(|| vec![[1.0; 4]; positions.len()]);
+            if has_source_colors {
+                // 当前 CUE4Parse glTF 导出器把 FColor 的隐式 [0,1] 转换又除了一次 255。
+                // 因而本应为 1 的通道在 GLB 中只有 1/255；这些通道正是原材质用来控制
+                // XiaoYou/FakeFluid 等效果的顶点遮罩。只识别这种明确的特征，兼容早期
+                // 已正确导出的包（其最大值会显著大于 1/255）。
+                let max = colors
+                    .iter()
+                    .flat_map(|c| c.iter())
+                    .copied()
+                    .fold(0.0f32, f32::max);
+                if max == 0.0 && (spec.yutu_ear.is_some() || spec.fake_fluid.is_some()) {
+                    // 旧版 CUE4Parse 把“没有颜色缓冲”导成了显式全黑 COLOR_0；只在确认会读取
+                    // 该通道的两个原生材质族上恢复 UE 的白色 vertex-factory 默认值。
+                    colors.fill([1.0; 4]);
+                } else if max > 0.0 && max <= 1.0 / 255.0 + 1.0e-6 {
+                    for color in &mut colors {
+                        for channel in color {
+                            *channel = (*channel * 255.0).min(1.0);
+                        }
+                    }
+                }
+            }
             let joint_ids: Vec<[u16; 4]> = reader
                 .read_joints(0)
                 .context("缺 JOINTS_0")?
@@ -364,6 +459,7 @@ impl Model {
                     joints: joint_ids[i],
                     weights: weights[i],
                     local_pos: positions[i],
+                    color: colors[i],
                 });
             }
             let first_index = indices.len() as u32;
@@ -383,7 +479,11 @@ impl Model {
                 // 只有 alpha 真的有高低之分才启用纹路提亮(要在 base_color 被移动前算)
                 let line_detail = base_color.as_ref().is_some_and(alpha_has_detail);
                 // 特效层的遮罩/噪声贴图 alpha 原样保留:形状全靠它
-                let effect = spec.base_color.is_none().then(|| EffectMaterial {
+                let effect = (spec.base_color.is_none()
+                    && spec.yutu_ear.is_none()
+                    && spec.fake_fluid.is_none()
+                    && spec.matcap_masked.is_none())
+                .then(|| EffectMaterial {
                     tint: spec.effect.tint,
                     opacity: spec.effect.opacity,
                     glow: spec.effect.glow,
@@ -458,6 +558,70 @@ impl Model {
                         fresnel: g.fresnel,
                         noise: g.noise,
                         mask: g.mask,
+                    }),
+                    xiaoyou: spec.xiaoyou.as_ref().map(|x| XiaoYou {
+                        noise: spec
+                            .effect
+                            .noise
+                            .as_deref()
+                            .and_then(|p| load_texture(p, true)),
+                        base1: x.base1,
+                        base2: x.base2,
+                        flow1: x.flow1,
+                        flow2: x.flow2,
+                        star_color: x.star_color,
+                        noise_flow: x.noise_flow,
+                        shape: x.shape,
+                        star_uv: x.star_uv,
+                    }),
+                    yutu_ear: spec.yutu_ear.as_ref().map(|y| YutuEar {
+                        bubble: y.bubble.as_deref().and_then(|p| load_texture(p, true)),
+                        distort: y.distort.as_deref().and_then(|p| load_texture(p, true)),
+                        flow: y.flow.as_deref().and_then(|p| load_texture(p, true)),
+                        bubble_color: y.bubble_color,
+                        flow_color: y.flow_color,
+                        fresnel_color: y.fresnel_color,
+                        inner_color: y.inner_color,
+                        overall_color: y.overall_color,
+                        ramp_color: y.ramp_color,
+                        top_color: y.top_color,
+                        bubble_shape: y.bubble_shape,
+                        flow_shape: y.flow_shape,
+                        light_shape: y.light_shape,
+                        top_shape: y.top_shape,
+                    }),
+                    fake_fluid: spec.fake_fluid.as_ref().map(|f| FakeFluid {
+                        mask: spec
+                            .effect
+                            .mask
+                            .as_deref()
+                            .and_then(|p| load_texture(p, true)),
+                        lut: spec
+                            .effect
+                            .noise
+                            .as_deref()
+                            .and_then(|p| load_texture(p, true)),
+                        edge_color: f.edge_color,
+                        fresnel_color: f.fresnel_color,
+                        plane_color: f.plane_color,
+                        gradient1: f.gradient1,
+                        gradient2: f.gradient2,
+                        height_tiling: f.height_tiling,
+                        plane_axis: f.plane_axis,
+                        plane_center: f.plane_center,
+                        body_shape: f.body_shape,
+                        gradient_shape: f.gradient_shape,
+                        top_shape: f.top_shape,
+                    }),
+                    matcap_masked: spec.matcap_masked.as_ref().map(|m| MatcapMasked {
+                        matcap: m.matcap.as_deref().and_then(|p| load_texture(p, true)),
+                        base_color: m.base_color,
+                        light_ramp: m.light_ramp,
+                        flat_emissive: m.flat_emissive,
+                        main_color: m.main_color,
+                        selection_color: m.selection_color,
+                        rim_shape: m.rim_shape,
+                        surface_shape: m.surface_shape,
                     }),
                     effect,
                 });

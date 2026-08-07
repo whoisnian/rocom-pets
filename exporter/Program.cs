@@ -511,11 +511,32 @@ FormReport ExportForm(
             maskFile = ExportEffectTexture(info.MaskTexture);
             noiseFile = ExportEffectTexture(info.NoiseTexture);
         }
-        else if (info.WaterColor1 is not null)
+        else if (info.WaterColor1 is not null || info.IsXiaoYou)
         {
             // 水体预设的 caustics 也走 `noise_tex` 那个槽(它有基色,但没有色带,槽是空的)
             noiseFile = ExportEffectTexture(info.NoiseTexture);
         }
+        var yutuEar = info.IsYutuEar
+            ? new YutuEarMaterial(
+                maskFile, noiseFile, ExportEffectTexture(info.YutuFlowTexture),
+                info.YutuBubbleColor, info.YutuFlowColor, info.YutuFresnelColor,
+                info.YutuInnerColor, info.YutuOverallColor, info.YutuRampColor, info.YutuTopColor,
+                info.YutuBubbleShape, info.YutuFlowShape, info.YutuLightShape, info.YutuTopShape)
+            : null;
+        var fakeFluid = info.IsFakeFluid
+            ? new FakeFluidMaterial(
+                info.FluidEdgeColor, info.FluidFresnelColor, info.FluidPlaneColor,
+                info.FluidGradient1, info.FluidGradient2, info.FluidHeightTiling,
+                info.FluidPlaneAxis, info.FluidPlaneCenter, info.FluidBodyShape,
+                info.FluidGradientShape, info.FluidTopShape)
+            : null;
+        var matcapMasked = info.IsMatcapMasked
+            ? new MatcapMaskedMaterial(
+                info.MatcapMaskedBaseColor, info.MatcapMaskedLightRamp,
+                info.MatcapMaskedFlatEmissive, info.MatcapMaskedMainColor,
+                info.MatcapMaskedSelectionColor, info.MatcapMaskedRimShape,
+                info.MatcapMaskedSurfaceShape)
+            : null;
         materials.Add(new MaterialEntry(name, baseColor, info.IsFacePatch,
             info.OpacityMaskClipValue, info.BlendMode.ToString(), info.ParentChain,
             info.Tint, info.Opacity, info.Glow, info.Flow, maskFile, noiseFile, info.MaskIsMatcap,
@@ -542,7 +563,12 @@ FormReport ExportForm(
             info.NoiseUv,
             info.IsGlassyInner,
             info.GlassyFlowColor01, info.GlassyFlowColor02, info.GlassyFresnelColor,
-            info.GlassyNoiseParams, info.GlassyMaskParams));
+            info.GlassyNoiseParams, info.GlassyMaskParams,
+            info.IsXiaoYou,
+            info.XiaoYouBaseColor1, info.XiaoYouBaseColor2,
+            info.XiaoYouFlowColor1, info.XiaoYouFlowColor2, info.XiaoYouStarColor,
+            info.XiaoYouNoiseFlow, info.XiaoYouShape, info.XiaoYouStarUv,
+            yutuEar, fakeFluid, matcapMasked));
 
         if (info.StarTexture is not null && ExportEffectTexture(info.StarTexture) is { } starTex
             && (starLayer is null || (info.IsFakeTrans && !starFromFakeTrans)))
@@ -597,6 +623,9 @@ FormReport ExportForm(
         for (var i = 0; i < materials.Count; i++)
         {
             if (!hasLayer.Contains(materials[i].Name)) continue;
+            // XiaoYou 的 StarTex 是该材质自身 PS 的 t4，并不属于通用 Stick 星点层；
+            // 跨材质统一会把中间层的专用星图误换成另一个 Fx 遮罩。
+            if (materials[i].XiaoYou) continue;
             materials[i] = materials[i] with
             {
                 StarTexture = star.Tex,

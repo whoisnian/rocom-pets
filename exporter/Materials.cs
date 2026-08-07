@@ -60,9 +60,14 @@ public record MaterialInfo(
     bool Resolved = true)
 {
     /// 承载基色的参数名。`BaseTex` = 本体一类,`EyeTex` = 眼/嘴那种贴脸的小面片。
+    /// `M_P_Object_XiaoYou` 是一套独立的不透明材质，固有色入口明确叫 `MainTex`；
+    /// 过去只认前两项会把它误分成纯特效层，正是小灵面身体缺失的直接原因。
     /// 没有这两个参数 = 这个材质**不画固有色**(纯 VFX:火焰、水壳、光晕),桌宠该整片跳过。
     public string? BaseColorParam =>
-        Textures.Keys.FirstOrDefault(k => k.Equals("BaseTex", StringComparison.OrdinalIgnoreCase))
+        (IsXiaoYou
+            ? Textures.Keys.FirstOrDefault(k => k.Equals("MainTex", StringComparison.OrdinalIgnoreCase))
+            : null)
+        ?? Textures.Keys.FirstOrDefault(k => k.Equals("BaseTex", StringComparison.OrdinalIgnoreCase))
         ?? Textures.Keys.FirstOrDefault(k => k.Equals("EyeTex", StringComparison.OrdinalIgnoreCase));
 
     /// 基色贴图的对象路径;没有就是纯特效材质。
@@ -120,33 +125,25 @@ public record MaterialInfo(
     /// 数据也对得上:春花兔 `_Fx` 那块 UV 的基色 alpha 中位 **0.378**(它的 `_By` 是 1.000),
     /// 是张画出来的不透明度图。所以判据改成「开关开着 **或** 父链走 `M_P_Object_Trans`」。
     ///
-    /// **`Trans_MatCap` 那一支要排除掉。** 汇编里最终 alpha 不是那个重映射值本身,而是
-    /// `lerp(max(重映射, 高光, 菲涅尔), 重映射, ForceUseDefOpacity = 0)` —— 要和
-    /// matcap / 菲涅尔那两层取 max。那两层**已经接进 alpha 了**(见 pet.wgsl 玻璃分支里的
-    /// `alpha = max(alpha, max(rim_strength, matcap_strength))`),可这一支仍然不能放进来:
-    /// 幽星光那两颗球的基色 alpha 实测**中位 0.000、p90 也是 0.000**,球的形状压根不在
-    /// 基色里,放进来球就从实心变成**空心玻璃泡**(实机截图里它是一颗实心红球),
-    /// 调色板 0.088 → 0.095。
-    ///
-    /// **也别拿「静态排列相同」去推这个开关的根默认是开的** —— 那条推理对这一支不成立:
-    /// `MI_Ill_XingGuang1_001_Fx1`(开关**没设**)命中 24 个 shader map、
-    /// `MI_Ill_XingGuang3_001_Fx1`(开关**开**)命中 36 个,**两套不一样**。
-    /// 春兔/春花兔那两个之所以一样,多半是别的原因(父材质那份被原样带下来了)。
-    /// 结论:这个开关到底怎么默认还没查实,现在的判据是「开关 + 父链(排除 MatCap)」这条
-    /// **经验规则**,靠 17 只对照守着。
+    /// `Trans_MatCap` 也必须包含在内：它的目标 PS 最终是
+    /// `lerp(max(重映射 alpha, 高光, 菲涅尔), 重映射 alpha, ForceUseDefOpacity)`。
+    /// 先前为了让两颗星光球在不完整的 MatCap 近似下保持实心而排除了这一支，副作用是
+    /// 莫比乌乌的整个玻璃外壳 alpha 恒为 1，原生不透明内层无论怎么画都会被挡住。
+    /// 现在高光/菲涅尔覆盖已进入运行时，按 cooked shader 恢复整族语义。
     public bool AlphaIsOpacity =>
         Switch("Opacity or OpacityMask")
-        || (ParentChain.Any(p => p.Contains("Object_Trans", StringComparison.OrdinalIgnoreCase))
-            && !ParentChain.Any(p => p.Contains("Trans_MatCap", StringComparison.OrdinalIgnoreCase)));
+        || ParentChain.Any(p => p.Contains("Object_Trans", StringComparison.OrdinalIgnoreCase));
 
     /// 遮罩/噪声贴图:特效的形状与流动来源。没有就当常量 1。
     public string? MaskTexture =>
-        FirstTexture("Mask", "MaskTex", "BaseMap", "Base Color", "MatCap", "MatCapTex");
+        (IsYutuEar ? YutuBubbleTexture : null)
+        ?? FirstTexture("FuildMask", "Mask", "MaskTex", "BaseMap", "Base Color", "MatCap", "MatCapTex");
 
     /// 遮罩是不是 MatCap。**这决定采样方式**:matcap 要按视空间法线采(球面反射查找表),
     /// 拿网格 UV 采会变成一块块的斑,水灵的水膜就是这么糊掉的。
     public bool MaskIsMatcap =>
-        !Textures.ContainsKey("Mask") && !Textures.ContainsKey("MaskTex")
+        !Textures.ContainsKey("FuildMask")
+        && !Textures.ContainsKey("Mask") && !Textures.ContainsKey("MaskTex")
         && !Textures.ContainsKey("BaseMap") && !Textures.ContainsKey("Base Color")
         && (Textures.ContainsKey("MatCap") || Textures.ContainsKey("MatCapTex"));
 
@@ -155,7 +152,167 @@ public record MaterialInfo(
     public bool IsGlassyInner =>
         ParentChain.Any(p => p.Equals("M_ShuiMu_ByIn", StringComparison.OrdinalIgnoreCase));
 
-    public string? NoiseTexture => FirstTexture("Noise", "NoiseTex", "FlowTexture", "GlassyNoiseTex")
+    /// 小灵面家族专用的 `MI_P_Object_XiaoYou`。目标 Low PS 32511 输出 alpha=1，
+    /// 并用 MainTex/NoiseTex/StarTex 与 COLOR_0 合成，不是通用半透或 VFX。
+    public bool IsXiaoYou =>
+        ParentChain.Any(p => p.Equals("MI_P_Object_XiaoYou", StringComparison.OrdinalIgnoreCase));
+
+    /// 莫比乌乌内层使用的独立不透明材质。目标 Low PS 6037 的四张材质贴图依次是
+    /// Bubble Texture / DistortTex / FlowTex / BaseColor；后三张只存在于根材质默认值。
+    public bool IsYutuEar =>
+        ParentChain.Any(p => p.Equals("M_Gra_Yutu_Ear_Lighting", StringComparison.OrdinalIgnoreCase));
+
+    /// 克莱因龙的玻璃液体材质。游戏资产里的 `Fulid/Fuild` 就是这个拼写，不能按正确的
+    /// Fluid 去匹配；目标 Low PS 42877 直接以 COLOR_0.g 乘最终覆盖率。
+    public bool IsFakeFluid =>
+        ParentChain.Any(p => p.Contains("FakeFulid", StringComparison.OrdinalIgnoreCase));
+
+    /// 克莱因龙外壳使用的 MatCap 遮罩材质。目标 Low color PS 19654 先算
+    /// `BaseColor * LightRamp + MatCap`，再接 Rim/FlatEmissive/Main/Selection，
+    /// 最终 alpha 恒为 1；基础 OpacityMask 由同 resource 的 Early-Z depth PS 15293
+    /// 以 `max(MatCap亮度,Fresnel) >= 0.3333` 写深度。过去把它当“无基色纯特效”并按
+    /// HDR tint 判成加色层，会绕过遮罩且在所有内层液体之后盖上一整层白膜。
+    public bool IsMatcapMasked =>
+        ParentChain.Any(p => p.Equals("M_P_MatCap_Masked", StringComparison.OrdinalIgnoreCase));
+
+    public float[] MatcapMaskedBaseColor =>
+        FirstVector("BaseColor")
+        ?? RootDefaults?.Vectors.GetValueOrDefault("BaseColor")
+        ?? [1f, 1f, 1f, 0f];
+
+    public float[] MatcapMaskedLightRamp =>
+        FirstVector("LightRampColor")
+        ?? RootDefaults?.Vectors.GetValueOrDefault("LightRampColor")
+        ?? [1f, 1f, 1f, 0f];
+
+    public float[] MatcapMaskedFlatEmissive =>
+        FirstVector("Flat_EmissiveColor")
+        ?? RootDefaults?.Vectors.GetValueOrDefault("Flat_EmissiveColor")
+        ?? [1f, 1f, 1f, 1f];
+
+    public float[] MatcapMaskedMainColor =>
+        FirstVector("MainColor")
+        ?? RootDefaults?.Vectors.GetValueOrDefault("MainColor")
+        ?? [1f, 1f, 1f, 1f];
+
+    public float[] MatcapMaskedSelectionColor =>
+        FirstVector("SelectionColor")
+        ?? RootDefaults?.Vectors.GetValueOrDefault("SelectionColor")
+        ?? [0f, 0f, 0f, 0f];
+
+    /// PS 19654 中 cb3[5].xy / cb3[13].z / cb3[14].w 的确切参数映射。
+    public float[] MatcapMaskedRimShape =>
+    [
+        Scalar("Rim Power", RootScalar("Rim Power", 0.4f)),
+        Scalar("Rim Soft Edge", RootScalar("Rim Soft Edge", 0.3f)),
+        Scalar("Rim Intensity", RootScalar("Rim Intensity", 0f)),
+        Scalar("FresnelPow", RootScalar("FresnelPow", 3f)),
+    ];
+
+    /// PS 19654 的 Flat/Main 与 Xray 门。最后一项是 Xray/Common_Xray 的 max，
+    /// 对应 uniform preshader scalar-slot[11] 的原式。
+    public float[] MatcapMaskedSurfaceShape =>
+    [
+        RootScalar("Flat_EmissiveIntensity", 1f),
+        RootScalar("Flat_EmissiveRatio", 0f),
+        RootScalar("MainBright", 1f),
+        Math.Max(RootScalar("Xray", 0f), RootScalar("Common_Xray", 0f)),
+    ];
+
+    public string? YutuBubbleTexture => IsYutuEar ? FirstTexture("Bubble Texture") : null;
+    public string? YutuDistortTexture => IsYutuEar
+        ? RootDefaults?.Textures.GetValueOrDefault("DistortTex") : null;
+    public string? YutuFlowTexture => IsYutuEar
+        ? RootDefaults?.Textures.GetValueOrDefault("FlowTex") : null;
+
+    public float[] YutuBubbleColor => FirstVector("Bubble Color") ?? [0f, 0.508735f, 1f, 1f];
+    public float[] YutuFlowColor => FirstVector("FlowColor") ?? [1f, 1f, 1f, 0f];
+    public float[] YutuFresnelColor => FirstVector("FresnelCol") ?? [1f, 1f, 1f, 0f];
+    public float[] YutuInnerColor => FirstVector("InColor") ?? [1f, 1f, 1f, 1f];
+    public float[] YutuOverallColor => FirstVector("OverAllColor") ?? [1f, 1f, 1f, 0f];
+    public float[] YutuRampColor => FirstVector("RampColor") ?? [1f, 1f, 1f, 0f];
+    public float[] YutuTopColor => FirstVector("TopColor2") ?? [0f, 0f, 0f, 0f];
+    public float[] YutuBubbleShape =>
+    [
+        Scalar("Bubble Speed 1", 0.05f), Scalar("Bubble Speed 2", 0.05f),
+        Scalar("Bubbles Scale", 5f), Scalar("FlowDistort", 0.2f),
+    ];
+    public float[] YutuFlowShape =>
+    [
+        Scalar("U_Speed1", 0.1f), Scalar("V_Speed1", -0.5f),
+        Scalar("U_Tiling1", 1f), Scalar("V_Tiling1", 0.8f),
+    ];
+    public float[] YutuLightShape =>
+    [
+        Scalar("Flow Int", 0.3f), Scalar("Fres ExponentIn", 1f),
+        Scalar("Fres Int", 1f), Scalar("InColor Size", 0f),
+    ];
+    public float[] YutuTopShape =>
+    [
+        Scalar("TopColor Offset", 0f), Scalar("TopColor Size", 0f),
+        Scalar("TopColor Size2", 1f), Scalar("Contrast Soft 软硬", 0f),
+    ];
+
+    public float[] FluidEdgeColor => FirstVector("EdgeColor") ?? [1f, 1f, 1f, 1f];
+    public float[] FluidFresnelColor => FirstVector("FresnelColor") ?? [1f, 1f, 1f, 0f];
+    public float[] FluidPlaneColor => FirstVector("FulidPlaneColor") ?? [1f, 1f, 1f, 1f];
+    public float[] FluidGradient1 => FirstVector("GradientColor01") ?? [1f, 1f, 1f, 1f];
+    public float[] FluidGradient2 => FirstVector("GradientColor02") ?? [1f, 1f, 1f, 1f];
+    public float[] FluidHeightTiling => FirstVector("HeightNoiseTiling") ?? [1f, 1f, 0f, 0f];
+    public float[] FluidPlaneAxis => FirstVector("PlaneAxis") ?? [0f, 0f, 1f, 1f];
+    public float[] FluidPlaneCenter => FirstVector("PlaneCenter") ?? [0f, 0f, 0f, 0f];
+    public float[] FluidBodyShape =>
+    [
+        Scalar("BodyEdgeArea", 5f), Scalar("BodyEdgeOffset", 0.8f),
+        Scalar("BodyEdgeSmooth", 0.1f), Scalar("HeightNoiseIntensity", 5f),
+    ];
+    public float[] FluidGradientShape =>
+    [
+        Scalar("GradientOffset", 0.5f), Scalar("GradientSmooth", 0.01f),
+        Scalar("FresnelOffset", 0.3f), Scalar("FresnelSmooth", 0.2f),
+    ];
+    public float[] FluidTopShape =>
+    [
+        Scalar("TopEdgeOffset", 0.3f), Scalar("TopEdgeSmooth", 0.05f),
+        RootScalar("RippleOpacity", 1f), Scalar("FadeDistance", 30f),
+    ];
+
+    public float[] XiaoYouBaseColor1 =>
+        FirstVector("BaseColor1") ?? [0f, 0f, 0f, 1f];
+
+    public float[] XiaoYouBaseColor2 =>
+        FirstVector("BaseColor2") ?? [0f, 0f, 0f, 1f];
+
+    public float[] XiaoYouFlowColor1 =>
+        FirstVector("FlowNoiseColor1") ?? [0f, 0f, 0f, 1f];
+
+    public float[] XiaoYouFlowColor2 =>
+        FirstVector("FlowNoiseColor2") ?? [0f, 0f, 0f, 1f];
+
+    public float[] XiaoYouStarColor =>
+        FirstVector("StarColor") ?? [0f, 0f, 0f, 0f];
+
+    /// 原材质两组 panner 速度，参数名与目标 PS 使用的两条时间坐标一一对应。
+    public float[] XiaoYouNoiseFlow =>
+    [
+        Scalar("USpeedTex01"), Scalar("VSpeedTex01"),
+        Scalar("USpeedTex02"), Scalar("VSpeedTex02"),
+    ];
+
+    /// [两层 flow 强度, RG 星点阈值强度, 闪烁速度]。
+    public float[] XiaoYouShape =>
+    [
+        Scalar("FlowNoseInt1", 1f), Scalar("FlowNoiseInt2", 1f),
+        Scalar("Star_RG_Int", 1f), Scalar("Star_RG_TwinkleSpeed", 0f),
+    ];
+
+    public float[] XiaoYouStarUv =>
+        FirstVector("Star_RG_UV_Control") ?? [1f, 0f, 1f, 0f];
+
+    public string? NoiseTexture =>
+        (IsYutuEar ? YutuDistortTexture : null)
+        ?? (IsFakeFluid ? FirstTexture("BubbleColorLutTex") : null)
+        ?? FirstTexture("Noise", "NoiseTex", "FlowTexture", "GlassyNoiseTex")
         ?? (IsGlassyInner ? RootDefaults?.Textures.GetValueOrDefault("GlassyNoiseTex") : null);
 
     public float[] GlassyFlowColor01 =>
@@ -209,11 +366,15 @@ public record MaterialInfo(
     /// = `T_..._Fx_D`(青↔粉竖条纹渐变)+ `Flow_U_Speed` = 0.25,于是青粉渐变绕着环跑;
     /// 基色贴图里环带那一条是**纯粉的**,渐变完全来自这张图。
     ///
-    /// **判据是「`UVFlow` 族(公式写死在父材质里)或静态开关 `是否需要BaseColor流动` 打开」。**
+    /// **判据是「明确的 `XingGuang_UVFlow` 色带族,或静态开关
+    /// `是否需要BaseColor流动` 打开」。** 不能把所有名字含 `UVFlow` 的父材质都算进来:
+    /// `MI_P_Object_UVFlow_WPO_NoMetal` 的 `FlowTexture` 在目标 Low shader 中接的是
+    /// **法线扰动**,不是 BaseColor。水灵的蝴蝶结与身体走这支；把那张蓝黑遮罩当颜色混入，
+    /// 就会把本来干净的红蝴蝶结染蓝。`XingGuang_UVFlow` 才是把贴图接到颜色的那一支。
     /// 原来只看「美术给了流速」,那会多出 17 个火焰族材质(火花/迪莫/守夜烛):它们的
     /// `Flow_U_Speed` 是给**特效层自己的噪声卷动**用的,不是给固有色叠色带。
     public string? FlowTexture =>
-        (ParentChain.Any(p => p.Contains("UVFlow", StringComparison.OrdinalIgnoreCase))
+        (ParentChain.Any(p => p.Contains("XingGuang_UVFlow", StringComparison.OrdinalIgnoreCase))
          || Switch("是否需要BaseColor流动"))
         && (Scalar("Flow_U_Speed") != 0f || Scalar("Flow_V_Speed") != 0f)
             ? FirstTexture("FlowTexture")
@@ -356,6 +517,7 @@ public record MaterialInfo(
     /// 也算进这个门会让更多材质新启用这一层 —— 那是未经验证的行为改动,没做。
     public string? StarTexture =>
         !TransStarGate ? null
+        : IsXiaoYou ? FirstTexture("StarTex")
         : Vectors.ContainsKey("StarStickTiling") ? FirstTexture("StarStickTex", "ShinyStarTex", "StarTex")
         : IsFakeTrans ? FirstTexture("NoiseTex", "Noise")
         : null;
@@ -426,7 +588,9 @@ public record MaterialInfo(
     /// 原来拿「美术有没有显式设 `MatCapColor`」当判据,数目正好也是 17 个但对错各有两处
     /// (多算了果冻与翡翠水母、漏了莫比乌乌与风铃鲨三阶)—— 开关是明写的答案,不必再推断。
     public string? MatcapTexture =>
-        Switch("是否使用MatCap") ? FirstTexture("MatCap", "MatCapTex") : null;
+        IsFakeFluid
+            ? FirstTexture("MatCapTex")
+            : Switch("是否使用MatCap") ? FirstTexture("MatCap", "MatCapTex") : null;
 
     public float[]? MatcapColor => FirstVector("MatCapColor");
 
