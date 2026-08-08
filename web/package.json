@@ -7,7 +7,7 @@
     "build": "tsc --noEmit && vite build",
     "preview": "vite preview",
     "deploy": "npm run build && wrangler deploy",
-    "catalog": "python3 scripts/gen_catalog.py",
+    "catalog": "uv run --with pillow python scripts/gen_catalog.py",
     "db:init": "wrangler d1 execute rocom-pets --remote --file schema.sql",
     "db:init:local": "wrangler d1 execute rocom-pets --local --file schema.sql",
     "cf-typegen": "wrangler types"

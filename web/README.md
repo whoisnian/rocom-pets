@@ -43,20 +43,20 @@ wrangler secret put DEDUPE_SALT         # 随便一串随机字符
 ## 出目录、传文件、上线
 
 ```sh
-# 1. 扫包目录,算 sha256,读 manifest 里的形态构成,顺便从 rocom-petvo 取头像精灵图
-npm run catalog -- --packs ~/Downloads/rocom/packs-all-v2 \
+# 1. 扫包目录,算 sha256,读 manifest 里的形态构成,顺便从解包数据拼头像精灵图
+npm run catalog -- --packs ~/Downloads/rocom/packs-all \
                    --apps  ~/Downloads/rocom/dist-bin --version 0.1.0
 
 # 2. 传 R2。用 rclone(配 R2 的 S3 endpoint),不要用 wrangler r2 object put ——
 #    它一次只传一个,而且会把中文对象键 percent-encode,和 Worker 查的键对不上。
-rclone copy ~/Downloads/rocom/packs-all-v2 r2:rocom-pets/packs/ --progress
+rclone copy ~/Downloads/rocom/packs-all r2:rocom-pets/packs/ --progress
 rclone copy ~/Downloads/rocom/dist-bin     r2:rocom-pets/app/0.1.0/ --progress
 
 # 3. 上线
 npm run deploy
 ```
 
-`gen_catalog.py` 还有个**演示模式**,给没有那 1.4GB 包的机器用 —— 从
+`gen_catalog.py` 还有个**演示模式**,给没有那 1.6GB 包的机器用 —— 从
 `docs/petindex.md` 的清单造一份只有名字、没有大小与哈希的目录,页面会把这些条目
 标成「待上传」:
 
@@ -108,7 +108,14 @@ D1 的自增走 `INSERT … ON CONFLICT DO UPDATE SET downloads = downloads + 1`
 
 ## 头像
 
-来自隔壁 [rocom-petvo](../../rocom-petvo) 的 `sprite.webp`(425 只,21 列 × 128px)+
-`data.js` 里的中文名 → 序号映射。petvo 只收录了**有图鉴号且有 `Common_Happy` 事件**的宠物,
-所以 `000` 那批包和少数形态查不到头像 —— 记 `null`,前端退回「首字 + 按名字哈希出来的底色」,
-不留空位。有图鉴号的包命中率约 93%。
+**自己从解包数据拼**,不引外部仓库的成品图。游戏自带 `Icon/HeadIcon/<conf_id>.png`
+(128px 一张,解包树里 634 张),而 manifest 里 `[species].id` 与 `[[forms]].id` 就是
+conf_id —— **按 id 直接对上**。用得上的那些拼成一张 webp(当前 573 张,24 列 × 128px,
+1.9MB),其余不进图:多拼一张就是白让访客下载一张的字节。
+
+按 id 对比按中文名好在两处:同名不同图鉴号的宠物各有各的头像(按名字只能给一个),
+以及不受「哪些宠物被收录过」的限制。**实测命中率:包 196/201、形态 573/607**
+(此前按中文名查外部表是 168/201 与 369/607)。剩下的是游戏里本来就没出图标的,
+记 `null`,前端退回「首字 + 按名字哈希出来的底色」,不留空位。
+
+没有解包数据也能跑:`--parsed` 指不到就整站文字头像,不报错。

@@ -10,7 +10,7 @@ function hueOf(name: string): number {
 
 interface Props {
   name: string;
-  /** 精灵图序号,行主序;null 表示 petvo 里没有这只(「000」那批都没有) */
+  /** 精灵图序号,行主序;null 表示游戏里没给这只出头像图标 */
   sprite: number | null;
   sheet: SpriteSheet;
   /** 显示边长(px) */
