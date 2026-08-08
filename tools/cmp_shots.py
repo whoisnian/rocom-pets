@@ -6,7 +6,7 @@
 
     uv run --with numpy --with pillow python tools/cmp_shots.py
 
-## 七个坑,都踩过一次,判据里都堵上了
+## 八个坑,都踩过一次,判据里都堵上了
 
 1. **实机侧抠图会把「颜色贴近背景」的部位整段丢掉**,而且**填充率检测不出来**。
    红绒十字那张背景是橙色卡片、红腿距背景只有 39,抠图只剩乳白上身 ——
@@ -36,6 +36,13 @@
    高宽比在 **0.80~1.20** 之间摆(实机那张正好是 1.21)。「很暗占比」「描边比」这类按面积算的
    量会跟着姿势变。现在按 `POSES` 渲三格、每格各算一遍指标再**取中位**。
 
+8. **我们这侧的选区也会空,空了会直接把工具打崩**。实机侧早就有「太小就跳过」那条,
+   我们这侧没有:取景盒是各动作姿势的并集,CallOut 从天而降的那批能把盒子撑到身高两倍多,
+   宠物在 2400 的画布里只占一小块,缩到 1/4 再腐蚀两圈之后 `inner` 可能一个像素不剩,
+   `palette()` 返回空 → `palette_dist` 里 `min()` 拿到空序列抛异常,**整批一只都出不来**。
+   补了和实机侧同样的下限。另外**变体形态的名字带括号**(manifest 写「鸭吉吉(等一等鸭)」、
+   截图叫 `等一等鸭.png`),`pick_asset` 精确名对不上时会再试括号里那半。
+
 另外:**有些宠物有异色形态**(`MutationColorSwitch` + `RedChannel`/`GreenChannel`/`BlueChannel`
 + `MaskTex` 分区),我们没实现;拿截图当参考前要先确认那张不是异色版。
 """
@@ -62,19 +69,26 @@ POSES = (0.25, 0.4, 0.6)
 
 
 def pick_asset(name: str):
-    """→ (包目录, asset);见模块头第 2 条。"""
-    best = None
-    for man in sorted(PACKS.glob("*/manifest.toml")):
-        txt = man.read_text()
-        m = re.search(rf'^name = "{re.escape(name)}"$\n(?:.*\n)*?^asset = "([^"]+)"$',
-                      txt, re.M)
-        if not m:
-            continue
-        asset = m.group(1)
-        key = (1 if "Ar_" in asset else 0, asset)
-        if best is None or key < best[0]:
-            best = (key, man.parent, asset)
-    return (best[1], best[2]) if best else (None, None)
+    """→ (包目录, asset);见模块头第 3 条。
+
+    **变体形态的名字带括号**:manifest 里写的是「鸭吉吉(等一等鸭)」,而截图按人叫它的名字
+    存成 `等一等鸭.png`。所以精确名对不上时再试一次括号里那半 —— 顺序不能反,
+    否则 `鸭吉吉.png` 会先撞上某个 `鸭吉吉(…)` 变体,而它该取的是链首那个基础形态。
+    """
+    for pattern in (rf'^name = "{re.escape(name)}"$', rf'^name = "[^"]*\({re.escape(name)}\)"$'):
+        best = None
+        for man in sorted(PACKS.glob("*/manifest.toml")):
+            txt = man.read_text()
+            m = re.search(pattern + r'\n(?:.*\n)*?^asset = "([^"]+)"$', txt, re.M)
+            if not m:
+                continue
+            asset = m.group(1)
+            key = (1 if "Ar_" in asset else 0, asset)
+            if best is None or key < best[0]:
+                best = (key, man.parent, asset)
+        if best:
+            return best[1], best[2]
+    return None, None
 
 
 def ours(path: Path, down=4, erode=2):
@@ -219,6 +233,13 @@ def main() -> None:
         per_pose, dropped = [], None
         for png in pngs:
             A, inner, ring = ours(png)
+            # **我们这侧也要有下限**,和上面实机侧那条一样。取景盒是「各动作姿势的并集」,
+            # 有些宠物的 CallOut 从天而降、把盒子撑到身高两倍多,于是它在 2400 的画布里
+            # 只占一小块;缩到 1/4 再腐蚀两圈之后 inner 可能一个像素都不剩,
+            # `palette()` 拿到空数组 → `palette_dist` 里 `min()` 空序列直接抛。
+            # 补上这条之前,新加的四张截图(绅士鸡/翠顶夫人/黑羽夫人/等一等鸭)会让整个工具崩掉。
+            if inner.sum() < 300 or ring.sum() < 100:
+                continue
             if (d := dropped_by_bg(A[inner], a[gin], background(shot))) is not None:
                 dropped = d
                 break
