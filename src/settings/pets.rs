@@ -106,7 +106,13 @@ impl SettingsApp {
                                     .x
                             })
                             .fold(0.0_f32, f32::max);
-                        egui::ComboBox::from_id_salt(("form", slot))
+                        // **id 里带上形态个数**,否则同一个槽位换成形态更多的包会卡住:
+                        // popup 那个 `Area` 把上一帧量到的尺寸记在 `ctx.memory().areas()` 里
+                        // (egui 0.35 area.rs:466/666),而 `height(f32::INFINITY)` 让里面那个
+                        // `ScrollArea` 退回 `available_rect_before_wrap()`(scroll_area.rs:763)
+                        // —— 于是**可用高度 = 上一帧的自己**,只会缩不会涨,滚动条一出就下不去。
+                        // 尺寸由几行决定,那就按几行分开记。
+                        egui::ComboBox::from_id_salt(("form", slot, pack.forms.len()))
                             .width(220.0)
                             // 形态最多的那几条链有十三个(雪绒鸟、蹦蹦种子、脆筒甜甜),
                             // 默认上限 `Spacing::combo_height` = 200px 只够七八条 ——
@@ -474,5 +480,117 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 当前那个下拉 popup 的高度:前景层里最高的那个 `Area`。
+    fn popup_height(ctx: &egui::Context) -> Option<f32> {
+        ctx.memory(|m| {
+            m.areas()
+                .visible_layer_ids()
+                .into_iter()
+                .filter(|layer| layer.order == egui::Order::Foreground)
+                .filter_map(|layer| m.area_rect(layer.id))
+                .map(|rect| rect.height())
+                .max_by(f32::total_cmp)
+        })
+    }
+
+    /// 写一个有 `forms` 个形态的包,返回包名。
+    fn write_pack(root: &std::path::Path, name: &str, id: u32, forms: usize) -> String {
+        let dir = root.join(name);
+        std::fs::create_dir_all(&dir).expect("该能建目录");
+        let mut toml =
+            format!("schema = 1\n[species]\nid = {id}\nname = \"{name}\"\nchain = [{id}]\n");
+        for i in 0..forms {
+            toml.push_str(&format!(
+                "[[forms]]\n\
+                 id = {}\n\
+                 name = \"{name}{}\"\n\
+                 stage = {}\n\
+                 asset = \"Asset_{name}_{i}\"\n\
+                 model = \"forms/Asset_{name}_{i}/model.glb\"\n\
+                 scale = 1\n\
+                 height_cm = 80.0\n\
+                 locomotion = \"ground\"\n\
+                 [forms.clips]\n\
+                 Idle = {{ clip = \"Idle\", ms = 1000, frames = 30 }}\n",
+                id + i as u32,
+                i + 1,
+                i + 1,
+            ));
+        }
+        std::fs::write(dir.join("manifest.toml"), toml).expect("该能写 manifest");
+        name.to_string()
+    }
+
+    /// 形态下拉必须**把每个形态都露出来**,哪怕这个槽位上一次开的是个形态更少的包。
+    ///
+    /// 曾经会偶现滚动条、还把最后一个形态挡在外面:popup 的 `Area` 把上一帧量到的尺寸
+    /// 记在 `ctx.memory().areas()` 里(egui 0.35 `area.rs:466/666`),而
+    /// `ComboBox::height(f32::INFINITY)` 让里面那个 `ScrollArea` 退回
+    /// `available_rect_before_wrap()`(`scroll_area.rs:763`)—— 于是**可用高度 = 上一帧的
+    /// 自己**,只会缩不会涨。同一个 `id_salt` 换成形态更多的包,就永远卡在旧高度上。
+    #[test]
+    fn the_form_dropdown_never_hides_a_form() {
+        use super::super::{Page, SettingsApp};
+        use egui_kittest::Harness;
+        use egui_kittest::kittest::Queryable;
+
+        let dir = std::env::temp_dir().join(format!("rocom-combo-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let packs = dir.join("packs");
+        write_pack(&packs, "短链", 3001, 2);
+        write_pack(&packs, "长链", 4001, 13);
+        std::fs::write(dir.join("roster.toml"), "[[pet]]\npack = \"短链\"\n").expect("该能写阵容");
+
+        let app = std::rc::Rc::new(std::cell::RefCell::new(SettingsApp::new(
+            Some(dir.join("config.toml")),
+            Some(packs.clone()),
+            crate::control::SettingsPage::Pets,
+        )));
+        assert!(
+            matches!(app.borrow().page, Page::Pet(0)),
+            "前置条件:停在这一只的页上"
+        );
+
+        let driven = app.clone();
+        // **要装真主题**:行高由 `theme::install` 的字号与 `button_padding` 决定,
+        // 用 egui 默认样式量出来的行只有一半高,十三行轻松塞进去,这个测试就白做了。
+        let mut harness = Harness::new_ui(move |ui| {
+            theme::install(ui.ctx());
+            driven.borrow_mut().pet_page(ui, 0);
+        });
+        harness.run();
+
+        // ① 先开短链那个包的下拉,把这个 slot 的 popup 尺寸喂成「两行」
+        harness.get_by_value("短链1(1 / 2)").click();
+        harness.run();
+        harness.run();
+        harness.get_by_label("短链2(80cm)").click();
+        harness.run();
+
+        // ② 同一个 slot 换成九个形态的包,再开一次
+        app.borrow_mut().roster[0].pack = "长链".into();
+        app.borrow_mut().roster[0].form = None;
+        harness.run();
+        harness.get_by_value("长链1(1 / 13)").click();
+        harness.run();
+        harness.run();
+
+        // popup 的高度要装得下九行。**不能拿选项自己的 rect 判** —— 被滚动区裁掉的那几行
+        // 照样按真实位置分配矩形,裁的是绘制不是布局。看 popup 那个 `Area` 自己的高度。
+        // 行距从相邻两条自己量,别把间隔写死
+        let first = harness.get_by_label("长链1(80cm)").rect();
+        let second = harness.get_by_label("长链2(80cm)").rect();
+        let pitch = second.min.y - first.min.y;
+        let need = pitch * 12.0 + first.height();
+        let popup = popup_height(&harness.ctx).expect("下拉该是开着的");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            popup >= need,
+            "十三个形态要一次全露出来:popup 高 {popup},装下要 {need}(行距 {pitch}),\
+             差 {:.1} 行",
+            (need - popup) / pitch
+        );
     }
 }

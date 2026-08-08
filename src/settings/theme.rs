@@ -53,6 +53,12 @@ pub fn install(ctx: &egui::Context) {
         style.spacing.item_spacing = egui::vec2(8.0, 6.0);
         style.spacing.button_padding = egui::vec2(10.0, 5.0);
         style.spacing.interact_size.y = CONTROL_H;
+        // **下拉 popup 第一帧量尺寸的上限。** egui 默认 400px(`Spacing::default_area_size`),
+        // 而 `Area` 之后每帧都拿上一帧量到的尺寸当可用空间(area.rs:466/666),
+        // 里面那个 `ScrollArea` 又按可用空间裁自己 —— 第一帧被这个上限卡住,后面就只会缩
+        // 不会涨。形态最多的链有十三个,按这套字号正好要 364px,离 400 只剩 36px。
+        // 给个大数就行:`Area` 还会再 `at_most(窗口)`,等于「窗口放得下就全露出来」。
+        style.spacing.default_area_size.y = 4000.0;
         // 侧栏那些行要能整行点中,不是只有文字可点
         style.spacing.menu_margin = egui::Margin::same(4);
         // 可编辑的数值框也算「数值」,跟着等宽走(见 `value`)
