@@ -236,6 +236,88 @@ public static class MaterialProbe
         param.Equals("BaseTex", StringComparison.OrdinalIgnoreCase)
         || param.Equals("EyeTex", StringComparison.OrdinalIgnoreCase);
 
+    /// 全库普查描边材质(`--probe-material OUTLINES`)。
+    ///
+    /// 想回答的是「实机的描边到底有多宽、是不是逐宠物调的」。判据不能只看实例覆盖了什么:
+    /// **实例里的覆盖是按参数名查根材质的**,名字对不上就是一条死设定。本作正好有这么一条
+    /// (`OutLine Offset`),而且几乎每份 `_Ol` 都写了 0 —— 照着它做会得出「全库都没有描边」
+    /// 的错误结论。所以这里对每个标量同时打印:链上的覆盖值、根材质默认值,以及
+    /// **名字在根材质里存不存在**。
+    private static void SurveyOutlines(AbstractVfsFileProvider provider)
+    {
+        const string petsRoot = "NRC/Content/ArtRes/AnimSequence/Pets";
+        var files = provider.Files.Values
+            .Select(f => f.Path)
+            .Where(p => p.StartsWith(petsRoot + "/", StringComparison.OrdinalIgnoreCase)
+                        && p.EndsWith("_Ol.uasset", StringComparison.OrdinalIgnoreCase))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .OrderBy(p => p, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+        Console.WriteLine($"=== {files.Count} 份 _Ol 描边材质");
+
+        string[] watch =
+        [
+            "OutlineWidthPC", "MaxWidthScale", "MinWidthScale", "OutlineOffset", "OutLine Offset",
+            "Outline Intensity", "UseNormalVector", "IgnoreVertexColor", "DistanceUniform",
+            "描边中心剔除范围", "MinID",
+        ];
+        // 参数名 → 「有效值 → 命中数」。有效值 = 链上覆盖过且名字在根里存在,否则根默认。
+        var effective = watch.ToDictionary(w => w, _ => new Dictionary<string, int>(), StringComparer.OrdinalIgnoreCase);
+        var deadNames = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+        var parents = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+        var sample = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        var failed = 0;
+
+        foreach (var path in files)
+        {
+            UMaterialInstance? mi;
+            try { mi = provider.LoadPackageObject(path[..path.LastIndexOf('.')]) as UMaterialInstance; }
+            catch { failed++; continue; }
+            if (mi is null) { failed++; continue; }
+
+            // 顺父链合并:从最远的祖先开始写,近的覆盖远的(与 Materials.Resolve 同一套规则)
+            var chain = new List<UMaterialInstance>();
+            for (var cur = mi; cur is not null && chain.Count < 8; cur = cur.Parent as UMaterialInstance)
+                chain.Add(cur);
+            var scalars = new Dictionary<string, float>(StringComparer.OrdinalIgnoreCase);
+            for (var i = chain.Count - 1; i >= 0; i--)
+                foreach (var p in chain[i].GetOrDefault<FScalarParameterValue[]>("ScalarParameterValues", []))
+                    if (!string.IsNullOrEmpty(p.Name)) scalars[p.Name] = p.ParameterValue;
+
+            var root = RootMaterial.Of(mi);
+            var rootName = chain[^1].Parent?.Name ?? "(无根)";
+            parents[rootName] = parents.GetValueOrDefault(rootName) + 1;
+
+            foreach (var name in watch)
+            {
+                var live = root.Scalars.ContainsKey(name);
+                var value = live && scalars.TryGetValue(name, out var v) ? v
+                    : root.Scalars.TryGetValue(name, out var d) ? d
+                    : float.NaN;
+                var key = float.IsNaN(value) ? "(根材质没有这个参数)" : $"{value:0.####}";
+                if (scalars.ContainsKey(name) && !live)
+                {
+                    deadNames[name] = deadNames.GetValueOrDefault(name) + 1;
+                    sample.TryAdd(name, Path.GetFileNameWithoutExtension(path));
+                }
+                effective[name][key] = effective[name].GetValueOrDefault(key) + 1;
+                sample.TryAdd($"{name}={key}", Path.GetFileNameWithoutExtension(path));
+            }
+        }
+
+        Console.WriteLine($"读取失败 {failed} 份;根材质分布:" +
+                          string.Join("、", parents.Select(kv => $"{kv.Key} × {kv.Value}")));
+        Console.WriteLine("\n--- 有效值分布(链上覆盖 → 根默认)");
+        foreach (var name in watch)
+            Console.WriteLine($"  {name,-22} " + string.Join("  ",
+                effective[name].OrderByDescending(kv => kv.Value)
+                    .Select(kv => $"{kv.Key} × {kv.Value}"
+                                  + (kv.Value > 8 ? "" : $"({sample[$"{name}={kv.Key}"]})"))));
+        Console.WriteLine("\n--- 死设定(实例写了,但根材质里没有同名参数 ⇒ 运行时查不到,不生效)");
+        foreach (var (name, n) in deadNames.OrderByDescending(kv => kv.Value))
+            Console.WriteLine($"  {name,-22} × {n}   例:{sample[name]}");
+    }
+
     public static void Run(AbstractVfsFileProvider provider, string asset)
     {
         if (asset.StartsWith("FIND:", StringComparison.OrdinalIgnoreCase))
@@ -284,6 +366,11 @@ public static class MaterialProbe
             return;
         }
 
+        if (asset.Equals("OUTLINES", StringComparison.OrdinalIgnoreCase))
+        {
+            SurveyOutlines(provider);
+            return;
+        }
         if (asset == "ALL")
         {
             Survey(provider, int.MaxValue);

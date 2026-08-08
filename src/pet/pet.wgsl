@@ -14,7 +14,8 @@ struct Camera {
     view_proj: mat4x4<f32>,
     // 光照方向(指向光源)与描边参数打包进一个 vec4 省 binding
     light_dir: vec3<f32>,
-    outline_width: f32,
+    // 描边宽度的全局倍率(1 = 材质里读出来的实机宽度);宽度本身在 `material.outline.x`
+    outline_scale: f32,
     // 秒;特效层的 UV 卷动靠它推进
     time: f32,
     // 是否选择高材质质量排列。目标实机为 Low；它实际绑定了 MobileDirectionalLight，
@@ -100,6 +101,8 @@ struct MaterialParams {
     family9: vec4<f32>,
     family10: vec4<f32>,
     family11: vec4<f32>,
+    // 描边:[沿法线外扩多少米, -, -, -]
+    outline: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> camera: Camera;
@@ -206,7 +209,10 @@ fn vs_outline(input: VsIn) -> VsOut {
     let normal = normalize((m * vec4<f32>(input.normal, 0.0)).xyz);
     let world = m * vec4<f32>(input.pos, 1.0);
     var out: VsOut;
-    out.clip = camera.view_proj * (world + vec4<f32>(normal * camera.outline_width, 0.0));
+    // 宽度逐材质,来自那份 `_Ol` 描边材质(`0.01 × OutlineWidthPC × MaxWidthScale` 厘米);
+    // 推导与「有一条看着像宽度、其实是死设定的参数」见 exporter/Materials.cs 的 `OutlineWidthOf`。
+    let width = material.outline.x * camera.outline_scale;
+    out.clip = camera.view_proj * (world + vec4<f32>(normal * width, 0.0));
     out.ndc = out.clip.xy / max(out.clip.w, 1e-6);
     out.uv = input.uv;
     out.normal = normal;
@@ -1334,6 +1340,13 @@ fn fs_outline(in: VsOut) -> @location(0) vec4<f32> {
         discard;
     }
     // 描边取基色的暗版而不是纯黑,卡通渲染里这样更自然。
+    //
+    // **⚠ 下面这条 0.80 是在描边粗了 4.6 倍的时候标出来的,别再拿它当准。**
+    // 宽度后来按描边 VS 的公式改对了(见 exporter/Materials.cs 的 `OutlineWidthOf`),
+    // 「描边环 ÷ 主体」那个比值随之从 1.01 走到 1.06 —— 也就是当年是拿颜色补宽度的账。
+    // 实机的描边色是 `OutLineOtherColor1..5` 按 `MatID` 分 5 档挑再乘 `Outline Intensity`
+    // (描边 PS 58499 第 32~41 行),都接近黑;要换成那套得连 `MatID` 贴图一起导,
+    // 单独一轮。在 0.39 厘米这个宽度上差别很小,而桌宠要在任意背景上认得出轮廓。
     //
     // **0.25 → 0.55 是量出来的**(2026-07-28,17 只有实机截图的宠物全覆盖)。做法:把两边的
     // 不透明遮罩各腐蚀 2 像素,分成「描边环」与「主体」,比 `中位(环)/中位(主体)`。

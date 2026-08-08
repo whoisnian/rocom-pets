@@ -157,8 +157,6 @@ pub fn render(request: &Request) -> Result<()> {
     // 对比这一项的退化是**诊断性**的 —— 实机的明暗是 `底色 × mix(暗部色, 亮部色, h89)`
     // 一对**颜色**,我们还是灰阶 `mix(0.5, 1.5, lit)`,本来就更平。光向估准之后这一点暴露得更清楚。
     let light_dir = Vec3::new(0.25, 0.9, 0.5);
-    // 描边宽度按模型尺寸走,免得大小形态粗细不一
-    let outline_width = (model.bounds.1 - model.bounds.0).length() * 0.004;
 
     let mut tiles: Vec<(String, Vec<u8>)> = Vec::new();
     // **零动画的形态渲绑定姿势。** 全库 819 个形态里有 64 个一段动作都没有 ——
@@ -177,7 +175,7 @@ pub fn render(request: &Request) -> Result<()> {
             &crate::pet::FrameParams {
                 view_proj,
                 light_dir,
-                outline_width,
+                outline_scale: 1.0,
                 time: request.time,
                 // 目标实机配置是 MaterialQualityLevel=Low。
                 high_material_quality: false,
@@ -213,7 +211,7 @@ pub fn render(request: &Request) -> Result<()> {
             &crate::pet::FrameParams {
                 view_proj,
                 light_dir,
-                outline_width,
+                outline_scale: 1.0,
                 time: request.time,
                 high_material_quality: false,
                 // 这段动作自带的表情。离屏渲染不带性格,所以「没意见」就是默认那张脸 ——
@@ -258,7 +256,7 @@ pub fn render(request: &Request) -> Result<()> {
             &crate::pet::FrameParams {
                 view_proj,
                 light_dir,
-                outline_width,
+                outline_scale: 1.0,
                 time: request.time,
                 high_material_quality: false,
                 face_uv: crate::persona::DEFAULT_FACE.uv_offset(),
@@ -340,7 +338,7 @@ fn benchmark(
             &crate::pet::FrameParams {
                 view_proj,
                 light_dir: light,
-                outline_width: 0.004,
+                outline_scale: 1.0,
                 time: frame_time,
                 high_material_quality: false,
                 face_uv: crate::persona::DEFAULT_FACE.uv_offset(),

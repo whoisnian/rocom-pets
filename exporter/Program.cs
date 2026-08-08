@@ -616,7 +616,7 @@ FormReport ExportForm(
             info.XiaoYouBaseColor1, info.XiaoYouBaseColor2,
             info.XiaoYouFlowColor1, info.XiaoYouFlowColor2, info.XiaoYouStarColor,
             info.XiaoYouNoiseFlow, info.XiaoYouShape, info.XiaoYouStarUv,
-            yutuEar, fakeFluid, matcapMasked, info.HasOutline, info.IsPaintOrder));
+            yutuEar, fakeFluid, matcapMasked, info.OutlineWidth ?? 0f, info.IsPaintOrder));
 
         if (info.StarTexture is not null && ExportEffectTexture(info.StarTexture) is { } starTex
             && (starLayer is null || (info.IsFakeTrans && !starFromFakeTrans)))

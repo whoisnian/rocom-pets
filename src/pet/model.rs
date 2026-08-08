@@ -63,6 +63,8 @@ pub struct Material {
     pub translucent: bool,
     /// 见 `pack::MaterialSpec::outline`。
     pub outline: Option<bool>,
+    /// 见 `pack::MaterialSpec::outline_width`(米)。
+    pub outline_width: Option<f32>,
     /// 见 `pack::MaterialSpec::paint_order`。
     pub paint_order: bool,
     pub opacity: f32,
@@ -513,6 +515,7 @@ impl Model {
                     line_detail,
                     translucent: spec.translucent,
                     outline: spec.outline,
+                    outline_width: spec.outline_width,
                     paint_order: spec.paint_order,
                     opacity: spec.opacity,
                     // 星点/matcap 的 alpha 原样保留:形状全在 alpha 里

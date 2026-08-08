@@ -16,7 +16,10 @@ pub const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 struct CameraUniform {
     view_proj: [[f32; 4]; 4],
     light_dir: [f32; 3],
-    outline_width: f32,
+    /// 描边宽度的**全局倍率**(1 = 按材质里读出来的实机宽度)。宽度本身逐材质,
+    /// 在 `MaterialUniform::outline` 里;这儿留一个倍率是为了桌宠那条取舍 ——
+    /// 实机的描边只有 ~0.39 厘米、几乎看不见,而桌宠要在任意背景上认得出轮廓。
+    outline_scale: f32,
     /// 秒。特效层的 UV 卷动靠它推进(火焰在流动)。
     time: f32,
     /// 是否选择原游戏的高材质质量排列。目标实机配置为 Low；对应的
@@ -37,7 +40,8 @@ struct CameraUniform {
 pub struct FrameParams {
     pub view_proj: Mat4,
     pub light_dir: Vec3,
-    pub outline_width: f32,
+    /// 描边宽度的全局倍率;1 = 实机宽度(逐材质,见 `MaterialSpec::outline_width`)。
+    pub outline_scale: f32,
     /// 秒;特效层的 UV 卷动靠它推进。
     pub time: f32,
     /// 是否选择原游戏的高材质质量排列；桌面与离屏默认复现实机的 Low。
@@ -121,6 +125,9 @@ struct MaterialUniform {
     family9: [f32; 4],
     family10: [f32; 4],
     family11: [f32; 4],
+    /// 描边:[沿法线外扩多少米, -, -, -]。**逐材质**(游戏里也是),见
+    /// `pack::MaterialSpec::outline_width`。
+    outline: [f32; 4],
 }
 
 /// 本体贴图 alpha 里那层曾经使用的加性白色补偿。
@@ -146,6 +153,14 @@ struct MaterialUniform {
 /// 因而通用路径必须保持为 0；星光族、水体缺失的亮度要在各自的原始材质分支中补齐，
 /// 不能用一层全局白膜代偿。矮脚爬爬的低对比正是这层代偿在高 alpha 纹理上的副作用。
 const LINE_BOOST: f32 = 0.0;
+
+/// 旧包(没有 `outline_width` 字段)的描边宽度,单位**米**。
+///
+/// 取全库模态值:`0.01 × OutlineWidthPC(0.13) × MaxWidthScale(300)` 厘米 = 0.39 厘米。
+/// 854 份 `_Ol` 里 `OutlineWidthPC = 0.13` 的有 848 份、`MaxWidthScale = 300` 的有 847 份,
+/// 例外只有火源两份、呜呜 `_Fx` 一份和挂在别的根上的 3 份。
+/// 推导见 `exporter/Materials.cs` 的 `OutlineWidthOf`。
+const DEFAULT_OUTLINE_WIDTH: f32 = 0.0039;
 
 /// 一只宠物的 GPU 资源(网格与贴图按形态共享,实例状态另说)。
 pub struct PetGpu {
@@ -283,7 +298,8 @@ impl PetGpu {
                 },
                 wgpu::BindGroupLayoutEntry {
                     binding: 3,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    // 顶点阶段也要读:描边宽度是逐材质的,`vs_outline` 从这里拿
+                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Uniform,
                         has_dynamic_offset: false,
@@ -626,6 +642,9 @@ impl PetGpu {
                 family[5] = m.rim_shape;
                 family[6] = m.surface_shape;
             }
+            // 旧包没有 `outline_width` ⇒ 用全库模态值 0.13 × 300。这比旧包自己当年那条
+            // 「包围盒对角线 × 0.004」更接近实机(魔力猫 1.79 厘米 vs 0.39 厘米)。
+            let outline_width = material.outline_width.unwrap_or(DEFAULT_OUTLINE_WIDTH);
             let uniform = match &material.effect {
                 Some(effect) => MaterialUniform {
                     tint: effect.tint,
@@ -699,6 +718,7 @@ impl PetGpu {
                     family9: family[9],
                     family10: family[10],
                     family11: family[11],
+                    outline: [outline_width, 0.0, 0.0, 0.0],
                 },
                 // 有基色的材质:params.x/.z 说明 alpha 怎么解释
                 // (x=1 镂空遮罩、z=1 不透明度,都为 0 则是线条遮罩)
@@ -797,6 +817,7 @@ impl PetGpu {
                     family9: family[9],
                     family10: family[10],
                     family11: family[11],
+                    outline: [outline_width, 0.0, 0.0, 0.0],
                 },
             };
             let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -1128,7 +1149,7 @@ impl PetGpu {
             bytemuck::bytes_of(&CameraUniform {
                 view_proj: frame.view_proj.to_cols_array_2d(),
                 light_dir: frame.light_dir.normalize().to_array(),
-                outline_width: frame.outline_width,
+                outline_scale: frame.outline_scale,
                 time: frame.time,
                 high_material_quality: if frame.high_material_quality {
                     1.0

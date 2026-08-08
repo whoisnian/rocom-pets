@@ -162,8 +162,8 @@ public record MaterialEntry(
     YutuEarMaterial? YutuEar,
     FakeFluidMaterial? FakeFluid,
     MatcapMaskedMaterial? MatcapMasked,
-    /// 同目录里有没有配套的 `_Ol` 描边材质;见 `MaterialInfo.HasOutline`。
-    bool HasOutline = true,
+    /// 配套 `_Ol` 描边材质算出来的描边宽度(米);0 = 不画。见 `Materials.OutlineWidthOf`。
+    float OutlineWidth = 0f,
     /// 按画家序画(不写深度),见 `MaterialInfo.IsPaintOrder`。
     bool PaintOrder = false);
 
@@ -272,8 +272,10 @@ public static class Manifest
                     parts.Add($"blend = {Quote(mat.Blend)}");
                     if (mat.Translucent) parts.Add("translucent = true");
                     // **逐材质写**(不是「有才写」):运行时对旧包没有这个字段时得退回老行为,
-                    // 只有明确写出来才敢按它开关描边。
-                    parts.Add($"outline = {(mat.HasOutline ? "true" : "false")}");
+                    // 只有明确写出来才敢按它开关描边。`outline` 是开关、`outline_width` 是宽度
+                    // (米),同一个来源算出来的两面 —— 前者留着是因为旧包只有它。
+                    parts.Add($"outline = {(mat.OutlineWidth > 0f ? "true" : "false")}");
+                    parts.Add($"outline_width = {Num(mat.OutlineWidth)}");
                     if (mat.PaintOrder) parts.Add("paint_order = true");
                     // 星点/MatCap/边缘光对所有材质都可能有
                     if (mat.StarTexture is not null)

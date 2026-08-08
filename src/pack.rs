@@ -113,6 +113,10 @@ struct RawMaterial {
     /// 那时按老规矩来:不透明的画描边、半透的不画。
     #[serde(default)]
     outline: Option<bool>,
+    /// 描边宽度(米),由 `_Ol` 材质的 `OutlineWidthPC × MaxWidthScale` 算出。
+    /// **旧包没有这个字段** ⇒ `None`,退回全库模态值(见 `MaterialSpec::outline_width`)。
+    #[serde(default)]
+    outline_width: Option<f32>,
     /// 按画家序画:不写深度,后画的盖住先画的。见 `MaterialSpec::paint_order`。
     #[serde(default)]
     paint_order: bool,
@@ -362,6 +366,10 @@ pub struct Material {
     /// 这个材质画不画描边 —— 游戏是**逐材质**开的(`Mat/` 里有没有配套的 `_Ol` 资产)。
     /// `None` = 旧包没这个字段,退回「不透明画、半透不画」。
     pub outline: Option<bool>,
+    /// 沿法线外扩多少**米**。来自 `_Ol` 材质:`0.01 × OutlineWidthPC × MaxWidthScale` 厘米,
+    /// 全库 847/854 是 `0.13 × 300` ⇒ 0.0039 米。推导见 `Materials.cs` 的 `OutlineWidthOf`。
+    /// `None` = 旧包没这个字段,退回那个模态值(比旧包自己的「对角线 × 0.004」更接近实机)。
+    pub outline_width: Option<f32>,
     /// **按画家序画:进不写深度的那一遍,后画的三角盖住先画的。**
     /// 幽火那一族(`M_Gho_XiaoYou_GhostFire`)每团是「外壳套内壳」两层闭合几何,
     /// 索引缓冲里就是「外壳 → 内壳」的顺序;走不透明通道的话外壳会把内壳整个挡住
@@ -902,6 +910,7 @@ impl Pack {
                                 },
                                 translucent: mat.translucent,
                                 outline: mat.outline,
+                                outline_width: mat.outline_width,
                                 paint_order: mat.paint_order,
                                 opacity: mat.opacity,
                                 star: mat.star_tex.map(|rel| root.join(rel)),

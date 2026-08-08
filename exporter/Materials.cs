@@ -58,15 +58,20 @@ public record MaterialInfo(
     /// 材质资产是不是真的读到了。`false` = 网格引用的材质包在 pak 里根本不存在(悬空引用),
     /// 参数全空,导出器会退回按贴图命名约定给基色,见 Program.cs。
     bool Resolved = true,
-    /// 同目录里有没有同名的 `_Ol` 材质 —— **游戏的描边是逐材质开的,不是每个材质都画**。
+    /// 同目录那份 `_Ol` 描边材质算出来的**描边宽度(米)**;没有 `_Ol` 就是 null(不画描边)。
     ///
-    /// 这不是启发式,是资产表本身:`Mat/` 目录里除了 `MI_<形态>_<槽>` 还并排放着
+    /// 「画不画」不是启发式,是资产表本身:`Mat/` 目录里除了 `MI_<形态>_<槽>` 还并排放着
     /// `MI_<形态>_<槽>_Ol`,而那份材质的参数表是描边专用的(`Outline Intensity`、
-    /// `OutlineWidthPC`、`OutLineOtherColor1..5`、`MinID`/`MatID`…)。有它才画描边。
+    /// `OutlineWidthPC`、`OutLineOtherColor1..5`、`MinID`/`MatID`…)。
     /// 实测:小灵面 `_By`/`_By1` 有、幽火 `_Fx` **没有**;水灵只有 `_By`;
     /// 幽星光 `_By` 与**那两颗玻璃球 `_Fx1`** 都有;克莱因龙 `_By`/`_Fx` 有、液面 `_Fx1` 没有。
-    bool HasOutline = false)
+    ///
+    /// 宽度怎么来的见 `OutlineWidthOf`。
+    float? OutlineWidth = null)
 {
+    /// 这个材质画不画描边。
+    public bool HasOutline => OutlineWidth is > 0f;
+
     /// 承载基色的参数名。`BaseTex` = 本体一类,`EyeTex` = 眼/嘴那种贴脸的小面片。
     /// `M_P_Object_XiaoYou` 是一套独立的不透明材质，固有色入口明确叫 `MainTex`；
     /// 过去只认前两项会把它误分成纯特效层，正是小灵面身体缺失的直接原因。
@@ -874,7 +879,7 @@ public static class Materials
                     var info = Resolve(key, material) with
                     {
                         RootDefaults = roots,
-                        HasOutline = HasOutlineAsset(material),
+                        OutlineWidth = OutlineWidthOf(material),
                     };
                     // **实例没覆盖混合模式时,用根材质自己的。** 实例侧的 `BLEND_Opaque` 是 0,
                     // 与「没写」不可区分(见 `Resolve` 里那条注释),所以直接挂在根材质上的
@@ -894,23 +899,71 @@ public static class Materials
         return result;
     }
 
-    /// 这个材质旁边有没有配套的 `_Ol` 描边材质(见 `MaterialInfo.HasOutline`)。
+    /// 配套 `_Ol` 描边材质算出来的描边宽度(**米**);没有 `_Ol` 返回 null。
     ///
-    /// 只查文件是否存在,不加载 —— 描边材质的参数(宽度/强度/分色)另说,这里要的只是
-    /// 「这个槽画不画描边」这一位。名字大小写在本作的 pak 里对不齐,所以两种拼法都试:
-    /// 对象名(`material.Name`)与包名(`material.Owner.Name` 的最后一段)。
-    private static bool HasOutlineAsset(UMaterialInstance material)
+    /// ## 宽度是从描边 VS 读出来的,不是调出来的
+    ///
+    /// `M_P_Outline` 的顶点着色器(垂头鸟 `_Ol` 的 ES3.1/Low/LOD0/Switch0 排列,
+    /// resource `984D6A92…`,shader 69972)最后把顶点在**裁剪空间**沿投影后的法线推开:
+    ///
+    ///     clip.xy += 0.01 × OutlineWidthPC × max(|LocalToWorld 三行|)
+    ///                     × lerp(1, 顶点色, IgnoreVertexColor)
+    ///                     × lerp(1, atan(ClipToView[0][0]) × 1.283426, DistanceUniform)
+    ///                     × clamp(clip.w, MinWidthScale, MaxWidthScale) × (ViewProj·N).xy
+    ///
+    /// 除以 w 之后等价于「沿法线在世界空间外扩 ε 厘米」,ε = 前面那一串(不含 `clip.w` 的除法)。
+    /// 于是:
+    ///
+    /// - `max(|LocalToWorld|)` 是**物体缩放**,而我们的网格坐标就是局部坐标 ⇒ 这一项正好抵消,
+    ///   宽度与 `model_scale` 无关;
+    /// - `clamp(clip.w, …)` 是相机距离(厘米)。我们是**正交相机**,没有这个量;实机看宠物的
+    ///   镜头在 `MaxWidthScale` 上下,所以取上限 —— 也正是那 3 份 `MinWidthScale =
+    ///   MaxWidthScale = 200` 的材质(火源)刻意做成的「与距离无关」;
+    /// - `DistanceUniform` 那一项是 FOV 补偿,`atan(tan(半水平FOV)) × 1.283426` 在
+    ///   **水平 FOV ≈ 89°** 时正好 = 1 —— 这是这套公式唯一钉不死的因子(实机各界面的镜头
+    ///   FOV 不同),取它自己的中性点 1。
+    ///
+    /// 代进全库的模态值 `0.13 × 300`:**ε = 0.39 厘米 = 0.0039 米**。原来运行时写的是
+    /// `包围盒对角线 × 0.004`(魔力猫 = 1.79 厘米),**粗了 4.6 倍** —— 这就是「实机几乎看不见
+    /// 描边、我们这儿一圈很明显」的原因。
+    ///
+    /// ## 有一条看着像宽度、其实是死设定的参数
+    ///
+    /// 854 份 `_Ol` 里有 851 份写着 `OutLine Offset = 0`(父级 `MI_P_Outline` 写 0.7)。
+    /// **它不生效**:`M_P_Outline` 的参数表里根本没有这个名字(哈希对不上,
+    /// `--probe-material OUTLINES` 会把这类「死设定」单独列出来),UE 是按参数名查的,
+    /// 查不到就退回根默认。照着它做会得出「全库都没有描边」的错误结论。
+    ///
+    /// 全库分布(`--probe-material OUTLINES`):`OutlineWidthPC` 0.13 × 848、
+    /// `MaxWidthScale` 300 × 847;例外只有火源的两份(0.4/0.7 × 200)、呜呜 `_Fx`
+    /// (`MaxWidthScale = 0` ⇒ 不画)、以及 3 份挂在 `M_FairyBall_BallBack` 上的(没有这套参数)。
+    private static float? OutlineWidthOf(UMaterialInstance material)
     {
         var provider = material.Owner?.Provider;
         var package = material.Owner?.Name;
-        if (provider is null || string.IsNullOrEmpty(package)) return false;
+        if (provider is null || string.IsNullOrEmpty(package)) return null;
         var dir = package[..(package.LastIndexOf('/') + 1)];
+        // 名字大小写在本作的 pak 里对不齐,所以两种拼法都试:
+        // 对象名(`material.Name`)与包名(`material.Owner.Name` 的最后一段)。
+        UMaterialInstance? outline = null;
         foreach (var stem in new[] { material.Name, package[(package.LastIndexOf('/') + 1)..] })
         {
             if (string.IsNullOrEmpty(stem)) continue;
-            if (provider.Files.ContainsKey($"{dir}{stem}_Ol.uasset")) return true;
+            if (!provider.Files.ContainsKey($"{dir}{stem}_Ol.uasset")) continue;
+            try { outline = provider.LoadPackageObject($"{dir}{stem}_Ol") as UMaterialInstance; }
+            catch { /* 读不出来就退回全库模态值,下面兜底 */ }
+            break;
         }
-        return false;
+        if (outline is null) return null;
+
+        var chain = Resolve(outline.Name, outline);
+        var roots = RootMaterial.Of(outline);
+        // 实例侧的覆盖**只有在根材质里有同名参数时才生效**(见上面「死设定」那段)。
+        float Value(string name, float fallback) =>
+            roots.Scalars.ContainsKey(name) && chain.Scalars.TryGetValue(name, out var v) ? v
+                : roots.Scalars.GetValueOrDefault(name, fallback);
+        // 兜底用全库模态值:`M_FairyBall_BallBack` 那 3 份没有这套参数。
+        return 0.0001f * Value("OutlineWidthPC", 0.13f) * Value("MaxWidthScale", 300f);
     }
 
     /// 全零 GUID 是「没记」(材质层参数就是这样),不收。

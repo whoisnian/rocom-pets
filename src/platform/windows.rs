@@ -576,8 +576,6 @@ impl App {
             let (aw, ah) = entity.actor().size();
             let canvas_size =
                 shared::canvas_size((aw, ah), scale, gpu.device.limits().max_texture_dimension_2d);
-            let extent = pet.model.bounds.1 - pet.model.bounds.0;
-            let outline = extent.length() * 0.004;
             let view = view_proj(pet.model.motion_bounds, pet.yaw, CANVAS_PADDING);
             let matrices = pet.player.matrices.clone();
             // 表情:性格决定脸上那张图集用哪一格(见 persona.rs)
@@ -596,7 +594,7 @@ impl App {
                 &crate::pet::FrameParams {
                     view_proj: view,
                     light_dir: Vec3::new(-0.4, 0.8, 0.6),
-                    outline_width: outline,
+                    outline_scale: 1.0,
                     time: effect_time(),
                     // 复现目标实机的 MaterialQualityLevel=Low shader map。
                     high_material_quality: false,
