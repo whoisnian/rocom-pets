@@ -163,6 +163,7 @@ pub struct PetGpu {
     material_binds: Vec<wgpu::BindGroup>,
     pipeline: wgpu::RenderPipeline,
     outline_pipeline: wgpu::RenderPipeline,
+    paint_order_pipeline: wgpu::RenderPipeline,
     effect_pipeline: wgpu::RenderPipeline,
     glass_pipeline: wgpu::RenderPipeline,
     glassy_inner_pipeline: wgpu::RenderPipeline,
@@ -177,6 +178,8 @@ pub struct PetGpu {
     special_opaque_draws: Vec<(u32, u32, usize)>,
     /// 要画描边的那些(逐材质按 `_Ol` 资产开关;半透里有 `_Ol` 的也在这儿)。
     outline_draws: Vec<(u32, u32, usize)>,
+    /// 剔正面画的那些(幽火族的双层壳),见 `paint_order_pipeline`。
+    paint_order_draws: Vec<(u32, u32, usize)>,
 }
 
 impl PetGpu {
@@ -1003,6 +1006,19 @@ impl PetGpu {
         );
         // `M_ShuiMu_ByIn` 在原资产里是 BLEND_Opaque、alpha 恒 1。它必须写深度，且用自己
         // 的折射/三平面噪声片元函数；把它塞进通用半透 fs_effect 会同时改错颜色与遮挡。
+        // **幽火那一族剔正面、留背面。** 每团幽火是「外壳套内壳」两层闭合几何,
+        // 实机能同时看到两层:剔掉正面之后,看到的是外壳的**内表面**,而内壳(整体在外壳里面)
+        // 的内表面比它更靠近相机,于是照常写深度就压在上面 —— 两层都在、各自不透明、
+        // **与三角顺序无关**。判据与证据链见 `pack::MaterialSpec::paint_order`。
+        let paint_order_pipeline = make_pipeline(
+            "pet-paint-order",
+            "vs_main",
+            "fs_main",
+            Some(wgpu::Face::Front),
+            true,
+            false,
+        );
+
         let glassy_inner_pipeline = make_pipeline(
             "pet-glassy-inner",
             "vs_main",
@@ -1023,6 +1039,9 @@ impl PetGpu {
         let (special_opaque_draws, remaining): (Vec<_>, Vec<_>) = remaining
             .into_iter()
             .partition(|&(_, _, m)| model.materials[m].yutu_ear.is_some());
+        let (paint_order_draws, remaining): (Vec<_>, Vec<_>) = remaining
+            .into_iter()
+            .partition(|&(_, _, m)| model.materials[m].paint_order);
         // 需要混合的最后画(叠在本体之上)。判据是 `blended()` 而不是 `translucent`:
         // 标着 BLEND_Translucent 但不透明度就是 1 的(幽星光那两个球)输出和不透明一样,
         // 放进混合通道只会因为不写深度而互相盖不住 —— 两颗球绕着转就闪。
@@ -1081,6 +1100,7 @@ impl PetGpu {
             material_binds,
             pipeline,
             outline_pipeline,
+            paint_order_pipeline,
             effect_pipeline,
             glass_pipeline,
             glassy_inner_pipeline,
@@ -1091,6 +1111,7 @@ impl PetGpu {
             glassy_inner_draws,
             special_opaque_draws,
             outline_draws,
+            paint_order_draws,
         })
     }
 
@@ -1162,6 +1183,13 @@ impl PetGpu {
         if !self.glassy_inner_draws.is_empty() {
             pass.set_pipeline(&self.glassy_inner_pipeline);
             for &(first, count, material) in &self.glassy_inner_draws {
+                pass.set_bind_group(1, &self.material_binds[material], &[]);
+                pass.draw_indexed(first..first + count, 0, 0..1);
+            }
+        }
+        if !self.paint_order_draws.is_empty() {
+            pass.set_pipeline(&self.paint_order_pipeline);
+            for &(first, count, material) in &self.paint_order_draws {
                 pass.set_bind_group(1, &self.material_binds[material], &[]);
                 pass.draw_indexed(first..first + count, 0, 0..1);
             }

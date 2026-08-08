@@ -467,7 +467,16 @@ public record MaterialInfo(
     public bool IsWater =>
         ParentChain.Any(p => p.Contains("Water", StringComparison.OrdinalIgnoreCase));
 
-    public float EmissiveIntensity => Scalar("Emitter Intensity", 0f);
+    /// **水体预设里这一层不乘 `Emitter Intensity`。** 目标 Low PS 48738 第 59 行是
+    /// `mul r4.xyz, mask, cb6[2].xyzx`,随后第 111 行直接 `add` 进发光累加器 —— 中间没有
+    /// 任何标量;而 `cb6[2]` 的 preshader 字节码是 `04 0100 23 03 000102FF`
+    /// = `vector-param[1].xyz` = **`Emitter Color`** 本身。通用 `M_P_Object`
+    /// (PS 68952 第 64~65 行)才有那一步 `× cb6[39].z`。
+    ///
+    /// `Emitter Intensity` 在水体链里是**另一层**(`Color1`)的增益,见 `IsWater`;
+    /// 所以这一族既不能拿它当强度、也不能拿它当开关(shader 里根本没有开关)。
+    /// 实测:水灵身上那道条纹的峰值提升,乘 0.5 时 +39、不乘时 +89,实机是 +96。
+    public float EmissiveIntensity => IsWater ? 1f : Scalar("Emitter Intensity", 0f);
 
 
     /// 水体预设(`ML_P_StylizedWater` 图层)。整条链是从 shader 35663 读出来的,
