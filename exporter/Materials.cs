@@ -119,8 +119,14 @@ public record MaterialInfo(
         "BaseColor", "BaseColor1", "Emitter Color", "FresnelColor", "PatternColor",
         "BackColor");
 
-    /// 半透强度;没写就当全不透明。
-    public float Opacity => Scalars.TryGetValue("Opacity", out var v) ? v : 1f;
+    /// 半透强度。实例没写就问**根材质的默认值**,根上也没有才当全不透明。
+    ///
+    /// **不能直接兜 1。** `M_FairyBall_BallFront`(沙漏/水晶球那层玻璃壳)的根默认就是 0 ——
+    /// 「这层壳自己不出颜色,亮的只有 MatCap 与边缘光」。实例普遍不覆盖它,于是兜 1 就把
+    /// 玻璃壳画成了实心:等一等鸭手里那个沙漏成了一坨白,把里面的紫沙整个挡住(实机是透的)。
+    /// 同一个根材质的落陨星兔在实例上显式写了 `Opacity = 0`,渲出来是对的 —— 一个根材质
+    /// 两种结果,差别只在「实例写没写」,这正是该问根默认的信号。
+    public float Opacity => RootScalar("Opacity", 1f);
 
     /// **基色贴图的 alpha 是不透明度还是纹路遮罩,由这个静态开关决定。**
     ///
