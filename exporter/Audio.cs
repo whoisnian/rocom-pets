@@ -1,9 +1,25 @@
-// 宠物叫声:从 Wwise SoundBank 里找到事件对应的 .wem,转成 ogg 进包。
+// 宠物音频:从 Wwise SoundBank 里找到事件对应的 .wem,转成 ogg 进包。
 //
-// 关联链路是 rocom-capture/docs/audio.md 查实的,rocom-petvo 的 scripts/wwise.py 已经跑通
-// 一遍;这里是那份 Python 的最小 C# 移植 —— 只要「事件名 → wem」与「音调 RTPC 曲线」两件事。
+// 关联链路是 rocom-capture/docs/audio.md 查实的,rocom-petvo 的网页版已经跑通一遍;
+// 这里是那条链路的最小移植 —— 只要「事件名 → wem」与「音调 RTPC 曲线」两件事。
 //
 // **不必另外解包音频**:WwiseAudio 那 3.3GB 就在 pak 里,导出器手上已经有 provider。
+//
+// ## 两族库 = 两层声音
+//
+// 同一只宠物、同一段情绪,游戏里叠着放两条:
+//
+// | 库 | 内容 | 变调 |
+// | --- | --- | --- |
+// | `Pet_Vo_<拼音>.bnk` | 叫声(嗓子发出来的) | 跟着 `Pet_Vo_Pitch` |
+// | `Pet_Action_<拼音>.bnk` | 动作音效(身体动静:落地、扑翅、拖尾巴) | **不变调** |
+//
+// 两条**不是同一段音频的两份拷贝**:同名事件的 10ms RMS 包络相关只有 0.1~0.4,
+// 而「同一段」的判据是 0.87 以上(rocom-capture/docs/audio.md §10)。动作那层还明显更轻
+// (RMS 约 0.015 比 0.045),听感上是垫在叫声底下的一层。
+//
+// 「不变调」也是查出来的而不是猜的:621 个 `Pet_Vo_*` 里 619 个挂着 `Pet_Vo_Pitch` 曲线,
+// 而 650 个 `Pet_Action_*` 里**只有 1 个**有。那个 Game Parameter 是给嗓子用的。
 //
 // 偏移全是对本作(BKHD version 135 / Wwise 2021.1)的实测值,换游戏不保证适用。
 
@@ -13,44 +29,54 @@ using CUE4Parse.FileProvider.Vfs;
 
 namespace RocomPets.Export;
 
-/// 一段叫声在包里的样子。
-public record VoiceClip(string Key, string RelativePath, int Ms);
+/// 一段音频在包里的样子。`Key` 是**动作逻辑名**,与 `[forms.clips]` 同一把键。
+public record AudioClip(string Key, string RelativePath, int Ms);
 
-/// 一个形态的叫声:若干段 + 音调曲线两端。
-public record VoiceInfo(List<VoiceClip> Clips, int CentsLow, int CentsHigh);
+/// 一个形态的声音:叫声若干段 + 动作音效若干段 + 音调曲线两端。
+public record AudioInfo(List<AudioClip> Voice, List<AudioClip> Sfx, int CentsLow, int CentsHigh);
 
-public static class Voice
+public static class Audio
 {
     private const string WwiseDir = "NRC/Content/NewRoco/WwiseAudio/Windows/";
 
-    /// 运行时的触发点 → Wwise 事件后缀(按顺序尝试,取第一个能解出 wem 的)。
+    /// 桌宠会播的动作 → Wwise 事件后缀。
+    ///
+    /// **键就是动作逻辑名**(`[forms.clips]` 那一张表的键),不另起一套触发点名字:
+    /// 运行时是「播哪段动作」决定「出什么声」,两张表同一把键才不会各对各的。
+    /// 剩下的动作(Idle/Walk/Run/JumpFall/Sleep*)在两族库里都没有对应事件。
     ///
     /// 后缀大小写在源数据里不统一(`Common_SAd` / `Fight_Callout` 都有),但**这里不用管**:
     /// Wwise 的 FNV-1 是**先转小写**再哈希的,各种写法命中同一个 Event id。
-    private static readonly (string Key, string[] Events)[] Wanted =
+    ///
+    /// 全库覆盖率(621 个 `Pet_Vo_*` / 650 个 `Pet_Action_*`):八个 `Common_*` 都是
+    /// 617~648 只有,`Fight_CallOut` 612/644。也就是说**降级基本用不上** ——
+    /// 原来那张「取不到 Happy 就退 Show」的导出期降级表是空转,已经去掉;
+    /// 真缺一段时由运行时按它自己的动作降级表(`stage::fallbacks`)退,那才是一套。
+    private static readonly (string Key, string Event)[] Wanted =
     [
-        // 摸头满意
-        ("happy", ["Common_Happy", "Common_Show"]),
-        // 受惊
-        ("shock", ["Common_Shock", "Common_Fear", "Common_Alert"]),
-        // 召唤(上台)
-        ("callout", ["Fight_CallOut", "Common_Show", "Common_Happy"]),
-        // 睡醒
-        ("relax", ["Common_Relax", "Common_Happy"]),
+        ("Happy", "Common_Happy"),
+        ("Shock", "Common_Shock"),
+        ("Fear", "Common_Fear"),
+        ("Sad", "Common_Sad"),
+        ("Anger", "Common_Anger"),
+        ("Show", "Common_Show"),
+        ("Relax", "Common_Relax"),
+        ("Alert", "Common_Alert"),
+        ("CallOut", "Fight_CallOut"),
     ];
 
     /// Game Parameter 名:游戏把 -100~100 的 `voice` 属性喂给它,由 RTPC 曲线实时变调。
     private const string PitchParam = "Pet_Vo_Pitch";
 
-    /// 外部工具在不在。缺了就整批跳过叫声(包仍然可用),而不是让导出失败。
+    /// 外部工具在不在。缺了就整批跳过音频(包仍然可用),而不是让导出失败。
     private static readonly Lazy<bool> ToolsReady = new(() =>
         Which("vgmstream-cli") && Which("ffmpeg"));
 
     public static bool Available => ToolsReady.Value;
 
-    /// 导出一个形态的叫声。拿不到就返回 null(不是错误:39 个 bnk 查无此宠,
+    /// 导出一个形态的音频。拿不到就返回 null(不是错误:39 个 bnk 查无此宠,
     /// 还有形态压根没有 `Pet_Vo_*` 库)。
-    public static VoiceInfo? Export(
+    public static AudioInfo? Export(
         AbstractVfsFileProvider provider,
         string pinyin,
         string formDir,
@@ -58,38 +84,63 @@ public static class Voice
         List<string> warnings)
     {
         if (!Available) return null;
-        var bankPath = $"{WwiseDir}Pet_Vo_{pinyin}.bnk";
-        if (!provider.TrySaveAsset(bankPath, out var bankBytes)) return null;
+        var voiceBank = Load(provider, $"Pet_Vo_{pinyin}");
+        var sfxBank = Load(provider, $"Pet_Action_{pinyin}");
 
-        var bank = new Bank(bankBytes);
-        var voiceDir = Path.Combine(formDir, "voice");
-        var clips = new List<VoiceClip>();
-        foreach (var (key, events) in Wanted)
-        {
-            uint? source = null;
-            foreach (var suffix in events)
-            {
-                // 同一个事件通常挂 3 个随机变体,**取最小 id** 那条:导出要可复现
-                var wems = bank.EventWems($"Pet_Vo_{pinyin}_{suffix}");
-                if (wems.Count > 0) { source = wems.Min(); break; }
-            }
-            if (source is null) continue;
-            if (!provider.TrySaveAsset($"{WwiseDir}{source}.wem", out var wem)) continue;
-
-            Directory.CreateDirectory(voiceDir);
-            var outPath = Path.Combine(voiceDir, key + ".ogg");
-            var ms = Transcode(wem, outPath, warnings);
-            if (ms <= 0) continue;
-            clips.Add(new VoiceClip(key, $"{relativeDir}/voice/{key}.ogg", ms));
-        }
-        if (clips.Count == 0) return null;
+        var voice = Rip(provider, voiceBank, $"Pet_Vo_{pinyin}",
+            formDir, relativeDir, "voice", warnings);
+        var sfx = Rip(provider, sfxBank, $"Pet_Action_{pinyin}",
+            formDir, relativeDir, "sfx", warnings);
+        if (voice.Count == 0 && sfx.Count == 0) return null;
 
         // 音调曲线:三点线性(x = -100 / 0 / +100),两端的音分就是「粗嗓门 / 婉转声」。
-        // 读不到就按 0 走(不变调),叫声照样能用
-        var curve = bank.PitchCurve(PitchParam);
+        // 只问叫声那族库 —— 动作音效不跟着变调。读不到就按 0 走(不变调),声音照样能用
+        var curve = voiceBank?.PitchCurve(PitchParam);
         var low = curve is null ? 0 : CentsAt(curve, -100);
         var high = curve is null ? 0 : CentsAt(curve, 100);
-        return new VoiceInfo(clips, low, high);
+        return new AudioInfo(voice, sfx, low, high);
+    }
+
+    private static Bank? Load(AbstractVfsFileProvider provider, string stem) =>
+        provider.TrySaveAsset($"{WwiseDir}{stem}.bnk", out var bytes) ? new Bank(bytes) : null;
+
+    /// 把一族库里认得的事件全转成 ogg,写进 `<形态>/<sub>/`。
+    private static List<AudioClip> Rip(
+        AbstractVfsFileProvider provider,
+        Bank? bank,
+        string eventPrefix,
+        string formDir,
+        string relativeDir,
+        string sub,
+        List<string> warnings)
+    {
+        var clips = new List<AudioClip>();
+        if (bank is null) return clips;
+        var dir = Path.Combine(formDir, sub);
+        // 同一段 wem 被两个事件共用是有的(全库 621 只里 1 只),转一次就够
+        var done = new Dictionary<uint, AudioClip>();
+        foreach (var (key, suffix) in Wanted)
+        {
+            // 同一个事件通常挂 3 个随机变体,**取最小 id** 那条:导出要可复现
+            var wems = bank.EventWems($"{eventPrefix}_{suffix}");
+            if (wems.Count == 0) continue;
+            var source = wems.Min();
+            if (done.TryGetValue(source, out var same))
+            {
+                clips.Add(same with { Key = key });
+                continue;
+            }
+            if (!provider.TrySaveAsset($"{WwiseDir}{source}.wem", out var wem)) continue;
+
+            Directory.CreateDirectory(dir);
+            var outPath = Path.Combine(dir, key + ".ogg");
+            var ms = Transcode(wem, outPath, warnings);
+            if (ms <= 0) continue;
+            var clip = new AudioClip(key, $"{relativeDir}/{sub}/{key}.ogg", ms);
+            done[source] = clip;
+            clips.Add(clip);
+        }
+        return clips;
     }
 
     /// 曲线上 x 处的音分(线性内插;超出端点就取端点)。
@@ -120,17 +171,20 @@ public static class Voice
             File.WriteAllBytes(wemPath, wem);
             if (!Run("vgmstream-cli", ["-o", wavPath, wemPath], out var err))
             {
-                warnings.Add($"叫声解码失败: {err}");
+                warnings.Add($"音频解码失败: {err}");
                 return 0;
             }
-            // 单声道 + 32kbps:桌宠叫声是一秒左右的短音,再高听不出来,而全库 800 多个形态
-            // 每 10KB 都要乘 800。-q:a 0 大致就是这个量级
+            // 单声道 + 最低质量档:桌宠的叫声是一两秒的短音,再高听不出来,而全库 800 多个
+            // 形态、每个形态最多 18 段,每 10KB 都要乘上万。
+            //
+            // **别顺手裁尾巴**:源里每段末尾都挂着 0.6~1.5 秒的数字静音(占时长三成),
+            // 看着像白占地方 —— 实测裁掉只省 1~5% 字节,vorbis 编静音本来就几乎不花钱。
             if (!Run("ffmpeg", [
                     "-hide_banner", "-loglevel", "error", "-y",
                     "-i", wavPath, "-ac", "1", "-c:a", "libvorbis", "-q:a", "0", outPath
                 ], out err))
             {
-                warnings.Add($"叫声转码失败: {err}");
+                warnings.Add($"音频转码失败: {err}");
                 return 0;
             }
             return WavMs(wavPath);

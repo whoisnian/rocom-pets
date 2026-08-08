@@ -361,7 +361,7 @@ impl SettingsApp {
         });
     }
 
-    /// 状态栏那句「已选…」。顺手报一下有几个形态带叫声 —— 那是导包时最常缺的一块。
+    /// 状态栏那句「已选…」。顺手报一下有几个形态带声音 —— 那是导包时最常缺的一块。
     fn pack_summary(&mut self, path: &Path) -> String {
         let chain = self
             .entries
@@ -372,7 +372,7 @@ impl SettingsApp {
         match self.pack_at(path) {
             Some(pack) => {
                 let voiced = pack.forms.iter().filter(|f| f.voice.is_some()).count();
-                format!("已选「{chain}」· 其中 {voiced} 个形态有叫声")
+                format!("已选「{chain}」· 其中 {voiced} 个形态有声音")
             }
             None => format!("「{chain}」读不了(manifest 坏了或者不是宠物包)"),
         }

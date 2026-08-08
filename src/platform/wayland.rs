@@ -66,7 +66,7 @@ use crate::pet::target::{PetTarget, view_proj};
 use crate::pet::{Model, PetGpu};
 use crate::render::{Gpu, Quad, QuadDraw, Target};
 use crate::sprite::Sprite;
-use crate::stage::{Actor, EntityId, Reaction, Stage, StageEvent, VoiceKind};
+use crate::stage::{Actor, EntityId, Reaction, Stage, StageEvent};
 
 use super::Options;
 use super::shared::{self, Assets, CANVAS_PADDING, Member, PetOptions};
@@ -797,7 +797,7 @@ impl App {
         for stage in &mut self.stages {
             for slot in &greeting {
                 if let Some(id) = stage.slots.get(*slot) {
-                    stage.stage.speak(*id, VoiceKind::CallOut);
+                    stage.stage.speak(*id, "CallOut");
                 }
             }
         }

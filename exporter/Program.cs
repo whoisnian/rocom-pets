@@ -43,7 +43,7 @@ const string usage = """
       --skip-existing   跳过已经有 manifest.toml 的包(增量重跑)
       -j <n>            并行度(默认 CPU 核数;每个并行任务会同时持有一个形态的数据,
                         内存吃紧就调小)
-      --no-voice        不导叫声(默认导:要 vgmstream-cli 与 ffmpeg,缺了会自动跳过)
+      --no-audio        不导叫声与动作音效(默认导:要 vgmstream-cli 与 ffmpeg,缺了会自动跳过)
       --zip             额外打成 <链名>.rkpet(包目录仍然留着)
       --zip-only        同上,但打完就删掉包目录 —— 只要归档时用这个。
                         全量导出的产物从 3.3GB(目录)+2.0GB(归档)降到只剩 2.0GB;
@@ -73,7 +73,7 @@ var aesKey = "0x34254D23E47299B3B7F6C4CFDE9BD0688703446D9D8F37B2EBDDDE5B06ED5ADF
 var species = new List<int>();
 var lodIndex = 0;
 var allClips = false;
-var noVoice = false;
+var noAudio = false;
 var zip = false;
 var zipOnly = false;
 var all = false;
@@ -98,7 +98,7 @@ for (var i = 0; i < args.Length; i++)
         case "--aes": aesKey = Next(ref i); break;
         case "--lod": lodIndex = int.Parse(Next(ref i)); break;
         case "--all-clips": allClips = true; break;
-        case "--no-voice": noVoice = true; break;
+        case "--no-audio": noAudio = true; break;
         case "--all": all = true; break;
         case "--limit": limit = int.Parse(Next(ref i)); break;
         case "--skip-existing": skipExisting = true; break;
@@ -712,14 +712,14 @@ FormReport ExportForm(
         }
     }
 
-    // 叫声:拿不到就是 null(39 个 bnk 查无此宠,还有形态压根没有 Pet_Vo_* 库),不算失败
-    var voice = noVoice || pinyin is null
+    // 音频:拿不到就是 null(39 个 bnk 查无此宠,还有形态压根没有 Pet_Vo_* 库),不算失败
+    var audio = noAudio || pinyin is null
         ? null
-        : Voice.Export(fileProvider, pinyin, formDir, $"forms/{form.Asset}", warnings);
+        : Audio.Export(fileProvider, pinyin, formDir, $"forms/{form.Asset}", warnings);
 
     var bounds = mesh.ImportedBounds;
     return new FormReport(form, written, textures, materials, glb.Length, bounds.BoxExtent.Z * 2f,
-        warnings, voice);
+        warnings, audio);
 }
 
 /// 上游的 `FPackedNormal(FVector)` 是否能把向量原样存取回来。

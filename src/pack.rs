@@ -53,6 +53,9 @@ struct RawForm {
     materials: HashMap<String, RawMaterial>,
     #[serde(default)]
     voice: Option<RawVoice>,
+    /// `[forms.sfx]`:动作音效层,键与 `[forms.voice]`、`[forms.clips]` 同一套。
+    #[serde(default)]
+    sfx: HashMap<String, RawVoiceClip>,
 }
 
 /// `[forms.voice]`:叫声。`cents_low/high` 是游戏里 `voice` 属性拉到 ±100 时的音分
@@ -63,7 +66,7 @@ struct RawVoice {
     cents_low: f32,
     #[serde(default)]
     cents_high: f32,
-    /// 其余键都是「触发点 → 音频文件」。
+    /// 其余键都是「动作逻辑名 → 音频文件」。
     #[serde(flatten)]
     clips: HashMap<String, RawVoiceClip>,
 }
@@ -576,22 +579,26 @@ pub struct Form {
     pub height_cm: f32,
     pub locomotion: String,
     pub clips: HashMap<String, Clip>,
-    /// 叫声;None = 这个形态没导出(没有 `Pet_Vo_*` 库,或者导出时缺 vgmstream/ffmpeg)。
+    /// 声音;None = 这个形态没导出(两族 Wwise 库都没有,或者导出时缺 vgmstream/ffmpeg)。
     pub voice: Option<Voice>,
     /// glb 里的材质名 → 该画什么。**载入模型必需**,空的话 `Model::load` 直接报错
     /// (旧版导出的包没有这一节,重导即可)。
     pub materials: HashMap<String, Material>,
 }
 
-/// 一个形态的叫声。
+/// 一个形态的声音。**两层**:嗓子发出来的叫声,和身体动静的音效 ——
+/// 游戏里同一段情绪就是这两条叠着放的,分别来自 `Pet_Vo_*` 与 `Pet_Action_*` 两族库。
 #[derive(Clone)]
 pub struct Voice {
     /// `voice` 属性拉到 ±100 时的音分(粗嗓门 / 婉转声),运行时按
     /// `2^(音分/1200)` 调播放速率 —— Wwise 的 pitch 本来就是重采样。
+    /// **只管叫声那层**:动作音效不跟着变调(`Pet_Action_*` 库压根没挂这条曲线)。
     pub cents_low: f32,
     pub cents_high: f32,
-    /// 触发点(happy/shock/callout/relax)→ 音频文件。
+    /// 动作逻辑名(与 `clips` 同一把键)→ 叫声文件。
     pub clips: HashMap<String, VoiceClip>,
+    /// 同一把键 → 动作音效文件。
+    pub sfx: HashMap<String, VoiceClip>,
 }
 
 #[derive(Clone)]
@@ -599,6 +606,21 @@ pub struct VoiceClip {
     pub path: PathBuf,
     #[allow(dead_code)] // 时长目前只用于排查;播放不需要预先知道长度
     pub seconds: f32,
+}
+
+/// manifest 里那一节音频表 → 包内绝对路径。两层各调一次。
+fn sound_files(root: &Path, raw: HashMap<String, RawVoiceClip>) -> HashMap<String, VoiceClip> {
+    raw.into_iter()
+        .map(|(key, clip)| {
+            (
+                key,
+                VoiceClip {
+                    path: root.join(clip.path),
+                    seconds: clip.ms as f32 / 1000.0,
+                },
+            )
+        })
+        .collect()
 }
 
 impl Form {
@@ -833,8 +855,15 @@ impl Pack {
         let path = crate::assets::manifest_path(root);
         let text = crate::assets::read_manifest(root)
             .with_context(|| format!("读不到 {path:?}(不是宠物包?)"))?;
+        Self::parse(&text, root)
+    }
+
+    /// manifest 正文 → `Pack`。**从读盘那一步拆出来**是为了能拿一段内联 manifest 做单测:
+    /// 包是本地生成物、不入仓库,不拆的话「这个字段解没解出来」只能靠跑全库肉眼看。
+    fn parse(text: &str, root: &Path) -> Result<Self> {
+        let path = crate::assets::manifest_path(root);
         let raw: RawManifest =
-            toml::from_str(&text).with_context(|| format!("{path:?} 解析失败"))?;
+            toml::from_str(text).with_context(|| format!("{path:?} 解析失败"))?;
         if raw.schema > SUPPORTED_SCHEMA {
             bail!(
                 "{path:?} 的 schema 是 {},本运行时只支持到 {SUPPORTED_SCHEMA}",
@@ -864,22 +893,18 @@ impl Pack {
                     80.0
                 },
                 locomotion: form.locomotion,
-                voice: form.voice.map(|v| Voice {
-                    cents_low: v.cents_low,
-                    cents_high: v.cents_high,
-                    clips: v
-                        .clips
-                        .into_iter()
-                        .map(|(key, clip)| {
-                            (
-                                key,
-                                VoiceClip {
-                                    path: root.join(clip.path),
-                                    seconds: clip.ms as f32 / 1000.0,
-                                },
-                            )
-                        })
-                        .collect(),
+                // 两族库各自可能缺席(叫声 621 个 bnk、音效 650 个),**任一有就算有声音**
+                voice: (form.voice.is_some() || !form.sfx.is_empty()).then(|| {
+                    let (cents_low, cents_high, clips) = match form.voice {
+                        Some(v) => (v.cents_low, v.cents_high, v.clips),
+                        None => (0.0, 0.0, HashMap::new()),
+                    };
+                    Voice {
+                        cents_low,
+                        cents_high,
+                        clips: sound_files(root, clips),
+                        sfx: sound_files(root, form.sfx),
+                    }
                 }),
                 clips: form
                     .clips
@@ -1090,3 +1115,76 @@ impl Pack {
     }
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 一段真实 manifest 的节选(导出器的产物,只删了无关的表)。
+    const MANIFEST: &str = r#"
+schema = 1
+[species]
+id = 3001
+name = "喵喵"
+
+[[forms]]
+id = 3001
+name = "喵喵"
+stage = 1
+asset = "Gra_MiaoMiao1_001"
+model = "forms/Gra_MiaoMiao1_001/model.glb"
+height_cm = 55.6
+
+  [forms.clips]
+  Happy = { clip = "Happy", ms = 1500, frames = 46 }
+  Alert = { clip = "Alert", ms = 4000, frames = 121 }
+
+  [forms.voice]
+  cents_low = -300
+  cents_high = 300
+  Happy = { path = "forms/Gra_MiaoMiao1_001/voice/Happy.ogg", ms = 2366 }
+  Alert = { path = "forms/Gra_MiaoMiao1_001/voice/Alert.ogg", ms = 4499 }
+
+  [forms.sfx]
+  Happy = { path = "forms/Gra_MiaoMiao1_001/sfx/Happy.ogg", ms = 2354 }
+"#;
+
+    /// 声音是**两层**,而且两层与 `[forms.clips]` 同一把键 —— 运行时按动作名取声音就靠这个。
+    #[test]
+    fn both_sound_layers_are_read_and_keyed_by_clip_name() {
+        let pack = Pack::parse(MANIFEST, Path::new("/packs/喵喵")).expect("该解得开");
+        let form = &pack.forms[0];
+        let voice = form.voice.as_ref().expect("该有声音");
+
+        let mut keys: Vec<&str> = voice.clips.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["Alert", "Happy"], "叫声的键就是动作逻辑名");
+        assert!(form.clip("Happy").is_some(), "同一把键在动作表里查得到");
+
+        assert_eq!(voice.sfx.len(), 1, "音效层单独一节,少几段是常事");
+        assert_eq!(
+            voice.sfx["Happy"].path,
+            Path::new("/packs/喵喵/forms/Gra_MiaoMiao1_001/sfx/Happy.ogg"),
+            "路径要拼到包根上"
+        );
+        assert_eq!(voice.cents_low, -300.0);
+    }
+
+    /// 只有 `Pet_Action_*` 库、没有 `Pet_Vo_*` 的形态(全库 22 个)照样算有声音 ——
+    /// 原来 `[forms.voice]` 一缺就整只哑掉。
+    #[test]
+    fn a_form_with_only_sfx_still_has_sound() {
+        let text = MANIFEST
+            .split("  [forms.voice]")
+            .next()
+            .expect("前半段")
+            .to_string()
+            + "  [forms.sfx]\n  Happy = { path = \"forms/x/sfx/Happy.ogg\", ms = 1 }\n";
+        let pack = Pack::parse(&text, Path::new("/packs/x")).expect("该解得开");
+        let voice = pack.forms[0].voice.as_ref().expect("只有音效也算有声音");
+        assert!(voice.clips.is_empty());
+        assert_eq!(voice.sfx.len(), 1);
+        // 没有叫声那层就没有曲线,按原调走
+        assert_eq!((voice.cents_low, voice.cents_high), (0.0, 0.0));
+    }
+}

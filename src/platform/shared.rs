@@ -155,6 +155,28 @@ pub fn canvas_size(logical: (u32, u32), scale: f32, max: u32) -> (u32, u32) {
     (side(logical.0), side(logical.1))
 }
 
+/// 解一层声音(叫声或动作音效)。
+///
+/// **加载时就解码**:每次出声都重解是白费,而且直接把解码器丢进 mixer 出不了声
+/// (见 audio.rs 的 `Pcm`)。
+fn decode_layer(
+    files: &HashMap<String, crate::pack::VoiceClip>,
+) -> HashMap<String, Arc<crate::audio::Pcm>> {
+    let mut out = HashMap::new();
+    for (key, clip) in files {
+        match crate::audio::decode(&clip.path) {
+            Ok(pcm) => {
+                if pcm.peak() <= 0.0 {
+                    log::warn!("{:?} 解出来是静音的", clip.path);
+                }
+                out.insert(key.clone(), Arc::new(pcm));
+            }
+            Err(e) => log::warn!("声音读不了({e:#})"),
+        }
+    }
+    out
+}
+
 impl Assets {
     /// GPU 起来之后把真实的纹理边长上限告诉它。**建任何角色之前调** ——
     /// 画布尺寸是按这个上限钳的,晚了就钳不住第一批。
@@ -184,8 +206,8 @@ impl Assets {
         Ok(built)
     }
 
-    /// 取这个形态的叫声库。`with_audio = false`(没声卡或音量为 0)时直接不读。
-    /// 读不到文件只警告 —— 少一段叫声不该让宠物上不了台。
+    /// 取这个形态的声音库(叫声 + 动作音效两层)。`with_audio = false`(没声卡或音量为 0)
+    /// 时直接不读。读不到文件只警告 —— 少一段声音不该让宠物上不了台。
     pub fn voice(&mut self, form: &Form, with_audio: bool) -> Option<Arc<VoiceBank>> {
         if !with_audio {
             return None;
@@ -194,32 +216,26 @@ impl Assets {
             return Some(Arc::clone(bank));
         }
         let Some(voice) = form.voice.as_ref() else {
-            log::debug!("{} 没有叫声", form.name);
+            log::debug!("{} 没有声音", form.name);
             return None;
         };
-        // **加载时就解码**:每次叫都重解是白费,而且直接把解码器丢进 mixer 出不了声
-        // (见 audio.rs 的 `Pcm`)
-        let mut clips = HashMap::new();
-        for (key, clip) in &voice.clips {
-            match crate::audio::decode(&clip.path) {
-                Ok(pcm) => {
-                    if pcm.peak() <= 0.0 {
-                        log::warn!("叫声 {:?} 解出来是静音的", clip.path);
-                    }
-                    clips.insert(key.clone(), Arc::new(pcm));
-                }
-                Err(e) => log::warn!("叫声读不了({e:#})"),
-            }
-        }
-        if clips.is_empty() {
+        let clips = decode_layer(&voice.clips);
+        let sfx = decode_layer(&voice.sfx);
+        if clips.is_empty() && sfx.is_empty() {
             return None;
         }
         let bank = Arc::new(VoiceBank {
             clips,
+            sfx,
             cents_low: voice.cents_low,
             cents_high: voice.cents_high,
         });
-        log::debug!("{} 的叫声 {} 段", form.name, bank.clips.len());
+        log::debug!(
+            "{} 的声音:叫声 {} 段、音效 {} 段",
+            form.name,
+            bank.clips.len(),
+            bank.sfx.len()
+        );
         self.voices.insert(form.model.clone(), Arc::clone(&bank));
         Some(bank)
     }
