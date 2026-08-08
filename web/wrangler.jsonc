@@ -1,0 +1,52 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "rocom-pets-dl",
+  "main": "worker/index.ts",
+  "compatibility_date": "2026-08-01",
+  "compatibility_flags": ["nodejs_compat"],
+
+  "assets": {
+    "directory": "./dist/client",
+    "binding": "ASSETS",
+    // 静态资源优先;只有 /api/* 强制先进 Worker,其余路径直接命中边缘缓存,
+    // 不烧 Worker 请求数(免费额度 10 万/天,是这套里唯一真会被刷爆的资源)。
+    "run_worker_first": ["/api/*"],
+    "not_found_handling": "single-page-application"
+  },
+
+  "observability": { "enabled": true },
+
+  "r2_buckets": [
+    { "binding": "FILES", "bucket_name": "rocom-pets" }
+  ],
+
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "rocom-pets",
+      // wrangler d1 create rocom-pets 之后把返回的 uuid 填进来
+      "database_id": "00000000-0000-0000-0000-000000000000"
+    }
+  ],
+
+  "kv_namespaces": [
+    {
+      "binding": "DEDUPE",
+      // wrangler kv namespace create DEDUPE 之后把返回的 id 填进来
+      "id": "0000000000000000000000000000000f"
+    }
+  ],
+
+  "vars": {
+    // R2 自定义域。留空则由 Worker 代理字节(能跑,但 Range/缓存都要自己扛,
+    // 且每次下载都算一次 Worker 请求)。生产务必填,别用 *.r2.dev —— 官方明说
+    // 那个域有可变速率限制、带宽也会被限流,不用于生产。
+    "PUBLIC_BASE": "",
+    // 前端 Turnstile widget 的 sitekey;留空则不显示人机校验
+    "TURNSTILE_SITEKEY": ""
+  }
+
+  // 机密用 wrangler secret put 写,不要进这个文件:
+  //   wrangler secret put DEDUPE_SALT        # 去重哈希的盐,随便一串随机字符
+  //   wrangler secret put TURNSTILE_SECRET   # 配了 sitekey 才需要
+}

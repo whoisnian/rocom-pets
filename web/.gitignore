@@ -1,0 +1,10 @@
+node_modules/
+dist/
+.wrangler/
+
+# 本地机密与覆盖(PUBLIC_BASE / DEDUPE_SALT / TURNSTILE_SECRET)
+.dev.vars
+
+# 生成物,不入仓库 —— 素材版权属原发行方,见根 README 与 docs/design.md §11
+public/catalog.json
+public/sprite.webp

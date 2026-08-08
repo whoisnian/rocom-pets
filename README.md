@@ -79,6 +79,11 @@ debug 版(`cargo build` 不带 `--release`)保持控制台子系统。
   `--zip` 额外打一个 `.rkpet`、`--zip-only` 打完就删掉包目录,运行时两种都直接读。
   叫声要 `vgmstream-cli` 与 `ffmpeg`(缺了自动跳过,`--no-voice` 显式关);
   全库 607 个形态里 **511 个有叫声**。
+- 下载站(`web/`)：应用本体与宠物包的下载页,整站在 Cloudflare 上 ——
+  Workers 出页面并接管 `/api/*`、R2 存文件、D1 记下载与异常标记次数、KV 按 IP + 日期去重防刷。
+  头像复用 rocom-petvo 的精灵图,搜索认图鉴号、链首名与**包里任何一个形态名**。
+  目录(`catalog.json`)由 `web/scripts/gen_catalog.py` 扫包目录生成 —— 算 sha256、
+  读 manifest 取形态构成,和素材一样是生成物、不入仓库。部署见 [web/README.md](web/README.md)。
 - 验证工具(`tools/`)：`verify_glb.py` 按 glTF 规范自采样 + 蒙皮 + 光栅化，渲图肉眼核对动画正确性;
   `sweep.py` 是**回归闸门** —— 全库每个形态渲一格,统计「失败 / 空白 / 过曝」三个数,
   改着色或改导出器之后跑一遍,三个数都不许变差;`cmp_shots.py` 拿实机截图对照渲图给出差距数字

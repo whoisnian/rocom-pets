@@ -1,0 +1,13 @@
+# 拷成 .dev.vars 用于本地开发。生产环境里这三个的写法各不相同:
+#   PUBLIC_BASE / TURNSTILE_SITEKEY  →  wrangler.jsonc 的 vars(不是机密)
+#   DEDUPE_SALT / TURNSTILE_SECRET   →  wrangler secret put(是机密)
+
+# R2 自定义域。留空则由 Worker 代理字节 —— 本地开发方便,生产别这么用。
+PUBLIC_BASE=""
+
+# 去重哈希的盐。换掉它等于把当天的去重记录全部作废(计数会重新开始计)。
+DEDUPE_SALT="换成一串随机字符"
+
+# 配了这两个才会在异常标记弹窗里显示人机校验
+TURNSTILE_SITEKEY=""
+TURNSTILE_SECRET=""
