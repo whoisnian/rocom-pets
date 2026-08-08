@@ -84,8 +84,34 @@ impl SettingsApp {
                     label(ui, "形态:");
                     ui.horizontal(|ui| {
                         let mut picked = form_index;
+                        let items: Vec<String> = pack
+                            .forms
+                            .iter()
+                            .map(|f| format!("{}({:.0}cm)", f.name, f.height_cm))
+                            .collect();
+                        // popup 要多宽:量最长那条,别让它换行或被裁。
+                        // **归并成一个包之后形态名可以很长**(`晶石蜗(西瓜碧玺的样子)`),
+                        // 按固定宽度给的话十有八九不够
+                        let font = egui::TextStyle::Button.resolve(ui.style());
+                        let widest = items
+                            .iter()
+                            .map(|text| {
+                                ui.painter()
+                                    .layout_no_wrap(
+                                        text.clone(),
+                                        font.clone(),
+                                        egui::Color32::PLACEHOLDER,
+                                    )
+                                    .size()
+                                    .x
+                            })
+                            .fold(0.0_f32, f32::max);
                         egui::ComboBox::from_id_salt(("form", slot))
                             .width(220.0)
+                            // 形态最多的那几条链有十三个(雪绒鸟、蹦蹦种子、脆筒甜甜),
+                            // 默认上限 `Spacing::combo_height` = 200px 只够七八条 ——
+                            // 和性格那个下拉一样,一次全露出来,别让人滚
+                            .height(f32::INFINITY)
                             .selected_text(format!(
                                 "{}({} / {})",
                                 pack.forms[form_index].name,
@@ -93,12 +119,11 @@ impl SettingsApp {
                                 pack.forms.len()
                             ))
                             .show_ui(ui, |ui| {
-                                for (index, f) in pack.forms.iter().enumerate() {
-                                    ui.selectable_value(
-                                        &mut picked,
-                                        index,
-                                        format!("{}({:.0}cm)", f.name, f.height_cm),
-                                    );
+                                // 选项比框宽是正常的(框里那行还带「几 / 几」),
+                                // 撑开 popup 就不会横向滚
+                                ui.set_min_width(widest + theme::COMBO_ITEM_PAD);
+                                for (index, text) in items.into_iter().enumerate() {
+                                    ui.selectable_value(&mut picked, index, text);
                                 }
                             });
                         if picked != form_index {

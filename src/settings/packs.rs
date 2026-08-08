@@ -15,9 +15,17 @@ use super::{Page, SettingsApp, theme};
 use crate::assets;
 
 /// 表格四列的宽度:名称吃剩下的,后三列固定。
-const COL_FORMS: f32 = 74.0;
-const COL_SIZE: f32 = 92.0;
-const COL_SOURCE: f32 = 78.0;
+///
+/// 后三列都收窄过一轮:装的分别是个位数、`12.3MB`、`rkpet`/`目录`,原来的宽度是按
+/// 表头那两个字给的,内容根本占不满。省下的 60px 全给名称列 —— 那一列才是会不够用的
+/// (「治愈兔 → 红丝绒 → 红绒十字」这种链名)。
+const COL_FORMS: f32 = 46.0;
+const COL_SIZE: f32 = 74.0;
+const COL_SOURCE: f32 = 64.0;
+/// 视口上下各多画几行。**不为性能,为观感**:滚动时视口边缘那半行不会等到滚进来才出现,
+/// 底部也不会因为「剩下的高度不足一行」而露出一条空白。
+const OVERSCAN: usize = 2;
+
 /// 搜索框右边那两个导入按钮占的宽度(含它们之间的间距)。
 const IMPORT_BUTTONS_W: f32 = 190.0;
 
@@ -62,14 +70,14 @@ impl Columns {
 impl SettingsApp {
     pub(super) fn packs_page(&mut self, ui: &mut egui::Ui) {
         ui.heading("宠物包");
-        let Some(packs_dir) = self.packs_dir.clone() else {
+        if self.packs_dir.is_none() {
             ui.add_space(12.0);
             ui.colored_label(
                 ui.visuals().error_fg_color,
                 "定不出包目录,没法管理宠物包。用 --packs-dir 指定一个。",
             );
             return;
-        };
+        }
 
         ui.add_space(12.0);
         ui.horizontal(|ui| {
@@ -93,7 +101,7 @@ impl SettingsApp {
         });
 
         if self.entries.is_empty() {
-            self.empty_state(ui, &packs_dir);
+            self.empty_state(ui);
             return;
         }
 
@@ -109,7 +117,10 @@ impl SettingsApp {
 
     /// 一个包都没有:这一页要承担「为什么这里是空的」的解释责任。
     /// **不分发素材是这个项目的硬约束**,第一次打开就得说清。
-    fn empty_state(&mut self, ui: &mut egui::Ui, packs_dir: &Path) {
+    ///
+    /// **只说话,不放按钮**:导入的那两个按钮就在上面搜索框右边,一直在那儿(空不空都画)。
+    /// 空状态再摆一组就是同一个动作的第二个入口,还得让人分辨两组有没有区别。
+    fn empty_state(&self, ui: &mut egui::Ui) {
         ui.add_space(40.0);
         ui.vertical_centered(|ui| {
             ui.add_space(10.0);
@@ -119,31 +130,8 @@ impl SettingsApp {
                 ui,
                 "宠物包不随程序分发,需要用导出器从你自己的游戏安装里生成。",
             );
-            theme::hint(ui, "已经有包的话,用下面的「导入包…」或「导入目录…」。");
-            ui.add_space(16.0);
-            ui.horizontal(|ui| {
-                if ui.button("导入包…").clicked() {
-                    self.import_files();
-                }
-                if ui.button("导入目录…").clicked() {
-                    self.import_folder();
-                }
-            });
+            theme::hint(ui, "已经有包的话,用右上角的「导入包…」或「导入目录…」。");
         });
-        ui.add_space(24.0);
-        // 命令抄下来就能用 —— 空状态最该给的就是「下一步敲什么」
-        let visuals = ui.visuals().clone();
-        egui::Frame::new()
-            .fill(visuals.faint_bg_color)
-            .stroke(visuals.widgets.noninteractive.bg_stroke)
-            .corner_radius(4)
-            .inner_margin(egui::Margin::symmetric(12, 10))
-            .show(ui, |ui| {
-                ui.label(theme::value(format!(
-                    "dotnet run --project exporter -- --species 3001 --out {}",
-                    packs_dir.display()
-                )));
-            });
     }
 
     /// 表格:名称(整条进化链)/ 形态数 / 体积 / 来源。
@@ -209,16 +197,35 @@ impl SettingsApp {
                     .max_height((height - 34.0).max(60.0))
                     .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
                     .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        if matches.is_empty() {
-                            ui.add_space(10.0);
-                            ui.label("没有匹配的包。");
-                            return;
-                        }
-                        for (index, path) in matches.iter().enumerate() {
+                    // **只画看得见的那十几行**:每一行都要给链名做一次文字排版,
+                    // 整库两百多个包时那是每帧两百多次排版 —— 打开这一页要卡上一二百毫秒,
+                    // 滚动时一直卡着。
+                    //
+                    // 自己算可见区间,**不用 `show_rows`**:那个函数在调回调之**前**就把
+                    // `item_spacing` 读走了(egui 0.35 scroll_area.rs:991),而行间距要等
+                    // 进了回调才能清零 —— 于是它按 30+6 算高度、我们按 30 画,
+                    // 内容高度被高估了 1/5,滚到底就是一片空白。
+                    .show_viewport(ui, |ui, viewport| {
+                        ui.spacing_mut().item_spacing.y = 0.0;
+                        let total = matches.len();
+                        // 撑满整份内容的高度,滚动条的行程才对
+                        ui.set_height(theme::ROW_H * total as f32);
+                        let first = ((viewport.min.y / theme::ROW_H).floor() as usize)
+                            .saturating_sub(OVERSCAN);
+                        let last = ((viewport.max.y / theme::ROW_H).ceil() as usize + OVERSCAN)
+                            .min(total);
+                        // 跳过的那些行也要占位,否则第一行会顶到滚动区顶上
+                        ui.add_space(first as f32 * theme::ROW_H);
+                        for (index, path) in matches.iter().enumerate().take(last).skip(first) {
                             self.row(ui, path, index);
                         }
                     });
+                // 「一个都没匹配上」要在滚动区**外面**说:上面那个回调在没有行时
+                // 什么也画不出来,写在里面等于什么都不显示
+                if matches.is_empty() {
+                    ui.add_space(10.0);
+                    ui.label("没有匹配的包。");
+                }
             });
     }
 
@@ -250,13 +257,22 @@ impl SettingsApp {
         let body = egui::FontId::proportional(theme::BODY);
         let mono = egui::FontId::monospace(theme::GROUP);
         let y = rect.center().y;
-        // 链名可以很长(「治愈兔 → 红丝绒 → 红绒十字」),超了要截断而不是压到下一列上
-        let galley = painter.layout(
-            chain,
-            body.clone(),
-            text_color,
-            cols.name_width(),
+        // 链名可以很长(「治愈兔 → 红丝绒 → 红绒十字」)。**必须锁死一行**:
+        // `layout` 默认是折行,而行高是固定的 `ROW_H` —— 折出第二行就压到下一行上去了。
+        // 锁一行 + 结尾省略号,完整名字交给悬浮提示。
+        let mut job = egui::text::LayoutJob::single_section(
+            chain.clone(),
+            egui::TextFormat::simple(body.clone(), text_color),
         );
+        job.wrap = egui::text::TextWrapping {
+            max_width: cols.name_width(),
+            max_rows: 1,
+            // 链名里有中文也有 `→`,断在哪儿都行 —— 要的是「填满这一行再省略」
+            break_anywhere: true,
+            overflow_character: Some('…'),
+        };
+        let galley = painter.layout_job(job);
+        let elided = galley.elided;
         painter.galley(
             egui::pos2(cols.left, y - galley.size().y * 0.5),
             galley,
@@ -284,6 +300,10 @@ impl SettingsApp {
             mono,
             weak,
         );
+        // 截断了才给悬浮提示:没截断的话提示里是一模一样的字,纯属噪音
+        if elided {
+            response.clone().on_hover_text(chain);
+        }
         if response.clicked() {
             self.selected_pack = Some(path.to_path_buf());
             let summary = self.pack_summary(path);
@@ -391,14 +411,25 @@ impl SettingsApp {
         }
     }
 
-    /// 选一个解开的包目录导入。
+    /// 选一个目录导入。**两种选法都认**,见 [`packs_under`]。
     fn import_folder(&mut self) {
-        if let Some(dir) = rfd::FileDialog::new()
-            .set_title("选一个包目录(里面有 manifest.toml)")
+        let Some(dir) = rfd::FileDialog::new()
+            .set_title("选一个包目录,或一个装着若干 .rkpet 的目录")
             .pick_folder()
-        {
-            self.import(&[dir]);
+        else {
+            return;
+        };
+        let found = packs_under(&dir);
+        // **空手而归要单独说**:交给 `import` 的话,报的是「不是宠物包(目录里没有
+        // manifest.toml)」—— 那是第一种选法的说辞,选了个收纳夹的人看了会更糊涂
+        if found.is_empty() {
+            self.status.fail(format!(
+                "{} 里没找到宠物包(往下找了 {SCAN_DEPTH} 层)",
+                dir.display()
+            ));
+            return;
         }
+        self.import(&found);
     }
 
     /// 把这些路径拷进包目录。文件对话框与拖放共用一条路。
@@ -424,6 +455,8 @@ impl SettingsApp {
             return;
         }
         self.rescan_packs();
+        // **桌宠那边也要重扫**:它的「加一只」菜单列的是同一个包目录
+        self.apply_packs_changed();
         self.page = Page::Packs;
         self.status.ok(match ok.len() {
             1 => format!("已导入 {}", ok[0]),
@@ -527,12 +560,15 @@ impl SettingsApp {
             {
                 self.page = Page::Packs;
             }
-            self.apply();
+            self.apply_packs_changed();
         }
         if self.selected_pack.as_deref() == Some(path) {
             self.selected_pack = None;
         }
         self.rescan_packs();
+        // 没有宠物用到它时上面那条 apply 不会走,这儿补一次 —— 包没了,
+        // 桌宠的「加一只」菜单不该还列着
+        self.apply_packs_changed();
         self.status.ok(format!(
             "已删除 {}{}",
             path.file_name().unwrap_or_default().to_string_lossy(),
@@ -555,6 +591,58 @@ fn pack_aliases(path: &Path) -> Vec<String> {
         names.push(stem.to_string_lossy().into_owned());
     }
     names
+}
+
+/// 「导入目录…」往下找几层。
+///
+/// 两层就够覆盖导出器与网盘那几种摆法(`收纳夹/喵喵.rkpet`、`收纳夹/某批次/喵喵.rkpet`),
+/// 再深就该问一句「你是不是选错目录了」了 —— 而且这个上限也是**误选家目录时的刹车**:
+/// 没有它,选中 `~` 就会把整棵盘扫一遍。
+const SCAN_DEPTH: usize = 2;
+
+/// 选中的目录里有哪些包要导入。**「导入目录…」的两种选法在这里合流**:
+///
+/// 1. 选中的**就是**一只宠物解开的包目录(里面有 `manifest.toml`)—— 导它自己;
+/// 2. 选中的是个收纳夹,里面摆着若干 `.rkpet`(或若干解开的包目录)—— 里面的全导。
+///
+/// 第一种优先:选中的自己是包就到此为止,不再往里看。包目录里面本来就还有一层层子目录
+/// (`forms/…`),继续往下找纯属浪费,万一里面真放着个 `.rkpet` 更是会导出个莫名其妙的东西。
+///
+/// 往下**最多 [`SCAN_DEPTH`] 层**,而且**认出是包就不再往它里面递归**。
+/// 排序是为了「已导入 3 个包:…」那句话每次的顺序一样(`read_dir` 不保证顺序)。
+fn packs_under(root: &Path) -> Vec<PathBuf> {
+    if assets::is_pack(root) {
+        return vec![root.to_path_buf()];
+    }
+    let mut found = Vec::new();
+    collect_packs(root, SCAN_DEPTH, &mut found);
+    found.sort();
+    found
+}
+
+/// [`packs_under`] 的递归部分。`depth` 是**还能往下走几层**,0 就到底了。
+///
+/// 读不动的目录直接跳过:收纳夹里混着个没权限的子目录,不该让整次导入失败。
+fn collect_packs(dir: &Path, depth: usize, found: &mut Vec<PathBuf>) {
+    if depth == 0 {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    // 先把这一层看完再往下走:这样同一层的包在结果里挨着,深的排在后面
+    let mut subdirs = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if assets::is_pack(&path) {
+            found.push(path);
+        } else if path.is_dir() {
+            subdirs.push(path);
+        }
+    }
+    for sub in subdirs {
+        collect_packs(&sub, depth - 1, found);
+    }
 }
 
 /// 导入一个包,返回它的名字。
@@ -662,6 +750,68 @@ mod tests {
         let packs = root.join("packs");
         assert!(import_one(&junk, &packs).is_err());
         assert!(!packs.join("随便一个目录").exists(), "验不过就不该拷");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn touch(at: &Path) {
+        std::fs::create_dir_all(at.parent().expect("有父目录")).expect("该能建");
+        std::fs::write(at, b"PK").expect("该能写");
+    }
+
+    #[test]
+    fn picking_an_unpacked_pack_directory_imports_just_that_one() {
+        // 第一种选法(本来就有的那种):选中的自己就是包 —— 不再往里看
+        let root = scratch("self");
+        let pack = root.join("喵喵");
+        make_pack_dir(&pack);
+        // 包里面藏个 .rkpet 也不该被当成「收纳夹里的一员」拽出来
+        touch(&pack.join("forms/别管我.rkpet"));
+
+        assert_eq!(packs_under(&pack), vec![pack.clone()]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn picking_a_folder_of_archives_imports_all_of_them() {
+        // 第二种选法:收纳夹里若干 .rkpet,连解开的包目录一起认
+        let root = scratch("many");
+        let box_dir = root.join("收纳夹");
+        touch(&box_dir.join("喵喵.rkpet"));
+        touch(&box_dir.join("火花.rkpet"));
+        make_pack_dir(&box_dir.join("解开的"));
+        // 不是包的东西一概不进来
+        touch(&box_dir.join("说明.txt"));
+        std::fs::create_dir_all(box_dir.join("空目录")).expect("该能建");
+
+        let mut expected = vec![
+            box_dir.join("喵喵.rkpet"),
+            box_dir.join("火花.rkpet"),
+            box_dir.join("解开的"),
+        ];
+        expected.sort();
+        assert_eq!(
+            packs_under(&box_dir),
+            expected,
+            "三个包都要找到,txt 与空目录不算"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_scan_gives_up_below_two_levels() {
+        // 两层是刹车:再深就不找了,免得误选家目录时扫穿整个盘
+        let root = scratch("depth");
+        touch(&root.join("一层.rkpet"));
+        touch(&root.join("子/两层.rkpet"));
+        touch(&root.join("子/孙/三层.rkpet"));
+
+        let found = packs_under(&root);
+        assert!(found.contains(&root.join("一层.rkpet")));
+        assert!(found.contains(&root.join("子/两层.rkpet")));
+        assert!(
+            !found.contains(&root.join("子/孙/三层.rkpet")),
+            "第三层不该找"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 

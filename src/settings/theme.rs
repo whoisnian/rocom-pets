@@ -25,6 +25,9 @@ pub const MONO: f32 = 12.5;
 /// 控件高度 28 / 行高 30 —— 设计稿 KDE 栏的规格。
 pub const CONTROL_H: f32 = 28.0;
 pub const ROW_H: f32 = 30.0;
+/// 下拉选项左右要留的余量(选中标记 + 内边距 + 可能出现的滚动条位置)。
+/// 量出文字宽度之后加上它,才是 popup 该有的宽度。
+pub const COMBO_ITEM_PAD: f32 = 34.0;
 /// 表单标签列宽(设计稿写的是 78–82)。
 pub const LABEL_W: f32 = 78.0;
 /// 侧栏宽度。
