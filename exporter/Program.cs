@@ -35,6 +35,9 @@ const string usage = """
       --lod <n>         用第几级 LOD(默认 0)
       --all-clips       导出 ANIM_CONF 里的全部动作,而不是桌宠动作白名单
       --all             导出全部宠物(按图鉴号归并成包);与 --species 二选一
+      --probe-anim <资产>
+                        只打印动画的调查信息:骨架的平移重定向模式、各段动画里整只跑偏的
+                        骨骼;给 ALL 则全库普查「剥掉类别前缀之后哪些逻辑名撞了」
       --index           只列出归并后的包名与形态构成(不碰 pak,不导东西)
       --limit <n>       配合 --all:只导前 n 条链(试跑用)
       --skip-existing   跳过已经有 manifest.toml 的包(增量重跑)
@@ -78,6 +81,7 @@ var limit = int.MaxValue;
 var skipExisting = false;
 var jobs = Environment.ProcessorCount;
 var probeAsset = (string?)null;
+var probeAnimAsset = (string?)null;
 var indexOnly = false;
 
 for (var i = 0; i < args.Length; i++)
@@ -102,6 +106,7 @@ for (var i = 0; i < args.Length; i++)
         case "--zip": zip = true; break;
         case "--zip-only": zip = zipOnly = true; break;
         case "--probe-material": probeAsset = Next(ref i); break;
+        case "--probe-anim": probeAnimAsset = Next(ref i); break;
         case "--index": indexOnly = true; break;
         case "-h" or "--help": Console.WriteLine(usage); return 0;
         default:
@@ -109,7 +114,7 @@ for (var i = 0; i < args.Length; i++)
             return 1;
     }
 }
-if (species.Count == 0 && !all && probeAsset is null && !indexOnly)
+if (species.Count == 0 && !all && probeAsset is null && probeAnimAsset is null && !indexOnly)
 {
     Console.Error.WriteLine($"缺 --species(或 --all)\n{usage}");
     return 1;
@@ -194,6 +199,12 @@ Console.WriteLine($"挂载 {provider.MountedVfs.Count} 个包,{provider.Files.Co
 if (probeAsset is not null)
 {
     MaterialProbe.Run(provider, probeAsset);
+    return 0;
+}
+
+if (probeAnimAsset is not null)
+{
+    AnimProbe.Run(provider, probeAnimAsset);
     return 0;
 }
 
@@ -442,12 +453,21 @@ FormReport ExportForm(
     // 逻辑动作 → AnimSequence:文件名去掉类别前缀(World_/Common_/Fight_…)再忽略下划线大小写比对
     // 有些形态自己没有 Animation/ 目录(如 Gra_DiMo2_001),动画挂在共享同一 anim_conf_id
     // 的另一个资产下——按 anim_conf_id 找过去,这也解释了 anim_conf_id 为什么能与 model 不同
+    //
+    // 剥完前缀会撞名(`World_Idle` 与 `Ride_Idle` 都是 idle),**按类别优先级挑**,
+    // 不能先到先得——原因与代价见 AnimNames.cs。
     var animDir = $"{assetDir}/Animation";
-    var byNormalized = new Dictionary<string, string>(StringComparer.Ordinal);
+    var byNormalized = new Dictionary<string, (string Path, int Rank)>(StringComparer.Ordinal);
     void Collect(string dir)
     {
         foreach (var path in Textures.TopLevelFiles(fileProvider, dir))
-            byNormalized.TryAdd(Normalize(Path.GetFileNameWithoutExtension(path)), path);
+        {
+            var name = Path.GetFileNameWithoutExtension(path);
+            var key = Normalize(name);
+            var rank = AnimNames.Rank(name);
+            if (!byNormalized.TryGetValue(key, out var chosen) || rank < chosen.Rank)
+                byNormalized[key] = (path, rank);
+        }
     }
     Collect(animDir);
     if (byNormalized.Count == 0)
@@ -490,11 +510,12 @@ FormReport ExportForm(
     {
         if (whitelist is not null && !whitelist.Contains(clip.Logical, StringComparer.OrdinalIgnoreCase))
             continue;
-        if (!byNormalized.TryGetValue(Normalize(clip.Logical), out var file))
+        if (!byNormalized.TryGetValue(Normalize(clip.Logical), out var chosen))
         {
             warnings.Add($"动作 {clip.Logical} 在 {form.Asset}/Animation 里找不到对应资产");
             continue;
         }
+        var file = chosen.Path;
         try
         {
             // file 是完整虚拟路径(可能借自别的资产目录),去掉扩展名喂给加载器
@@ -720,15 +741,8 @@ static bool PackedNormalRoundTrips()
 static bool MissingVertexColorIsWhite() =>
     new VertexColorXTextureX([]).Color == System.Numerics.Vector4.One;
 
-// "World_Idle" → "idle";"Common_Sleep_Loop" → "sleeploop";逻辑名 "SleepLoop" → "sleeploop"
-static string Normalize(string name)
-{
-    string[] categories = ["World", "Common", "Fight", "Ride", "Battle", "Scene"];
-    var parts = name.Split('_', StringSplitOptions.RemoveEmptyEntries).ToList();
-    if (parts.Count > 1 && categories.Contains(parts[0], StringComparer.OrdinalIgnoreCase))
-        parts.RemoveAt(0);
-    return string.Concat(parts).ToLowerInvariant();
-}
+// 规则搬去 AnimNames.cs(探针要用同一份,而顶层语句里的局部函数外面调不到)
+static string Normalize(string name) => AnimNames.Normalize(name);
 
 /// 扫一遍 VFS,找出所有「Animation/ 下有东西」的宠物资产,按族名分组。
 /// 族名 = 资产名中段去掉末尾的变体后缀(Ar)与阶段数字:
