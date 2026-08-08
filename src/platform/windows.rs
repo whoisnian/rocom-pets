@@ -1350,13 +1350,26 @@ unsafe extern "system" fn control_proc(
     lparam: LPARAM,
 ) -> LRESULT {
     if control::is_tray_message(message) {
-        // 托盘回调:哪个鼠标消息在 lparam 里
-        with_app(|app| {
-            if let Some(tray) = app.tray.as_ref() {
-                tray.on_tray_message(lparam.0 as u32);
-            }
+        // 托盘回调:哪个鼠标消息在 lparam 里。
+        //
+        // **菜单必须在 `with_app` 之外弹**:`TrackPopupMenu` 会一直不返回,自己在里面跑一条
+        // 模态消息循环,`WM_TIMER` 照样派发进来。要是这会儿 `App` 还借着,那些 tick 全都
+        // `try_borrow_mut` 失败被丢掉 —— 菜单开着的整段时间桌面上的宠物定在那儿不动
+        // (Windows 上左右键都会走到这儿,所以两个键点下去都是这个样子)。
+        let menu = with_app(|app| {
+            let menu = app.tray.as_ref().and_then(|t| t.menu_for(lparam.0 as u32));
             app.drain_control();
-        });
+            menu
+        })
+        .flatten();
+        if let Some(menu) = menu {
+            if let Err(e) = menu.popup() {
+                log::warn!("弹托盘菜单失败: {e}");
+            }
+            // 选中的那一项是 `TrackPopupMenu` 返回之后才送进通道的(`TPM_RETURNCMD`
+            // 不发 `WM_COMMAND`),所以这儿要再收一次
+            with_app(|app| app.drain_control());
+        }
         return control::HANDLED;
     }
     if message == WM_TIMER {

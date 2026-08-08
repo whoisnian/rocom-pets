@@ -188,17 +188,45 @@ impl TrayHandle {
 
     /// 托盘图标被点了:左右键都弹菜单(Windows 上左键通常是「主操作」,
     /// 但桌宠没有主窗口可显示,弹菜单最有用)。
-    pub fn on_tray_message(&self, message: u32) {
+    ///
+    /// **这儿只抄一份状态出来,不弹**;弹的动作见 [`TrayMenu::popup`],
+    /// 由调用方在放开运行时状态的借用之后做。
+    pub fn menu_for(&self, message: u32) -> Option<TrayMenu> {
         if message != WM_RBUTTONUP && message != WM_LBUTTONUP {
-            return;
+            return None;
         }
-        if let Err(e) = self.popup() {
-            log::warn!("弹托盘菜单失败: {e}");
-        }
+        Some(TrayMenu {
+            hwnd: self.hwnd,
+            sender: self.sender.clone(),
+            passthrough: self.passthrough,
+            muted: self.muted,
+            common: self.common,
+        })
     }
+}
 
+/// 弹一次托盘菜单要的全部状态(从 [`TrayHandle`] 抄出来的一份快照)。
+///
+/// **单独拆出来是有原因的**:`TrackPopupMenu` 自己会进一条模态消息循环,菜单开着的
+/// 那几秒里主线程照收 `WM_TIMER`。要是弹菜单时还攥着运行时状态,那些 tick 全都借不到
+/// 它、被整个丢掉 —— 表现就是「一点托盘,桌面上的宠物就定住」。抄一份出来弹,
+/// 借用在弹之前就还回去了,菜单开着的时候动画照跑。
+///
+/// 抄的都是弹菜单当下要回显的值(勾选项、选中的档位)。托盘提示里那个在场数量不在其中:
+/// 菜单里本来就不显示它。
+pub struct TrayMenu {
+    hwnd: HWND,
+    sender: Sender<Control>,
+    passthrough: bool,
+    muted: Option<bool>,
+    common: Common,
+}
+
+impl TrayMenu {
     /// 弹菜单。结构与 KDE 那边逐条对齐;在场数量两边都只在图标的悬停提示里。
-    fn popup(&self) -> Result<()> {
+    ///
+    /// **会阻塞到菜单关掉为止**(模态循环),所以只能在不持有运行时状态时调。
+    pub fn popup(&self) -> Result<()> {
         let mut point = POINT::default();
         // SAFETY: 取当前光标位置,只写我们自己的栈变量。
         unsafe { GetCursorPos(&mut point) }.context("拿不到光标位置")?;
@@ -317,7 +345,9 @@ impl TrayHandle {
             log::warn!("主循环已退出,托盘命令没送出去");
         }
     }
+}
 
+impl TrayHandle {
     fn update_tip(&self) {
         let mut data = self.icon_data();
         data.uFlags = NIF_TIP;
@@ -414,7 +444,7 @@ pub fn spawn_tray(
     Ok(handle)
 }
 
-/// 托盘消息要不要交给 [`TrayHandle::on_tray_message`]。
+/// 托盘消息要不要交给 [`TrayHandle::menu_for`]。
 pub fn is_tray_message(message: u32) -> bool {
     message == WM_TRAY
 }
