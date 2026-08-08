@@ -17,6 +17,7 @@ using CUE4Parse.UE4.Objects.Core.Misc;
 using CUE4Parse.UE4.Objects.RenderCore;
 using CUE4Parse.UE4.Versions;
 using CUE4Parse_Conversion.Textures;
+using CUE4Parse_Conversion.Writers.Gltf;
 using System.Text;
 using RocomPets.Export;
 using Serilog;
@@ -121,6 +122,20 @@ if (!PackedNormalRoundTrips())
         先给 CUE4Parse 克隆打补丁:
           git -C "$CUE4PARSE_DIR" apply <本仓库>/exporter/patches/0001-fix-FPackedNormal-quantize.patch
         细节见 docs/design.md §1「法线」那几行。
+        """);
+    return 1;
+}
+
+// 同理再拦一道顶点色。没打这个补丁时,**没有顶点色缓冲的网格**会拿到 (0,0,0,0) 而不是白,
+// 而 XiaoYou / FakeFulid / YutuEar 三族都拿 `COLOR_0` 当遮罩 —— 整层被静默关掉
+// (春兔耳朵里那泡液体渲成黑的就是这么来的),模型照样导得出来,更该硬拦。
+if (!MissingVertexColorIsWhite())
+{
+    Console.Error.WriteLine("""
+        CUE4Parse 在网格没有顶点色缓冲时把 COLOR_0 填成 0(该是白)。
+        先给 CUE4Parse 克隆打补丁:
+          git -C "$CUE4PARSE_DIR" apply <本仓库>/exporter/patches/0002-fix-FColor-missing-vertex-colors.patch
+        细节见 docs/design.md §1.1。
         """);
     return 1;
 }
@@ -666,6 +681,11 @@ static bool PackedNormalRoundTrips()
         && Math.Abs(packed.Y - -0.5f) < 0.02f
         && Math.Abs(packed.Z - 0.75f) < 0.02f;
 }
+
+/// 没有顶点色缓冲的网格,`COLOR_0` 该是白的(UE 的顶点工厂就是这么补的),上游给的是 0。
+/// 判据直接问那个结构体:不传颜色时它填什么。
+static bool MissingVertexColorIsWhite() =>
+    new VertexColorXTextureX([]).Color == System.Numerics.Vector4.One;
 
 // "World_Idle" → "idle";"Common_Sleep_Loop" → "sleeploop";逻辑名 "SleepLoop" → "sleeploop"
 static string Normalize(string name)

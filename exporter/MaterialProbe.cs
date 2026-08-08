@@ -349,7 +349,7 @@ public static class MaterialProbe
                                       $"LOD {candidate.LODModels?.Length ?? 0}, " +
                                       $"bounds={candidate.ImportedBounds.BoxExtent}");
                     Console.WriteLine("    slots: " + string.Join(", ",
-                        candidate.Materials.Select((m, i) => $"{i}:{m?.Name.Text ?? "(null)"}")));
+                        candidate.Materials.Select((m, i) => $"{i}:{m?.Name ?? "(null)"}")));
                     if (candidate.LODModels is null) continue;
                     for (var i = 0; i < candidate.LODModels.Length; i++)
                     {

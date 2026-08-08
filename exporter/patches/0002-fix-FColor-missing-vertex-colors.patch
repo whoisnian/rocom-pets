@@ -1,0 +1,15 @@
+diff --git a/CUE4Parse-Conversion/Writers/Gltf/VertexColorXTextureX.cs b/CUE4Parse-Conversion/Writers/Gltf/VertexColorXTextureX.cs
+index 982e8c67..506a586e 100644
+--- a/CUE4Parse-Conversion/Writers/Gltf/VertexColorXTextureX.cs
++++ b/CUE4Parse-Conversion/Writers/Gltf/VertexColorXTextureX.cs
+@@ -24,7 +24,9 @@ public struct VertexColorXTextureX : IVertexMaterial, IEquatable<VertexColorXTex
+ 
+     public VertexColorXTextureX(Vector2[] texCoords, Vector4? color = null)
+     {
+-        Color = color ?? Vector4.Zero;
++        // UE's vertex factory supplies white when a mesh has no color buffer. Zero here silently
++        // disables materials which consume COLOR_0 as a mask (FakeFluid/YutuEar/XiaoYou among others).
++        Color = color ?? Vector4.One;
+         TexCoord0 = texCoords.Length > 0 ? texCoords[0] : Vector2.Zero;
+         TexCoord1 = texCoords.Length > 1 ? texCoords[1] : Vector2.Zero;
+         TexCoord2 = texCoords.Length > 2 ? texCoords[2] : Vector2.Zero;

@@ -10,6 +10,7 @@
 using CUE4Parse.FileProvider;
 using CUE4Parse.FileProvider.Vfs;
 using CUE4Parse.UE4.Assets.Exports.Texture;
+using CUE4Parse_Conversion.Options;
 using CUE4Parse_Conversion.Textures;
 using SkiaSharp;
 

@@ -24,9 +24,10 @@ using System.Numerics;
 using CUE4Parse.UE4.Assets.Exports.Animation;
 using CUE4Parse.UE4.Assets.Exports.SkeletalMesh;
 using CUE4Parse.UE4.Objects.Core.Math;
-using CUE4Parse_Conversion;
 using CUE4Parse_Conversion.Animations;
-using CUE4Parse_Conversion.Meshes;
+using CUE4Parse_Conversion.Dto;
+using CUE4Parse_Conversion.Formats.Meshes;
+using CUE4Parse_Conversion.Options;
 using SharpGLTF.Schema2;
 using SharpGLTF.Transforms;
 
@@ -55,11 +56,19 @@ public static class GlbBuilder
         int lodIndex)
     {
         var warnings = new List<string>();
-        var options = new ExporterOptions
-        {
-            MeshFormat = EMeshFormat.Gltf2,
-            LodFormat = lodIndex == 0 ? ELodFormat.FirstLod : ELodFormat.AllLods,
-            ExportMaterials = false, // 贴图另走命名约定,见 Textures.cs
+        // **不走 `SkeletalMeshExporter`**。上游 2026-08 那次重构(`Delete duplicated classes`)
+        // 把导出器改成了「`ExportSession` + 异步写盘」的形状:`BuildExportFiles` 是 protected,
+        // 拿字节只能先落盘再读回来。而我们要的就是内存里那份 glb —— 转换格式本身是公开的
+        // (`GltfMeshFormat.BuildSkeletalMesh` 返回 `ExportFile.Data`),直接调它即可,
+        // 少一次落盘、也不必给每个形态造一个 session。
+        //
+        // `EMeshQuality` 取代了旧的 `ELodFormat`:`Highest` = 只要第一级(旧 `FirstLod`)、
+        // `All` = 全部(旧 `AllLods`),语义一一对应。
+        var quality = lodIndex == 0 ? EMeshQuality.Highest : EMeshQuality.All;
+        var options = new ExportOptions(
+            meshFormat: EMeshFormat.Gltf2,
+            meshQuality: quality,
+            exportMaterials: false, // 贴图另走命名约定,见 Textures.cs
             // 不导 morph target(表情 blend shape)。我们只播骨骼动画,从不驱动它们
             // (glb 里既没有 morph 通道也没有 mesh.weights),纯属死重;
             // 更要命的是 CUE4Parse 会把空的 morph 写成**没有 bufferView 的 accessor**——
@@ -67,17 +76,17 @@ public static class GlbBuilder
             // 「accessors[N].bufferView: Missing data」直接拒绝加载。
             // 实测全量 826 个形态里 32 个带 morph target,这 32 个**全部**加载失败。
             // 将来若真要做表情,除了打开这个开关还得把 AnimSequence 的曲线转成 morph 通道。
-            ExportMorphTargets = false,
-        };
+            exportMorphTargets: false);
 
-        var exporter = new MeshExporter(mesh, options);
-        if (exporter.MeshLods.Count == 0)
+        using var dto = new SkeletalMeshDto(mesh, quality);
+        var files = new GltfMeshFormat().BuildSkeletalMesh(mesh.Name, options, dto);
+        if (files.Count == 0)
             throw new InvalidOperationException($"{mesh.Name}: glTF 导出没产出 LOD");
-        var lod = lodIndex < exporter.MeshLods.Count ? exporter.MeshLods[lodIndex] : exporter.MeshLods[0];
-        if (lodIndex >= exporter.MeshLods.Count)
-            warnings.Add($"要 LOD{lodIndex} 但只有 {exporter.MeshLods.Count} 级,退回 LOD0");
+        var lod = lodIndex < files.Count ? files[lodIndex] : files[0];
+        if (lodIndex >= files.Count)
+            warnings.Add($"要 LOD{lodIndex} 但只有 {files.Count} 级,退回 LOD0");
 
-        var model = ModelRoot.ParseGLB(lod.FileData);
+        var model = ModelRoot.ParseGLB(lod.Data);
         FixBindPose(model, mesh, warnings);
         var nodes = new Dictionary<string, Node>(StringComparer.Ordinal);
         foreach (var node in model.LogicalNodes)

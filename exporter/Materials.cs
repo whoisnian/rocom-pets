@@ -808,7 +808,7 @@ public static class Materials
                     // 如小浣蛋的 `MI_Dem_XiaoHuanDan1_001_By`)。仍然登记一条空的,
                     // 让导出器能按名字去凑基色贴图,免得整只宠物画不出来。
                     warnings.Add($"材质 {slot.Name} 在 pak 里没有资产(悬空引用),退回按贴图名接基色");
-                    result[slot.Name.Text] = new MaterialInfo(slot.Name.Text, [], [], [], [], [],
+                    result[slot.Name] = new MaterialInfo(slot.Name, [], [], [], [], [],
                         EBlendMode.BLEND_Opaque, DefaultMaskClip, [], Resolved: false);
                     continue;
                 }
