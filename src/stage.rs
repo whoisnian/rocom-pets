@@ -513,17 +513,15 @@ struct Clips {
 }
 
 impl PetActor {
-    /// 这只脸上那张图集要偏多少(见 persona.rs 的 `Expression`)。
+    /// 这只此刻该是哪张脸(见 persona.rs 的 `Expression`)。
     ///
     /// **正在播的那段动作说了算**,它没意见才用性格那张脸 —— 游戏里也是这样:
     /// 一只「哭哭眼」的幽星光生气时是生气眼、睡着时是困倦眼,性格给的只是它平时的样子。
     /// 按当前动作现算,不另存一份状态:换脸和换动作本来就是同一件事,
     /// 存两份就会有对不上的时候。
-    pub fn face_uv(&self) -> [f32; 2] {
+    pub fn face(&self) -> crate::persona::Expression {
         let clip = &self.model.clips[self.player.current()].name;
-        crate::persona::face_for_clip(clip)
-            .unwrap_or(self.persona.face)
-            .uv_offset()
+        crate::persona::face_for_clip(clip).unwrap_or(self.persona.face)
     }
 
     /// 播一次性反应动作,播完回待机。缺对应动作就只改状态(至少行为语义还在)。
@@ -2188,7 +2186,7 @@ mod home_tests {
             ..test_build(model, 5)
         })));
         let face = |stage: &Stage| match stage.entity(id).map(|e| e.actor()) {
-            Some(Actor::Pet(pet)) => pet.face_uv(),
+            Some(Actor::Pet(pet)) => pet.face().uv_offset(),
             _ => panic!("不是宠物"),
         };
         assert_eq!(face(&stage), timid.face.uv_offset(), "待机时是性格那张脸");

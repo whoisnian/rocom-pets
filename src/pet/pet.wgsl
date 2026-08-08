@@ -27,6 +27,8 @@ struct Camera {
     face_uv: vec2<f32>,
     // 当前蒙皮姿势的 PrimitiveSceneData bounds：[中心.xyz,最长边]。
     object_bounds: vec4<f32>,
+    // 网格脸要画第几张卡(1–8);已在 CPU 侧退过档,这只一定有这张。
+    face_card: f32,
 };
 
 /// 每材质一份。普通材质也有(tint 全 1、params.z=0),两条通道共用布局。
@@ -1054,8 +1056,9 @@ fn shade_main(in: VsOut, depth_coverage: f32) -> vec4<f32> {
         return shade_matcap_masked(in);
     }
     // 表情:脸那两个槽的贴图是 2×4 的图集,网格 UV 落在左上那一格,
-    // 换表情就是整格地偏一下(flags.x = 这是脸)。其余材质偏移量恒为 0。
-    let uv = in.uv + camera.face_uv * step(0.5, material.flags.x);
+    // 换表情就是整格地偏一下(flags.x = 1 表示图集脸)。其余材质偏移量恒为 0 ——
+    // **网格脸(flags.x = 2)也不能偏**:它八张卡的 UV 早各自钉在一格上了,再偏就串格。
+    let uv = in.uv + camera.face_uv * select(0.0, 1.0, is_atlas_face());
     let tex = textureSample(base_color, base_sampler, uv);
     // **alpha 有三种含义,由材质决定**(params.x / params.z):
     // - 镂空遮罩(眼/嘴的表情图集,params.x):按阈值剔,不剔就是一块方糊;
@@ -1322,18 +1325,36 @@ fn shade_main(in: VsOut, depth_coverage: f32) -> vec4<f32> {
     return vec4<f32>(encoded * alpha, alpha);
 }
 
+// 脸有两种做法,由 `material.flags.x` 区分:1 = 图集脸(偏 UV)、2 = 网格脸(挑一张卡)。
+fn is_atlas_face() -> bool {
+    return material.flags.x > 0.5 && material.flags.x < 1.5;
+}
+
+/// 网格脸(`M_P_Eyes_Mesh`)只画当前表情那一张卡,其余七张整片剔掉。
+///
+/// 卡号写在顶点色 G 里(`floor(G × 10)` ∈ 1..8);八张卡是**叠在同一处的独立几何**,
+/// 不剔就是「眉毛、眼睛、腮红搅在一起」。整张卡的顶点同色,所以插值出来的值也稳。
+fn cull_face_card(in: VsOut) {
+    if material.flags.x > 1.5 && abs(floor(in.color.g * 10.0) - camera.face_card) > 0.5 {
+        discard;
+    }
+}
+
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
+    cull_face_card(in);
     return shade_main(in, 0.0);
 }
 
 @fragment
 fn fs_glass(in: VsOut) -> @location(0) vec4<f32> {
+    cull_face_card(in);
     return shade_main(in, trans_depth_coverage(in));
 }
 
 @fragment
 fn fs_outline(in: VsOut) -> @location(0) vec4<f32> {
+    cull_face_card(in);
     let tex = textureSample(base_color, base_sampler, in.uv);
     // 只有镂空遮罩才剔;本体的线条遮罩要是拿来剔,描边壳会跟着被啃掉
     if material.params.x > 0.5 && tex.a < 0.35 {

@@ -1061,8 +1061,8 @@ impl App {
             // 取景用动作包围盒(与 build_pet_actor 的画布尺寸算法必须一致)
             let view = view_proj(pet.model.motion_bounds, pet.yaw, CANVAS_PADDING);
             let matrices = pet.player.matrices.clone();
-            // 表情:性格决定脸上那张图集用哪一格(见 persona.rs)
-            let face_uv = pet.face_uv();
+            // 表情:性格决定脸上是哪张脸(见 persona.rs)
+            let face = pet.face();
             let Some(surfaces) = stage.pets.iter_mut().find(|s| s.id == *id) else {
                 continue;
             };
@@ -1082,7 +1082,8 @@ impl App {
                     time: effect_time(),
                     // 复现目标实机的 MaterialQualityLevel=Low shader map。
                     high_material_quality: false,
-                    face_uv,
+                    face_uv: face.uv_offset(),
+                    face_card: face.card(),
                 },
                 &matrices,
             );

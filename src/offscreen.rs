@@ -11,6 +11,11 @@ use glam::Vec3;
 
 use crate::pet::{Model, PetGpu, Player, gpu::DEPTH_FORMAT, orthographic_view};
 
+/// 这段动作自带的表情;它没意见就用默认那张脸(离屏渲染不带性格)。
+fn clip_face(clip: &str) -> crate::persona::Expression {
+    crate::persona::face_for_clip(clip).unwrap_or(crate::persona::DEFAULT_FACE)
+}
+
 /// 输出纹理格式:和 stage 表面一致(非 sRGB,预乘 alpha)。
 const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 /// 取景余量。包围盒已经含了各动作的伸展(`Model::motion_bounds`),这里只需给描边与
@@ -169,7 +174,7 @@ pub fn render(request: &Request) -> Result<()> {
     if model.clips.is_empty() {
         let identity = vec![glam::Mat4::IDENTITY; model.skeleton.joints.len()];
         // 离屏渲染不带性格,一律默认那张脸
-        let face = crate::persona::DEFAULT_FACE.uv_offset();
+        let face = crate::persona::DEFAULT_FACE;
         pet.update(
             &queue,
             &crate::pet::FrameParams {
@@ -179,7 +184,8 @@ pub fn render(request: &Request) -> Result<()> {
                 time: request.time,
                 // 目标实机配置是 MaterialQualityLevel=Low。
                 high_material_quality: false,
-                face_uv: face,
+                face_uv: face.uv_offset(),
+                face_card: face.card(),
             },
             &identity,
         );
@@ -206,6 +212,9 @@ pub fn render(request: &Request) -> Result<()> {
         let mut player = Player::new(&model, index);
         player.seek(duration * request.at);
         player.update(&model);
+        // 这段动作自带的表情。离屏渲染不带性格,所以「没意见」就是默认那张脸 ——
+        // 于是这张图也顺带成了「换动作换眼睛」的验收图
+        let face = clip_face(name);
         pet.update(
             &queue,
             &crate::pet::FrameParams {
@@ -214,11 +223,8 @@ pub fn render(request: &Request) -> Result<()> {
                 outline_scale: 1.0,
                 time: request.time,
                 high_material_quality: false,
-                // 这段动作自带的表情。离屏渲染不带性格,所以「没意见」就是默认那张脸 ——
-                // 于是这张图也顺带成了「换动作换眼睛」的验收图
-                face_uv: crate::persona::face_for_clip(name)
-                    .unwrap_or(crate::persona::DEFAULT_FACE)
-                    .uv_offset(),
+                face_uv: face.uv_offset(),
+                face_card: face.card(),
             },
             &player.matrices,
         );
@@ -260,6 +266,7 @@ pub fn render(request: &Request) -> Result<()> {
                 time: request.time,
                 high_material_quality: false,
                 face_uv: crate::persona::DEFAULT_FACE.uv_offset(),
+                face_card: crate::persona::DEFAULT_FACE.card(),
             },
             &player.matrices,
         );
@@ -342,6 +349,7 @@ fn benchmark(
                 time: frame_time,
                 high_material_quality: false,
                 face_uv: crate::persona::DEFAULT_FACE.uv_offset(),
+                face_card: crate::persona::DEFAULT_FACE.card(),
             },
             &player.matrices,
         );

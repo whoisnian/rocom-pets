@@ -113,6 +113,25 @@ impl Expression {
             self.cell.1 as f32 / FACE_ROWS,
         ]
     }
+
+    /// **网格脸**要画第几张卡(1–8),见 `pack.rs` 的 `Material::face_cards`。
+    ///
+    /// 那一族(`M_P_Eyes_Mesh`,全库 20 个形态、21 片网格)把整套表情做成**八张重叠的几何**,
+    /// 每张的 UV 早就钉在图集的某一格上,顶点色的 **G 通道**写着它是第几张
+    /// (`floor(G × 10)`,实测取值 0.149/0.247/…/0.847,正好落在 1..8 每一档的中间)。
+    /// 所以这一族不偏 UV,改成**只画一张**。
+    ///
+    /// 编号与格子的对应是 `col + 2·row + 1`(21 片里 16 片逐格对得上,
+    /// 其余 5 片是美术摆位的出入)。**只有 1 号是例外:它不是「默认」。**
+    /// 证据:① 觅觅蝠一/三阶压根没有 1 号卡,碎晶蝎与觅觅蝠二阶的 1 号卡只有十几个顶点
+    /// (占位);② 翠顶夫人/黑羽夫人的 1 号卡与 5 号卡(困倦)是同一份美术;
+    /// ③ 实机图鉴里这两只的待机脸是 **2 号卡**那张(尖睫毛 + 腮红)。
+    /// 图鉴用的就是默认表情 —— 拿单卡族的点点对照过:图鉴里是圆睁的绿眼,
+    /// 正是 (0,0) 那格,不是微笑那格。所以 1 号是眨眼/占位一类,默认落在 2 号。
+    /// 于是「默认」与「微笑」在这一族里是同一张脸(它们只有七张)。
+    pub fn card(&self) -> u32 {
+        (self.cell.0 + self.cell.1 * 2 + 1).max(2)
+    }
 }
 
 /// 一个性格。字段里那五个倍率是**乘在 stage.rs 的手感常量上**的,1.0 = 照基线来。
@@ -423,6 +442,46 @@ mod tests {
                 face.cell
             );
         }
+    }
+
+    /// 网格脸的卡号:1..8 之内,而且 1 号永远不选(它不是「默认」,见 `Expression::card`)。
+    /// 每格一号、号不重复 —— 除了「默认」与「微笑」共用 2 号,那一族只有七张脸。
+    #[test]
+    fn face_cards_are_one_per_cell_and_never_number_one() {
+        let faces = [
+            DEFAULT_FACE,
+            SMILE,
+            SURPRISED,
+            ANGRY,
+            SLEEPY,
+            CRYING,
+            LAUGHING,
+        ];
+        for face in faces {
+            let card = face.card();
+            assert!(
+                (2..=8).contains(&card),
+                "「{}」的卡号 {card} 不在 2..8 里",
+                face.name
+            );
+        }
+        // 网格脸只有七张:「默认」与「微笑」共用 2 号
+        assert_eq!(DEFAULT_FACE.card(), SMILE.card());
+        // 除那一对外,别的格子不许撞号 —— 撞了就是有张脸永远轮不到
+        let others = [SURPRISED, ANGRY, SLEEPY, CRYING, LAUGHING];
+        let mut seen = vec![DEFAULT_FACE.card()];
+        for face in others {
+            assert!(
+                !seen.contains(&face.card()),
+                "「{}」的卡号 {} 和别人撞了",
+                face.name,
+                face.card()
+            );
+            seen.push(face.card());
+        }
+        // 卡号是**按行读**图集:(列, 行) → 列 + 行×2 + 1。抽两格钉住这个换算。
+        assert_eq!(ANGRY.card(), 4, "生气在 (1,1)");
+        assert_eq!(LAUGHING.card(), 7, "大笑在 (0,3)");
     }
 
     /// 会换脸的动作与不换脸的动作,两边都点名核一遍 —— 这张表是手挑的,

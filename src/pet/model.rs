@@ -51,6 +51,9 @@ pub struct Material {
     pub name: String,
     /// 脸(眼/嘴)那两个槽 —— 表情图集就贴在它们身上,见 pack.rs 的 `Material::face`。
     pub face: bool,
+    /// 这张脸是**八张重叠的表情卡**(`M_P_Eyes_Mesh`),不是偏 UV 的图集。
+    /// 见 pack.rs 的 `Material::face_cards` 与 `Model::face_cards`。
+    pub face_cards: bool,
     /// 基色贴图(RGBA8),路径来自 manifest 的材质表;读失败才是 None,渲染时用白色兜底。
     pub base_color: Option<Image>,
     /// 贴图 alpha 是**镂空遮罩**(眼/嘴的表情图集)还是**线条遮罩**(本体的纹路)。
@@ -310,6 +313,10 @@ pub struct Model {
     /// 实测(120 个抽样形态 × Idle/Happy/Show/Walk 各查一次):按绑定盒取景 11 个被裁
     /// (阿米亚特/波波拉肉眼可见)→ 按这个盒子取景剩 1 个;代价是画布面积平均 1.64 倍。
     pub motion_bounds: (Vec3, Vec3),
+    /// 网格脸这只**真的有**哪几张表情卡(升序,取值 1..8;不是网格脸就是空)。
+    /// 卡是按需做的,缺号不少见 —— 觅觅蝠一/三阶没有 1 号、蝴蝶陶陶三阶没有 5 号。
+    /// 想要的那号不在这儿就得退档,否则整张脸一个像素都不画(眼睛直接消失)。
+    pub face_cards: Vec<u32>,
 }
 
 impl Model {
@@ -511,6 +518,7 @@ impl Model {
                     name: name.clone(),
                     base_color,
                     face: spec.face,
+                    face_cards: spec.face_cards,
                     cutout: spec.mask_alpha,
                     line_detail,
                     translucent: spec.translucent,
@@ -728,6 +736,7 @@ impl Model {
 
         let bounds = bind_pose_bounds(&vertices, &skeleton);
         let motion_bounds = animated_bounds(&vertices, &skeleton, &clips, bounds);
+        let face_cards = face_cards(&vertices, &indices, &primitives, &materials);
         Ok(Self {
             vertices,
             indices,
@@ -738,6 +747,7 @@ impl Model {
             source: glb_path.to_path_buf(),
             bounds,
             motion_bounds,
+            face_cards,
         })
     }
 
@@ -1177,6 +1187,32 @@ fn animated_bounds(
     (min, max)
 }
 
+/// 网格脸(`M_P_Eyes_Mesh`)这只有哪几张表情卡:顶点色 G 通道 `floor(G × 10)`,升序去重。
+///
+/// 只认 1..8。同族的**单卡**脸把 G 写成 1.0(`floor` 得 10),那不是卡号、是「没有卡系统」;
+/// 月牙雪熊那种 `M_P_Eyes` 里也混着 G=1.0 的顶点,不能一起算进来 —— 所以先按材质筛。
+fn face_cards(
+    vertices: &[Vertex],
+    indices: &[u32],
+    primitives: &[Primitive],
+    materials: &[Material],
+) -> Vec<u32> {
+    let mut seen = [false; 9];
+    for prim in primitives {
+        if !materials[prim.material].face_cards {
+            continue;
+        }
+        let range = prim.first_index as usize..(prim.first_index + prim.index_count) as usize;
+        for &i in &indices[range] {
+            let card = (vertices[i as usize].color[1] * 10.0).floor();
+            if (1.0..=8.0).contains(&card) {
+                seen[card as usize] = true;
+            }
+        }
+    }
+    (1u32..=8).filter(|&k| seen[k as usize]).collect()
+}
+
 /// 绑定姿势下的顶点包围盒(蒙皮矩阵在绑定姿势是单位矩阵,直接取顶点即可)。
 fn bind_pose_bounds(vertices: &[Vertex], _skeleton: &Skeleton) -> (Vec3, Vec3) {
     let mut min = Vec3::splat(f32::INFINITY);
@@ -1221,6 +1257,8 @@ impl Model {
             bounds: (Vec3::new(-0.5, 0.0, -0.5), Vec3::new(0.5, 1.0, 0.5)),
             // 合成模型没有顶点,动作包围盒就等于绑定姿势
             motion_bounds: (Vec3::new(-0.5, 0.0, -0.5), Vec3::new(0.5, 1.0, 0.5)),
+            // 也没有网格脸
+            face_cards: Vec::new(),
         }
     }
 }

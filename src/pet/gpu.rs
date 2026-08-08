@@ -33,6 +33,11 @@ struct CameraUniform {
     /// PrimitiveSceneData 读取的正是 ObjectWorldPositionAndRadius / ObjectBounds；
     /// 不能拿未蒙皮 POSITION 或绑定姿势盒替代，否则液面会跟着身体弯曲。
     object_bounds: [f32; 4],
+    /// 网格脸要画第几张卡(1–8),已经退过档、保证这只身上有。
+    /// 和 `face_uv` 一样是**每只**的,所以放这份 uniform 里。
+    face_card: f32,
+    /// vec4 要 16 字节对齐,`object_bounds` 之后只能整块地补。
+    _pad: [f32; 3],
 }
 
 /// 画一帧要给的东西。**打包传**:拆成参数的话 `update` 要排到第八个,而它们
@@ -48,6 +53,9 @@ pub struct FrameParams {
     pub high_material_quality: bool,
     /// 表情:脸那两个材质的 UV 偏移(见 persona.rs 的 `Expression`)。
     pub face_uv: [f32; 2],
+    /// 表情:网格脸要画第几张卡(见 persona.rs 的 `Expression::card`)。
+    /// 这只没有这张卡时会自动退档,调用方不必管。
+    pub face_card: u32,
 }
 
 /// 每个材质一份的特效参数。**普通材质也占一份**(tint 全 1、flags=0),
@@ -172,6 +180,8 @@ pub struct PetGpu {
     /// 只在模型含 FakeFulid 时保留一份 CPU 顶点，用当前关节矩阵复原 UE 每帧更新的
     /// PrimitiveSceneData bounds。其他宠物不承担逐帧蒙皮包围盒的开销。
     bounds_vertices: Option<Vec<Vertex>>,
+    /// 这只网格脸真有哪几张表情卡(见 `Model::face_cards`);不是网格脸就是空。
+    face_cards: Vec<u32>,
     bind_bounds: [f32; 4],
     frame_bind: wgpu::BindGroup,
     depth_layout: wgpu::BindGroupLayout,
@@ -749,9 +759,14 @@ impl PetGpu {
                     ],
                     // flags.y = 1 表示「玻璃/纱」:fs_main 据此加 MatCap 高光与材质边缘光,
                     // 普通不透明宠物无条件叠这两样会整只发白。
-                    // flags.x 在这条路上原来是空的,拿来放「这是脸」(表情要偏 UV)
+                    // flags.x 在这条路上原来是空的,拿来放「这是哪种脸」:
+                    // 0 = 不是脸、1 = 图集脸(偏 UV)、2 = 网格脸(八张卡里只画一张)
                     flags: [
-                        has(material.face),
+                        if material.face_cards {
+                            2.0
+                        } else {
+                            has(material.face)
+                        },
                         has(material.translucent),
                         has(material.star.is_some()),
                         has(material.matcap.is_some()),
@@ -1115,6 +1130,7 @@ impl PetGpu {
             joint_capacity,
             camera,
             bounds_vertices,
+            face_cards: model.face_cards.clone(),
             bind_bounds,
             frame_bind,
             depth_layout,
@@ -1158,6 +1174,8 @@ impl PetGpu {
                 },
                 face_uv: frame.face_uv,
                 object_bounds,
+                face_card: resolve_face_card(&self.face_cards, frame.face_card) as f32,
+                _pad: [0.0; 3],
             }),
         );
         let count = matrices.len().min(self.joint_capacity);
@@ -1283,9 +1301,42 @@ fn posed_object_bounds(vertices: &[Vertex], matrices: &[Mat4]) -> Option<[f32; 4
     Some([center.x, center.y, center.z, (max - min).max_element()])
 }
 
+/// 想画的那张表情卡这只有没有;没有就退档(`cards` 是这只真有的卡号,升序)。
+///
+/// 退档顺序:**先退回 2 号**(网格脸的默认脸,见 `Expression::card`),再退到最小的那张。
+/// 卡是按需做的,缺号不少见 —— 觅觅蝠一/三阶没有 1 号、蝴蝶陶陶三阶没有 5 号(困倦),
+/// 它睡着时若照着 5 号剔就整张脸都不画了。
+/// `cards` 为空(不是网格脸)时原样返回:着色器那条判据本来就不生效。
+fn resolve_face_card(cards: &[u32], want: u32) -> u32 {
+    if cards.is_empty() || cards.contains(&want) {
+        return want;
+    }
+    if cards.contains(&2) {
+        return 2;
+    }
+    cards[0]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 缺卡要退档,而且不能退成「一张都不画」。
+    #[test]
+    fn a_missing_face_card_falls_back_instead_of_vanishing() {
+        let full: Vec<u32> = (1..=8).collect();
+        assert_eq!(resolve_face_card(&full, 5), 5, "有就用它");
+        // 蝴蝶陶陶三阶缺 5 号(困倦):退回默认那张
+        let no_sleepy = [1, 2, 3, 4, 6, 7, 8];
+        assert_eq!(resolve_face_card(&no_sleepy, 5), 2);
+        // 觅觅蝠一阶连 1 号都没有,但 2 号在,默认脸照样有
+        let no_first = [2, 3, 4, 5, 6, 7, 8];
+        assert_eq!(resolve_face_card(&no_first, 2), 2);
+        // 连 2 号都没有的极端情况:退到最小的一张,而不是什么都不画
+        assert_eq!(resolve_face_card(&[3, 6], 5), 3);
+        // 不是网格脸:原样返回(着色器不看这个值)
+        assert_eq!(resolve_face_card(&[], 2), 2);
+    }
 
     fn skinned_vertex(pos: [f32; 3], joint: u16) -> Vertex {
         Vertex {

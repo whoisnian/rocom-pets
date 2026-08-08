@@ -358,6 +358,14 @@ pub struct Material {
     /// **表情就画在这两个槽上**:贴图是 2×4 的表情图集,网格 UV 落在左上那一格,
     /// 换表情 = 给 UV 加一个整格的偏移(见 persona.rs 的 `Expression`)。
     pub face: bool,
+    /// 脸的另一种做法:父链里是 `M_P_Eyes_Mesh`(全库 859 片脸网格里有 21 片)。
+    ///
+    /// 这一族**不偏 UV**:八种表情各是一份独立几何,叠在同一处,UV 各自钉死在图集的一格上,
+    /// 顶点色 G 通道写着自己是第几张(`floor(G × 10)` ∈ 1..8)。游戏靠材质参数只画其中一张
+    /// (根材质 `M_P_Eyes_Mesh` 上那个默认值为 1 的 `Number`)。
+    /// **我们原来把它当普通图集脸画,于是八张一起画** —— 乖乖鹄一家的
+    /// 「眉毛、眼睛、腮红搅在一起」就是这么来的。选哪张见 persona.rs 的 `Expression::card`。
+    pub face_cards: bool,
     /// 只在 `base_color` 为 None 时有效。
     pub effect: Effect,
     /// 半透。**有基色的材质也可能是半透**:暮星辰的裙子与那两个球都是,
@@ -898,6 +906,7 @@ impl Pack {
                                 base_color: mat.base_color.map(|rel| root.join(rel)),
                                 mask_alpha: mat.mask_alpha,
                                 face: mat.parents.iter().any(|p| p.contains("P_Eyes")),
+                                face_cards: mat.parents.iter().any(|p| p.contains("P_Eyes_Mesh")),
                                 effect: Effect {
                                     // 没给主色就用白,至少形体在
                                     tint: mat.tint.unwrap_or([1.0; 4]),
