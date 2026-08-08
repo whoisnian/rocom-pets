@@ -34,7 +34,8 @@ const string usage = """
       --aes <hex>       pak 主密钥(默认内置)
       --lod <n>         用第几级 LOD(默认 0)
       --all-clips       导出 ANIM_CONF 里的全部动作,而不是桌宠动作白名单
-      --all             导出全部宠物(按进化链去重);与 --species 二选一
+      --all             导出全部宠物(按图鉴号归并成包);与 --species 二选一
+      --index           只列出归并后的包名与形态构成(不碰 pak,不导东西)
       --limit <n>       配合 --all:只导前 n 条链(试跑用)
       --skip-existing   跳过已经有 manifest.toml 的包(增量重跑)
       -j <n>            并行度(默认 CPU 核数;每个并行任务会同时持有一个形态的数据,
@@ -77,6 +78,7 @@ var limit = int.MaxValue;
 var skipExisting = false;
 var jobs = Environment.ProcessorCount;
 var probeAsset = (string?)null;
+var indexOnly = false;
 
 for (var i = 0; i < args.Length; i++)
 {
@@ -100,16 +102,27 @@ for (var i = 0; i < args.Length; i++)
         case "--zip": zip = true; break;
         case "--zip-only": zip = zipOnly = true; break;
         case "--probe-material": probeAsset = Next(ref i); break;
+        case "--index": indexOnly = true; break;
         case "-h" or "--help": Console.WriteLine(usage); return 0;
         default:
             Console.Error.WriteLine($"未知参数: {args[i]}\n{usage}");
             return 1;
     }
 }
-if (species.Count == 0 && !all && probeAsset is null)
+if (species.Count == 0 && !all && probeAsset is null && !indexOnly)
 {
     Console.Error.WriteLine($"缺 --species(或 --all)\n{usage}");
     return 1;
+}
+
+// --index:只读配置表,把归并后的包列出来就走 —— **不碰 pak**,所以没有游戏安装也能跑。
+// 拿来和 tools/petindex.py 对账:两边同一套规则各实现了一遍,结果必须一字不差。
+if (indexOnly)
+{
+    foreach (var pack in new GameConfig(parsedPath).Packs())
+        Console.WriteLine($"{pack.Book:D3}-{pack.Name}.rkpet\t" +
+                          string.Join("/", pack.Forms.Select(f => f.Name)));
+    return 0;
 }
 
 // **上游必须先打补丁**,见 patches/0001-fix-FPackedNormal-quantize.patch。
@@ -194,24 +207,33 @@ var sourceVersion = Fingerprint(paksPath, provider.Files.Count);
 var animIndex = BuildAnimIndex(provider);
 Console.WriteLine($"动画索引: {animIndex.Count} 个族,{animIndex.Sum(kv => kv.Value.Count)} 个带动画的资产");
 
-// --all:遍历全部宠物,按链首去重(一条链只导一次)
-var targets = new List<Chain>();
-var seenChains = new HashSet<int>();
+// 按图鉴号归并出全部包(见 Config.cs 的 `Chain`);--species 从里面挑。
+// **算一次就够** —— 归并要读三张表、遍历全部宠物,每个 --species 各算一遍是白费。
+var allPacks = config.Packs();
 var chainErrors = new List<string>();
+var targets = new List<Chain>();
+var seenChains = new HashSet<string>();
 var skipped = 0;
-foreach (var petId in all ? config.AllPetIds() : species)
+IEnumerable<Chain> wanted;
+if (all)
 {
-    Chain chain;
-    try
+    wanted = allPacks;
+}
+else
+{
+    var picked = new List<Chain>();
+    foreach (var petId in species)
     {
-        chain = config.ResolveChain(petId);
+        var hit = allPacks.FirstOrDefault(p => p.Forms.Any(f => f.Id == petId))
+                  ?? allPacks.FirstOrDefault(p => p.Forms.Any(f => f.Asset == config.AssetOf(petId)));
+        if (hit is null) chainErrors.Add($"宠物 {petId} 不在任何包里(未实装?占位行?)");
+        else picked.Add(hit);
     }
-    catch (Exception e)
-    {
-        chainErrors.Add($"宠物 {petId} 归链失败: {e.Message}");
-        continue;
-    }
-    if (!seenChains.Add(chain.RootId)) continue;
+    wanted = picked;
+}
+foreach (var chain in wanted)
+{
+    if (!seenChains.Add($"{chain.Book:D3}-{chain.Name}")) continue;
     // 先按「已导出」过滤再计 limit:否则 --limit 永远只覆盖前 n 条链,分批续跑推不动
     if (skipExisting && ChainAlreadyExported(outDir, chain))
     {
@@ -238,20 +260,15 @@ var stopwatch = System.Diagnostics.Stopwatch.StartNew();
 // 并行导出:每条链一个任务。链之间没有共享可变状态(各写自己的包目录),
 // provider 的并行读在 rocom-capture 的解包脚本里已经压过(16 线程),这里同样只读。
 // 控制台与报告文本先按链攒着,跑完按原顺序合并 —— 并行下直接打印会交错到没法看。
-// 同名物种不少(实测「棋契陛下」有 10 条链、72 个名字重复),直接拿名字当目录会互相覆盖,
-// 并行下甚至可能两条链交错写同一个目录。重名的追加链首 id。
-// **统计范围必须是全部宠物,不能只看这次要导的那几条。** 否则同一条链的包目录名会随
-// 批次变化:单独重导「迪莫」时这批里没有同名链,目录就叫 `迪莫`;而全量导时它叫 `迪莫-3004`。
-// 那样增量重导会另起一个目录、把原来的孤立掉(实测踩过:重导 14 条链后有 3 个包名变了)。
-var nameCounts = AllChainNames(config).GroupBy(n => n).ToDictionary(g => g.Key, g => g.Count());
-var packDirName = new Func<Chain, string>(chain =>
-{
-    var name = SafeName(chain.Name);
-    return nameCounts.TryGetValue(name, out var n) && n > 1 ? $"{name}-{chain.RootId}" : name;
-});
-var duplicated = nameCounts.Count(kv => kv.Value > 1);
-if (duplicated > 0)
-    Console.WriteLine($"{duplicated} 个物种名被多条链共用,这些包目录会带链首 id 后缀");
+// 包目录名 = `<图鉴号>-<链首名>`。**图鉴号就是去重手段**:同名的两条链(海盔虫的
+// 「本来的样子」与「磨损的样子」)本来就是同一只宠物,归并阶段已经并成一个包了;
+// 而真的不同宠物碰了同名的(大耳帽兜、逗逗)图鉴号不同,自然分开 —— 于是原来那套
+// 「重名就追加链首 id」连同它的批次漂移问题一起没有了。
+// 没有图鉴号的都记 000,那一档理论上还能撞;实测这份数据没撞,撞了就报出来别硬导。
+var packDirName = new Func<Chain, string>(chain => $"{chain.Book:D3}-{SafeName(chain.Name)}");
+var clashes = allPacks.GroupBy(packDirName).Where(g => g.Count() > 1).ToList();
+foreach (var clash in clashes)
+    Console.WriteLine($"[警告] 包名 {clash.Key} 被 {clash.Count()} 个包共用,它们会互相覆盖");
 
 var results = new ChainResult[targets.Count];
 var completed = 0;
@@ -318,6 +335,22 @@ ChainResult ExportChain(Chain chain)
             {
                 detail.AppendLine($"  {form.Name}({form.Asset}): 跳过 — {e.Message}");
                 chainReport.AppendLine($"  {form.Name}({form.Asset}) stage {form.Stage}: 跳过 — {e.Message}");
+                formsSkipped++;
+                continue;
+            }
+            // **一个动作都没有的形态不出包**:桌宠靠 Idle/Walk 活着,零动作的形态上了台
+            // 就是一尊不动的雕像,形态菜单里还白占一格。实测约三分之一的王者形态
+            // (`…Bo_001`)在 pak 里压根没有 Animation/ 目录 —— 叶冕魔力猫、圣水守护、
+            // 千棘海针都是。**这一档以前碰不到**:王者形态不在 evolution_pet_id 那条路上,
+            // 改按 PET_EVOLUTION_CONF 归并之后才进得来。
+            if (formReport.Clips.Count == 0)
+            {
+                // 模型/贴图这会儿已经落盘了(有没有动作要导完才知道),连目录一起删掉 ——
+                // 留着就是包里一份谁也不引用的 glb
+                var dead = Path.Combine(packDir, "forms", form.Asset);
+                if (Directory.Exists(dead)) Directory.Delete(dead, recursive: true);
+                detail.AppendLine($"  {form.Name}({form.Asset}): 跳过 — 一个动作都没有(资产里没有 Animation/)");
+                chainReport.AppendLine($"  {form.Name}({form.Asset}) stage {form.Stage}: 跳过 — 零动作");
                 formsSkipped++;
                 continue;
             }
@@ -766,28 +799,9 @@ static string Fingerprint(string paksPath, int fileCount)
 /// 续跑会把整库重导一遍。
 static bool ChainAlreadyExported(string outDir, Chain chain)
 {
-    foreach (var name in new[] { SafeName(chain.Name), $"{SafeName(chain.Name)}-{chain.RootId}" })
-    {
-        if (File.Exists(Path.Combine(outDir, name, "manifest.toml"))) return true;
-        if (File.Exists(Path.Combine(outDir, name + ".rkpet"))) return true;
-    }
-    return false;
-}
-
-/// 全部进化链的物种名(按链首去重)。只用来判「这个名字是不是被多条链共用」,
-/// 所以必须覆盖整个配置表,与这次要导哪几条无关——否则包目录名会随批次漂移。
-static List<string> AllChainNames(GameConfig config)
-{
-    var names = new List<string>();
-    var seen = new HashSet<int>();
-    foreach (var petId in config.AllPetIds())
-    {
-        Chain chain;
-        try { chain = config.ResolveChain(petId); }
-        catch { continue; }
-        if (seen.Add(chain.RootId)) names.Add(SafeName(chain.Name));
-    }
-    return names;
+    var name = $"{chain.Book:D3}-{SafeName(chain.Name)}";
+    if (File.Exists(Path.Combine(outDir, name, "manifest.toml"))) return true;
+    return File.Exists(Path.Combine(outDir, name + ".rkpet"));
 }
 
 /// 物种名直接当目录名:大多是中文,但个别名字可能带斜杠之类,做一层净化。

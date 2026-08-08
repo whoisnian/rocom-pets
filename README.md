@@ -5,7 +5,8 @@
 
 **当前状态:多只宠物可同时在场**——上桌待机/走动/奔跑/睡觉、鼠标交互(轮廓命中、受惊、摸头、
 拖放,拎起的只是被点中的那只)、穿透开关、托盘里加一只/撤下/切形态且重启恢复阵容,
-全量宠物包已导完(539 条进化链 / 835 个形态)。
+全量宠物包已导完(**201 个包 / 607 个形态**,1.4GB;按图鉴号归并,见
+[docs/petindex.md](docs/petindex.md))。
 宠物之间会互相注意到并打招呼、受惊会跑开,凑近了还会演一段跨宠互动
 (珀尔鼬指挥捕尘长绒清扫)。叫声也接上了:摸头/受惊/召唤/睡醒各一段,
 嗓音可调(游戏里那个 −100~100 的 `voice` 属性),默认小声、托盘可静音。
@@ -72,10 +73,12 @@ debug 版(`cargo build` 不带 `--release`)保持控制台子系统。
   骨骼动画 + toon 着色见 [docs/spike-s2.md](docs/spike-s2.md);
   行为、多实体、音频与配置窗口见 design.md §9 的 Phase 1–8。
 - 导出器(`exporter/`)：C# + CUE4Parse，从自己的游戏 pak 生成宠物包;
-  一条进化链一个包(glb 含全部动作 + 贴图 + 叫声 + manifest.toml)，见 [docs/spike-s3.md](docs/spike-s3.md)。
+  **一个图鉴号一个包**(`076-海盔虫.rkpet`,glb 含全部动作 + 贴图 + 叫声 + manifest.toml),
+  归并规则与全量清单见 [docs/petindex.md](docs/petindex.md),结构见 [docs/spike-s3.md](docs/spike-s3.md)。
+  `--index` 只列包名不碰 pak(和 `tools/petindex.py` 对账用);
   `--zip` 额外打一个 `.rkpet`、`--zip-only` 打完就删掉包目录,运行时两种都直接读。
   叫声要 `vgmstream-cli` 与 `ffmpeg`(缺了自动跳过,`--no-voice` 显式关);
-  全库 835 个形态里 **499 个有叫声**,合计 31MB。
+  全库 607 个形态里 **511 个有叫声**。
 - 验证工具(`tools/`)：`verify_glb.py` 按 glTF 规范自采样 + 蒙皮 + 光栅化，渲图肉眼核对动画正确性;
   `sweep.py` 是**回归闸门** —— 全库每个形态渲一格,统计「失败 / 空白 / 过曝」三个数,
   改着色或改导出器之后跑一遍,三个数都不许变差;`cmp_shots.py` 拿实机截图对照渲图给出差距数字
