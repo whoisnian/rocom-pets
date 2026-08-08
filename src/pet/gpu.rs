@@ -127,9 +127,15 @@ struct MaterialUniform {
 ///
 /// **形状已经按汇编改对了**(罗隐 body shader 51377 第 99~103 行):
 ///     r1.w = saturate((基色.a − 0.04) × 1.1111)     ← 和不透明度用的是同一个重映射
-///     mad r6.xyz, cb6[7].xyzx, r1.w, r6.xyzx         ← 往**固有色**里加 cb6[7] × 那个遮罩
+///     mad r6.xyz, cb6[7].xyzx, r1.w, r6.xyzx         ← 加上 cb6[7] × 那个遮罩
 /// 原来这里是 `× mix(1.0, 1.55, alpha)`(乘法、且用生 alpha),形状就不对 —— 那个 1.55
 /// 还是在上游法线 bug 修好前对着截图挑的。
+///
+/// **位置在 2026-08-08 改过一次**:原来加在固有色累加器上,而水灵本体那条
+/// ES3.1/Low/LOD0 的 `M_P_Object`(资源 `BF0167AE…`,PS 68952)里,`Glow Color × Glow
+/// Intensity × 遮罩`(第 145 行)与 `Emitter Color × Emitter Intensity × 遮罩`
+/// (第 62~65 行)**都进发光累加器 r1**,第 268 行才和已着色的颜色相加。现在按汇编放在
+/// `glow` 里(见 pet.wgsl)。值仍然是 0,所以这次搬家对渲图是零改动。
 ///
 /// 把 51377(罗隐 body,cb6、`dcl cb6[148]`、V=112)配到 `MI_P_Object` 块 14
 /// (V=112 / S=142 ⇒ 总槽 149 ≥ 148),`cb6[7]` 解出来是 **`Glow Color × Glow Intensity`**,
@@ -169,6 +175,8 @@ pub struct PetGpu {
     glassy_inner_draws: Vec<(u32, u32, usize)>,
     /// 原材质为不透明、但不应套桌宠统一描边的专用内层（当前为 YutuEar）。
     special_opaque_draws: Vec<(u32, u32, usize)>,
+    /// 要画描边的那些(逐材质按 `_Ol` 资产开关;半透里有 `_Ol` 的也在这儿)。
+    outline_draws: Vec<(u32, u32, usize)>,
 }
 
 impl PetGpu {
@@ -1037,6 +1045,29 @@ impl PetGpu {
                     .as_ref()
                     .is_some_and(|e| !e.additive)
             });
+        // **描边是逐材质开的**:游戏的 `Mat/` 目录里除了材质本体还并排放着 `MI_…_Ol`,
+        // 有它才画描边(见 `pack::MaterialSpec::outline`)。小灵面身旁那两团幽火、
+        // 克莱因龙的液面、春兔耳朵里那泡液体都没有,原来一律画上去是多出来的一圈暗边。
+        //
+        // **`MI_P_Object_Trans_MatCap` 那一族的半透玻璃件也要画,而且要画在写深度的这一遍。**
+        // 幽星光/曜星光/暮星辰的那两颗球(`_Fx1`/`_Fx2`,各自都有 `_Ol`)就是这么成为
+        // 实心球的:外扩的背面壳是闭合凸体,从相机看正好铺满整个圆盘,半透的玻璃壳再盖上去。
+        //
+        // **为什么只有这一族**:它的覆盖率整条链只剩 MatCap 那一路 —— 目标 Low PS 1355 里
+        // `alpha = max(基色a重映射, 高光×SpecInt, MatCap.r)`,而实例的 `HighLight SpecInt = 0`、
+        // 球那块 UV 的基色 alpha 中位与 p90 **都是 0.000**,`matcap26` 本身又是一张暗图
+        // (均值 0.199)。也就是说玻璃壳自己顶多盖住两成,实机看到的那颗**实心红球**
+        // 只能来自它背后的描边壳。而同样标着半透、也有 `_Ol` 的暮星辰裙子与春兔耳膜
+        // **是画出来的不透明度图**(那块 UV 的基色 alpha 中位 0.537 / 0.378),实机里
+        // 确实透得见背景 —— 给它们补一层不透明壳会把耳朵里那泡液体连同背景一起糊掉(试过)。
+        let outline_draws: Vec<_> = draws
+            .iter()
+            .copied()
+            .filter(|&(_, _, m)| model.materials[m].outline.unwrap_or(true))
+            .chain(glass_draws.iter().copied().filter(|&(_, _, m)| {
+                model.materials[m].outline == Some(true) && model.materials[m].matcap.is_some()
+            }))
+            .collect();
         Ok(Self {
             vertices,
             indices,
@@ -1059,6 +1090,7 @@ impl PetGpu {
             inner_draws,
             glassy_inner_draws,
             special_opaque_draws,
+            outline_draws,
         })
     }
 
@@ -1115,16 +1147,17 @@ impl PetGpu {
         pass.set_vertex_buffer(0, self.vertices.slice(..));
         pass.set_index_buffer(self.indices.slice(..), wgpu::IndexFormat::Uint32);
         pass.set_bind_group(0, &self.frame_bind, &[]);
-        for stage in 0..if outline { 2 } else { 1 } {
-            pass.set_pipeline(if stage == 0 && outline {
-                &self.outline_pipeline
-            } else {
-                &self.pipeline
-            });
-            for &(first, count, material) in &self.draws {
+        if outline && !self.outline_draws.is_empty() {
+            pass.set_pipeline(&self.outline_pipeline);
+            for &(first, count, material) in &self.outline_draws {
                 pass.set_bind_group(1, &self.material_binds[material], &[]);
                 pass.draw_indexed(first..first + count, 0, 0..1);
             }
+        }
+        pass.set_pipeline(&self.pipeline);
+        for &(first, count, material) in &self.draws {
+            pass.set_bind_group(1, &self.material_binds[material], &[]);
+            pass.draw_indexed(first..first + count, 0, 0..1);
         }
         if !self.glassy_inner_draws.is_empty() {
             pass.set_pipeline(&self.glassy_inner_pipeline);

@@ -297,19 +297,6 @@ const GLASS_MATCAP_GAIN: f32 = 1.0;
 /// **那两条测量都是在显示空间做的**(量的是截图像素),搬进线性后要换算:
 /// `旧² / EXPOSURE` = 0.16² / 0.4816 ≈ 0.0532。换算保持观感等值,原来那两条测量的效力也保留。
 const GLASS_RIM_GAIN: f32 = 0.0532;
-/// 自发光那层的遮罩代理:0 = 平加、1 = 乘菲涅尔。汇编里那个遮罩是若干标量拼出的 ramp,
-/// **输入没追到**,所以两种都实现了、用 17 只实机对照挑。结果如实记(调色板距离):
-///
-/// | | 基线(没这层) | 平加 | **菲涅尔** |
-/// |---|---|---|---|
-/// | 火神(橙 0.5) | 0.162 | 0.244 | **0.113** |
-/// | 波波拉(蓝 0.3/0.4) | 0.329 | 0.339 | 0.338 |
-/// | 水灵 | 0.107 | 0.112 | 0.123 |
-///
-/// 取菲涅尔:自发光最强的火神好 30%,而且更接近汇编里 ramp 遮罩的形状。
-/// **波波拉没改善**,说明它的差距不在自发光,而在 `MI_P_Object_Water_NoMetal` 那套水体着色
-/// (我们完全没实现),已另记待办。
-const EMISSIVE_FRESNEL: f32 = 1.0;
 /// 输出前软肩的白点(extended Reinhard);<= 0 关闭,退回硬削顶。见 `fs_main` 末尾。
 ///
 /// **它解开了一个卡了很久的死结。** 之前两次都撞到同一堵墙:想把亮度比从 0.83 拉到 1.0,
@@ -838,13 +825,24 @@ fn shade_xiaoyou(in: VsOut) -> vec4<f32> {
     let star_pulse = saturate(wave) * star_gain;
     let star_amount = star.g * star_pulse;
 
+    // 32511 第 92~97 行:噪声与星光都要算进覆盖遮罩,再乘顶点色 R·G·(1−A)。
     let vertex_mask = saturate(
-        (1.0 + star_amount) * in.color.r * in.color.g * saturate(1.0 - in.color.a)
+        (1.0 + noise + star_amount) * in.color.r * in.color.g * (1.0 - in.color.a)
     );
+    // **固有色不读 MainTex,读的是材质自己的 BaseColor1/BaseColor2** —— 32511 第 140~143 行:
+    //     r4 = lerp(cb6[28], cb6[27], 1 − 顶点色 G)
+    //     r3 = lerp(MF_ToneMapInverse(BaseTex), r4, 1 − 顶点色 A)
+    // 这一族三只的顶点色 A 恒为 0 ⇒ 基色贴图整支权重为 0,固有色**全部**来自那对颜色;
+    // 顶点色 G 在身体上是 1(取 BaseColor1 的暗紫)、在手臂上降到 0.23~0.71
+    // (混向 BaseColor2 的青)——实机手臂那道紫→青的渐变就是它。
+    //
+    // 原来这里写的是 `mix(MainTex, mix(base1, base2, flow.g), flow.r)`:`flow.r` 只到 0.19,
+    // 于是手臂几乎整块显示 `Tex_PetGlassy_007_D` 的原样。那是一张**全库共享的红/绿平铺图案图**
+    // (design.md §1.1 早已查实「不是本体固有色」),照搬出来就是实机没有的橙绿斑。
     let custom_base = mix(material.xiaoyou_base1.rgb,
                           material.xiaoyou_base2.rgb,
-                          saturate(flow_color.g));
-    let base = mix(main_linear, custom_base, saturate(flow_color.r));
+                          saturate(1.0 - in.color.g));
+    let base = mix(main_linear, custom_base, saturate(1.0 - in.color.a));
     let effect = flow_color + material.xiaoyou_star_color.rgb * star_amount;
     // r5(flow + star) 在原 PS 中加到 emissive 分支，绕过 mobile 直接/间接光；
     // 只有 `(1-mask) * base` 进入受光照的 base-color 分支。
@@ -885,11 +883,14 @@ fn shade_yutu_ear(in: VsOut) -> vec4<f32> {
     let fresnel = pow(max(1.0 - ndv, 1e-4), max(material.family9.y, 1e-4))
         * material.family9.z;
 
-    // 原式用朝上的法线分出 TopColor 区，TopColor Size 是幂次；Contrast Soft 只控制
-    // 阈值附近的过渡宽度。没有按模型高度或宠物名称另造液面。
-    let up = pow(max(n.y, 0.0), max(material.family10.y, 1e-4));
-    let top_width = max(material.family10.w, 0.01);
-    let top = smoothstep(0.5 - top_width, 0.5 + top_width, up);
+    // **液面是顶点色 R 的阈值门,不是法线朝向。** 目标 Low PS 70474 第 147~152 行:
+    //     ge r2.w, v2.x, <随时间摆动的液面高度>     ← v2 = COLOR0(ISGN 查实)
+    //     ge r3.w, v2.x, l(0.5)
+    //     mul r2.w, r2.w, r3.w                      ← 两道门都过才算「液面之上」
+    //     mad r7.xyz, …, r2.w, …                    ← 在液面色与内胆色之间选
+    // 春兔耳膜里那泡液体的顶点色实测 R = 0(238 个顶点)/ 0.78(10 个),G 才是 1 ——
+    // 也就是**几乎整泡都在液面以下**,取 InColor 那支。
+    let top = select(0.0, 1.0, in.color.r >= 0.5);
     let ramped_inner = mix(material.family3.rgb * material.family5.rgb,
                            material.family6.rgb,
                            top);
@@ -903,7 +904,10 @@ fn shade_yutu_ear(in: VsOut) -> vec4<f32> {
     let shade = mix(0.5, 1.5, lit) + AMBIENT;
     let color = ramped_inner * material.family4.rgb * shade
         + (surface - ramped_inner * material.family4.rgb);
-    return vec4<f32>(encode_linear_color(max(color * in.color.r, vec3<f32>(0.0))), 1.0);
+    // **整层不再乘顶点色 R。** 70474 里 `v2.x` 只出现在两处:第 88 行给
+    // `lerp(cb5[6], cb5[5], …) × 菲涅尔` 那一层调强度、第 147~152 行当液面门 ——
+    // 没有一处是乘在最终颜色上的。原来那一乘把整泡液体乘成了黑的(R 实测 0)。
+    return vec4<f32>(encode_linear_color(max(color, vec3<f32>(0.0))), 1.0);
 }
 
 /// `M_P_FakeFulid` 的目标 Low PS 42877 局部链。原 shader 从 PrimitiveSceneData 读取
@@ -1128,16 +1132,10 @@ fn shade_main(in: VsOut, depth_coverage: f32) -> vec4<f32> {
     } else {
         albedo = pow(albedo, vec3<f32>(DECODE_GAMMA));
     }
-    // **线条遮罩是「往固有色里加一个颜色」,不是「乘一个亮度倍数」。** 查实于罗隐(阿米亚特)
-    // 的 body shader 51377 第 99~103 行:
-    //     r1.w = saturate((基色.a − 0.04) × 1.1111)     ← 和不透明度用的是同一个重映射
-    //     mad r6.xyz, cb6[7].xyzx, r1.w, r6.xyzx         ← 加上 cb6[7] × 那个遮罩
-    // 那一步的 `r6` 还是**固有色累加器**(两段明暗的乘法在更后面),所以要加在这里、
-    // 不能加在 `albedo * shade` 之后 —— 后者试过,对比比从 0.96 崩到 0.40。
-    //
-    // `cb6[7]` 那个颜色的名字还没解出来(这条 shader 的 V=112,全库没有材质带这个块),
-    // 先取中性白 × 一个标定强度;**形状按汇编改对了**,原来那个 `× mix(1, 1.55, alpha)` 是错的。
-    albedo += vec3<f32>(material.params.y) * saturate((line - 0.04) * 1.1111);
+    // 基色 alpha 的那个重映射:`Glow Color × Glow Intensity` 与 `Emitter Color ×
+    // Emitter Intensity` 两层共用它当遮罩(水灵 Low PS 68952 第 60~65 行与第 145 行,
+    // 两条都是 `颜色 × 这个遮罩`,而且**都进发光累加器 r1**、在光照之后才相加)。
+    let detail_mask = saturate((line - 0.04) * 1.1111);
     // 加上去的光。**不透明层不叠 MatCap**——游戏那边靠遮罩通道选择性反射,
     // 无条件叠会把宠物冲白(试过,整只发白),而 toon 着色本身对着截图已经够像。
     //
@@ -1145,18 +1143,28 @@ fn shade_main(in: VsOut, depth_coverage: f32) -> vec4<f32> {
     // **玻璃族不加**:它有材质自己的边缘光(`RimColor`/`RimIntensity`/`RimPower`),
     // 两层叠起来轮廓会糊成一圈白 —— 暮星辰的裙子就是这么被冲成淡青的。
     let generic_rim = select(rim, 0.0, material.flags.y > 0.5);
-    var glow = vec3<f32>(generic_rim);
-    // **自发光**:材质的 `Emitter Color` × `Emitter Intensity`,线性空间里加性叠加。
-    // 根默认强度是 0(这一层默认关闭),所以只影响明确开启的宠物 —— 全库唯二是
-    // 波波拉(蓝 0.3/0.4)与火神(橙 0.5),而它们正好是 17 只实机对照里唯二的
-    // **非构图色差离群项**(调色板 0.329 / 0.162),关着的那些都在 0.02~0.11。
+    // `params.y` = `Glow Color × Glow Intensity`(实测全库根默认 0、只有 2 处实例覆盖),
+    // 位置按汇编放进发光层;原来它加在固有色上,那是从另一条 shader 读串了。
+    var glow = vec3<f32>(generic_rim + material.params.y * detail_mask);
+    // **自发光**:`Emitter Color × Emitter Intensity × 基色 alpha 的那个重映射`,
+    // 线性空间里加性叠加在光照**之后**。遮罩不再是猜的了 —— 水灵本体那条
+    // ES3.1/Low/LOD0 的 `M_P_Object` 像素着色器(资源 `BF0167AE…`,PS 68952)写着:
     //
-    // 汇编里它是 `材质颜色 × 一个遮罩` 加进结果(水蓝蓝 body 的 shader 33729 第 553 行:
-    // `mad r5.xyz, cb6[94].xyzx, r2.y, r5.xyzx`,r5 随后 `add` 进颜色)。那个遮罩由若干
-    // 标量拼出的 ramp 给,**输入还没追到**;`EMISSIVE_FRESNEL` 选用哪种代理,见它的注释。
+    //     add     r2.z, r3.w, l(-0.04)          ← r3 = BaseTex 采样
+    //     mul_sat r2.z, r2.z, l(1.1111)         ← 和不透明度用的是同一个重映射
+    //     mul     r4.xyz, r2.z, cb6[2].xyzx     ← 颜色 × 那个遮罩
+    //     mul     r5.xyz, r4.xyzx, cb6[39].z    ← × 强度标量
+    //     …
+    //     add     r0.xyz, r0.xyzx, r1.xyzx      ← 第 268 行:发光累加器 + 已着色的颜色
+    //
+    // 也就是「**基色 alpha 画在哪儿就发光在哪儿**」,整条链里没有任何 Fresnel/N·V 项。
+    // 两张贴图都能对上眼:水灵 `_By_D` 的 alpha 就是身上那几道竖向条纹(>200 占 21%),
+    // 火神 `_By_D` 的 alpha 只圈住火焰爪/角上的高光块(>200 占 1.1%),黑翅膀是 0。
+    //
+    // 原来这里拿 `facing` 当遮罩、把整层糊在所有像素上:水灵的条纹一根都看不见(遮罩没参与),
+    // 火神那对黑翅膀反被橙色自发光染成褐黄 —— 实机报的「多了一层黄色遮罩」就是它。
     if material.emissive.w > 0.0 {
-        let mask = select(1.0, facing, EMISSIVE_FRESNEL > 0.5);
-        glow += material.emissive.rgb * material.emissive.w * mask;
+        glow += material.emissive.rgb * material.emissive.w * detail_mask;
     }
     // **不透明度**:`alpha_is_opacity` 的材质取基色 alpha,并照汇编做那个重映射
     // (`add r1.z, a, -0.04` → `mul_sat r1.z, r1.z, 1.1111`,即把 0.04..0.94 拉到 0..1)。
@@ -1343,7 +1351,34 @@ fn fs_outline(in: VsOut) -> @location(0) vec4<f32> {
     // **实机侧的抠图也踩过一次**:按「与角落背景色的距离」判,好几张截图里宠物很小、
     // 背景是带花纹的卡片,会把大片背景算成宠物(菊花梨的「色偏」因此虚高到 1.46,
     // 修正后只有 0.16)。判据要加两道:**取最大连通块**、面积占比 > 55% 视为抠图失败。
-    return vec4<f32>(tex.rgb * 0.80, 1.0);
+    // **不是每个材质绑在 `base_color` 上的都是固有色贴图。** 四个专用族里绑的分别是
+    // MatCap 查找表 / 泡泡图 / 液面遮罩 / 全库共享的图案图 —— 按网格 UV 采出来是一块
+    // 与外观无关的乱色。其中走不透明通道、因而真的会画描边的是下面两族;
+    // 耳膜(special_opaque)与液面(混合通道)本来就不进这一遍。
+    var albedo = tex.rgb;
+    if material.family_flags.w > 0.5 {
+        // `M_P_MatCap_Masked`:克莱因龙的玻璃壳。整只泡泡原来罩着一层黑,就是这一遍 ——
+        // 外扩的背面壳用 `MatCap34` 按网格 UV 采出近黑色,而正面壳按遮罩 discard 掉了,
+        // 于是背面壳直接露出来铺满整个泡泡。这里补上同一条遮罩(与 depth PS 15293 一致),
+        // 描边底色改用材质自己的 BaseColor。
+        let n = normalize(in.normal);
+        let ndv = saturate(dot(n, view_direction()));
+        let matcap = srgb_to_linear(
+            textureSample(base_color, base_sampler, matcap_uv(n)).rgb);
+        let matcap_luma = dot(matcap, vec3<f32>(0.3, 0.59, 0.11));
+        let fresnel = pow(max(1.0 - ndv, 1e-4), max(material.family5.w, 1e-4));
+        if max(matcap_luma, fresnel) < 0.3333 {
+            discard;
+        }
+        albedo = encode_linear_color(material.family0.rgb);
+    } else if material.family_flags.x > 0.5 {
+        // `MI_P_Object_XiaoYou`:绑的是 `Tex_PetGlassy_007_D`(红/绿平铺图案),
+        // 描边因此在小灵面身上镶了一圈橙绿。改用与 `shade_xiaoyou` 同一条固有色。
+        albedo = encode_linear_color(mix(material.xiaoyou_base1.rgb,
+                                         material.xiaoyou_base2.rgb,
+                                         saturate(1.0 - in.color.g)));
+    }
+    return vec4<f32>(albedo * 0.80, 1.0);
 }
 
 /// `M_ShuiMu_ByIn` 的原始材质局部链（pixel shader 71636）。这不是通用特效近似：

@@ -109,6 +109,10 @@ struct RawMaterial {
     /// 以下对所有材质都可能有(有基色的也一样)。
     #[serde(default)]
     translucent: bool,
+    /// 同名 `_Ol` 描边材质在不在(导出器逐材质写)。**旧包没有这个字段** ⇒ `None`,
+    /// 那时按老规矩来:不透明的画描边、半透的不画。
+    #[serde(default)]
+    outline: Option<bool>,
     #[serde(default)]
     star_tex: Option<String>,
     /// 星点层来自「假半透」族(`NoiseTex` + `Color02`),着色走 `star_color` 而不是四段渐变
@@ -132,6 +136,10 @@ struct RawMaterial {
     emissive: Option<[f32; 3]>,
     #[serde(default)]
     emissive_intensity: f32,
+    /// 水体预设的 `Color1`(rgb)+ `Emitter Intensity`(a)。见 `MaterialSpec::emissive`
+    /// 那条注释:这一族的加光层与通用自发光是同一个形状,运行时合到同一个槽里。
+    #[serde(default)]
+    water_color1: Option<[f32; 4]>,
     #[serde(default = "default_rim_power")]
     rim_power: f32,
     #[serde(default = "default_rim_soft_edge")]
@@ -352,6 +360,9 @@ pub struct Material {
     /// 半透。**有基色的材质也可能是半透**:暮星辰的裙子与那两个球都是,
     /// 当不透明画就是死板的实心块。
     pub translucent: bool,
+    /// 这个材质画不画描边 —— 游戏是**逐材质**开的(`Mat/` 里有没有配套的 `_Ol` 资产)。
+    /// `None` = 旧包没这个字段,退回「不透明画、半透不画」。
+    pub outline: Option<bool>,
     pub opacity: f32,
     /// 身上那些细碎星光。
     pub star: Option<PathBuf>,
@@ -368,8 +379,15 @@ pub struct Material {
     pub matcap_color: [f32; 3],
     pub rim_color: [f32; 3],
     pub rim_intensity: f32,
-    /// 自发光色(线性)与强度:材质的 `Emitter Color` × `Emitter Intensity`。
-    /// **根默认强度是 0**,只有明确开启的宠物才有(全库唯二:波波拉 蓝 0.3/0.4、火神 橙 0.5)。
+    /// 加在光照**之后**的那层色,遮罩是基色 alpha 的重映射(见 pet.wgsl 的 `detail_mask`)。
+    ///
+    /// 两个来源合到这一个槽,因为它们在汇编里是同一个形状 `颜色 × 强度 × 遮罩`:
+    /// - 通用 `M_P_Object`:`Emitter Color` × `Emitter Intensity`(Low PS 68952 第 62~65 行);
+    /// - **水体预设**:`Color1` × `Emitter Intensity`(shader 35663,
+    ///   `mad r4.xyz, r4.xyzx, cb5[83].x, r5.xyzx`,`r4 = 遮罩 × Color1`,见
+    ///   `Materials.cs` 的 `IsWater` 注释)。导出器把这一族的 `Emitter Intensity` 清成 0
+    ///   并单独传 `water_color1`,正是为了不让它被当成白色自发光;这里按它真正的颜色接回来。
+    ///   水灵身上那几道竖向浅色条纹就是它 —— 基色 alpha 画的就是那几道线。
     pub emissive: [f32; 3],
     pub emissive_intensity: f32,
     /// 边缘光的衰减次数。**小于 1 = 整片泛色**(幽星光的球 0.35),不是一圈细边。
@@ -858,6 +876,7 @@ impl Pack {
                                     mask_matcap: mat.mask_matcap,
                                 },
                                 translucent: mat.translucent,
+                                outline: mat.outline,
                                 opacity: mat.opacity,
                                 star: mat.star_tex.map(|rel| root.join(rel)),
                                 star_fake_trans: mat.star_fake_trans,
@@ -868,8 +887,14 @@ impl Pack {
                                 matcap_color: mat.matcap_color.unwrap_or([1.0; 3]),
                                 rim_color: mat.rim_color.unwrap_or([1.0; 3]),
                                 rim_intensity: mat.rim_intensity,
-                                emissive: mat.emissive.unwrap_or([0.0; 3]),
-                                emissive_intensity: mat.emissive_intensity,
+                                emissive: match mat.water_color1 {
+                                    Some(c) => [c[0], c[1], c[2]],
+                                    None => mat.emissive.unwrap_or([0.0; 3]),
+                                },
+                                emissive_intensity: match mat.water_color1 {
+                                    Some(c) => c[3],
+                                    None => mat.emissive_intensity,
+                                },
                                 rim_power: mat.rim_power,
                                 rim_soft_edge: mat.rim_soft_edge,
                                 highlight_offset: mat.highlight_offset.unwrap_or([0.0; 3]),

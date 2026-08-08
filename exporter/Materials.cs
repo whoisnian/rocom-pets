@@ -57,7 +57,15 @@ public record MaterialInfo(
     RootDefaults? RootDefaults = null,
     /// 材质资产是不是真的读到了。`false` = 网格引用的材质包在 pak 里根本不存在(悬空引用),
     /// 参数全空,导出器会退回按贴图命名约定给基色,见 Program.cs。
-    bool Resolved = true)
+    bool Resolved = true,
+    /// 同目录里有没有同名的 `_Ol` 材质 —— **游戏的描边是逐材质开的,不是每个材质都画**。
+    ///
+    /// 这不是启发式,是资产表本身:`Mat/` 目录里除了 `MI_<形态>_<槽>` 还并排放着
+    /// `MI_<形态>_<槽>_Ol`,而那份材质的参数表是描边专用的(`Outline Intensity`、
+    /// `OutlineWidthPC`、`OutLineOtherColor1..5`、`MinID`/`MatID`…)。有它才画描边。
+    /// 实测:小灵面 `_By`/`_By1` 有、幽火 `_Fx` **没有**;水灵只有 `_By`;
+    /// 幽星光 `_By` 与**那两颗玻璃球 `_Fx1`** 都有;克莱因龙 `_By`/`_Fx` 有、液面 `_Fx1` 没有。
+    bool HasOutline = false)
 {
     /// 承载基色的参数名。`BaseTex` = 本体一类,`EyeTex` = 眼/嘴那种贴脸的小面片。
     /// `M_P_Object_XiaoYou` 是一套独立的不透明材质，固有色入口明确叫 `MainTex`；
@@ -68,7 +76,14 @@ public record MaterialInfo(
             ? Textures.Keys.FirstOrDefault(k => k.Equals("MainTex", StringComparison.OrdinalIgnoreCase))
             : null)
         ?? Textures.Keys.FirstOrDefault(k => k.Equals("BaseTex", StringComparison.OrdinalIgnoreCase))
-        ?? Textures.Keys.FirstOrDefault(k => k.Equals("EyeTex", StringComparison.OrdinalIgnoreCase));
+        ?? Textures.Keys.FirstOrDefault(k => k.Equals("EyeTex", StringComparison.OrdinalIgnoreCase))
+        // **`Base Color`(带空格)也是基色。** 一只一份的定制材质用的是这个名字,而不是
+        // 通用的 `BaseTex` —— 小灵面一族身旁那两团幽火(`M_Gho_XiaoYou_GhostFire`)就是:
+        // 它的 `Base Color` 指着一张画好的青色渐变图,整团幽火的颜色全在那儿。
+        // 认不出来就落进「纯特效层」那条路,拿它当形状遮罩、颜色走 `Tint`(这个材质没有)
+        // ⇒ 渲成一团**没有颜色的白**,正是实机反馈里的「幽火缺少颜色」。
+        // 排在 `BaseTex`/`EyeTex` 之后:两者都有时仍以通用名为准。
+        ?? Textures.Keys.FirstOrDefault(k => k.Equals("Base Color", StringComparison.OrdinalIgnoreCase));
 
     /// 基色贴图的对象路径;没有就是纯特效材质。
     public string? BaseColorTexture => BaseColorParam is { } p ? Textures[p] : null;
@@ -817,7 +832,11 @@ public static class Materials
                 // glb 里的材质名取的是对象名,键不一致运行时就查不到 → 整只宠物一片都画不出来。
                 var key = material.Name;
                 if (!string.IsNullOrEmpty(key))
-                    result[key] = Resolve(key, material) with { RootDefaults = RootMaterial.Of(material) };
+                    result[key] = Resolve(key, material) with
+                    {
+                        RootDefaults = RootMaterial.Of(material),
+                        HasOutline = HasOutlineAsset(material),
+                    };
             }
             catch (Exception e)
             {
@@ -825,6 +844,25 @@ public static class Materials
             }
         }
         return result;
+    }
+
+    /// 这个材质旁边有没有配套的 `_Ol` 描边材质(见 `MaterialInfo.HasOutline`)。
+    ///
+    /// 只查文件是否存在,不加载 —— 描边材质的参数(宽度/强度/分色)另说,这里要的只是
+    /// 「这个槽画不画描边」这一位。名字大小写在本作的 pak 里对不齐,所以两种拼法都试:
+    /// 对象名(`material.Name`)与包名(`material.Owner.Name` 的最后一段)。
+    private static bool HasOutlineAsset(UMaterialInstance material)
+    {
+        var provider = material.Owner?.Provider;
+        var package = material.Owner?.Name;
+        if (provider is null || string.IsNullOrEmpty(package)) return false;
+        var dir = package[..(package.LastIndexOf('/') + 1)];
+        foreach (var stem in new[] { material.Name, package[(package.LastIndexOf('/') + 1)..] })
+        {
+            if (string.IsNullOrEmpty(stem)) continue;
+            if (provider.Files.ContainsKey($"{dir}{stem}_Ol.uasset")) return true;
+        }
+        return false;
     }
 
     /// 全零 GUID 是「没记」(材质层参数就是这样),不收。

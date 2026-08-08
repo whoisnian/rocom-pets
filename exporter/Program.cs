@@ -17,8 +17,8 @@ using CUE4Parse.UE4.Objects.Core.Misc;
 using CUE4Parse.UE4.Objects.RenderCore;
 using CUE4Parse.UE4.Versions;
 using CUE4Parse_Conversion.Textures;
-using CUE4Parse_Conversion.Writers.Gltf;
 using System.Text;
+using CUE4Parse_Conversion.Writers.Gltf;
 using RocomPets.Export;
 using Serilog;
 using Serilog.Events;
@@ -135,7 +135,7 @@ if (!MissingVertexColorIsWhite())
         CUE4Parse 在网格没有顶点色缓冲时把 COLOR_0 填成 0(该是白)。
         先给 CUE4Parse 克隆打补丁:
           git -C "$CUE4PARSE_DIR" apply <本仓库>/exporter/patches/0002-fix-FColor-missing-vertex-colors.patch
-        细节见 docs/design.md §1.1。
+        细节见 docs/design.md §1.1「六条实机反馈」那节。
         """);
     return 1;
 }
@@ -583,7 +583,7 @@ FormReport ExportForm(
             info.XiaoYouBaseColor1, info.XiaoYouBaseColor2,
             info.XiaoYouFlowColor1, info.XiaoYouFlowColor2, info.XiaoYouStarColor,
             info.XiaoYouNoiseFlow, info.XiaoYouShape, info.XiaoYouStarUv,
-            yutuEar, fakeFluid, matcapMasked));
+            yutuEar, fakeFluid, matcapMasked, info.HasOutline));
 
         if (info.StarTexture is not null && ExportEffectTexture(info.StarTexture) is { } starTex
             && (starLayer is null || (info.IsFakeTrans && !starFromFakeTrans)))

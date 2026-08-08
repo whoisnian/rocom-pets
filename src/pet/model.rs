@@ -61,6 +61,8 @@ pub struct Material {
     /// 留在不写深度的混合通道。即使参数 Opacity 恰好为 1，也不能据此改成不透明材质：
     /// 莫比乌乌的外壳会挡住先画的内层液体。
     pub translucent: bool,
+    /// 见 `pack::MaterialSpec::outline`。
+    pub outline: Option<bool>,
     pub opacity: f32,
     /// 星点 / MatCap 两张附加贴图与它们的着色,以及边缘光。
     pub star: Option<Image>,
@@ -508,6 +510,7 @@ impl Model {
                     cutout: spec.mask_alpha,
                     line_detail,
                     translucent: spec.translucent,
+                    outline: spec.outline,
                     opacity: spec.opacity,
                     // 星点/matcap 的 alpha 原样保留:形状全在 alpha 里
                     star: spec.star.as_deref().and_then(|p| load_texture(p, true)),

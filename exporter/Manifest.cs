@@ -161,7 +161,9 @@ public record MaterialEntry(
     float[] XiaoYouStarUv,
     YutuEarMaterial? YutuEar,
     FakeFluidMaterial? FakeFluid,
-    MatcapMaskedMaterial? MatcapMasked);
+    MatcapMaskedMaterial? MatcapMasked,
+    /// 同目录里有没有配套的 `_Ol` 描边材质;见 `MaterialInfo.HasOutline`。
+    bool HasOutline = true);
 
 public record FormReport(
     Form Form,
@@ -267,6 +269,9 @@ public static class Manifest
                     parts.Add($"mask_clip = {Num(mat.MaskClip)}");
                     parts.Add($"blend = {Quote(mat.Blend)}");
                     if (mat.Translucent) parts.Add("translucent = true");
+                    // **逐材质写**(不是「有才写」):运行时对旧包没有这个字段时得退回老行为,
+                    // 只有明确写出来才敢按它开关描边。
+                    parts.Add($"outline = {(mat.HasOutline ? "true" : "false")}");
                     // 星点/MatCap/边缘光对所有材质都可能有
                     if (mat.StarTexture is not null)
                     {
