@@ -677,6 +677,104 @@ V + ⌈S/4⌉ + 1 = 120 ≥ 声明的 `cb6[119]`)这条 shader 唯一配到冻�
 接上去的收益是全库主力材质一次到位,**代价是 25 只全部重标** —— 仍然记在待办里,
 **别顺手做**。
 
+**六条实机反馈:五条的根因在汇编里查到了,一条是导出器认漏了参数名(2026-08-08)**
+
+反馈原文:小灵面一族身旁的幽火缺颜色、手臂颜色不对(实机都偏蓝);幽星光那两颗球
+壳太透;春兔/春花兔耳朵里的液体发黑;克莱因龙玻璃壳发黑;水灵身上的竖向浅色线条没了;
+焰火/火神像罩了一层黄色遮罩,实机的黑翅膀发黄。
+
+这一轮**先把反汇编流水线接通再动手** —— 上一轮那批「Low 原生材质」有几处是照着旧笔记
+重写的,而不是照着这只宠物这条排列的指令流。做法与工具见 `scripts/matshader.py`,
+六个材质各自的 Low/LOD0/DynamicSwitchId=0 resource 用探针的 `PROBE_RAWMAP=1` 挑
+(SHA 前 24 字节的第 4、5 个 uint32 都为 0 的那条)。
+
+| 反馈 | 根因 | 依据 |
+|---|---|---|
+| 小灵面**手臂**橙绿 | `shade_xiaoyou` 的固有色写成 `mix(MainTex, mix(base1,base2,flow.g), flow.r)`,而 `flow.r` 最大只有 0.19 ⇒ 手臂几乎整块显示 `Tex_PetGlassy_007_D` 原样 | PS 32511 第 140~143 行:`lerp(MF_ToneMapInverse(BaseTex), lerp(BaseColor1, BaseColor2, 1−顶点色G), 1−顶点色A)`。这一族**顶点色 A 恒为 0** ⇒ 基色贴图权重为 0,固有色全部来自那对颜色;顶点色 G 身体 1.0(暗紫)、手臂 0.23~0.71(混向青)——实机手臂那道紫→青渐变就是它 |
+| 小灵面**幽火**发白 | 导出器不认带空格的 `Base Color`,幽火落进「纯特效层」⇒ 拿基色图当形状遮罩、颜色走 `Tint`(这个材质没有)⇒ 一团白 | 探针:`MI_Gho_XiaoYou1_001_Fx` 的 `tex Base Color → T_Gho_Xiaoyou1_001_Fx_D`,那张图就是画好的青色渐变 |
+| 水灵**竖条纹**看不见 | 那层是 `Color1 × Emitter Intensity × saturate((基色a−0.04)×1.1111)`,而导出器为了不让水体族被当白色自发光,把 `Emitter Intensity` 清成 0 并单独传 `water_color1`——**运行时从来没读过它** | 水灵 `_By` 的 Low PS 68952 第 60~65 行是同一个形状;`_By_D` 的 alpha 画的正好就是那几道竖线(>200 占 21%) |
+| 火神/焰火**黄色遮罩** | 自发光那层原来乘 `facing` 当遮罩、糊在所有像素上 | 68952 里 `颜色 × 遮罩` 的遮罩就是上面那个基色 alpha 重映射,**整条链没有任何 Fresnel/N·V 项**。火神 `_By_D` 的 alpha 只圈住火焰爪/角上的高光块(>200 占 1.1%),黑翅膀是 0 |
+| 春兔**耳内液体发黑** | `shade_yutu_ear` 末尾整层乘了 `in.color.r`,而那泡液体的顶点色 R 实测 0(238/356 个顶点) | Low PS 70474 里 `v2`(ISGN 查实 = COLOR0)只出现两次:第 88 行给一层菲涅尔调强度、第 147~152 行当**液面高度门**(`v2.x ≥ 0.5`),**没有一处乘在最终颜色上** |
+| 克莱因龙**玻璃壳发黑** | 描边那一遍对 `M_P_MatCap_Masked` 采的是绑在 `base_color` 上的**球面 MatCap 查找表**、还按网格 UV 采;正面壳又按遮罩 discard 掉了,于是外扩的背面壳直接铺满整个泡泡 | 把 `fs_outline` 临时改成品红渲一张就看得见:黑块的形状与描边壳逐像素重合 |
+| 幽星光**球壳太透** | 玻璃壳自己顶多盖住两成,实机那颗**实心红球**来自它背后的描边壳 —— 而我们的描边只画不透明材质 | 球的 Low PS 1355:`alpha = max(基色a重映射, 高光×SpecInt, MatCap.r)`,而实例 `HighLight SpecInt = 0`、球那块 UV 的基色 alpha 中位与 p90 **都是 0.000**、`matcap26` 均值 0.199 |
+
+**这一轮拿到的一条通用事实:游戏的描边是逐材质开的。** `Mat/` 目录里除了
+`MI_<形态>_<槽>` 还并排放着 `MI_<形态>_<槽>_Ol`,那份材质的参数表是描边专用的
+(`Outline Intensity`、`OutlineWidthPC`、`OutLineOtherColor1..5`、`MinID`/`MatID`、
+`描边中心剔除范围`…)。**有它才画描边**,实测:小灵面 `_By`/`_By1` 有、幽火 `_Fx` 没有;
+水灵只有 `_By`;幽星光 `_By` 与那两颗玻璃球 `_Fx1` 都有;克莱因龙 `_By`/`_Fx` 有、
+液面 `_Fx1` 没有。导出器现在逐材质写 `outline = true/false`(旧包没这个字段 ⇒ 退回
+「不透明画、半透不画」)。
+
+**半透明材质的描边壳只给 `_Trans_MatCap` 那一族开,这条是量出来的边界。** 第一版给
+所有「半透 + 有 `_Ol`」都补了壳,结果**春兔的耳膜整片变成不透明的灰绿**,里面那泡液体
+连同背景一起被糊掉。差别在**它们的不透明度是不是画出来的**:暮星辰的裙子与春兔的耳膜
+那块 UV 的基色 alpha 中位是 0.537 / 0.378(画出来的不透明度图,实机确实透得见背景),
+而 `MI_P_Object_Trans_MatCap` 的球是 0.000 —— 它整条覆盖率链只剩 MatCap 那一路。
+判据因此取「半透 + 有 `_Ol` + 有 MatCap 贴图」,全库正好命中幽星光/曜星光/暮星辰的
+三对球,一个不多。
+
+**配对复量(同一份新包,新旧两版二进制各跑一遍 `cmp_shots`)**。调色板距离:
+
+    波波拉   0.373 → 0.149    克莱因龙 0.198 → 0.071(对比比 9.07 → 3.43、很暗 0.172 → 0.000)
+    幽冥眼   0.224 → 0.203    幽星光   0.104 → 0.097    曜星光 0.088 → 0.084
+    水灵     0.115 → 0.112    暮星辰   0.067 → 0.065    小灵面 0.188 → 0.183
+    火神     0.086 → **0.182**   春花兔 0.064 → **0.075**   莫比乌乌 0.029 → 0.036
+    25 只中位 0.076 → 0.075;全库扫描 失败 0 / 空白 1 / **过曝 11 → 3**
+
+**变差的两只都要按肉眼判,而且判下来都是「改对了」**:
+
+- **火神**:旧版把自发光平铺在所有像素上,整只泛黄 —— 那层黄正好把身体的色度往实机
+  (更亮更饱和的橙)拉近了一点,所以调色板反而好看。裁图并排比就很清楚:实机的翅膀/
+  项圈/尾巴是接近黑的炭色,旧版是暖褐色,新版是黑的。**指标变差、观感变好**,如实记下。
+- **春花兔**:耳朵里那泡液体从黑变成粉(实机就是粉的),多出来一个新的主色簇,
+  而两边选区又不是同一块(见 `cmp_shots.py` 模块头第 1、5 条)。
+
+**一处工具上的坎,记下来免得下次又卡住**:**在一份新 clone 或全新 build 目录里,
+`CUE4Parse-Natives.so` 会被编成一个 15KB 的空壳**(只导出 1 个符号),于是所有动作加载时报
+`Unable to find an entry point named 'nAllocate'`,导出的 glb **一个动作都没有**。
+正常那份是 535KB(`CUE4Parse-Natives/builddir/CUE4Parse-Natives.so`,由 meson 完整构建出来)。
+**导出完要看报告里的动作命中数**(如「火神 16/46 个动作」),不然会拿一份没有动画的包去渲图。
+
+**导出器已适配 CUE4Parse 最新版(2026-08-08,`f081f32e`)**
+
+上游 `Delete duplicated classes`(2026-08-04)那次重构把导出侧整个换了形状,四处要跟:
+
+| 旧 | 新 | 说明 |
+|---|---|---|
+| `CUE4Parse_Conversion.ETextureFormat` | `CUE4Parse_Conversion.Options.ETextureFormat` | 只是换命名空间,`Decode()`/`Encode()` 签名没动 |
+| `new MeshExporter(mesh, options)` + `exporter.MeshLods[i].FileData` | `new SkeletalMeshDto(mesh, quality)` + `new GltfMeshFormat().BuildSkeletalMesh(...)` → `ExportFile.Data` | **不要走 `SkeletalMeshExporter`**:新导出器是「`ExportSession` + 异步写盘」,`BuildExportFiles` 是 protected,拿字节只能先落盘再读回来。而转换格式本身是公开的,直接调它,少一次落盘 |
+| `ExporterOptions { … }`(对象初始化器) | `new ExportOptions(meshFormat:…, meshQuality:…, …)`(全 `readonly`,只能构造函数传) | — |
+| `ELodFormat.FirstLod` / `AllLods` | `EMeshQuality.Highest` / `All` | 语义一一对应 |
+| `FPackageIndex.Name` 是 `FName` | 已经是 `string` | 去掉 `.Text` 即可(`Materials.cs` / `MaterialProbe.cs` 各一处) |
+
+`ConvertAnims()` 还在(挪到 `CUE4Parse-Conversion/Legacy/AnimConverter.cs`,命名空间没变)。
+
+**补丁也跟着重做了**:`0002` 原来修两处,现在只剩一处 ——
+「`(Vector4)FColor` 之后又除了一次 255」上游自己修好了(`/255` 现在只在 `FColor` 的隐式转换里),
+而「网格没有顶点色缓冲时给 0 而不是白」还在,只是搬到了
+`CUE4Parse-Conversion/Writers/Gltf/VertexColorXTextureX.cs` 的 `Color = color ?? Vector4.Zero`。
+文件因此改名为 `0002-fix-FColor-missing-vertex-colors.patch`。**这条不能不打**:
+XiaoYou / FakeFulid / YutuEar 三族都拿 `COLOR_0` 当遮罩,给 0 等于整层关掉。
+`0001`(FPackedNormal 量化)原样仍能应用。
+
+**换版前后逐项对过,只有一类差异,而且是上游修对了**。做法:同一份 paks、同一个导出器,
+分别对 `80b5e44d` 与 `f081f32e` 各导 6 条链,再按**结构**比 17 份 glb
+(节点按名字配对、蒙皮 joints 按名字比、每个 primitive 的每条属性数组逐值比):
+
+- 网格属性(POSITION/NORMAL/COLOR_0/TEXCOORD/JOINTS/WEIGHTS/indices)**全部逐值一致**;
+  骨骼集合、动画名与时长一致;manifest 只差 `generated_at`;贴图逐字节一致。
+- 唯一的差异:**绑定姿势现在带上了参考姿势的缩放**(旧版一律压成 1)。例如春团的
+  `Bone_L_001` 从 `[1,1,1]` 变成 `[1.0457, 1, 1]`,IBM 跟着差 0.037,而那几段动画里
+  **恒定且等于新绑定姿势**的缩放轨道被我们自己的「恒定且等于绑定姿势就不写」优化省掉了
+  —— 合成出来的变换一模一样。真正变的只有**没有缩放轨道的那些片段**:旧版按 1 摆、
+  新版按美术的参考姿势摆,后者才是 UE 的行为。
+- 34 张渲图逐像素比:23 张完全一致,春团 7.2% 像素有变(就是上面那几根叶子骨),
+  水灵 0.018%,其余 ≤ 0.009%。
+
+⇒ 临时 worktree 那套(`git worktree add /tmp/cue4parse-<日期> <旧提交>`)**不再需要**,
+`CUE4PARSE_DIR` 用默认的 `~/Git/gh/CUE4Parse` 即可。
+
 **cb 槽位 ↔ 参数名这堵墙通了 —— 而且当年卡住的原因是挑错了排列(2026-08-06)**
 
 文档里两处把它记成死路:「这条 shader 的 `FUniformExpressionSet` **压根不在包里**」、
