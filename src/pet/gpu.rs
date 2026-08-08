@@ -486,7 +486,7 @@ impl PetGpu {
                 .and_then(|y| y.distort.as_ref())
                 .or_else(|| material.fake_fluid.as_ref().and_then(|f| f.lut.as_ref()))
                 .or_else(|| material.xiaoyou.as_ref().and_then(|x| x.noise.as_ref()))
-                .or_else(|| match &material.effect {
+                .or(match &material.effect {
                     Some(effect) => effect.noise.as_ref(),
                     None => material.flow.as_ref(),
                 });
@@ -1317,58 +1317,6 @@ fn resolve_face_card(cards: &[u32], want: u32) -> u32 {
     cards[0]
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// 缺卡要退档,而且不能退成「一张都不画」。
-    #[test]
-    fn a_missing_face_card_falls_back_instead_of_vanishing() {
-        let full: Vec<u32> = (1..=8).collect();
-        assert_eq!(resolve_face_card(&full, 5), 5, "有就用它");
-        // 蝴蝶陶陶三阶缺 5 号(困倦):退回默认那张
-        let no_sleepy = [1, 2, 3, 4, 6, 7, 8];
-        assert_eq!(resolve_face_card(&no_sleepy, 5), 2);
-        // 觅觅蝠一阶连 1 号都没有,但 2 号在,默认脸照样有
-        let no_first = [2, 3, 4, 5, 6, 7, 8];
-        assert_eq!(resolve_face_card(&no_first, 2), 2);
-        // 连 2 号都没有的极端情况:退到最小的一张,而不是什么都不画
-        assert_eq!(resolve_face_card(&[3, 6], 5), 3);
-        // 不是网格脸:原样返回(着色器不看这个值)
-        assert_eq!(resolve_face_card(&[], 2), 2);
-    }
-
-    fn skinned_vertex(pos: [f32; 3], joint: u16) -> Vertex {
-        Vertex {
-            pos,
-            normal: [0.0, 1.0, 0.0],
-            uv: [0.0; 2],
-            joints: [joint, 0, 0, 0],
-            weights: [1.0, 0.0, 0.0, 0.0],
-            local_pos: pos,
-            color: [1.0; 4],
-        }
-    }
-
-    #[test]
-    fn posed_bounds_follow_skin_matrices() {
-        let vertices = [
-            skinned_vertex([-1.0, -2.0, -3.0], 0),
-            skinned_vertex([1.0, 2.0, 3.0], 1),
-        ];
-        let matrices = [
-            Mat4::from_translation(Vec3::new(2.0, 3.0, 4.0)),
-            Mat4::from_translation(Vec3::new(-2.0, -1.0, 0.0)),
-        ];
-
-        assert_eq!(
-            posed_object_bounds(&vertices, &matrices),
-            Some([0.0, 1.0, 2.0, 2.0])
-        );
-        assert_eq!(posed_object_bounds(&[], &matrices), None);
-    }
-}
-
 fn upload_texture(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
@@ -1433,4 +1381,56 @@ pub fn orthographic_view(bounds: (Vec3, Vec3), yaw: f32, padding: f32) -> Mat4 {
         radius * 4.0,
     );
     proj * view
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 缺卡要退档,而且不能退成「一张都不画」。
+    #[test]
+    fn a_missing_face_card_falls_back_instead_of_vanishing() {
+        let full: Vec<u32> = (1..=8).collect();
+        assert_eq!(resolve_face_card(&full, 5), 5, "有就用它");
+        // 蝴蝶陶陶三阶缺 5 号(困倦):退回默认那张
+        let no_sleepy = [1, 2, 3, 4, 6, 7, 8];
+        assert_eq!(resolve_face_card(&no_sleepy, 5), 2);
+        // 觅觅蝠一阶连 1 号都没有,但 2 号在,默认脸照样有
+        let no_first = [2, 3, 4, 5, 6, 7, 8];
+        assert_eq!(resolve_face_card(&no_first, 2), 2);
+        // 连 2 号都没有的极端情况:退到最小的一张,而不是什么都不画
+        assert_eq!(resolve_face_card(&[3, 6], 5), 3);
+        // 不是网格脸:原样返回(着色器不看这个值)
+        assert_eq!(resolve_face_card(&[], 2), 2);
+    }
+
+    fn skinned_vertex(pos: [f32; 3], joint: u16) -> Vertex {
+        Vertex {
+            pos,
+            normal: [0.0, 1.0, 0.0],
+            uv: [0.0; 2],
+            joints: [joint, 0, 0, 0],
+            weights: [1.0, 0.0, 0.0, 0.0],
+            local_pos: pos,
+            color: [1.0; 4],
+        }
+    }
+
+    #[test]
+    fn posed_bounds_follow_skin_matrices() {
+        let vertices = [
+            skinned_vertex([-1.0, -2.0, -3.0], 0),
+            skinned_vertex([1.0, 2.0, 3.0], 1),
+        ];
+        let matrices = [
+            Mat4::from_translation(Vec3::new(2.0, 3.0, 4.0)),
+            Mat4::from_translation(Vec3::new(-2.0, -1.0, 0.0)),
+        ];
+
+        assert_eq!(
+            posed_object_bounds(&vertices, &matrices),
+            Some([0.0, 1.0, 2.0, 2.0])
+        );
+        assert_eq!(posed_object_bounds(&[], &matrices), None);
+    }
 }
