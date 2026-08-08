@@ -126,17 +126,49 @@ pub struct Assets {
     models: HashMap<PathBuf, Arc<Model>>,
     pet_gpus: HashMap<PathBuf, Arc<PetGpu>>,
     voices: HashMap<PathBuf, Arc<VoiceBank>>,
+    /// 画布边长的上限 = GPU 的最大 2D 纹理边长。GPU 起来之后由平台层填(见 `set_max_canvas`)。
+    max_canvas: Option<u32>,
+    /// 最近用过的形态(glb 路径),最近的排最前。`prune` 靠它决定留哪几份,见那里的说明。
+    recent: Vec<PathBuf>,
+}
+
+/// GPU 还没起来时按这个数当上限。8192 是 wgpu 默认限制里的 `max_texture_dimension_2d`,
+/// 也是当下显卡的普遍下限;真实值一拿到就覆盖掉。
+const FALLBACK_MAX_CANVAS: u32 = 8192;
+
+/// `prune` 时额外留几份「最近用过、当前没人用」的资产。见 [`Assets::prune`]。
+const KEEP_RECENT: usize = 2;
+
+/// 建一个角色超过这个时间就把分段打出来(命中缓存时是微秒级,只有真读盘才够得着)。
+const SLOW_BUILD: std::time::Duration = std::time::Duration::from_millis(150);
+
+/// 离屏画布的**物理**尺寸:逻辑尺寸 × 这台的缩放,再钳进 GPU 的纹理上限。
+///
+/// **两道钳子都要**:[`Assets::build_actor`] 那道管的是逻辑尺寸(顺带把脚底与速度一起缩,
+/// 免得宠物在屏幕上高得没法看),而缩放是这一层才乘上去的 —— 逻辑边长 8192 在 1.5 倍
+/// 缩放的屏幕上就是 12288,照样超限 panic(实测踩过,就在钳完逻辑尺寸之后)。
+///
+/// 钳这里是安全的:画布只是宠物的渲染分辨率,上台画多大由实体的逻辑尺寸定 ——
+/// 钳过头最多是这一只糊一点,不会变形也不会被裁。
+pub fn canvas_size(logical: (u32, u32), scale: f32, max: u32) -> (u32, u32) {
+    let side = |v: u32| ((v as f32 * scale) as u32).clamp(1, max.max(1));
+    (side(logical.0), side(logical.1))
 }
 
 impl Assets {
+    /// GPU 起来之后把真实的纹理边长上限告诉它。**建任何角色之前调** ——
+    /// 画布尺寸是按这个上限钳的,晚了就钳不住第一批。
+    pub fn set_max_canvas(&mut self, limit: u32) {
+        self.max_canvas = Some(limit);
+    }
+
     /// 取这个形态的模型:缓存里有就直接共享,没有才读盘。
     pub fn model(&mut self, form: &Form) -> Result<Arc<Model>> {
+        self.touch(&form.model);
         if let Some(model) = self.models.get(&form.model) {
             return Ok(Arc::clone(model));
         }
         let model = Arc::new(Model::load(&form.model, &form.materials)?);
-        self.models
-            .retain(|_, cached| Arc::strong_count(cached) > 1);
         self.models.insert(form.model.clone(), Arc::clone(&model));
         Ok(model)
     }
@@ -147,8 +179,6 @@ impl Assets {
             return Ok(Arc::clone(cached));
         }
         let built = Arc::new(PetGpu::new(&gpu.device, &gpu.queue, model, gpu.format())?);
-        self.pet_gpus
-            .retain(|_, cached| Arc::strong_count(cached) > 1);
         self.pet_gpus
             .insert(model.source.clone(), Arc::clone(&built));
         Ok(built)
@@ -190,20 +220,29 @@ impl Assets {
             cents_high: voice.cents_high,
         });
         log::debug!("{} 的叫声 {} 段", form.name, bank.clips.len());
-        self.voices
-            .retain(|_, cached| Arc::strong_count(cached) > 1);
         self.voices.insert(form.model.clone(), Arc::clone(&bank));
         Some(bank)
     }
 
     /// 撤一只/切形态之后清掉没人用的。不清的话它的网格与贴图会一直占着。
+    ///
+    /// **但留几份最近用过的**:切形态是来回切的(A→B 之后多半还要 B→A),而重新读一遍
+    /// glb + 解码四段叫声实测要三五十毫秒。一律照 `strong_count == 1` 清的话,
+    /// 换回去必然是全新加载 —— 用户看到的就是「切回刚才那个形态照样卡」。
+    /// 留 [`KEEP_RECENT`] 份是权衡:够覆盖来回切,又不至于让内存无限涨。
     pub fn prune(&mut self) {
-        self.models
-            .retain(|_, cached| Arc::strong_count(cached) > 1);
-        self.pet_gpus
-            .retain(|_, cached| Arc::strong_count(cached) > 1);
-        self.voices
-            .retain(|_, cached| Arc::strong_count(cached) > 1);
+        let keep: Vec<PathBuf> = self.recent.iter().take(KEEP_RECENT).cloned().collect();
+        let live = |path: &PathBuf, cached: usize| cached > 1 || keep.contains(path);
+        self.models.retain(|k, v| live(k, Arc::strong_count(v)));
+        self.pet_gpus.retain(|k, v| live(k, Arc::strong_count(v)));
+        self.voices.retain(|k, v| live(k, Arc::strong_count(v)));
+        self.recent.truncate(KEEP_RECENT);
+    }
+
+    /// 记一笔「这个形态刚被用到」,最近的排最前(见 `prune`)。
+    fn touch(&mut self, path: &Path) {
+        self.recent.retain(|p| p != path);
+        self.recent.insert(0, path.to_path_buf());
     }
 
     /// 把 manifest 里的厘米单位换成屏幕像素,算出画布尺寸与脚底位置。
@@ -219,15 +258,16 @@ impl Assets {
     ) -> Result<Actor> {
         // 每只自己的大小倍数就叠在 px_per_cm 上:走速/跑速是按 px_per_cm 换算的,
         // 一起放大才不会出现「个头大了却还是原来的步幅」那种滑步
-        let px_per_cm = px_per_cm * options.scale;
+        let mut px_per_cm = px_per_cm * options.scale;
+        let t_model = std::time::Instant::now();
         let model = self.model(form)?;
+        let d_model = t_model.elapsed();
         // 两个包围盒各管一件事:**尺寸**按绑定姿势(站姿高度不能随动作变),
         // **取景**按动作包围盒(否则伸手/张翅/跳跃会被画布裁掉,见 model.rs 的 motion_bounds)
         let stand = model.bounds.1 - model.bounds.0;
         let (frame_min, frame_max) = model.motion_bounds;
         let frame_extent = frame_max - frame_min;
         let frame_center = (frame_min + frame_max) * 0.5;
-        let height_px = form.height_cm * form.scale * px_per_cm;
         // 画布是方的,取景按动作包围盒最长边;正交框半径 = 最长边/2 × 余量
         let longest = frame_extent
             .x
@@ -236,9 +276,34 @@ impl Assets {
             .max(1e-4);
         let radius = longest * 0.5 * CANVAS_PADDING;
         // 画布边长 = 正交框的 2×半径(米),按「站姿高 ↔ height_px」的比例换成像素
-        let side = (height_px * 2.0 * radius / stand.y.max(1e-4))
-            .round()
-            .max(16.0);
+        let side_of = |ppc: f32| {
+            (form.height_cm * form.scale * ppc * 2.0 * radius / stand.y.max(1e-4))
+                .round()
+                .max(16.0)
+        };
+        // **必须钳在 GPU 的纹理上限内**:manifest 里的 `height_cm` 是从模型包围盒量的,
+        // 个别形态大得离谱(荆棘笼二阶 `Dem_JingJiLong2_001` 写着 3162cm —— 31 米),
+        // 算出来的画布边长 10881px 超过 8192,`create_texture` 直接把进程 panic 掉,
+        // 而且阵容存档里留着它,**重启还是同一条崩** —— 用户就此进不去了。
+        // 钳的办法是把这一只的 px_per_cm 按比例缩小:画布、脚底、走跑速度都跟着一致地缩,
+        // 只是它在屏幕上没那么高了(本来也高得没法看)。
+        let max_canvas = self.max_canvas.unwrap_or(FALLBACK_MAX_CANVAS) as f32;
+        let raw_side = side_of(px_per_cm);
+        if raw_side > max_canvas {
+            let shrink = max_canvas / raw_side;
+            log::warn!(
+                "{} 的画布要 {}px,超过 GPU 上限 {}px(manifest 里 height_cm={:.0},多半是模型\
+                 包围盒本身就离谱);按 ×{:.3} 缩到上限内",
+                form.name,
+                raw_side as u32,
+                max_canvas as u32,
+                form.height_cm,
+                shrink
+            );
+            px_per_cm *= shrink;
+        }
+        let height_px = form.height_cm * form.scale * px_per_cm;
+        let side = side_of(px_per_cm).min(max_canvas);
         // 脚底 = 绑定姿势下沿在正交框里的 NDC 位置(框心是动作包围盒中心,不一定等于站姿中心)
         let ndc_bottom = (model.bounds.0.y - frame_center.y) / radius;
         let foot_offset = (1.0 - ndc_bottom) * 0.5 * side;
@@ -281,7 +346,17 @@ impl Assets {
             }
         );
         // 这一只关了叫声就干脆不读它的音频(省几 MB,也省一次解码)
+        let t_voice = std::time::Instant::now();
         let voice = self.voice(form, with_audio && options.voice);
+        let d_voice = t_voice.elapsed();
+        // **只在慢的时候才报分段**:命中缓存时这两项都是微秒级,天天打一行纯噪音;
+        // 而「切个形态卡一下」的反馈全靠它定位是慢在读模型还是解叫声。
+        if d_model + d_voice > SLOW_BUILD {
+            log::warn!(
+                "{} 这一次建得慢:读模型 {d_model:?}、解叫声 {d_voice:?}(没命中缓存)",
+                form.name
+            );
+        }
         Ok(Actor::Pet(PetActor::new(PetBuild {
             model,
             size: (side as u32, side as u32),
@@ -335,10 +410,17 @@ pub fn start_roster(pets: Vec<crate::platform::StartupPet>) -> Vec<Member> {
 ///
 /// 读不动的**只警告**(和启动时对存档的处理一致):某个包被删了不该让整次重载失败,
 /// 那会让「在配置窗口里删掉一个包」变成「宠物全没了」。
-pub fn load_roster(slots: &[Slot], packs_dir: Option<&Path>) -> Vec<Member> {
+/// **包目录要由调用方先扫好**(`Pack::list_entries`)。
+///
+/// 这里不自己扫是有原因的:`reload` 紧接着还要用同一份列表去更新「加一只」那张表,
+/// 各扫各的就是把整库读两遍。而更早的版本连这一份都没有 —— 它对每只宠物调一次
+/// `Pack::resolve`,那个函数内部会把整个包目录的 manifest 读一遍来认名字,
+/// 于是**六只在场 = 把 201 个包读了六遍**(实测 242ms,还随只数线性涨)。
+/// 「加一只宠物就像把所有包重新加载一遍,卡一两秒」说的就是它。
+pub fn load_roster(slots: &[Slot], entries: &[crate::pack::PackEntry]) -> Vec<Member> {
     let mut roster = Vec::with_capacity(slots.len());
     for slot in slots {
-        let pack = match Pack::resolve(&slot.pack, packs_dir) {
+        let pack = match Pack::resolve_in(&slot.pack, entries) {
             Ok(pack) => pack,
             Err(e) => {
                 log::warn!("阵容里的 {} 上不了台({e:#}),跳过", slot.pack);

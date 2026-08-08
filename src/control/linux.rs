@@ -134,7 +134,7 @@ impl ksni::Tray for Tray {
             StandardItem {
                 label: "重新载入".into(),
                 icon_name: "view-refresh".into(),
-                activate: Box::new(|tray: &mut Self| tray.send(Control::Reload)),
+                activate: Box::new(|tray: &mut Self| tray.send(Control::ReloadPacks)),
                 ..Default::default()
             }
             .into(),
@@ -297,9 +297,17 @@ impl DbusControl {
         self.send(Control::Play(slot, clip));
     }
 
-    /// 重读配置与阵容存档。**配置窗口存完盘就调它**,于是改动立刻落到台上。
+    /// 重读配置与阵容存档。**配置窗口改完形态/大小/性格就调它**,于是改动立刻落到台上。
+    ///
+    /// **不重扫包目录**:那要把整个包目录的 manifest 读一遍(热缓存 40ms、冷缓存 400ms),
+    /// 而这些改动跟包目录无关。要重扫的走 `ReloadPacks`。
     fn reload(&self) {
         self.send(Control::Reload);
+    }
+
+    /// 同上,外加重扫包目录。`--reload` 与「导入/删除了包」走这条。
+    fn reload_packs(&self) {
+        self.send(Control::ReloadPacks);
     }
 
     /// 打开配置窗口。
@@ -384,6 +392,7 @@ pub fn send_command(control: Control) -> Result<()> {
         Control::ToggleMute => "ToggleMute",
         Control::Recall => "Recall",
         Control::Reload => "Reload",
+        Control::ReloadPacks => "ReloadPacks",
         Control::OpenSettings(_) => "OpenSettings",
         Control::Quit => "Quit",
         // 这几个要带参数,命令行没暴露(托盘菜单或配置窗口里调更直观)

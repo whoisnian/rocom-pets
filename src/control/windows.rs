@@ -64,6 +64,7 @@ fn code_of(control: Control) -> Option<u32> {
         Control::Quit => 4,
         // 配置窗口存完盘就发这个,是**跨进程**的主用途
         Control::Reload => 5,
+        Control::ReloadPacks => 8,
         Control::OpenSettings(_) => 6,
         // 配置窗口的动作表用,参数走 lparam(见 `play`)
         Control::Play(..) => 7,
@@ -79,6 +80,7 @@ pub fn control_of(code: u32) -> Option<Control> {
         3 => Control::Recall,
         4 => Control::Quit,
         5 => Control::Reload,
+        8 => Control::ReloadPacks,
         6 => Control::OpenSettings(SettingsPage::Packs),
         // 7 带参数,由 `control_from_message` 拆 lparam,不走这儿
         _ => return None,
@@ -325,7 +327,7 @@ impl TrayMenu {
             ID_QUIT => Control::Quit,
             // 「完整配置」落在常用配置页:从子菜单点进来的人本来就在找这几项
             ID_SETTINGS => Control::OpenSettings(SettingsPage::Common),
-            ID_RELOAD => Control::Reload,
+            ID_RELOAD => Control::ReloadPacks,
             ID_CUSTOM_SIZE => Control::OpenSettings(SettingsPage::Common),
             id if id >= ID_FPS => match FPS_STEPS.get(id - ID_FPS) {
                 Some((value, _)) => Control::SetFps(*value),

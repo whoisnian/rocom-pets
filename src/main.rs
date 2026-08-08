@@ -16,6 +16,7 @@ mod assets;
 mod audio;
 mod config;
 mod control;
+mod fatal;
 mod offscreen;
 mod pack;
 mod pack_list;
@@ -124,7 +125,58 @@ fn attach_parent_console() {
     }
 }
 
-fn main() -> anyhow::Result<()> {
+/// 出错时该不该弹兜底窗口,以及弹的时候把哪份配置交给「重置」。
+///
+/// `run` 在**解析完命令行、确定要开窗口之后**填上它。命令行子命令(`--list`/`--reload`
+/// 之类)一直是 `None` —— 脚本里跑的东西不该弹窗。
+/// **进程全局,不是 thread_local**:panic 钩子可能在任何线程上跑
+/// (wgpu 的那条在主线程,但别的库不保证),挂在线程上就读不到了。
+static FATAL_HINT: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
+static FATAL_WINDOWED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn main() -> std::process::ExitCode {
+    install_panic_dialog();
+    match run() {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(e) => {
+            report_fatal("启动失败", &format!("{e:#}"));
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+/// **panic 也要有兜底窗口**:wgpu 默认把校验错误当致命错误 `panic!`(画布尺寸超限就是),
+/// 那条路不经过 `Result`。
+///
+/// 弹窗必须在 **panic 钩子里**弹,不能靠 `catch_unwind` —— release 档是
+/// `panic = "abort"`(见 Cargo.toml),根本不展开,`catch_unwind` 一次都不会命中。
+/// 钩子则是 abort 之前一定会跑的那一步。
+fn install_panic_dialog() {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        // 原样先打一份到 stderr:从命令行跑的人要的就是那个
+        previous(info);
+        // 弹窗自己再 panic 的话别无限递归
+        static SHOWING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if SHOWING.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+        report_fatal("程序崩溃了(panic)", &format!("{info}"));
+    }));
+}
+
+/// 弹兜底窗口;不是「要开窗口」的那条路就只往 stderr 写一行。
+fn report_fatal(title: &str, detail: &str) {
+    let windowed = FATAL_WINDOWED.load(std::sync::atomic::Ordering::SeqCst);
+    let config_path = FATAL_HINT.lock().ok().and_then(|p| p.clone());
+    if windowed {
+        fatal::report(title, detail, config_path.as_deref());
+    } else {
+        eprintln!("{title}:{detail}");
+    }
+}
+
+fn run() -> anyhow::Result<()> {
     #[cfg(target_os = "windows")]
     attach_parent_console();
 
@@ -210,7 +262,8 @@ fn main() -> anyhow::Result<()> {
                 return control::send_command(control::Control::TogglePassthrough);
             }
             "--recall" => return control::send_command(control::Control::Recall),
-            "--reload" => return control::send_command(control::Control::Reload),
+            // 人手动敲的这条要**连包目录一起重扫**:他多半正是手改完文件想让它生效
+            "--reload" => return control::send_command(control::Control::ReloadPacks),
             "--settings-window" => {
                 return control::send_command(control::Control::OpenSettings(
                     control::SettingsPage::Packs,
@@ -257,6 +310,12 @@ fn main() -> anyhow::Result<()> {
 
     // 配置文件位置:**配置窗口与桌宠必须按同一条规则定**,否则两边看的不是同一份文件
     let path = config_path.or_else(config::Config::default_path);
+
+    // 从这儿往下都是要开窗口的路:出错时弹兜底窗口而不是往 stderr 写一行(见 fatal.rs)
+    if let Ok(mut slot) = FATAL_HINT.lock() {
+        *slot = path.clone();
+    }
+    FATAL_WINDOWED.store(true, std::sync::atomic::Ordering::SeqCst);
 
     if open_settings {
         return settings::run(path, packs_dir, settings_page);

@@ -771,23 +771,45 @@ impl Pack {
     /// 文件名那一条要**连去掉后缀的也认**:阵容存的是 `喵喵.rkpet`,而用户在配置里
     /// 多半只写 `喵喵` —— 同一个包换成目录形态之后名字还得对得上。
     pub fn resolve(value: &str, packs_dir: Option<&Path>) -> Result<Pack> {
+        let scanned;
+        let entries = match packs_dir {
+            Some(dir) => {
+                scanned = Pack::list_entries(dir);
+                scanned.as_slice()
+            }
+            None => &[],
+        };
+        // 包目录写进上下文里,但**别用 Debug 格式** —— `{:?}` 出来是 `Some("/home/…")`,
+        // 这句话是要摆到报错窗口里给人看的
+        Pack::resolve_in(value, entries).with_context(|| match packs_dir {
+            Some(dir) => format!("包目录是 {}", dir.display()),
+            None => "而且定不出包目录".to_string(),
+        })
+    }
+
+    /// 同上,但**目录已经扫好了**。
+    ///
+    /// 一次要认好几个名字时必须走这条:`resolve` 自己会把整个包目录的 manifest 读一遍,
+    /// 每只宠物调一次就是把整库读上几遍 —— 实测六只在场时,`reload` 有 242ms 花在这儿
+    /// (库里 201 个包),而且随在场只数线性涨。用户看到的「加一只宠物就像把所有包
+    /// 重新加载一遍,卡一两秒」就是它。
+    pub fn resolve_in(value: &str, entries: &[PackEntry]) -> Result<Pack> {
+        // 存档里也可能直接写着路径(`--pack /some/where` 存下来的那种)
         let as_path = crate::config::Config::expand_path(value);
         if crate::assets::is_pack(&as_path) {
             return Pack::load(&as_path);
         }
-        if let Some(dir) = packs_dir {
-            for entry in Pack::list_entries(dir) {
-                let file_name = entry.path.file_name().map(|n| n.to_string_lossy());
-                let stem = entry.path.file_stem().map(|n| n.to_string_lossy());
-                let hit = entry.name == value
-                    || file_name.as_deref() == Some(value)
-                    || stem.as_deref() == Some(value);
-                if hit {
-                    return Pack::load(&entry.path);
-                }
+        for entry in entries {
+            let file_name = entry.path.file_name().map(|n| n.to_string_lossy());
+            let stem = entry.path.file_stem().map(|n| n.to_string_lossy());
+            let hit = entry.name == value
+                || file_name.as_deref() == Some(value)
+                || stem.as_deref() == Some(value);
+            if hit {
+                return Pack::load(&entry.path);
             }
         }
-        bail!("找不到宠物包 {value}(既不是包目录/`.rkpet`,也不在 {packs_dir:?} 里)")
+        bail!("找不到宠物包 {value}(既不是包目录/`.rkpet`,也不在包目录里)")
     }
 
     /// `root` 是包目录(含 manifest.toml)或 `.rkpet` 文件。
@@ -1049,3 +1071,4 @@ impl Pack {
         }
     }
 }
+

@@ -24,10 +24,10 @@
 //! 所以拖的时候只改内存里的值(桌面上不动),**松手才落盘**。
 
 mod common;
-mod fonts;
+pub(crate) mod fonts;
 mod packs;
 mod pets;
-mod theme;
+pub(crate) mod theme;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -370,12 +370,24 @@ impl SettingsApp {
     }
 
     /// 改了东西:存盘并让在跑的桌宠跟上。**每一次改动都走这里**。
+    /// 存盘 + 通知桌宠。**改形态/大小/性格这些走它**。
     fn apply(&mut self) {
+        self.apply_with(crate::control::Control::Reload);
+    }
+
+    /// 同上,但让桌宠**连包目录一起重扫**。只有导入/删除包之后才该用它 ——
+    /// 重扫要把整个包目录的 manifest 读一遍(热缓存 40ms、冷缓存 400ms),
+    /// 切个形态也扫一遍就是「切形态有明显延迟」的由来。
+    fn apply_packs_changed(&mut self) {
+        self.apply_with(crate::control::Control::ReloadPacks);
+    }
+
+    fn apply_with(&mut self, command: crate::control::Control) {
         if let Err(e) = self.write_files() {
             self.status.fail(format!("存不进去:{e:#}"));
             return;
         }
-        match crate::control::send_command(crate::control::Control::Reload) {
+        match crate::control::send_command(command) {
             Ok(()) => self.status.ok("改动已通过 Reload 送达桌宠"),
             // 桌宠没在跑是**正常情况**(先配置好再启动)
             Err(_) => self.status.ok("已存盘;桌宠没在跑,下次启动生效"),

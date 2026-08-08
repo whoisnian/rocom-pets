@@ -458,7 +458,12 @@ impl App {
         };
         if self.gpu.is_none() {
             match Gpu::new(&self.instance, &surface) {
-                Ok(gpu) => self.gpu = Some(gpu),
+                Ok(gpu) => {
+                    // 画布尺寸按它钳(见 `Assets::build_actor`)。**建角色之前就得填上**
+                    self.assets
+                        .set_max_canvas(gpu.device.limits().max_texture_dimension_2d);
+                    self.gpu = Some(gpu);
+                }
                 Err(e) => {
                     log::error!("初始化 GPU 失败: {e:#}");
                     self.exit = true;
@@ -491,11 +496,20 @@ impl App {
         self.assets.pet_gpu(gpu, model)
     }
 
+    /// GPU 的最大 2D 纹理边长;还没起来时按保守值来(见 `shared::canvas_size`)。
+    fn max_canvas(&self) -> u32 {
+        self.gpu
+            .as_ref()
+            .map(|g| g.device.limits().max_texture_dimension_2d)
+            .unwrap_or(8192)
+    }
+
     fn rebuild_pet_surfaces(&mut self, index: usize) {
         if self.gpu.is_none() {
             return;
         }
         let scale = self.stages[index].scale;
+        let max_canvas = self.max_canvas();
         // (标识, 模型, 逻辑尺寸);模型为 None = 调试精灵
         type Wanted = (EntityId, Option<Arc<Model>>, (u32, u32));
         let mut wanted: Vec<Wanted> = Vec::new();
@@ -522,10 +536,7 @@ impl App {
             if self.stages[index].pets.iter().any(|s| s.id == id) {
                 continue;
             }
-            let canvas_size = (
-                ((aw as f32 * scale) as u32).max(1),
-                ((ah as f32 * scale) as u32).max(1),
-            );
+            let canvas_size = shared::canvas_size((aw, ah), scale, max_canvas);
             let pet_gpu = match self.pet_gpu(&model) {
                 Ok(pet_gpu) => pet_gpu,
                 Err(e) => {
@@ -563,7 +574,8 @@ impl App {
                 continue;
             };
             let (aw, ah) = entity.actor().size();
-            let canvas_size = ((aw as f32 * scale) as u32, (ah as f32 * scale) as u32);
+            let canvas_size =
+                shared::canvas_size((aw, ah), scale, gpu.device.limits().max_texture_dimension_2d);
             let extent = pet.model.bounds.1 - pet.model.bounds.0;
             let outline = extent.length() * 0.004;
             let view = view_proj(pet.model.motion_bounds, pet.yaw, CANVAS_PADDING);
@@ -750,6 +762,7 @@ impl App {
         }
         // 画布尺寸跟着缩放走(**逐只取**:阵容里各宠物尺寸不同)
         if let Some(gpu) = self.gpu.as_ref() {
+            let max_canvas = gpu.device.limits().max_texture_dimension_2d;
             let sizes: Vec<(EntityId, (u32, u32))> = self.stages[index]
                 .stage
                 .entities()
@@ -757,10 +770,7 @@ impl App {
                 .map(|e| (e.id(), e.actor().size()))
                 .collect();
             for (id, (aw, ah)) in sizes {
-                let canvas = (
-                    ((aw as f32 * scale) as u32).max(1),
-                    ((ah as f32 * scale) as u32).max(1),
-                );
+                let canvas = shared::canvas_size((aw, ah), scale, max_canvas);
                 let Some(surfaces) = self.stages[index].pets.iter_mut().find(|s| s.id == id) else {
                     continue;
                 };
@@ -844,7 +854,8 @@ impl App {
             Control::SetFps(value) => self.set_fps(value),
             Control::SetPxPerCm(value) => self.set_px_per_cm(value),
             Control::SetVolume(value) => self.set_volume(value),
-            Control::Reload => self.reload(),
+            Control::Reload => self.reload(false),
+            Control::ReloadPacks => self.reload(true),
             Control::OpenSettings(page) => control::open_settings(page),
         }
     }
@@ -931,7 +942,9 @@ impl App {
 
     /// 重新读配置与阵容存档,把台上的一切对齐过去(配置窗口存完盘就发这个)。
     /// **整个阵容重来**,不做差量 —— 理由见 Wayland 后端同名函数。
-    fn reload(&mut self) {
+    fn reload(&mut self, rescan: bool) {
+        // 重载耗时值得常驻一行:「加一只就卡一下」这类反馈全靠它定位是慢在哪一步
+        let started = Instant::now();
         if let Some(path) = self.config_path.as_deref() {
             match crate::config::Config::load_or_create(path) {
                 Ok(config) => {
@@ -958,16 +971,27 @@ impl App {
             .iter()
             .map(|m| m.pack.species_name.clone())
             .collect();
-        self.roster = shared::load_roster(&slots, self.packs_dir.as_deref());
-        let greeting = shared::newcomers(&before, &self.roster);
-        if let Some(dir) = self.packs_dir.as_deref() {
-            self.available = Pack::list_entries(dir);
+        // **包目录只在 `rescan` 时重扫**(启动 / `--reload` / 导入删除包)。
+        // 阵容解析共用这一份缓存,不再各扫各的
+        if rescan {
+            self.refresh_packs();
         }
-        log::info!("已重载:{} 只在台上", self.roster.len());
+        let entries = std::mem::take(&mut self.available);
+        self.roster = shared::load_roster(&slots, &entries);
+        self.available = entries;
+        let greeting = shared::newcomers(&before, &self.roster);
         if !self.roster.is_empty() {
             self.sprite_mode = false;
         }
         self.respawn_all();
+        // **计时要含重建**:重建才是剩下的大头(模型/GPU/叫声解码),
+        // 打在它前面的话这行数字好看得没有意义
+        log::info!(
+            "已重载:{} 只在台上,用时 {:?}{}",
+            self.roster.len(),
+            started.elapsed(),
+            if rescan { "(含重扫包目录)" } else { "" }
+        );
         // 「启用召唤」那一声;开机恢复阵容时不叫
         for stage in &mut self.stages {
             for slot in &greeting {
@@ -982,6 +1006,16 @@ impl App {
     }
 
     /// 把每台上的角色全部推倒重建(reload 用)。
+    /// 重扫包目录。**只在该扫的时候扫**:启动、`--reload`、以及配置窗口那边
+    /// 导入/删除了包。切形态、调大小那些走 `Reload` 的改动一律不扫 ——
+    /// 把 201 个包的 manifest 全读一遍是热缓存 40ms、冷缓存 400ms,
+    /// 而它们跟包目录八竿子打不着(「切形态有明显延迟」就是这么来的)。
+    fn refresh_packs(&mut self) {
+        if let Some(dir) = self.packs_dir.as_deref() {
+            self.available = Pack::list_entries(dir);
+        }
+    }
+
     fn respawn_all(&mut self) {
         // 第三项是落脚点:勾了「记住」的回它自己那儿,其余交给 Stage 错开摆
         let builds: Vec<(Form, PetOptions, Option<f32>)> = self

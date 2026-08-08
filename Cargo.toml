@@ -14,6 +14,17 @@ codegen-units = 1  # 不切分,换更充分的优化(编译只能单线程,慢�
 panic = "abort"    # 桌宠没有捕获 panic 再续跑的地方,展开表纯属白带
 strip = "symbols"
 
+# **依赖按优化档编,自己的代码仍是 debug。**
+#
+# 日常是 `cargo run` 跑的,而这个程序的重活几乎全在依赖里:读 glb(gltf + 贴图解码)、
+# 解 ogg(symphonia)。不开这条时它们按 opt-level=0 编,切一次形态实测要 0.9~1.5 秒
+# (同一台机器 release 只要 44~68ms);开了之后降到 0.3~0.5 秒。
+# 还嫌慢就再加 `[profile.dev] opt-level = 1`(自己的代码也优化,调试体验会打点折),
+# 或者直接跑 --release。
+# 自己的代码不受影响,断点、变量名、行号照旧。代价是依赖第一次编译慢一些,之后有缓存。
+[profile.dev.package."*"]
+opt-level = 2
+
 [dependencies]
 anyhow = "1.0.104"
 bytemuck = "1.25.2"
