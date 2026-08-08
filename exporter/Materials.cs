@@ -149,6 +149,27 @@ public record MaterialInfo(
         Switch("Opacity or OpacityMask")
         || ParentChain.Any(p => p.Contains("Object_Trans", StringComparison.OrdinalIgnoreCase));
 
+    /// **幽火那一族要按画家序画(不写深度),不是普通不透明。**
+    ///
+    /// 小灵面一家身旁那两团幽火,每团在网格里是**两层闭合壳**:外壳(123 顶点、UV 落在
+    /// 基色图左半的青色区)套着一层小的内壳(147 顶点、UV 在右半的浅色区),
+    /// 而索引缓冲里的三角顺序是**每团「外壳 → 内壳」**。这个顺序只在「后画的盖住先画的」
+    /// 时才有意义 —— 也就是这一族在实机走的是**不写深度**的那一遍:外壳不写深度,
+    /// 随后的内壳照样通过深度测试、直接盖上去。
+    ///
+    /// 三条证据合到一起才敢这么判:
+    /// ① 目标 Low PS(资源 `0141823D…`)`o0.w = 1`,唯一那处 discard 是
+    ///    `1 − 1.01 × max(Xray, Common_Xray)`(两个都是 0)⇒ **完全不透明**,不是 alpha 混合;
+    /// ② 顶点着色器里没有任何沿法线的位置偏移,两层壳都是闭合的(边界边 0 条),
+    ///    所以外壳在不透明通道里必然把内壳整个挡住 —— 我们原来就是这样,实机不是;
+    /// ③ 按上面那条改成不写深度之后,渲图与实机逐一对上:外层青、内层浅、层次与位置都对,
+    ///    而且**背景一点都不透出来**(实机也不透)。
+    ///
+    /// 按材质根名认,与 `M_Gra_Yutu_Ear_Lighting` / `M_P_FakeFulid` / `M_P_MatCap_Masked`
+    /// 那几族的做法一致 —— 这些都是「一只(或一家)一份」的定制材质。
+    public bool IsPaintOrder =>
+        ParentChain.Any(p => p.Equals("M_Gho_XiaoYou_GhostFire", StringComparison.OrdinalIgnoreCase));
+
     /// 遮罩/噪声贴图:特效的形状与流动来源。没有就当常量 1。
     public string? MaskTexture =>
         (IsYutuEar ? YutuBubbleTexture : null)
@@ -446,7 +467,7 @@ public record MaterialInfo(
     public bool IsWater =>
         ParentChain.Any(p => p.Contains("Water", StringComparison.OrdinalIgnoreCase));
 
-    public float EmissiveIntensity => IsWater ? 0f : Scalar("Emitter Intensity", 0f);
+    public float EmissiveIntensity => Scalar("Emitter Intensity", 0f);
 
 
     /// 水体预设(`ML_P_StylizedWater` 图层)。整条链是从 shader 35663 读出来的,
@@ -481,8 +502,15 @@ public record MaterialInfo(
         Scalar("FresnelInt", 1f), Scalar("FresnelPower", 1f),
     ];
 
+    /// **实例没写 `Emitter Color` 时要退到根默认(通常是白),不能当成「没有自发光」。**
+    /// 水灵/波波拉的水体层就只写了 `Emitter Intensity`,颜色留在根上 —— 而实机身上那几道
+    /// 竖向浅色条纹正是「白 × 强度 × 基色 alpha」:把线上提升逐通道量出来,
+    /// 白 × 0.5 是 (43, 15.6, 9.0)、实机是 (96, 23, 9)(同一比例),
+    /// 而拿 `Color1` 那个蓝色去算是 (21, 11, 10) —— 色相与强度都不对。
     public float[]? EmissiveColor =>
-        EmissiveIntensity > 0f && Vectors.TryGetValue("Emitter Color", out var c) ? c : null;
+        EmissiveIntensity <= 0f ? null
+        : Vectors.TryGetValue("Emitter Color", out var c) ? c
+        : RootDefaults?.Vectors.GetValueOrDefault("Emitter Color") ?? [1f, 1f, 1f, 1f];
 
     /// 是不是半透材质。**有基色的材质也可能是半透**——暮星辰的裙子(`Fx1`)与那两个球(`Fx2`)
     /// 都是 `MI_P_Object_Trans_*` 家族、`BLEND_Translucent`,当成不透明画就是死板的实心块。
@@ -832,11 +860,22 @@ public static class Materials
                 // glb 里的材质名取的是对象名,键不一致运行时就查不到 → 整只宠物一片都画不出来。
                 var key = material.Name;
                 if (!string.IsNullOrEmpty(key))
-                    result[key] = Resolve(key, material) with
+                {
+                    var roots = RootMaterial.Of(material);
+                    var info = Resolve(key, material) with
                     {
-                        RootDefaults = RootMaterial.Of(material),
+                        RootDefaults = roots,
                         HasOutline = HasOutlineAsset(material),
                     };
+                    // **实例没覆盖混合模式时,用根材质自己的。** 实例侧的 `BLEND_Opaque` 是 0,
+                    // 与「没写」不可区分(见 `Resolve` 里那条注释),所以直接挂在根材质上的
+                    // 材质会被一律当成不透明 —— 幽火的 `M_Gho_XiaoYou_GhostFire` 就是这样,
+                    // 于是外层壳把里面那层小水滴整个盖住(实机是两层)。
+                    if (info.BlendMode == EBlendMode.BLEND_Opaque
+                        && roots.BlendMode != EBlendMode.BLEND_Opaque)
+                        info = info with { BlendMode = roots.BlendMode, OpacityMaskClipValue = roots.MaskClip };
+                    result[key] = info;
+                }
             }
             catch (Exception e)
             {

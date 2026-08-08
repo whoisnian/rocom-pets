@@ -113,6 +113,9 @@ struct RawMaterial {
     /// 那时按老规矩来:不透明的画描边、半透的不画。
     #[serde(default)]
     outline: Option<bool>,
+    /// 按画家序画:不写深度,后画的盖住先画的。见 `MaterialSpec::paint_order`。
+    #[serde(default)]
+    paint_order: bool,
     #[serde(default)]
     star_tex: Option<String>,
     /// 星点层来自「假半透」族(`NoiseTex` + `Color02`),着色走 `star_color` 而不是四段渐变
@@ -136,10 +139,6 @@ struct RawMaterial {
     emissive: Option<[f32; 3]>,
     #[serde(default)]
     emissive_intensity: f32,
-    /// 水体预设的 `Color1`(rgb)+ `Emitter Intensity`(a)。见 `MaterialSpec::emissive`
-    /// 那条注释:这一族的加光层与通用自发光是同一个形状,运行时合到同一个槽里。
-    #[serde(default)]
-    water_color1: Option<[f32; 4]>,
     #[serde(default = "default_rim_power")]
     rim_power: f32,
     #[serde(default = "default_rim_soft_edge")]
@@ -363,6 +362,12 @@ pub struct Material {
     /// 这个材质画不画描边 —— 游戏是**逐材质**开的(`Mat/` 里有没有配套的 `_Ol` 资产)。
     /// `None` = 旧包没这个字段,退回「不透明画、半透不画」。
     pub outline: Option<bool>,
+    /// **按画家序画:进不写深度的那一遍,后画的三角盖住先画的。**
+    /// 幽火那一族(`M_Gho_XiaoYou_GhostFire`)每团是「外壳套内壳」两层闭合几何,
+    /// 索引缓冲里就是「外壳 → 内壳」的顺序;走不透明通道的话外壳会把内壳整个挡住
+    /// (实机是两层都看得见,而且背景一点不透 ⇒ 不是 alpha 混合,是不写深度)。
+    /// 判据与三条证据见 `Materials.cs` 的 `IsPaintOrder`。
+    pub paint_order: bool,
     pub opacity: f32,
     /// 身上那些细碎星光。
     pub star: Option<PathBuf>,
@@ -381,13 +386,11 @@ pub struct Material {
     pub rim_intensity: f32,
     /// 加在光照**之后**的那层色,遮罩是基色 alpha 的重映射(见 pet.wgsl 的 `detail_mask`)。
     ///
-    /// 两个来源合到这一个槽,因为它们在汇编里是同一个形状 `颜色 × 强度 × 遮罩`:
-    /// - 通用 `M_P_Object`:`Emitter Color` × `Emitter Intensity`(Low PS 68952 第 62~65 行);
-    /// - **水体预设**:`Color1` × `Emitter Intensity`(shader 35663,
-    ///   `mad r4.xyz, r4.xyzx, cb5[83].x, r5.xyzx`,`r4 = 遮罩 × Color1`,见
-    ///   `Materials.cs` 的 `IsWater` 注释)。导出器把这一族的 `Emitter Intensity` 清成 0
-    ///   并单独传 `water_color1`,正是为了不让它被当成白色自发光;这里按它真正的颜色接回来。
-    ///   水灵身上那几道竖向浅色条纹就是它 —— 基色 alpha 画的就是那几道线。
+    /// 来源是材质的 `Emitter Color × Emitter Intensity`(Low PS 68952 第 62~65 行)。
+    /// **水体族也走这一条**:水灵/波波拉的水体层只写了强度、颜色留在根默认(白),
+    /// 身上那几道竖向浅色条纹就是「白 × 0.5 × 基色 alpha」。一度改成拿水体预设的
+    /// `Color1`(蓝)当颜色,量下来色相与强度都不对(线上提升 (21,11,10),
+    /// 白 × 0.5 是 (43,15.6,9.0),实机 (96,23,9)),已撤回。
     pub emissive: [f32; 3],
     pub emissive_intensity: f32,
     /// 边缘光的衰减次数。**小于 1 = 整片泛色**(幽星光的球 0.35),不是一圈细边。
@@ -877,6 +880,7 @@ impl Pack {
                                 },
                                 translucent: mat.translucent,
                                 outline: mat.outline,
+                                paint_order: mat.paint_order,
                                 opacity: mat.opacity,
                                 star: mat.star_tex.map(|rel| root.join(rel)),
                                 star_fake_trans: mat.star_fake_trans,
@@ -887,14 +891,8 @@ impl Pack {
                                 matcap_color: mat.matcap_color.unwrap_or([1.0; 3]),
                                 rim_color: mat.rim_color.unwrap_or([1.0; 3]),
                                 rim_intensity: mat.rim_intensity,
-                                emissive: match mat.water_color1 {
-                                    Some(c) => [c[0], c[1], c[2]],
-                                    None => mat.emissive.unwrap_or([0.0; 3]),
-                                },
-                                emissive_intensity: match mat.water_color1 {
-                                    Some(c) => c[3],
-                                    None => mat.emissive_intensity,
-                                },
+                                emissive: mat.emissive.unwrap_or([0.0; 3]),
+                                emissive_intensity: mat.emissive_intensity,
                                 rim_power: mat.rim_power,
                                 rim_soft_edge: mat.rim_soft_edge,
                                 highlight_offset: mat.highlight_offset.unwrap_or([0.0; 3]),

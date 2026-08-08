@@ -63,6 +63,8 @@ pub struct Material {
     pub translucent: bool,
     /// 见 `pack::MaterialSpec::outline`。
     pub outline: Option<bool>,
+    /// 见 `pack::MaterialSpec::paint_order`。
+    pub paint_order: bool,
     pub opacity: f32,
     /// 星点 / MatCap 两张附加贴图与它们的着色,以及边缘光。
     pub star: Option<Image>,
@@ -135,7 +137,13 @@ impl Material {
         // UE 的 BLEND_Translucent 无论材质参数里的 Opacity 是否恰好为 1，都不写深度。
         // 内层液体必须先画、外层玻璃随后混合；把 opacity=1 的玻璃改进不透明通道会直接
         // 挡掉莫比乌乌的 Fx1。这是混合模式语义，不是按宠物做排序特判。
-        self.effect.is_some() || self.translucent || self.alpha_opacity || self.fake_fluid.is_some()
+        // `paint_order` 走同一条通道:它要的也正是「只测深度、不写深度」——
+        // 外壳不写深度,随后的内壳才能盖上去(见 `pack::MaterialSpec::paint_order`)。
+        self.effect.is_some()
+            || self.translucent
+            || self.alpha_opacity
+            || self.fake_fluid.is_some()
+            || self.paint_order
     }
 }
 
@@ -511,6 +519,7 @@ impl Model {
                     line_detail,
                     translucent: spec.translucent,
                     outline: spec.outline,
+                    paint_order: spec.paint_order,
                     opacity: spec.opacity,
                     // 星点/matcap 的 alpha 原样保留:形状全在 alpha 里
                     star: spec.star.as_deref().and_then(|p| load_texture(p, true)),

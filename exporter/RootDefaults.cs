@@ -35,7 +35,14 @@ namespace RocomPets.Export;
 public record RootDefaults(
     Dictionary<string, string> Textures,
     Dictionary<string, float[]> Vectors,
-    Dictionary<string, float> Scalars)
+    Dictionary<string, float> Scalars,
+    /// **根材质自己的混合模式与镂空阈值。** 实例那边只有 `BasePropertyOverrides`,
+    /// 而本作的实例普遍不写 `bOverride_*`,`BLEND_Opaque` 又正好是 0 —— 于是
+    /// 「根材质本来就是半透」与「实例没覆盖」在实例侧长得一模一样。
+    /// 直接用根材质的材质就必须从这儿拿(小灵面身旁那两团幽火的
+    /// `M_Gho_XiaoYou_GhostFire` 就是这种:父链只有它自己)。
+    EBlendMode BlendMode = EBlendMode.BLEND_Opaque,
+    float MaskClip = 0.3333f)
 {
     public static readonly RootDefaults Empty = new([], [], []);
 }
@@ -125,7 +132,11 @@ public static class RootMaterial
     {
         var cached = root.GetOrDefault<FStructFallback>("CachedExpressionData")
             ?.GetOrDefault<FStructFallback>("Parameters");
-        if (cached is null) return RootDefaults.Empty;
+        if (cached is null) return RootDefaults.Empty with
+        {
+            BlendMode = root.BlendMode,
+            MaskClip = root.OpacityMaskClipValue,
+        };
 
         // RuntimeEntries 是**按参数类型分组**的:0=标量、1=向量、2=贴图(与 UE 的
         // EMaterialParameterType 同序),每组里的 ExpressionGuids 与对应的值数组同序。
@@ -167,6 +178,6 @@ public static class RootMaterial
         {
             if (t?.Load<UTexture>()?.GetPathName() is { } p) textures.TryAdd(n, p);
         });
-        return new RootDefaults(textures, vectors, scalars);
+        return new RootDefaults(textures, vectors, scalars, root.BlendMode, root.OpacityMaskClipValue);
     }
 }
