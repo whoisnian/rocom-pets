@@ -11,6 +11,10 @@
 它抓到过的真问题:64 个形态动画为零(渲出全空)、6 个形态被取景判据全拒(空白)、
 提亮改动把一批宠物冲到过曝。
 
+**已知未实装的形态从三个数字里排除**(见 `KNOWN_UNRELEASED`),但仍然照常渲、
+照常打印 —— 只是单独一行,不计进闸门。它们的资产还在做,拿它们当回归信号只会长期
+盖着一个不会变的数。
+
 ## 判据
 
 - **失败**:渲染进程非零退出或没出 PNG。
@@ -40,6 +44,21 @@ BIN = Path(__file__).resolve().parent.parent / "target/release/rocom-pets"
 BLANK_COVER = 0.005
 OVEREXP_LEVEL = 0.96
 OVEREXP_SHARE = 0.15
+
+# **已知未实装、不计进闸门的形态**:asset → 为什么。
+#
+# 进这张表的门槛是「问题出在资产本身,而且这只宠物游戏里还没上」,不是「我们画不好」。
+# 每条都要写清楚查到了什么,免得日后被当成挡箭牌。导出器那边已经挡掉了「材质资产全部
+# 悬空」的 13 个形态(见 Program.cs),这里只收它挡不住的。
+KNOWN_UNRELEASED = {
+    # 5753 个顶点里有 98 个停在 y ≈ -28.39 m(身体本身只有 3 m 高),权重绑在
+    # `Bone001` 上,而那根骨骼的绑定姿势局部平移就是 (0, -28.394, 0)。包围盒因此高
+    # 31.6 m、`height_cm` 写成 3162 —— 全库第二高的圣羽翼王才 426,是 7.4 倍的孤点。
+    # 取景按包围盒算,于是整只被缩成画面顶上一条(不透明占比 0.001)。
+    # **这不是着色/取景的 bug,是未实装资产里挂着一块没归位的几何**;
+    # 为它去改包围盒规则会改写全部 827 个形态的 `height_cm`,连带改掉桌面上的显示尺寸。
+    "Dem_JingJiLong2_001": "惩戒巨笼:游戏内尚未正式出现;98 个顶点挂在地下 28m 的骨骼上,撑爆包围盒",
+}
 
 
 def forms(manifest: Path):
@@ -87,6 +106,7 @@ def main() -> None:
         todo = todo[: args.limit]
 
     bad = {"fail": [], "blank": [], "overexposed": []}
+    skipped = []
     for i, (pack, name, asset) in enumerate(todo, 1):
         png = out / f"{asset}.png"
         r = subprocess.run([str(BIN), "--render", str(pack), "--form", asset,
@@ -97,18 +117,23 @@ def main() -> None:
             bad["fail"].append((name, asset, (r.stderr or b"").decode()[-160:]))
         else:
             kind, cover, hot = classify(png)
-            if kind != "ok":
+            if kind != "ok" and asset in KNOWN_UNRELEASED:
+                skipped.append((name, asset, kind, f"不透明 {cover:.3f} 过曝 {hot:.3f}"))
+            elif kind != "ok":
                 bad[kind].append((name, asset, f"不透明 {cover:.3f} 过曝 {hot:.3f}"))
             if not args.keep:
                 png.unlink()
         if i % 100 == 0:
             print(f"  …{i}/{len(todo)}", flush=True)
 
-    print(f"\n{len(todo)} 个形态:失败 {len(bad['fail'])}、空白 {len(bad['blank'])}、"
-          f"过曝 {len(bad['overexposed'])}")
-    for kind, label in (("fail", "失败"), ("blank", "空白"), ("overexposed", "过曝")):
+    label = {"fail": "失败", "blank": "空白", "overexposed": "过曝"}
+    print(f"\n{len(todo)} 个形态(不计已知未实装 {len(skipped)} 个):"
+          f"失败 {len(bad['fail'])}、空白 {len(bad['blank'])}、过曝 {len(bad['overexposed'])}")
+    for kind in ("fail", "blank", "overexposed"):
         for name, asset, why in bad[kind]:
-            print(f"  [{label}] {name} ({asset}) {why}")
+            print(f"  [{label[kind]}] {name} ({asset}) {why}")
+    for name, asset, kind, why in skipped:
+        print(f"  [不计:{label[kind]}] {name} ({asset}) {why} —— {KNOWN_UNRELEASED[asset]}")
     if args.keep:
         print(f"\n渲图留在 {out}")
 
