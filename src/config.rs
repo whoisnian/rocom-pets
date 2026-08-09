@@ -149,6 +149,8 @@ impl Config {
     ///
     /// 文件不在就从模板起头(于是新生成的那份也带注释)。**失败只警告不报错**:
     /// 托盘里调个音量不该让桌宠崩掉,值在内存里已经生效了,顶多下次启动回到旧值。
+    /// 只有桌面版会写回配置(浏览器里没有 config.toml,也没有 toml_edit)。
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn write_back(path: &Path, updates: &[(&str, Setting)]) -> Result<()> {
         let text = match std::fs::read_to_string(path) {
             Ok(text) => text,

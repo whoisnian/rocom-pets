@@ -613,6 +613,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "console_error_panic_hook"
+version = "0.1.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a06aeb73f470f66dcdbf7223caeebb85984942f22f1adb2a088cf9668146bbbc"
+dependencies = [
+ "cfg-if",
+ "wasm-bindgen",
+]
+
+[[package]]
 name = "core-foundation"
 version = "0.9.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2965,12 +2975,14 @@ version = "0.0.0"
 dependencies = [
  "anyhow",
  "bytemuck",
+ "console_error_panic_hook",
  "eframe",
  "egui_kittest",
  "env_logger",
  "glam",
  "gltf",
  "image",
+ "js-sys",
  "ksni",
  "log",
  "pollster 1.0.1",
@@ -2982,6 +2994,9 @@ dependencies = [
  "smithay-client-toolkit 0.21.1",
  "toml",
  "toml_edit",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
  "wgpu 30.0.0",
  "windows",
  "zbus",

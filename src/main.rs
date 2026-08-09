@@ -11,23 +11,8 @@
     windows_subsystem = "windows"
 )]
 
-mod act;
-mod assets;
-mod audio;
-mod config;
-mod control;
-mod fatal;
-mod offscreen;
-mod pack;
-mod pack_list;
-mod persona;
-mod pet;
-mod platform;
-mod render;
-mod roster;
-mod settings;
-mod sprite;
-mod stage;
+// 模块都在库那边(src/lib.rs);这个文件只剩「命令行怎么解释、起哪条路」。
+use rocom_pets::{config, control, fatal, offscreen, pack, pack_list, platform, roster, settings};
 
 use std::path::PathBuf;
 

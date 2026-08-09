@@ -8,8 +8,11 @@
 //! **为什么不把 `Form` 里的 `PathBuf` 换成「(来源, 包内相对路径)」**:那要改材质表里
 //! 二十多个字段、三张资产缓存的键、日志与阵容存档 —— 而收益只是把这一处判断挪个位置。
 //! 代价是路径不再一定能 `open`,所以**包内资产一律走这个模块读**,别再直接 `fs::read`。
+//!
+//! 浏览器里还有第三种形态:**根本没有文件系统**。下载站的预览把包内文件逐个喂进
+//! [`memory`] 那张表,虚拟路径当键 —— 上面那条「一律走这个模块读」的规矩,
+//! 正好让整条加载链(`Pack::load` / `Model::load`)在 wasm 上一行不改就能跑。
 
-use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -24,6 +27,7 @@ pub const MANIFEST: &str = "manifest.toml";
 ///
 /// 只认**真是文件**的那一段:目录也可以叫 `喵喵.rkpet`(解开时忘了改名就会这样),
 /// 那种照目录读才对。
+#[cfg(not(target_arch = "wasm32"))]
 fn split_archive(path: &Path) -> Option<(PathBuf, String)> {
     let mut archive = PathBuf::new();
     let mut rest = path.components();
@@ -47,6 +51,7 @@ fn split_archive(path: &Path) -> Option<(PathBuf, String)> {
 }
 
 /// 读一份包内资产。目录包就是 `fs::read`,归档包就从 zip 里取。
+#[cfg(not(target_arch = "wasm32"))]
 pub fn read(path: &Path) -> Result<Vec<u8>> {
     match split_archive(path) {
         Some((archive, inner)) => read_from_archive(&archive, &inner),
@@ -54,7 +59,16 @@ pub fn read(path: &Path) -> Result<Vec<u8>> {
     }
 }
 
+/// 同上,浏览器版:没有文件系统,只有 [`memory`] 那张表。
+#[cfg(target_arch = "wasm32")]
+pub fn read(path: &Path) -> Result<Vec<u8>> {
+    memory::read(path)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 fn read_from_archive(archive: &Path, inner: &str) -> Result<Vec<u8>> {
+    use std::io::Read;
+
     let file = std::fs::File::open(archive).with_context(|| format!("打不开 {archive:?}"))?;
     let mut zip = zip::ZipArchive::new(std::io::BufReader::new(file))
         .with_context(|| format!("{archive:?} 不是合法的 zip"))?;
@@ -69,6 +83,9 @@ fn read_from_archive(archive: &Path, inner: &str) -> Result<Vec<u8>> {
 }
 
 /// 这个位置看着像个宠物包吗?
+///
+/// 只有桌面版会问 —— 浏览器那边的「包」是 JS 喂进来的字节,没有目录可扫。
+#[cfg(not(target_arch = "wasm32"))]
 ///
 /// 只做**便宜的判断**(后缀 + manifest 在不在),真读得动要等 `Pack::load`。
 /// 列包目录时对每一项都会问一次,不能在这儿解压。
@@ -94,6 +111,7 @@ pub fn manifest_path(root: &Path) -> PathBuf {
 
 /// 包占多少字节。目录就递归相加,归档就是文件本身的大小。
 /// 读不动算 0 —— 这个数只用来在列表里给个量级。
+#[cfg(not(target_arch = "wasm32"))]
 pub fn size(root: &Path) -> u64 {
     if root.is_file() {
         return std::fs::metadata(root).map(|m| m.len()).unwrap_or(0);
@@ -111,7 +129,40 @@ pub fn size(root: &Path) -> u64 {
         .sum()
 }
 
-#[cfg(test)]
+/// 浏览器里的「文件系统」:一张 虚拟路径 → 字节 的表,由 JS 喂。
+///
+/// **按虚拟路径存**,而不是包内相对路径:这样 `Pack::load` 拼出来的
+/// `<根>/forms/…/model.glb` 直接就是键,加载链一个字都不用改。
+#[cfg(target_arch = "wasm32")]
+pub mod memory {
+    use super::*;
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+
+    thread_local! {
+        static FILES: RefCell<HashMap<PathBuf, Vec<u8>>> = RefCell::new(HashMap::new());
+    }
+
+    pub fn insert(path: PathBuf, bytes: Vec<u8>) {
+        FILES.with(|f| f.borrow_mut().insert(path, bytes));
+    }
+
+    /// 换一个包之前清一次 —— 不清的话上一只的贴图会一直占着内存。
+    pub fn clear() {
+        FILES.with(|f| f.borrow_mut().clear());
+    }
+
+    pub fn read(path: &Path) -> Result<Vec<u8>> {
+        FILES.with(|f| {
+            f.borrow()
+                .get(path)
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("没喂过 {path:?}"))
+        })
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::*;
 

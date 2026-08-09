@@ -25,9 +25,31 @@ strip = "symbols"
 [profile.dev.package."*"]
 opt-level = 2
 
+[lib]
+name = "rocom_pets"
+# `cdylib` 是下载站预览那份 wasm 要的;`rlib` 给同包的 bin 与单测用。
+crate-type = ["rlib", "cdylib"]
+
+# ── 两个目标都要的:渲染、动画、包格式、行为 ────────────────────────────
 [dependencies]
 anyhow = "1.0.104"
 bytemuck = "1.25.2"
+glam = "0.33.2"
+gltf = "1.4.1"
+image = { version = "0.25.10", default-features = false, features = ["png"] }
+log = "0.4.33"
+# 叫声解码。**两个目标都要**:`stage` 的 `SoundCue`/`VoiceBank` 用它的 `Pcm`,
+# 而 wasm 上 rodio 本身编得过(cpal 有 web-audio 后端),为它拆一套 cfg 不划算。
+rodio = { version = "0.22.2", default-features = false, features = ["playback", "vorbis"] }
+serde = { version = "1.0.229", features = ["derive"] }
+toml = "1.1.3"
+wgpu = "30.0.0"
+
+# ── 只有桌面版要的 ──────────────────────────────────────────────────
+#
+# **这一组以前是无条件的**,于是 Linux 托盘那套(ksni → zbus → async-io → rustix)
+# 连 Windows 版都跟着编;而 wasm 上 `errno` 直接 `compile_error!`,库根本构建不了。
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 # 配置窗口(`--settings`)。**走 glow 而不是 wgpu 后端**:配置窗口只是些控件,
 # 犯不着把第二份 wgpu(与桌宠那份版本还不同)链进同一个二进制。
 eframe = { version = "0.35.0", default-features = false, features = [
@@ -37,22 +59,23 @@ eframe = { version = "0.35.0", default-features = false, features = [
     "x11",
 ] }
 env_logger = "0.11.11"
-glam = "0.33.2"
-gltf = "1.4.1"
-image = { version = "0.25.10", default-features = false, features = ["png"] }
-ksni = { version = "0.3.6", default-features = false, features = ["blocking", "async-io"] }
-log = "0.4.33"
 pollster = "1.0.1"
 raw-window-handle = "0.6.2"
-rodio = { version = "0.22.2", default-features = false, features = ["playback", "vorbis"] }
-serde = { version = "1.0.229", features = ["derive"] }
-toml = "1.1.3"
 toml_edit = "0.25.13"
-wgpu = "30.0.0"
-zbus = { version = "5.18.0", default-features = false, features = ["blocking-api", "async-io"] }
 zip = { version = "8.6.0", default-features = false, features = ["deflate-flate2"] }
 
+# ── 只有网页预览要的 ────────────────────────────────────────────────
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+console_error_panic_hook = "0.1.7"
+js-sys = "0.3.83"
+wasm-bindgen = "0.2.106"
+wasm-bindgen-futures = "0.4.56"
+web-sys = { version = "0.3.83", features = ["HtmlCanvasElement"] }
+
 [target.'cfg(target_os = "linux")'.dependencies]
+# 托盘。**这两个以前是无条件依赖**,于是 Windows 版也跟着编了一份 DBus 栈。
+ksni = { version = "0.3.6", default-features = false, features = ["blocking", "async-io"] }
+zbus = { version = "5.18.0", default-features = false, features = ["blocking-api", "async-io"] }
 # 选文件的原生对话框(配置窗口的「导入」)。**走 XDG portal 而不是 GTK**:
 # 只为一个文件对话框把整套 GTK3 链进来不值当,而 portal 走的是我们已经有的 zbus。
 rfd = { version = "0.17.2", default-features = false, features = ["xdg-portal"] }

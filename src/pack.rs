@@ -707,6 +707,10 @@ impl Pack {
     }
 
     /// 包目录里所有**看着像包**的位置(目录含 manifest,或 `.rkpet` 文件),按路径排序。
+    ///
+    /// 以下几个「扫包目录」的方法**只有桌面版有** —— 浏览器里的包是 JS 喂进来的字节,
+    /// 没有目录可扫(见 assets.rs 的 `memory`)。
+    #[cfg(not(target_arch = "wasm32"))]
     fn candidates(dir: &Path) -> Vec<PathBuf> {
         let mut entries: Vec<PathBuf> = match std::fs::read_dir(dir) {
             Ok(read) => read
@@ -723,6 +727,7 @@ impl Pack {
     }
 
     /// 列出包目录下所有能读的包(按名字排序)。读不动的只警告,不让一个坏包挡住其他的。
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn list(dir: &Path) -> Vec<Pack> {
         Self::candidates(dir)
             .iter()
@@ -742,6 +747,7 @@ impl Pack {
     ///
     /// 解析不了的包退用目录名:它多半仍能加载(名字这一节坏了不代表形态坏了),
     /// 真加载失败时再报错也不迟。
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn list_entries(dir: &Path) -> Vec<PackEntry> {
         let mut packs: Vec<PackEntry> = Self::candidates(dir)
             .into_iter()
@@ -808,6 +814,7 @@ impl Pack {
     ///
     /// 文件名那一条要**连去掉后缀的也认**:阵容存的是 `喵喵.rkpet`,而用户在配置里
     /// 多半只写 `喵喵` —— 同一个包换成目录形态之后名字还得对得上。
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn resolve(value: &str, packs_dir: Option<&Path>) -> Result<Pack> {
         let scanned;
         let entries = match packs_dir {
@@ -831,6 +838,7 @@ impl Pack {
     /// 每只宠物调一次就是把整库读上几遍 —— 实测六只在场时,`reload` 有 242ms 花在这儿
     /// (库里 201 个包),而且随在场只数线性涨。用户看到的「加一只宠物就像把所有包
     /// 重新加载一遍,卡一两秒」就是它。
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn resolve_in(value: &str, entries: &[PackEntry]) -> Result<Pack> {
         // 存档里也可能直接写着路径(`--pack /some/where` 存下来的那种)
         let as_path = crate::config::Config::expand_path(value);
