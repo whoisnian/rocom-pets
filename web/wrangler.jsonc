@@ -25,7 +25,7 @@
       "binding": "DB",
       "database_name": "rocom-pets",
       // wrangler d1 create rocom-pets 之后把返回的 uuid 填进来
-      "database_id": "00000000-0000-0000-0000-000000000000"
+      "database_id": "05c92864-32c4-408c-8140-c52325f0e342"
     }
   ],
 
@@ -33,7 +33,7 @@
     {
       "binding": "DEDUPE",
       // wrangler kv namespace create DEDUPE 之后把返回的 id 填进来
-      "id": "0000000000000000000000000000000f"
+      "id": "6ed7a5514c14466c9750bb9b8428dc86"
     }
   ],
 
@@ -41,7 +41,7 @@
     // R2 自定义域。留空则由 Worker 代理字节(能跑,但 Range/缓存都要自己扛,
     // 且每次下载都算一次 Worker 请求)。生产务必填,别用 *.r2.dev —— 官方明说
     // 那个域有可变速率限制、带宽也会被限流,不用于生产。
-    "PUBLIC_BASE": "",
+    "PUBLIC_BASE": "https://rkpet-r2.whoisnian.com",
     // 前端 Turnstile widget 的 sitekey;留空则不显示人机校验
     "TURNSTILE_SITEKEY": ""
   }
