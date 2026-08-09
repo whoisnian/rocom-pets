@@ -23,6 +23,9 @@
 **KDE Plasma Wayland**(开发环境 Plasma 6.7.3 / kwin_wayland,日常在跑)。
 GNOME 等不实现 wlr-layer-shell 的合成器不在支持范围，也不做 X11 回退。
 
+KDE Plasma Wayland 运行截图：  
+![配置窗口与桌面上的四只宠物](docs/screenshot.webp)
+
 ### 编译 rocom-pets(Linux)
 
 要 [rustup](https://rustup.rs) 与 wgpu 跑 Vulkan 要的驱动(Mesa 或厂商驱动)。
