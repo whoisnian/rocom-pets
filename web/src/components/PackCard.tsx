@@ -1,4 +1,4 @@
-import { Download, Flag, TriangleAlert } from "lucide-react";
+import { Download, Eye, Flag, TriangleAlert } from "lucide-react";
 import type { AssetStat, Pack, SpriteSheet } from "../../shared/types.ts";
 import type { PackHit } from "@/lib/search.ts";
 import { PetAvatar } from "@/components/PetAvatar.tsx";
@@ -11,11 +11,12 @@ interface Props {
   sheet: SpriteSheet;
   stat: AssetStat | undefined;
   onOpen: (pack: Pack) => void;
+  onPreview: (pack: Pack) => void;
   onDownload: (pack: Pack) => void;
   onReport: (pack: Pack) => void;
 }
 
-export function PackCard({ hit, sheet, stat, onOpen, onDownload, onReport }: Props) {
+export function PackCard({ hit, sheet, stat, onOpen, onPreview, onDownload, onReport }: Props) {
   const { pack, formHits } = hit;
   const pending = !pack.sha256;
   const downloads = stat?.downloads ?? 0;
@@ -101,6 +102,17 @@ export function PackCard({ hit, sheet, stat, onOpen, onDownload, onReport }: Pro
             onClick={() => onReport(pack)}
           >
             <Flag />
+          </Button>
+        </Tooltip>
+        <Tooltip label={pending ? "这个包还没上传到 R2" : "在浏览器里看看它长什么样"}>
+          <Button
+            variant="outline"
+            size="sm"
+            disabled={pending}
+            onClick={() => onPreview(pack)}
+          >
+            <Eye />
+            预览
           </Button>
         </Tooltip>
         <Button size="sm" disabled={pending} onClick={() => onDownload(pack)}>

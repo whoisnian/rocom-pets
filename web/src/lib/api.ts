@@ -38,3 +38,14 @@ export async function submitReport(input: {
 export function startDownload(id: string) {
   window.location.href = `/api/dl/${encodeURIComponent(id)}`;
 }
+
+/**
+ * 预览取包用的地址。**和下载分两条路**,两个原因:
+ *
+ * - 预览是按 Range 分片取的,走 `/api/dl` 会把「一次预览」记成一次下载
+ *   (那个计数是给「有多少人装了这个包」看的);
+ * - 它由 `fetch` 发起,得同源,不能像下载那样 302 到 R2 自定义域 —— 跨源要 CORS。
+ */
+export function previewUrl(id: string): string {
+  return `/api/preview/${encodeURIComponent(id)}`;
+}

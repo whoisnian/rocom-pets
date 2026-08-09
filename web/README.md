@@ -106,6 +106,30 @@ D1 的自增走 `INSERT … ON CONFLICT DO UPDATE SET downloads = downloads + 1`
 一直点下载」。真被盯上了,在 `/api/*` 上加一条速率限制规则;**别在下载域上开 Bot Fight Mode**,
 它会挑战 `wget` / `curl` / `aria2c`,正好把下大文件的人全挡了。
 
+## 预览
+
+卡片与详情页上的「预览」点开是一块 WebGPU 画布,里面跑的是**桌面版那份运行时**:
+`src/` 的渲染与动画代码编成 wasm(`src/web.rs` 是那层胶水),动作清单、降级规则、
+表情图集全来自同一份源码,不是照着做的第二套。
+
+**点开才付钱**:wasm 是动态 `import` 的,单独一个 chunk(1.4MB,brotli 后约 380KB);
+`.rkpet` 也是点开才按 HTTP Range 取,而且**只取当前那个形态**(`forms/<资产>/` 前缀,
+中位 2.9MB)—— 不是整包(中位 6.8MB)。首屏与只想下载的人一个字节都不多付。
+
+- `src/lib/rkpet.ts` —— zip over HTTP Range:尾部找 EOCD → 中央目录 → 按条目取字节 →
+  `DecompressionStream('deflate-raw')` 解。**不用现成 zip 库**:它们都要先拿到整个文件。
+- `src/lib/preview.ts` —— 会话:装 wasm、喂资产、rAF 循环、跟随画布尺寸与主题色。
+- `src/components/PreviewDialog.tsx` —— 弹窗:形态/表情下拉 + 动作按钮 + 拖拽转视角。
+- 取包走 `/api/preview/:id`,和 `/api/dl/:id` 分开:**预览不计下载数**,也不 302 到
+  R2 自定义域(`fetch` 跨源要 CORS,自己代理反而简单)。
+
+出 wasm 要 `rustup target add wasm32-unknown-unknown` 与 `cargo install wasm-bindgen-cli`
+(版本对齐 `Cargo.lock` 里的 `wasm-bindgen`;版本不对时它会直接告诉你该装哪个)。
+`npm run build` 会先跑 `npm run wasm`,产物在 `src/wasm/`(生成物,不入仓库)。
+
+**只支持 WebGPU**:骨骼矩阵走只读 storage buffer,WebGL2 没有这东西。
+检测不到 `navigator.gpu` 就不加载那个 chunk,弹窗里给一句说明,下载照旧。
+
 ## 头像
 
 **自己从解包数据拼**,不引外部仓库的成品图。游戏自带 `Icon/HeadIcon/<conf_id>.png`

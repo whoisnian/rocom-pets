@@ -1,4 +1,4 @@
-import { Download, Flag, TriangleAlert } from "lucide-react";
+import { Download, Eye, Flag, TriangleAlert } from "lucide-react";
 import type { AssetStat, Pack, SpriteSheet } from "../../shared/types.ts";
 import { PetAvatar } from "@/components/PetAvatar.tsx";
 import { Sha256 } from "@/components/Sha256.tsx";
@@ -19,6 +19,7 @@ interface Props {
   sheet: SpriteSheet;
   stat: AssetStat | undefined;
   onOpenChange: (open: boolean) => void;
+  onPreview: (pack: Pack) => void;
   onDownload: (pack: Pack) => void;
   onReport: (pack: Pack) => void;
 }
@@ -28,7 +29,15 @@ function stageLabel(stage: number): string {
   return `${cnCount(stage)}阶`;
 }
 
-export function PackDialog({ pack, sheet, stat, onOpenChange, onDownload, onReport }: Props) {
+export function PackDialog({
+  pack,
+  sheet,
+  stat,
+  onOpenChange,
+  onPreview,
+  onDownload,
+  onReport,
+}: Props) {
   if (!pack) return null;
   const pending = !pack.sha256;
 
@@ -115,6 +124,10 @@ export function PackDialog({ pack, sheet, stat, onOpenChange, onDownload, onRepo
           <Button variant="outline" disabled={pending} onClick={() => onReport(pack)}>
             <Flag />
             标记异常
+          </Button>
+          <Button variant="outline" disabled={pending} onClick={() => onPreview(pack)}>
+            <Eye />
+            预览
           </Button>
           <Button disabled={pending} onClick={() => onDownload(pack)}>
             <Download />

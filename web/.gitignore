@@ -8,3 +8,6 @@ dist/
 # 生成物,不入仓库 —— 素材版权属原发行方,见根 README 与 docs/design.md §11
 public/catalog.json
 public/sprite.webp
+
+# 预览渲染器的 wasm,由 scripts/build-wasm.sh 生成(源码在 src/web.rs)
+src/wasm/

@@ -7,6 +7,7 @@ import { searchPacks } from "@/lib/search.ts";
 import { AppSection } from "@/components/AppSection.tsx";
 import { PackCard } from "@/components/PackCard.tsx";
 import { PackDialog } from "@/components/PackDialog.tsx";
+import { PreviewDialog } from "@/components/PreviewDialog.tsx";
 import { ReportDialog } from "@/components/ReportDialog.tsx";
 import { Button } from "@/components/ui/button.tsx";
 import {
@@ -39,6 +40,7 @@ export default function App() {
   const [query, setQuery] = useState("");
   const [sort, setSort] = useState<SortKey>("downloads");
   const [detail, setDetail] = useState<Pack | null>(null);
+  const [preview, setPreview] = useState<Pack | null>(null);
   const [reportTarget, setReportTarget] = useState<{ id: string; label: string } | null>(null);
   const [dark, setDark] = useState(() => document.documentElement.classList.contains("dark"));
 
@@ -245,6 +247,7 @@ export default function App() {
                   sheet={catalog.sprite}
                   stat={stats[hit.pack.id]}
                   onOpen={setDetail}
+                  onPreview={setPreview}
                   onDownload={download}
                   onReport={(p) => setReportTarget({ id: p.id, label: p.name })}
                 />
@@ -286,9 +289,12 @@ export default function App() {
         sheet={catalog?.sprite ?? { url: "/sprite.webp", cols: 21, cell: 128, count: 0 }}
         stat={detail ? stats[detail.id] : undefined}
         onOpenChange={(open) => !open && setDetail(null)}
+        onPreview={setPreview}
         onDownload={download}
         onReport={(p) => setReportTarget({ id: p.id, label: p.name })}
       />
+
+      <PreviewDialog pack={preview} onOpenChange={(open) => !open && setPreview(null)} />
 
       <ReportDialog
         target={reportTarget}
