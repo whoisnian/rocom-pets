@@ -23,14 +23,36 @@ npm install
 
 wrangler d1 create rocom-pets           # 把返回的 uuid 填进 wrangler.jsonc
 wrangler kv namespace create DEDUPE     # 把返回的 id   填进 wrangler.jsonc
-wrangler r2 bucket create rocom-pets
+wrangler r2 bucket create rocom-pets    # 见下,默认那份 OAuth token 跑不通这条
 
-wrangler d1 execute rocom-pets --remote --file schema.sql
+npm run db:init                         # 远端 D1 建表
 wrangler secret put DEDUPE_SALT         # 随便一串随机字符
 ```
 
-**给 R2 挂自定义域**(桶设置 → Custom Domains,比如 `files.你的域`),再把它填进
-`wrangler.jsonc` 的 `PUBLIC_BASE`。这一步不能省:
+`wrangler.jsonc` 里的 D1 uuid 与 KV id 是账户内的资源标识、不是凭据(拿它读写仍要账户的
+API token),可以进公开仓库;真机密只有 `DEDUPE_SALT` 与 `TURNSTILE_SECRET`,走
+`wrangler secret put`,不落文件。`schema.sql` 全是 `IF NOT EXISTS`,`db:init` 重复跑无副作用。
+
+`DEDUPE_SALT` 不设也能跑 —— `worker/index.ts` 的 `claim()` 会回落到硬编码的 `"rocom-pets"`。
+但那个回落值就写在公开源码里,盐一旦已知,拿 `report_log.ip_tag` 那 12 位十六进制穷举
+IPv4 就能反查回 IP,「原始 IP 不落盘」的保证也就没了。生产务必设。
+
+**`wrangler login` 默认签的 OAuth token 里没有 `r2` scope**,上面那条建桶命令会被拒
+(`wrangler whoami` 能看到完整 scope 列表)。要么在 Dashboard 的 R2 页面手工建桶,要么重新
+`wrangler login` 时把 R2 勾上。Worker 的 `r2_buckets` 绑定本身不受这个 scope 影响。
+
+**给 R2 挂自定义域**(桶设置 → Custom Domains,比如 `files.你的域`),再**带上协议头**填进
+`wrangler.jsonc` 的 `PUBLIC_BASE`:
+
+```jsonc
+"PUBLIC_BASE": "https://files.你的域",   // 少了 https:// 就是每次下载都 500
+```
+
+`worker/index.ts` 里 `new URL(target.key, PUBLIC_BASE)` 的 base 必须是绝对 URL,只写域名会抛
+`Invalid URL`。这个错还不显眼:`/api/config` 的 `direct` 照样回 `true`,页面看着一切正常,
+得真点一次下载才发现。
+
+这一步不能省:
 
 - 官方明说 `*.r2.dev` **不用于生产** —— 有可变速率限制,超了返 429,带宽也会被限流;
 - 走自定义域才进你自己的 zone,才有边缘缓存、WAF 与速率限制规则可用;
@@ -40,20 +62,86 @@ wrangler secret put DEDUPE_SALT         # 随便一串随机字符
 没配 `PUBLIC_BASE` 时 Worker 会自己从 R2 读字节回给客户端(Range 与条件请求都实现了),
 本地开发够用,生产不要这么跑。
 
+### 配 rclone
+
+传包用 rclone,**不要用 `wrangler r2 object put`** —— 它一次只传一个,而且会把中文对象键
+percent-encode,和 Worker 拿 `catalog.json` 里 `key` 去查的对不上。
+
+rclone 走 R2 的 S3 兼容端点,认的是 Access Key,**和 wrangler 那份 OAuth token 是两套凭据**,
+得单独签一份:Dashboard → R2 → API → Manage API tokens,权限选 Object Read & Write,范围限到
+`rocom-pets` 这一个桶。账户 ID 在 `wrangler whoami` 的输出里。
+
+```sh
+rclone config create r2 s3 \
+  provider=Cloudflare \
+  region=auto \
+  endpoint=https://<账户 ID>.r2.cloudflarestorage.com \
+  no_check_bucket=true \
+  access_key_id=<Access Key ID> \
+  secret_access_key=<Secret Access Key>
+```
+
+- **remote 必须叫 `r2`** —— 下面的命令、以及 `gen_catalog.py` 跑完打印的提示,写的都是
+  `r2:rocom-pets/…`。
+- `no_check_bucket=true`:桶级范围的 token 没有 `HeadBucket` / `CreateBucket` 权限,不加这条
+  rclone 每次传之前都要先探一下桶,然后被拒。
+- `secret_access_key` 在配置文件里是明文 —— S3 后端不走 obscure,只有 `~/.config/rclone/rclone.conf`
+  的 600 权限拦着。
+
+验证用 `rclone lsf r2:rocom-pets`,空桶回空、退出码 0 就算通。**别拿 `rclone lsd r2:` 验** ——
+那个要列出账户下所有桶,桶级范围的 token 会被拒,看着像配错了其实没有。
+
 ## 出目录、传文件、上线
 
 ```sh
-# 1. 扫包目录,算 sha256,读 manifest 里的形态构成,顺便从解包数据拼头像精灵图
+# 1. 打包本体。gen_catalog.py 按后缀认平台(APP_PATTERNS),没后缀的裸 ELF 认不出来,
+#    会打一行「[跳过] 认不出的文件」然后 apps 为空 —— Linux 那份得先打成 tar。
+#    两个 bin 都只链 rlib(ldd 可验),librocom_pets.so / rocom_pets.dll 不用一起发。
+mkdir -p ~/Downloads/rocom/dist-bin
+tar -C target/release -czf ~/Downloads/rocom/dist-bin/rocom-pets-kde-wayland-x64.tar.gz rocom-pets
+cp target/x86_64-pc-windows-msvc/release/rocom-pets.exe \
+   ~/Downloads/rocom/dist-bin/rocom-pets-windows-x64.exe
+
+# 2. 扫包目录,算 sha256,读 manifest 里的形态构成,顺便从解包数据拼头像精灵图
 npm run catalog -- --packs ~/Downloads/rocom/packs-all \
                    --apps  ~/Downloads/rocom/dist-bin --version 0.1.0
 
-# 2. 传 R2。用 rclone(配 R2 的 S3 endpoint),不要用 wrangler r2 object put ——
-#    它一次只传一个,而且会把中文对象键 percent-encode,和 Worker 查的键对不上。
-rclone copy ~/Downloads/rocom/packs-all r2:rocom-pets/packs/ --progress
-rclone copy ~/Downloads/rocom/dist-bin     r2:rocom-pets/app/0.1.0/ --progress
+# 3. 传 R2。--include 是必要的:导出器会在包目录里留下 report.txt,没加 --zip-only 的那几次
+#    还会留下一堆同名目录 —— catalog 只 glob *.rkpet 所以不受影响,但 rclone 会照单全收。
+rclone copy ~/Downloads/rocom/packs-all r2:rocom-pets/packs/ --include "*.rkpet" --progress
+rclone copy ~/Downloads/rocom/dist-bin  r2:rocom-pets/app/0.1.0/ --progress
 
-# 3. 上线
+# 4. 上线
 npm run deploy
+```
+
+`--version` 决定 R2 key 的前缀 `app/<版本>/` 与页面上显示的 `v0.1.0`,和 `Cargo.toml` 里的
+`version` 没有任何联动,自己对齐(比如对着 git tag 填)。
+
+**文件名只用来认平台,按钮上的展示名写死在 `APP_PATTERNS` 里** —— `.exe` → `Windows 10+ (x64)`,
+`.AppImage` / `.tar.{gz,xz,zst}` → `Linux (KDE/Wayland, x64)`。所以把 tar 改名成
+`…-kde-wayland-…` 并不会让页面上的字跟着变,要改得动 `scripts/gen_catalog.py` 那张表,
+再重跑一次第 2 步。
+
+### 上线前校验
+
+传完先对一遍,比上线之后被人点出 404 强:
+
+```sh
+# 桶里的东西和 catalog 对不对得上(键是不是字面 UTF-8、大小有没有错位)
+rclone lsjson -R r2:rocom-pets --files-only > /tmp/r2.json
+uv run --no-project python - <<'PY'
+import json
+r2   = {o["Path"]: o["Size"] for o in json.load(open("/tmp/r2.json"))}
+c    = json.load(open("public/catalog.json"))
+want = {x["key"]: x["size"] for x in c["packs"] + c["apps"]}
+print("缺失:    ", [k for k in want if k not in r2] or "无")
+print("大小不符:", [k for k in want if k in r2 and r2[k] != want[k]] or "无")
+print("桶里多出:", [k for k in r2 if k not in want] or "无")
+PY
+
+# 自定义域真能出字节。要的是 200 + accept-ranges —— 有这两样,302 直连那条路才成立
+curl -sI https://files.你的域/packs/001-迪莫.rkpet | head -5
 ```
 
 `gen_catalog.py` 还有个**演示模式**,给没有那 1.6GB 包的机器用 —— 从
@@ -72,6 +160,17 @@ npm run catalog -- --index                       # 先得有 catalog.json
 npm run db:init:local                            # 建本地 D1 表
 npm run dev                                      # Vite + workerd,/api/* 是真的
 ```
+
+**`.dev.vars` 只喂本地那个 workerd**,`wrangler deploy` 既不读它也不上传它,它也不入仓库。
+四个变量在生产各有各的去处,别指望改这个文件能影响线上:
+
+| | 本地 | 生产 |
+| --- | --- | --- |
+| `PUBLIC_BASE` / `TURNSTILE_SITEKEY` | `.dev.vars` | `wrangler.jsonc` 的 `vars` |
+| `DEDUPE_SALT` / `TURNSTILE_SECRET` | `.dev.vars` | `wrangler secret put` |
+
+四个留空本地也照跑:不填 `PUBLIC_BASE` 就由 Worker 代理字节,不填 Turnstile 就不显示人机校验,
+不填盐就用那个硬编码回落值。
 
 `npm run build` 会先跑 `tsc --noEmit` 再打包,两步都过才算过。
 

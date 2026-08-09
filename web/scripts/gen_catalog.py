@@ -61,7 +61,9 @@ CELL = 128
 # 应用本体的文件名 → (id, 平台, 展示名)。认不出来的文件会被跳过并打一行警告。
 APP_PATTERNS: list[tuple[re.Pattern[str], str, str, str]] = [
     (re.compile(r"\.exe$", re.I), "app-windows-x64", "windows", "Windows 10+ (x64)"),
-    (re.compile(r"\.(AppImage|tar\.(gz|xz|zst))$", re.I), "app-linux-x64", "linux", "Linux (x64)"),
+    # 只在 KDE/Wayland 上验过 —— 展示名里写明白,别让人下回去才发现跑不起来
+    (re.compile(r"\.(AppImage|tar\.(gz|xz|zst))$", re.I), "app-linux-x64", "linux",
+     "Linux (KDE/Wayland, x64)"),
 ]
 
 
