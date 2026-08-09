@@ -87,6 +87,12 @@ def skin_labels(megamap: dict) -> dict:
 
 ASSET_RE = re.compile(r"^([A-Za-z]+_[A-Za-z]+?)(\d+|Bo)(Ar)?_(\d+)$")
 
+#: 人工改名表:`PETBASE_CONF` 那行的名字明显是抄来的,拿别处的实名盖掉。
+#: **人工判断,不是数据直说的** —— 与 exporter/Config.cs 的 `NameOverrides` 一字一句对齐,
+#: 依据写在那边:3567(`Mac_LuoDaXie1_001`)的 name 与 icon 都还指着真·落陨星兔(3485,
+#: 在 335-粉星仔 里),而 NPC_CONF 里这份模型有三行写的是「守护者」。
+NAME_OVERRIDES = {3567: "守护者"}
+
 
 def asset_stem(asset: str) -> str:
     """`Gra_RuoYeXi1_001` → `Gra_RuoYeXi`(一条链共用的那截)。
@@ -279,6 +285,7 @@ def build(parsed: Path) -> list[Pack]:
             for m in chain.get("lordevo_chain") or []
         ]
         for pid, pet_name, stage, lord in listed:
+            pet_name = NAME_OVERRIDES.get(pid, pet_name)
             asset = asset_of(pid)
             if not asset:
                 continue
@@ -364,7 +371,7 @@ def adopt_unbooked(packs: dict, petbase: dict, asset_of) -> None:
         if asset in taken:
             continue  # 同一份模型挂着好几行(古路尼 3365/8024),头一行说了算
         taken.add(asset)
-        name = row.get("name") or str(pid)
+        name = NAME_OVERRIDES.get(pid) or row.get("name") or str(pid)
         lord = is_lord_asset(asset)
         stage = row.get("stage") or 0 if lord else (asset_stage(asset) or row.get("stage") or 0)
         stem = asset_stem(asset)

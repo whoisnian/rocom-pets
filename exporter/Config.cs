@@ -157,6 +157,22 @@ public class GameConfig
         public readonly Dictionary<string, int> Order = new();
     }
 
+    /// 人工改名表:`PETBASE_CONF` 那行的名字明显是抄来的,拿别处的实名盖掉。
+    /// **这是判断,不是数据直说的**,所以逐条写清依据 —— 与 tools/petindex.py 的
+    /// `NAME_OVERRIDES` 一字一句对齐。
+    ///
+    /// - **3567 → 守护者**(`Mac_LuoDaXie1_001`):这行的 `name` 与 `icon` 都还指着
+    ///   真·落陨星兔(3485,`Com_XingZai3Ar_001`,已经在 335-粉星仔 里),模型却是另一族
+    ///   的机械单位。`NPC_CONF` 里这份模型出现七行,三行写的是「守护者」
+    ///   (166220/166221/166225),取它;同族二阶 `Mac_LuoDaXie2_001` 在那张表里叫
+    ///   「罗达战车」,但它没有宠物行,本来就进不了清单。
+    ///   **别想着靠规则识别这类抄来的行**:按「名字与头像都属于另一只」去筛,全表命中 88 条,
+    ///   其中绝大多数是合法的(王者形态与它的战斗形态共用图标、圣代甜甜那八种外观互相错位)。
+    private static readonly Dictionary<int, string> NameOverrides = new() { [3567] = "守护者" };
+
+    /// 这一行该显示的名字。见 [`NameOverrides`]。
+    private string NameOf(int id, string raw) => NameOverrides.GetValueOrDefault(id, raw);
+
     /// 按图鉴号归并出全部包。与 tools/petindex.py 同算法,见 [`Chain`] 的说明。
     public List<Chain> Packs()
     {
@@ -252,7 +268,7 @@ public class GameConfig
             if (row["pictorial_book_id"] is not null && row["pictorial_book_id"]!.Type != JTokenType.Null) continue;
             var asset = AssetOf(id);
             if (asset.Length == 0 || !taken.Add(asset)) continue;
-            var name = row["name"]!.Value<string>()!;
+            var name = NameOf(id, row["name"]!.Value<string>()!);
             var stem = AssetStem(asset);
             if (!byStem.TryGetValue(stem, out var pack))
             {
@@ -311,9 +327,15 @@ public class GameConfig
     private IEnumerable<(int Id, string Name, bool Lord)> Members(JToken chain)
     {
         foreach (var m in chain["evolution_chain"] as JArray ?? [])
-            yield return (m["petbase_id"]!.Value<int>(), m["pet_name"]?.Value<string>() ?? "", false);
+        {
+            var id = m["petbase_id"]!.Value<int>();
+            yield return (id, NameOf(id, m["pet_name"]?.Value<string>() ?? ""), false);
+        }
         foreach (var m in chain["lordevo_chain"] as JArray ?? [])
-            yield return (m["lord_petbase_id"]!.Value<int>(), m["lord_pet_name"]?.Value<string>() ?? "", true);
+        {
+            var id = m["lord_petbase_id"]!.Value<int>();
+            yield return (id, NameOf(id, m["lord_pet_name"]?.Value<string>() ?? ""), true);
+        }
     }
 
     private int? BookOfChain(JToken chain)

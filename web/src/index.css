@@ -99,7 +99,10 @@
   .sprite-cell {
     background-image: var(--sp-img);
     background-repeat: no-repeat;
-    background-size: var(--sp-bg) var(--sp-bg);
+    /* 宽高**分开给**:精灵图只有在格子数恰好凑成正方形时才是方的(573 张 → 24×24,
+       591 张 → 25×24)。两个维度共用一个值的话,非正方的图竖向会被拉伸,
+       行号越大偏得越多 —— 表现是靠下那些头像卡在上下两张之间(踩过) */
+    background-size: var(--sp-bg) var(--sp-bh);
     background-position: var(--sp-x) var(--sp-y);
     image-rendering: -webkit-optimize-contrast;
   }

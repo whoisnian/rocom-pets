@@ -41,7 +41,10 @@ export function PetAvatar({ name, sprite, sheet, size = 56, className }: Props) 
   }
 
   // 源图 cols 列、每格 cell px。缩放到 size 时整张图跟着按同一比例缩,
-  // 于是背景尺寸 = cols * size,偏移 = -(列 * size, 行 * size)。
+  // 于是背景尺寸 = (cols * size, rows * size),偏移 = -(列 * size, 行 * size)。
+  // **行数得自己算**:图不一定是正方的(591 张 = 25 列 × 24 行),
+  // 拿 cols 当高度会把竖向拉伸,越靠下的头像偏得越多。
+  const rows = Math.ceil(sheet.count / sheet.cols);
   const col = sprite % sheet.cols;
   const row = Math.floor(sprite / sheet.cols);
   return (
@@ -53,6 +56,7 @@ export function PetAvatar({ name, sprite, sheet, size = 56, className }: Props) 
           height: size,
           "--sp-img": `url(${sheet.url})`,
           "--sp-bg": `${sheet.cols * size}px`,
+          "--sp-bh": `${rows * size}px`,
           "--sp-x": `${-col * size}px`,
           "--sp-y": `${-row * size}px`,
         } as React.CSSProperties

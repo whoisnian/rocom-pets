@@ -11,9 +11,16 @@
                 前端会把这类条目标成「待上传」。
 
 头像**自己从解包数据拼**(--parsed,默认 $ROCOM_PARSED 或 ~/Downloads/rocom/parsed):
-游戏自带 `Icon/HeadIcon/<conf_id>.png`,128px 一张,按 conf_id 命名 —— 而 manifest 里
-`[species].id` 与 `[[forms]].id` 就是 conf_id,所以**按 id 直接对上**,不必按中文名查表
-(同名不同图鉴号的宠物按名字只能给一个头像)。用得上的那些拼成一张 webp,其余不进图。
+游戏自带 `Icon/HeadIcon/*.png`,128px 一张。**文件名不是 conf_id**,而是
+`PETBASE_CONF[conf_id].model_conf → MODEL_CONF[…].icon` 指过去的那张 —— 607 个形态里
+547 个碰巧相等,剩下 60 个不等(苞米仔 3759 的图标是 3760,王者形态整批落在 4xxx,
+还有 `4078_1` 这种带后缀的)。**照 id 猜会错两次**:苞米仔那张空着,而炮米花顶着
+苞米仔的脸(3760 存在,但那是它前一阶的图)。所以老老实实过 MODEL_CONF。
+
+一张图标被多条配置共用是常态 —— 同一只的外观变体(板板壳「蜕皮时的样子」、石肤蜥
+「球球尾巴的样子」)本来就共用一张。但**跨包共用就是配置抄漏了**:`000-若叶蜥` 与
+`000-荆棘笼` 都指着鸭吉吉的图标,`000-落陨星兔` 指着真·落陨星兔(在 335-粉星仔 里)
+的图标 —— 这些一律不认,退回文字头像,免得给人配一张别的宠物的脸。
 
 取不到解包数据(或某只没有图标)就记 null,前端退回「首字 + 按名字哈希出来的底色」。
 
@@ -70,27 +77,53 @@ def sha256_of(path: Path) -> str:
 # ---------------------------------------------------------------- 头像精灵图
 
 
-def head_icons(parsed: Path) -> dict[int, Path]:
-    """conf_id → 头像 png。缺解包数据就是空表(全站退回文字头像,不算错)。
+def head_icons(parsed: Path) -> dict[str, Path]:
+    """文件名(不含扩展名)→ 头像 png。缺解包数据就是空表(全站退回文字头像,不算错)。
 
-    目录里还有 `3001_2.png` 这种带后缀的(同一只的备用图),**不收** ——
-    manifest 给的是纯 conf_id,收进来也对不上。
+    **键是字符串不是整数**:`MODEL_CONF` 指过来的名字有 `4078_1` 这种带后缀的
+    (风暴战犬用的就是它),按 int 收会把这类整批丢掉。
     """
     d = parsed / HEAD_ICONS
     if not d.is_dir():
         print(f"  [跳过] 找不到 {d} —— 全站用文字头像;要头像就 --parsed 指到解包根")
         return {}
-    icons = {int(p.stem): p for p in d.glob("*.png") if p.stem.isdigit()}
+    icons = {p.stem: p for p in d.glob("*.png")}
     print(f"  解包数据里有 {len(icons)} 张头像({d})")
     return icons
 
 
-def build_sprite(icons: dict[int, Path], wanted: list[int], out_dir: Path) -> tuple[dict[int, int], dict]:
-    """把用得上的头像拼成一张 webp,返回 conf_id → 序号 与几何参数。
+def icon_of_pet(parsed: Path) -> dict[int, str]:
+    """conf_id → 头像文件名。走 `PETBASE_CONF.model_conf` → `MODEL_CONF.icon`。
 
-    **只拼用得上的**:解包里有 819 张,而这批包只用到六百来张;多拼的每一张都是
-    白让访客下载的字节。行主序,列数取接近正方形的那个 —— 单边太长会撞上
-    浏览器的贴图上限,而且方图压得更小。
+    表读不到就是空表,调用方退回「文件名 == conf_id」那个近似(见模块头)。
+    """
+    pet_f = parsed / BIN_DIR / "PETBASE_CONF.json"
+    model_f = parsed / BIN_DIR / "MODEL_CONF.json"
+    if not (pet_f.is_file() and model_f.is_file()):
+        print("  [跳过] 读不到 PETBASE_CONF / MODEL_CONF —— 退回按 conf_id 找图,"
+              "少数几只会配错脸")
+        return {}
+    pets = json.loads(pet_f.read_text("utf-8")).get("RocoDataRows", {})
+    models = json.loads(model_f.read_text("utf-8")).get("RocoDataRows", {})
+
+    out: dict[int, str] = {}
+    for row in pets.values():
+        pid, mid = row.get("id"), row.get("model_conf")
+        if not isinstance(pid, int) or mid is None:
+            continue
+        # Texture2D'/Game/…/Icon/HeadIcon/3760.3760' → 3760
+        m = re.search(r"HeadIcon/(\w+)\.", (models.get(str(mid)) or {}).get("icon") or "")
+        if m:
+            out[pid] = m.group(1)
+    return out
+
+
+def build_sprite(icons: dict[str, Path], wanted: list[str], out_dir: Path) -> tuple[dict[str, int], dict]:
+    """把用得上的头像拼成一张 webp,返回文件名 → 序号 与几何参数。
+
+    **只拼用得上的**:解包里有一千六百多张,而这批包只用到六百来张;多拼的每一张都是
+    白让访客下载的字节。同一张被多只共用时也只拼一次(外观变体本来就共用一张)。
+    行主序,列数取接近正方形的那个 —— 单边太长会撞上浏览器的贴图上限,而且方图压得更小。
     """
     have = [i for i in wanted if i in icons]
     dst = out_dir / "sprite.webp"
@@ -103,7 +136,7 @@ def build_sprite(icons: dict[int, Path], wanted: list[int], out_dir: Path) -> tu
     cols = max(1, math.ceil(math.sqrt(len(have))))
     rows_n = math.ceil(len(have) / cols)
     sheet = Image.new("RGBA", (cols * CELL, rows_n * CELL), (0, 0, 0, 0))
-    index: dict[int, int] = {}
+    index: dict[str, int] = {}
     for n, conf_id in enumerate(have):
         im = Image.open(icons[conf_id]).convert("RGBA")
         if im.size != (CELL, CELL):
@@ -133,6 +166,44 @@ def names_to_ids(parsed: Path) -> dict[str, int]:
         if name and isinstance(pid, int) and pid < out.get(name, 1 << 30):
             out[name] = pid
     return out
+
+
+def resolve_icons(packs: list[dict], by_pet: dict[int, str]) -> list[tuple[str, str, int, str]]:
+    """把各处 `sprite` 里的 conf_id 就地换成**头像文件名**,返回被拒的那几条。
+
+    两条规矩:
+
+    1. 文件名走 `MODEL_CONF`(`by_pet`);表读不到就退回 `str(conf_id)` 那个近似。
+    2. **跨包共用的一律不认**。一张图标被同一个包里的多条配置共用是正常的
+       (外观变体),但指到**别的包**里某只宠物的 id 上,就是这行配置抄漏了 ——
+       实测 6 条,`000-` 那批无图鉴号的剧情单位。宁可给文字头像,也不给别人的脸。
+    """
+    owner: dict[str, str] = {}
+    for p in packs:
+        for cid in [p["sprite"]] + [f["sprite"] for f in p["forms"]]:
+            if isinstance(cid, int):
+                owner[str(cid)] = p["id"]
+
+    rejected: list[tuple[str, str, int, str, str]] = []
+
+    def key_for(pack: dict, cid: object, label: str) -> str | None:
+        if not isinstance(cid, int):
+            return None
+        key = by_pet.get(cid, str(cid))
+        holder = owner.get(key, pack["id"])
+        if key != str(cid) and holder != pack["id"]:
+            # 链首那只会被问两次(包一次、形态一次),报告里只留一条
+            entry = (pack["id"], label, cid, key, holder)
+            if entry not in rejected:
+                rejected.append(entry)
+            return None
+        return key
+
+    for p in packs:
+        for f in p["forms"]:
+            f["sprite"] = key_for(p, f["sprite"], f["name"])
+        p["sprite"] = key_for(p, p["sprite"], p["name"])
+    return rejected
 
 
 # ---------------------------------------------------------------- 真实模式
@@ -303,15 +374,16 @@ def main() -> int:
         print(f"宠物包(演示模式,读 {args.index}):")
         packs = scan_index(args.index, names_to_ids(args.parsed))
 
-    # 收齐用得上的 conf_id 再拼图,然后把各处的 id 换成格子序号。
+    # conf_id → 头像文件名,再收齐用得上的那些拼图,最后把各处换成格子序号。
     # **顺序按包列表出现的先后**:同一批包重跑出来的图逐字节一致,便于比对。
-    wanted: list[int] = []
-    seen: set[int] = set()
+    rejected = resolve_icons(packs, icon_of_pet(args.parsed))
+    wanted: list[str] = []
+    seen: set[str] = set()
     for p in packs:
-        for cid in [p["sprite"]] + [f["sprite"] for f in p["forms"]]:
-            if isinstance(cid, int) and cid not in seen:
-                seen.add(cid)
-                wanted.append(cid)
+        for key in [p["sprite"]] + [f["sprite"] for f in p["forms"]]:
+            if isinstance(key, str) and key not in seen:
+                seen.add(key)
+                wanted.append(key)
     sprite_index, sprite_geom = build_sprite(icons, wanted, args.out)
     for p in packs:
         p["sprite"] = sprite_index.get(p["sprite"])
@@ -345,6 +417,10 @@ def main() -> int:
     why = "游戏里就没出图标" if icons else "这次没读到解包数据"
     print(f"  有头像:包 {with_avatar}/{len(packs)}、形态 {forms_with}/{total_forms};"
           f"剩下的{why},页面退回文字头像")
+    if rejected:
+        print(f"  [注意] {len(rejected)} 条配置指着别的包里的头像,已按文字头像处理:")
+        for pack_id, label, cid, key, holder in rejected:
+            print(f"    {pack_id} · {label}(id {cid}) → HeadIcon/{key},那是 {holder} 的")
     if apps:
         print(f"  应用本体 {len(apps)} 个,版本 {args.version}")
 
