@@ -43,15 +43,22 @@ public static class Audio
     ///
     /// **键就是动作逻辑名**(`[forms.clips]` 那一张表的键),不另起一套触发点名字:
     /// 运行时是「播哪段动作」决定「出什么声」,两张表同一把键才不会各对各的。
-    /// 剩下的动作(Idle/Walk/Run/JumpFall/Sleep*)在两族库里都没有对应事件。
+    /// 剩下的动作(Idle/Walk/Run/JumpFall/Sleep*)在两族库里都没有对应事件 ——
+    /// 2026-08-09 把 1192 个库全枚举了一遍复核过,`World_Walk`/`World_Run`/`World_Idle`/
+    /// `World_Jump_Fall`/`Common_Sleep_Loop` 一个命中都没有。
     ///
     /// 后缀大小写在源数据里不统一(`Common_SAd` / `Fight_Callout` 都有),但**这里不用管**:
     /// Wwise 的 FNV-1 是**先转小写**再哈希的,各种写法命中同一个 Event id。
     ///
-    /// 全库覆盖率(621 个 `Pet_Vo_*` / 650 个 `Pet_Action_*`):八个 `Common_*` 都是
-    /// 617~648 只有,`Fight_CallOut` 612/644。也就是说**降级基本用不上** ——
+    /// 全库覆盖率(枚举 HIRC 的 Event 对象、拿候选名的 FNV-1 去命中,610 个 `Pet_Action_*` /
+    /// 582 个 `Pet_Vo_*` 解得出事件):八个 `Common_*` 是 604~609 / 579~580,
+    /// `Fight_CallOut` 606/574,`Fight_Skill_1/2/3` 606~609 / 579~580 —— 技能那三条和
+    /// 情绪那八条一样齐。也就是说**降级基本用不上** ——
     /// 原来那张「取不到 Happy 就退 Show」的导出期降级表是空转,已经去掉;
     /// 真缺一段时由运行时按它自己的动作降级表(`stage::fallbacks`)退,那才是一套。
+    ///
+    /// **技能是一技能一条事件,不分段**:`Skill2Loop1` 与 `Skill2Loop2` 都挂 `Fight_Skill_2`。
+    /// 同一段 wem 只转一次(`Rip` 里的 `done` 按 sourceID 去重),两把键指向同一个 ogg。
     private static readonly (string Key, string Event)[] Wanted =
     [
         ("Happy", "Common_Happy"),
@@ -63,6 +70,10 @@ public static class Audio
         ("Relax", "Common_Relax"),
         ("Alert", "Common_Alert"),
         ("CallOut", "Fight_CallOut"),
+        ("Skill1Loop", "Fight_Skill_1"),
+        ("Skill2Loop1", "Fight_Skill_2"),
+        ("Skill2Loop2", "Fight_Skill_2"),
+        ("Skill3Loop", "Fight_Skill_3"),
     ];
 
     /// Game Parameter 名:游戏把 -100~100 的 `voice` 属性喂给它,由 RTPC 曲线实时变调。

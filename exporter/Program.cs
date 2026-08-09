@@ -54,7 +54,7 @@ const string usage = """
     """;
 
 // 桌宠真正用得到的动作:名字是 ANIM_ID_CONF 里的逻辑名。
-// 其余(Attack/Skill/Hit/Die/CG 演出)对桌宠没用,占体积,默认不导。
+// 其余(Attack/Hit/Die/CG 演出)对桌宠没用,占体积,默认不导。
 string[] defaultClips =
 [
     "Idle", "Walk", "Run", "Happy", "Anger", "Sad", "Fear", "Shock", "Show", "Relax", "Alert",
@@ -62,6 +62,16 @@ string[] defaultClips =
     // 拖放松手之后的落地(design.md §9 Phase 1 遗留)。ANIM_CONF 里有这个逻辑名,
     // 但原来不在白名单里 ⇒ 全库 831 个形态一个都没导出来。
     "JumpFall",
+    // 技能的**循环段**。游戏里野外那些「一边转圈一边走」「扫地」在数据里**没有独立 clip**:
+    // 行为树把战斗技能的 Loop 段按住重播(点点巡逻起舞 = `Skill2Loop1`,片段自带整只自转
+    // 两圈;捕尘长绒的清扫 = `Skill2Loop1`/`Skill3Loop`)。全库 18 棵行为树这么用,
+    // 620/622 个 anim_conf 都齐着这四段。
+    //
+    // **只要 Loop,不要 Start/End/Trans**:抽样 60 个形态 648 段量根骨相对参考姿势的位移,
+    // 起落段有一半偏出 30cm 以上(最狠的噬影蚕 `Skill_2_End` 4.8m);桌宠站位固定、画布只有
+    // 1.64 倍取景余量,那种偏移看着就是瞬移。Loop 段 228 个里 68% 不到 0.25 身高,
+    // 没有一个超过一整个身高。
+    "Skill1Loop", "Skill2Loop1", "Skill2Loop2", "Skill3Loop",
 ];
 
 var home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);

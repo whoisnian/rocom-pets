@@ -131,6 +131,16 @@ pub const RUNTIME_CLIPS: &[(&str, &str)] = &[
     ("SleepLoop", "睡着"),
     ("SleepEnd", "醒来"),
     ("CallOut", "召唤"),
+    // 技能的循环段。游戏里野外那些「一边转圈一边走」「扫地」没有独立 clip,是行为树把这几段
+    // 按住重播出来的(点点 = `Skill2Loop1`,捕尘长绒的清扫 = `Skill2Loop1`/`Skill3Loop`),
+    // 导出器的白名单注释里有全部依据。**只有手动能点**:自发行为不会挑它们。
+    //
+    // **只能往后加,不能插中间** —— 平台层是按下标传动作的(`Control::Play(slot, clip)`,
+    // 见 platform/wayland.rs 与 windows.rs 的 `play_clip`)。
+    ("Skill1Loop", "技能一"),
+    ("Skill2Loop1", "技能二"),
+    ("Skill2Loop2", "技能二·后"),
+    ("Skill3Loop", "技能三"),
 ];
 
 /// 找不到这段就退而求其次 —— **降级是行为的一部分**,不是补救:幽星光没有
@@ -146,6 +156,30 @@ fn fallbacks(name: &str) -> &'static [&'static str] {
         "Fear" => &["Shock", "Alert"],
         "SleepLoop" => &["SleepStand"],
         _ => &[],
+    }
+}
+
+/// 「摆一段给人看」时,循环段至少按住多久(秒)。
+///
+/// 走/跑与技能那四段循环,一个周期只有 0.5~1.6s(点点 `Walk` 1.03s、`Run` 0.87s、
+/// 捕尘长绒 `Run` 0.53s):按原来「播一遍就回待机」的算法,点下去像抽了一下,
+/// 根本看不清在做什么。一次性动作(表情、召唤、落地)不在此列 —— 那些本来就是演完就完。
+const LOOP_HOLD: f32 = 3.0;
+
+/// 这段是不是**循环**段:走/跑,以及名字里带 `Loop` 的(技能四段、`SleepLoop`)。
+fn is_loop_clip(name: &str) -> bool {
+    matches!(name, "Walk" | "Run") || name.contains("Loop")
+}
+
+/// 摆一段动作时给 `Activity::React` 的时长:配置窗口/网页点的动作,以及演出里的一拍。
+///
+/// **循环段按整周期数凑够 [`LOOP_HOLD`]**:凑整周期是为了收尾时姿势正好回到起点,
+/// 掐在半路上会跳一下。其余动作照旧播一遍(短得离谱的给个 0.3s 下限)。
+fn play_hold(name: &str, duration: f32) -> f32 {
+    if is_loop_clip(name) && duration > 0.05 {
+        (LOOP_HOLD / duration).ceil() * duration
+    } else {
+        duration.max(0.3)
     }
 }
 
@@ -1268,8 +1302,10 @@ impl Stage {
         // **按点的那个名字出声,不是按降级后播的那段**:两边共用同一张降级表,
         // 点「受惊」而形态只有 Alert 时,动作与声音会一起退到 Alert
         pet.speak(name);
+        // 走/跑与技能循环段按住几秒再收(见 `manual_hold`):它们一个周期不到一秒,
+        // 播一遍就回待机的话点下去只看得见抽一下
         pet.activity = Activity::React {
-            remaining: pet.model.clips[clip].duration.max(0.3),
+            remaining: play_hold(name, pet.model.clips[clip].duration),
         };
         true
     }
@@ -1871,8 +1907,10 @@ impl Stage {
             Beat::Play(name) => match pet.model.clip(name) {
                 Some(clip) => {
                     pet.player.play(clip);
+                    // 循环段(演出里的「扫地」「指挥」)同样按住几个整周期,见 `play_hold`;
+                    // 下一拍到点了照样打断,这里给的只是「没人管的话演多久」
                     pet.activity = Activity::React {
-                        remaining: pet.model.clips[clip].duration.max(0.3),
+                        remaining: play_hold(name, pet.model.clips[clip].duration),
                     };
                 }
                 // 缺这段动作就跳过这一拍,整场照演 —— 全库动作覆盖不齐
@@ -2260,6 +2298,24 @@ mod tests {
         let mut stage = Stage::new((800, 600));
         stage.spawn(Actor::Sprite(Sprite::test_pattern(64)));
         stage
+    }
+
+    #[test]
+    fn loop_clips_are_held_for_whole_cycles() {
+        // 走/跑与技能循环段:凑够 3 秒,而且必须是整周期(收尾时姿势回到起点)
+        for (name, duration) in [("Walk", 1.033), ("Run", 0.533), ("Skill2Loop1", 1.6)] {
+            let held = play_hold(name, duration);
+            assert!(held >= LOOP_HOLD, "{name} 只按住了 {held}s");
+            let cycles = held / duration;
+            assert!(
+                (cycles - cycles.round()).abs() < 1e-3,
+                "{name} 按住 {held}s 不是整周期"
+            );
+            assert!(held < LOOP_HOLD + duration, "{name} 按过头了:{held}s");
+        }
+        // 一次性动作照旧播一遍;短得离谱的给下限
+        assert_eq!(play_hold("Happy", 1.5), 1.5);
+        assert_eq!(play_hold("CallOut", 0.1), 0.3);
     }
 
     #[test]

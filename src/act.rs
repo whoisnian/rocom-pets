@@ -7,8 +7,12 @@
 //! 这一版**硬编码在 Rust 里**:先把编排与打断语义跑通,确认这套结构够用,再决定要不要
 //! 抬到 Lua / 互动包。先引脚本 VM 会把「编排怎么写才好用」和「VM 怎么接」两个问题搅在一起。
 //!
-//! **诚实的限制**:游戏里由行为树驱动、没有独立 clip 的行为(比如「清扫」)只能用现成动作
-//! 拼近似 —— 这里是 `Run` 过去 + 两次 `Show` + 退半步,不是复刻。
+//! **原来那条「只能拼近似」的限制解掉了一半**(2026-08-09 查实):游戏里「清扫」不是没有
+//! clip,而是行为树按住**战斗技能的循环段**重播 —— 捕尘长绒的 `BT_Xiaozhu_SelfAction`
+//! (魔法扫帚)用 `Skill2Loop1` + `Skill3Loop`,珀尔鼬的 `BT_Patrol_Paer`(指挥大扫除)
+//! 用 `Skill1Loop`。那四段循环现在进白名单导出来了,这场演出用的就是**游戏里的那几段**。
+//!
+//! 仍然是近似:游戏那边还叠着泡泡特效、清扫目标点与导航位移,我们只有动作和走位。
 
 /// 一个角色在某一拍要做的事。
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -53,8 +57,10 @@ pub struct Script {
 
 /// 「珀尔鼬指挥捕尘长绒清扫」——design.md §6 点名的第一个样例。
 ///
-/// 拍子的依据:`CallOut`(呼叫)1.5s、`Alert`(警觉)4.2s、`Show`(展示)1.5s、
-/// `Happy` 1.5s。`Alert` 太长,第 2.0 秒就被下一拍接管 —— 时间轴**可以打断自己**,
+/// 拍子的依据(都是实测的 clip 时长):珀尔鼬 `CallOut` 1.5s、`Skill1Loop` 0.67s、
+/// `Happy` 1.5s;捕尘长绒 `Alert` 4.2s、`Skill2Loop1` 1.6s、`Skill3Loop` 1.13s。
+/// 循环段由 `stage::play_hold` 按整周期按住约 3s,所以一拍就是「扫两圈」而不是抽一下。
+/// `Alert` 太长,第 2.0 秒就被下一拍接管 —— 时间轴**可以打断自己**,
 /// 一段动作没播完就换下一件事是允许的。
 // 时间轴排成一行一拍的表:rustfmt 会把每个字段拆成一行,那样就读不出「第几秒谁做什么」了
 #[rustfmt::skip]
@@ -64,7 +70,7 @@ const PEEL_COMMANDS_CLEANER: Script = Script {
     cast: [3758, 3604],
     max_distance: 2.5,
     cooldown: 90.0,
-    length: 11.5,
+    length: 13.0,
     steps: &[
         // 珀尔鼬转过去喊它
         Step { at: 0.0, role: 0, beat: Beat::Face },
@@ -72,15 +78,17 @@ const PEEL_COMMANDS_CLEANER: Script = Script {
         // 捕尘长绒听见了
         Step { at: 0.9, role: 1, beat: Beat::Face },
         Step { at: 1.1, role: 1, beat: Beat::Play("Alert") },
-        // 跑过去,「扫」两下(没有清扫动作,用 Show + 退半步凑往返)
+        // 跑过去开扫。珀尔鼬这边举手指挥(游戏「指挥大扫除」用的就是 Skill1Loop 这段)
         Step { at: 2.0, role: 1, beat: Beat::Approach { gap: 1.3, running: true } },
-        Step { at: 3.6, role: 1, beat: Beat::Play("Show") },
-        Step { at: 5.2, role: 1, beat: Beat::Approach { gap: 2.1, running: false } },
-        Step { at: 6.2, role: 1, beat: Beat::Play("Show") },
+        Step { at: 2.4, role: 0, beat: Beat::Play("Skill1Loop") },
+        // 扫一段(Skill2Loop1 = 整只转着圈扫),退半步再换个姿势扫一段
+        Step { at: 3.6, role: 1, beat: Beat::Play("Skill2Loop1") },
+        Step { at: 6.8, role: 1, beat: Beat::Approach { gap: 2.1, running: false } },
+        Step { at: 7.6, role: 1, beat: Beat::Play("Skill3Loop") },
         // 回原位;珀尔鼬表示满意
-        Step { at: 7.8, role: 1, beat: Beat::GoHome { running: false } },
-        Step { at: 9.4, role: 0, beat: Beat::Face },
-        Step { at: 9.6, role: 0, beat: Beat::Play("Happy") },
+        Step { at: 9.9, role: 1, beat: Beat::GoHome { running: false } },
+        Step { at: 11.0, role: 0, beat: Beat::Face },
+        Step { at: 11.2, role: 0, beat: Beat::Play("Happy") },
     ],
 };
 
