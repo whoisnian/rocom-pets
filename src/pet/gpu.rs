@@ -1363,25 +1363,44 @@ fn upload_texture(
 ///
 /// `bounds` 是**绑定姿势**的包围盒,`yaw` 是绕 Y 轴的观察角(0 = 从 +Z 看;宠物朝 +Z,故 0 是正面)。
 /// `padding` 要留出余量:跳跃/伸展类动作会超出绑定姿势的包围盒(实测 Happy 会高出一截)。
+///
+/// 桌宠只绕 Y 转、画布也一定是正方的,所以这里没有俯仰与宽高比;
+/// 网页预览要拖着看,走 [`orbit_view`]。
 pub fn orthographic_view(bounds: (Vec3, Vec3), yaw: f32, padding: f32) -> Mat4 {
+    orbit_view(bounds, yaw, 0.0, padding, 1.0)
+}
+
+/// 同上,外加**俯仰**与**画布宽高比** —— 网页预览那块 canvas 可以拖、也不一定是正方的。
+///
+/// `pitch` 正值是从上往下看。**夹在 ±80° 内**:到极点时 `look_at` 的上方向会和视线共线,
+/// 矩阵直接退化成一片空白。宽高比只放宽横向,竖向那半径不动,于是不论画布多宽,
+/// 宠物在画面里的**高度**是一样的 —— 拖窗口大小时它不会跟着忽大忽小。
+pub fn orbit_view(bounds: (Vec3, Vec3), yaw: f32, pitch: f32, padding: f32, aspect: f32) -> Mat4 {
     let (min, max) = bounds;
     let center = (min + max) * 0.5;
     let extent = max - min;
     // 取最长边而不是对角线:对角线会把瘦高的模型框得过松,宠物在画面里缩成一小团
     let radius = extent.x.max(extent.y).max(extent.z) * 0.5 * padding;
-    let eye = center + glam::Quat::from_rotation_y(yaw) * Vec3::new(0.0, 0.0, radius * 2.0);
+    let pitch = pitch.clamp(-MAX_PITCH, MAX_PITCH);
+    let rotation = glam::Quat::from_rotation_y(yaw) * glam::Quat::from_rotation_x(pitch);
+    let eye = center + rotation * Vec3::new(0.0, 0.0, radius * 2.0);
     let view = glam::camera::rh::view::look_at_mat4(eye, center, Vec3::Y);
+    let half_w = radius * aspect.max(0.01);
     // 深度范围用 wgpu 的 0..1(DirectX 约定),与管线的 Depth32Float + CompareFunction::Less 匹配
     let proj = glam::camera::rh::proj::directx::orthographic(
-        -radius,
-        radius,
+        -half_w,
+        half_w,
         -radius,
         radius,
         0.01,
-        radius * 4.0,
+        // 俯仰会把相机推到包围盒的角上,近/远平面要按对角线留够,不然会削掉一块
+        radius * 6.0,
     );
     proj * view
 }
+
+/// 俯仰的上限(弧度)。差 10° 到极点就停 —— 再上去 `look_at` 就退化了。
+pub const MAX_PITCH: f32 = std::f32::consts::FRAC_PI_2 * 8.0 / 9.0;
 
 #[cfg(test)]
 mod tests {
@@ -1414,6 +1433,33 @@ mod tests {
             local_pos: pos,
             color: [1.0; 4],
         }
+    }
+
+    /// 拖视角那两条约束:**俯仰要夹住**(到极点 `look_at` 会退化成一片空白),
+    /// 而**宽高比只放宽横向** —— 不论画布多宽,宠物在画面里的高度不变。
+    #[test]
+    fn orbit_clamps_pitch_and_only_widens_horizontally() {
+        let bounds = (Vec3::new(-1.0, -1.0, -1.0), Vec3::new(1.0, 1.0, 1.0));
+        // 竖直方向的投影比例不受宽高比影响
+        let square = orbit_view(bounds, 0.0, 0.0, 1.0, 1.0);
+        let wide = orbit_view(bounds, 0.0, 0.0, 1.0, 2.0);
+        assert!((square.y_axis.y - wide.y_axis.y).abs() < 1e-6, "高度该一样");
+        assert!(wide.x_axis.x.abs() < square.x_axis.x.abs(), "横向该放宽");
+
+        // 俯仰给到超过 90° 也不能让矩阵烂掉(NaN / 全零)
+        let over = orbit_view(bounds, 0.3, 3.0, 1.0, 1.5);
+        assert!(over.to_cols_array().iter().all(|v| v.is_finite()));
+        assert_eq!(
+            over,
+            orbit_view(bounds, 0.3, MAX_PITCH, 1.0, 1.5),
+            "该夹到上限"
+        );
+
+        // 不给俯仰与宽高比时,就是原来那个正方取景
+        assert_eq!(
+            orthographic_view(bounds, 0.7, 1.15),
+            orbit_view(bounds, 0.7, 0.0, 1.15, 1.0)
+        );
     }
 
     #[test]

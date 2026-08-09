@@ -155,7 +155,10 @@ pub fn has_clip(form: &crate::pack::Form, name: &str) -> bool {
 }
 
 /// 在模型里找一段动作,找不到就按降级表退。
-fn find_clip(model: &Model, name: &str) -> Option<usize> {
+///
+/// `pub` 是给下载站的预览用的(`web.rs`):网页上「有哪些动作能点」必须和桌面上
+/// 「点下去有没有反应」是同一条判断,各写一份迟早对不上。
+pub fn find_clip(model: &Model, name: &str) -> Option<usize> {
     model
         .clip(name)
         .or_else(|| fallbacks(name).iter().find_map(|alt| model.clip(alt)))

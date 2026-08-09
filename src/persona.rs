@@ -80,6 +80,20 @@ pub const LAUGHING: Expression = Expression {
     cell: (0, 3),
 };
 
+/// 有名字的那七格,给「让人自己挑一张脸」的界面用(下载站的预览)。
+///
+/// **第八格 (1,3) 螺旋眼不在里面**:那是战斗里的「晕」,游戏的 `emotion_desc` 里没有它,
+/// 桌宠也没有哪段动作会用到 —— 列出来只会让人点一个不属于这只宠物的表情。
+pub const EXPRESSIONS: &[Expression] = &[
+    DEFAULT_FACE,
+    SMILE,
+    SURPRISED,
+    ANGRY,
+    SLEEPY,
+    CRYING,
+    LAUGHING,
+];
+
 /// 这段动作自带的表情。**换动作眼睛也跟着换** —— 游戏里一只「哭哭眼」的幽星光
 /// 生气时是生气眼、睡着时是困倦眼,性格给的那张脸只是它**平时**的样子。
 /// 返回 None = 这段动作不改脸,还用性格那张。
