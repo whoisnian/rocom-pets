@@ -573,17 +573,21 @@ fn flow_band(uv: vec2<f32>, albedo: vec3<f32>) -> vec3<f32> {
     if material.extra.w < 0.5 {
         return albedo;
     }
+    // **两次采样都提到分支外面。** WGSL 的均匀性规则:`textureSample` 自己算 mip 层级,
+    // 要靠同一个 quad 里四个像素的导数,所以**只能在均匀控制流里调**。
+    // 原来这里是「先按 ID 决定要不要早返回,再采色带」,而 ID 本身是采出来的 ——
+    // Dawn(Chrome)直接判整份 shader 非法,预览页一个像素都出不来。
+    // naga 那边只当警告放过去了,所以桌面版一直没露馅,但那儿的 mip 选择同样是未定义的。
+    // 无条件采两张,再拿采到的值决定要不要用:结果一样,而且到哪儿都合法。
+    let scrolled = uv * material.flow.zw + vec2<f32>(material.flow.x, material.flow.y) * camera.time;
+    let band = textureSample(noise_tex, base_sampler, scrolled).rgb;
+    let id = textureSample(mask_id_tex, base_sampler, uv).a;
     // **只在 ID 遮罩选中的地方卷。** `MaskTex` 的 alpha 是离散的材质 ID 台阶,材质给的
     // `MaskID Min/Max` 划出该卷动的那一档:暮星辰环带是 0.72、额头与身体中央的黄装饰是 0.50,
     // 阈值 0.6~0.8 只选中环带。不门控就是黄装饰跟着在黄绿之间来回变(实机里它们是固定黄)。
-    if material.mask_id.z > 0.5 {
-        let id = textureSample(mask_id_tex, base_sampler, uv).a;
-        if id < material.mask_id.x || id > material.mask_id.y {
-            return albedo;
-        }
+    if material.mask_id.z > 0.5 && (id < material.mask_id.x || id > material.mask_id.y) {
+        return albedo;
     }
-    let scrolled = uv * material.flow.zw + vec2<f32>(material.flow.x, material.flow.y) * camera.time;
-    let band = textureSample(noise_tex, base_sampler, scrolled).rgb;
     // **色带是黑的地方不混。** `FlowTexture` 这个槽位装的东西并不统一:暮星辰给的是一张
     // 青↔粉的**渐变色带**(`_Fx_D`),而水蓝蓝给的是一张 85% 全黑的**遮罩**(`_Fx_M`)——
     // 后者配上 `FlowPower = 1`,`mix(固有色, 色带, 1)` 直接把整只身体换成了黑,
