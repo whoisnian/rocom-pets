@@ -114,9 +114,7 @@ export function PackDialog({
           </div>
 
           <p className="mt-4 text-xs leading-relaxed text-muted-foreground">
-            下载后放进 <code className="font-mono">%LOCALAPPDATA%\rocom-pets\packs\</code>
-            (Windows)或 <code className="font-mono">~/.local/share/rocom-pets/packs/</code>
-            (Linux),也可以在配置窗口里点「导入」。运行时直接读 .rkpet,不用解压。
+            下载后到配置窗口里点击「导入包」，选择下载好的 .rkpet 文件即可。
           </p>
         </div>
 

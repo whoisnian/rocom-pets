@@ -75,6 +75,52 @@ npm run dev                                      # Vite + workerd,/api/* 是真�
 
 `npm run build` 会先跑 `tsc --noEmit` 再打包,两步都过才算过。
 
+`npm run dev` **不跑 `npm run wasm`**(只有 `build` 跑)。改了 `src/web.rs` 或清过
+`src/wasm/`,得自己先出一遍,否则点开预览时那个动态 import 会 404。
+
+### 本地要看预览,得先往本地 R2 里塞包
+
+演示模式的目录里 `sha256` 是空的,前端据此把这些条目判成「待上传」,预览、下载、
+标记异常三个按钮一起禁掉;本地 R2 也是空的,`/api/preview/:id` 只会回
+`404 R2 里没有 packs/….rkpet`。所以要真在浏览器里转一圈,得有真目录 + 本地对象:
+
+```sh
+npm run catalog -- --packs ~/Downloads/rocom/packs-all --version 0.1.0   # 带 size/sha256
+
+# dev 开着,往它那份本地 R2 里灌。键里的 / 必须写成 %2F(不然按路径分段,404),
+# 中文原样即可
+API=http://localhost:5173/cdn-cgi/local/explorer/api/r2/buckets/rocom-pets/objects
+for f in ~/Downloads/rocom/packs-all/*.rkpet; do
+    curl -s -o /dev/null -X PUT --data-binary @"$f" "$API/packs%2F$(basename "$f")"
+done
+```
+
+**别用 `wrangler r2 object put --local`**:它回显的是解码后的名字(`packs/002-喵喵.rkpet`),
+落进 miniflare 的键却是 percent-encode 过的 `packs/002-%E5%96%B5%E5%96%B5.rkpet` ——
+和 Worker 拿 `catalog.json` 里 `key` 去查的对不上,照样 404(和上面 R2 那节是同一个毛病,
+`--local` 躲不掉;把键预先编码再传也没用,存进去还是同一个编码后的键)。
+上面那个 Local Explorer API 存的是字面 UTF-8 键,目录不用动。
+
+**rclone 在这儿用不上** —— 它要的是 S3 endpoint,而本地 R2 根本不是服务,就是
+`.wrangler/state/v3/r2/` 下的 sqlite + blobs;rclone 的 http backend 又只读。R2 那节里
+用 rclone 是往**真桶**传,和这里两码事。
+
+Local Explorer 是 `@cloudflare/vite-plugin` 的 dev 期接口,`X_LOCAL_EXPLORER` 默认开
+(设 `X_LOCAL_EXPLORER=false` 关掉);miniflare 那侧的选项名叫 `unsafeLocalExplorer`,
+插件升级时这套路由可能变。同一个 API 也能列/删:
+
+```sh
+curl -s "$API?prefix=packs/"                                  # 列
+curl -s -X DELETE -H 'Content-Type: application/json' \
+     -d '["packs/002-喵喵.rkpet"]' "$API"                      # 批量删(键放 body,原样 UTF-8)
+```
+
+写进去立刻生效,不用重启 —— dev 起的 workerd 读的就是这份状态。但 Worker 侧的 catalog
+缓存 5 分钟,**改了 `catalog.json`** 没立刻生效的话等一会儿或重启 dev。
+
+预览还要浏览器支持 WebGPU;检测不到 `navigator.gpu` 时那个 chunk 根本不加载,弹窗里只有
+一句说明。
+
 ## 接口
 
 | 路由 | 说明 |
@@ -119,13 +165,16 @@ D1 的自增走 `INSERT … ON CONFLICT DO UPDATE SET downloads = downloads + 1`
 - `src/lib/rkpet.ts` —— zip over HTTP Range:尾部找 EOCD → 中央目录 → 按条目取字节 →
   `DecompressionStream('deflate-raw')` 解。**不用现成 zip 库**:它们都要先拿到整个文件。
 - `src/lib/preview.ts` —— 会话:装 wasm、喂资产、rAF 循环、跟随画布尺寸与主题色。
-- `src/components/PreviewDialog.tsx` —— 弹窗:形态/表情下拉 + 动作按钮 + 拖拽转视角。
+- `src/components/PreviewDialog.tsx` —— 弹窗:形态/表情下拉 + 动作按钮 + 相机操作。
+  相机绑定照 `OrbitControls` 那套:左键拖转视角,右键 / 中键 / Shift+左键拖平移,
+  滚轮缩放(0.5×~5×);触屏单指转、双指同时缩放与平移。「复位」把角度、缩放、平移一起还原。
 - 取包走 `/api/preview/:id`,和 `/api/dl/:id` 分开:**预览不计下载数**,也不 302 到
   R2 自定义域(`fetch` 跨源要 CORS,自己代理反而简单)。
 
 出 wasm 要 `rustup target add wasm32-unknown-unknown` 与 `cargo install wasm-bindgen-cli`
 (版本对齐 `Cargo.lock` 里的 `wasm-bindgen`;版本不对时它会直接告诉你该装哪个)。
-`npm run build` 会先跑 `npm run wasm`,产物在 `src/wasm/`(生成物,不入仓库)。
+`npm run build` 会先跑 `npm run wasm`,产物在 `src/wasm/`(生成物,不入仓库);
+`npm run dev` 不跑,本地怎么把预览跑起来见〈本地开发〉。
 
 **只支持 WebGPU**:骨骼矩阵走只读 storage buffer,WebGL2 没有这东西。
 检测不到 `navigator.gpu` 就不加载那个 chunk,弹窗里给一句说明,下载照旧。

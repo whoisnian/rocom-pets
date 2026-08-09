@@ -7,5 +7,5 @@ pub mod model;
 pub mod target;
 
 pub use anim::Player;
-pub use gpu::{FrameParams, PetGpu, orbit_view, orthographic_view};
+pub use gpu::{FrameParams, PetGpu, framing_radius, orbit_rotation, orbit_view, orthographic_view};
 pub use model::Model;

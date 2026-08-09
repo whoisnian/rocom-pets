@@ -1,9 +1,9 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useDeferredValue, useEffect, useMemo, useState, useTransition } from "react";
 import { Download, Moon, PackageSearch, Search, Sun, X } from "lucide-react";
 import { Toaster, toast } from "sonner";
 import type { AppBuild, Catalog, Pack, StatsResponse } from "../shared/types.ts";
 import { fetchCatalog, fetchConfig, fetchStats, startDownload } from "@/lib/api.ts";
-import { searchPacks } from "@/lib/search.ts";
+import { SORTS, type SortKey, searchPacks, sortHits } from "@/lib/search.ts";
 import { AppSection } from "@/components/AppSection.tsx";
 import { PackCard } from "@/components/PackCard.tsx";
 import { PackDialog } from "@/components/PackDialog.tsx";
@@ -20,16 +20,7 @@ import {
   Skeleton,
   TooltipProvider,
 } from "@/components/ui/primitives.tsx";
-import { formatBytes } from "@/lib/utils.ts";
-
-const SORTS = [
-  { value: "downloads", label: "下载次数" },
-  { value: "book", label: "图鉴号" },
-  { value: "name", label: "名称" },
-  { value: "size", label: "文件大小" },
-  { value: "reports", label: "异常标记" },
-] as const;
-type SortKey = (typeof SORTS)[number]["value"];
+import { cn, formatBytes } from "@/lib/utils.ts";
 
 export default function App() {
   const [catalog, setCatalog] = useState<Catalog | null>(null);
@@ -39,6 +30,11 @@ export default function App() {
 
   const [query, setQuery] = useState("");
   const [sort, setSort] = useState<SortKey>("downloads");
+  // 换排序要重排两百张卡片。放进 transition 后这活儿是可打断的:下拉菜单立刻收起,
+  // 列表晚一两帧再换,不再有「点完卡住小半秒」。
+  const [reordering, startTransition] = useTransition();
+  // 输入框用 `query` 立刻回显,列表用推迟的值:打字时不必每敲一个字都等一遍全量重排
+  const deferredQuery = useDeferredValue(query);
   const [detail, setDetail] = useState<Pack | null>(null);
   const [preview, setPreview] = useState<Pack | null>(null);
   const [reportTarget, setReportTarget] = useState<{ id: string; label: string } | null>(null);
@@ -87,21 +83,20 @@ export default function App() {
     [bumpLocal],
   );
 
-  const hits = useMemo(() => {
-    if (!catalog) return [];
-    const list = searchPacks(catalog.packs, query);
-    const cmp: Record<SortKey, (a: Pack, b: Pack) => number> = {
-      downloads: (a, b) =>
-        (stats[b.id]?.downloads ?? 0) - (stats[a.id]?.downloads ?? 0) ||
-        a.book.localeCompare(b.book),
-      reports: (a, b) =>
-        (stats[b.id]?.reports ?? 0) - (stats[a.id]?.reports ?? 0) || a.book.localeCompare(b.book),
-      book: (a, b) => a.book.localeCompare(b.book) || a.name.localeCompare(b.name, "zh"),
-      name: (a, b) => a.name.localeCompare(b.name, "zh"),
-      size: (a, b) => b.size - a.size,
-    };
-    return [...list].sort((x, y) => cmp[sort](x.pack, y.pack));
-  }, [catalog, query, sort, stats]);
+  // 卡片是 memo 过的,回调必须是稳的 —— 写成内联箭头函数的话每次渲染都是新引用,
+  // memo 当场失效,拆两个 memo 的意义也就没了
+  const reportPack = useCallback((p: Pack) => setReportTarget({ id: p.id, label: p.name }), []);
+
+  // 搜索与排序**分开两个 memo**:合在一起时换个排序也要把 201 个包连同 607 个形态名
+  // 重扫一遍,而且 `searchPacks` 每次都产出新的 hit 对象 —— 下游每张卡片的 props 全变,
+  // `memo` 一张也拦不住。拆开后换排序只动顺序,卡片对象原样复用。
+  const found = useMemo(
+    () => (catalog ? searchPacks(catalog.packs, deferredQuery) : []),
+    [catalog, deferredQuery],
+  );
+  const hits = useMemo(() => sortHits(found, sort, stats), [found, sort, stats]);
+  // 列表落后于操作的那一小段(换排序的 transition,或搜索还停在推迟的值上)
+  const listBusy = reordering || query !== deferredQuery;
 
   const totals = useMemo(() => {
     if (!catalog) return null;
@@ -160,7 +155,10 @@ export default function App() {
             )}
           </div>
 
-          <Select value={sort} onValueChange={(v) => setSort(v as SortKey)}>
+          <Select
+            value={sort}
+            onValueChange={(v) => startTransition(() => setSort(v as SortKey))}
+          >
             <SelectTrigger className="w-36" aria-label="排序方式">
               <SelectValue />
             </SelectTrigger>
@@ -188,7 +186,7 @@ export default function App() {
         <section className="py-6">
           <h1 className="text-xl font-semibold">应用本体</h1>
           <p className="mt-1 mb-4 text-sm text-muted-foreground">
-            运行时不联网、不读游戏内存、不注入进程。宠物包放进 packs 目录即可,不用解压。
+            运行时不联网，宠物包按需下载。
           </p>
           {catalog ? (
             <AppSection
@@ -239,7 +237,13 @@ export default function App() {
               没有匹配「{query}」的宠物包
             </div>
           ) : (
-            <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
+            <div
+              className={cn(
+                "grid gap-3 transition-opacity sm:grid-cols-2 lg:grid-cols-3",
+                // 真慢到看得见时给点反馈,而不是让人对着不动的旧列表怀疑没点中
+                listBusy && "opacity-60",
+              )}
+            >
               {hits.map((hit) => (
                 <PackCard
                   key={hit.pack.id}
@@ -249,7 +253,7 @@ export default function App() {
                   onOpen={setDetail}
                   onPreview={setPreview}
                   onDownload={download}
-                  onReport={(p) => setReportTarget({ id: p.id, label: p.name })}
+                  onReport={reportPack}
                 />
               ))}
             </div>

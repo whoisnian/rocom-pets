@@ -21,7 +21,10 @@ use web_sys::HtmlCanvasElement;
 
 use crate::pack::Pack;
 use crate::persona::{EXPRESSIONS, Expression};
-use crate::pet::{FrameParams, Model, PetGpu, Player, gpu::DEPTH_FORMAT, orbit_view};
+use crate::pet::{
+    FrameParams, Model, PetGpu, Player, framing_radius, gpu::DEPTH_FORMAT, orbit_rotation,
+    orbit_view,
+};
 use crate::stage::{RUNTIME_CLIPS, find_clip};
 
 /// 包在内存里的假根。虚拟路径由它拼出来,`Pack::load` 那条链一个字不用改。
@@ -30,8 +33,21 @@ const ROOT: &str = "/rkpet";
 /// 取景余量。与离屏渲染一致(包围盒已含各动作的伸展)。
 const PADDING: f32 = 1.15;
 
-/// 拖一个画布宽 = 转多少弧度。一整圈略多一点,手感上「拖到底能看完一圈」。
-const DRAG_TURN: f32 = std::f32::consts::TAU * 1.2;
+/// 拖过**一个画布高**转多少弧度 —— 一整圈。
+///
+/// 两个方向共用这一个尺度,而且都按高度算。以前横向除宽、纵向除高,同样的像素位移
+/// 竖直方向转得快一倍(那块画布是 724×352),斜着拖时画面不跟手。`OrbitControls`
+/// 两轴都除 `clientHeight`,就是为了避开这个。
+const DRAG_TURN: f32 = std::f32::consts::TAU;
+
+/// 平移能把轨道中心推出多远,单位是取景半径。超过一个半径宠物就出画了,留一点余量到 1.5,
+/// 再多就只剩「找不回来」——「复位」虽然能救,但让人先迷路再按按钮不算好设计。
+const PAN_LIMIT: f32 = 1.5;
+
+/// 缩放范围(相对默认取景)。下限退到还看得出这是只什么,上限顶到脸上 ——
+/// 再放大也没有更多细节,模型本身就那么些三角形。
+const ZOOM_MIN: f32 = 0.5;
+const ZOOM_MAX: f32 = 5.0;
 
 #[wasm_bindgen(start)]
 pub fn start() {
@@ -82,6 +98,11 @@ pub struct Preview {
     pet: Option<Pet>,
     yaw: f32,
     pitch: f32,
+    /// 取景倍率。1 = `PADDING` 那档默认余量,越大越近。
+    zoom: f32,
+    /// 轨道中心的偏移,**世界坐标**。见 [`orbit_view`] 里那段:存世界坐标,平移完再转视角时
+    /// 宠物待在原地,而不是跟着镜头甩。
+    target: Vec3,
     face: Expression,
     /// 喂给着色器的「秒」:火焰流动、星点闪烁靠它推进。
     time: f32,
@@ -105,6 +126,8 @@ impl Preview {
             pet: None,
             yaw: 0.0,
             pitch: 0.0,
+            zoom: 1.0,
+            target: Vec3::ZERO,
             face: crate::persona::DEFAULT_FACE,
             time: 0.0,
             // 中性灰:前端还没告诉我们主题色之前先用它,总比纯黑洞好
@@ -257,6 +280,9 @@ impl Preview {
             player,
         });
         self.face = crate::persona::DEFAULT_FACE;
+        // 换形态就把平移归零:偏移是按上一只的取景半径算的,新的一只可能小得多,
+        // 不清的话切过去第一眼人就在画面外(缩放留着,那是「想看多近」,跟哪只无关)
+        self.target = Vec3::ZERO;
         Ok(clips)
     }
 
@@ -282,14 +308,46 @@ impl Preview {
             .unwrap_or(crate::persona::DEFAULT_FACE);
     }
 
-    /// 拖动画布:按**画布宽高的比例**转,于是不论画布多大,拖过整块的角度是一样的。
+    /// 转视角。`dx`/`dy` 是位移**占画布高度的比例**(由 JS 折算,见 web/src/lib/preview.ts)。
+    ///
+    /// **别在这儿拿 `config.width/height` 去除**:那是设备像素,而指针事件给的是 CSS 像素,
+    /// 2 倍屏上除下来只有一半,同一份代码在不同显示器上手感不一样(踩过)。
     pub fn drag(&mut self, dx: f32, dy: f32) {
-        let (w, h) = self.gpu.as_ref().map_or((1.0, 1.0), |g| {
-            (g.config.width.max(1) as f32, g.config.height.max(1) as f32)
-        });
-        self.yaw -= dx / w * DRAG_TURN;
-        self.pitch = (self.pitch - dy / h * DRAG_TURN)
+        if !dx.is_finite() || !dy.is_finite() {
+            return;
+        }
+        self.yaw -= dx * DRAG_TURN;
+        self.pitch = (self.pitch - dy * DRAG_TURN)
             .clamp(-crate::pet::gpu::MAX_PITCH, crate::pet::gpu::MAX_PITCH);
+    }
+
+    /// 平移轨道中心。单位同 [`drag`](Self::drag):位移占画布高度的比例。
+    ///
+    /// **正交投影下画面高度正好是 `2 * radius`**,所以「一个画布高」就是 `2 * radius` 的
+    /// 世界距离,与相机远近无关 —— 换算成这个比例后物体精确跟手,拉近了也不会突然变快。
+    /// 屏幕的右/上方向由当前朝向给出,累加进 `target`;推得太远会找不回来,夹在
+    /// [`PAN_LIMIT`] 个半径内。
+    pub fn pan(&mut self, dx: f32, dy: f32) {
+        if !dx.is_finite() || !dy.is_finite() {
+            return;
+        }
+        let Some(pet) = &self.pet else { return };
+        let radius = framing_radius(pet.model.motion_bounds, PADDING / self.zoom);
+        let rotation = orbit_rotation(self.yaw, self.pitch);
+        // 抓着模型走:往右拖,中心就得往左挪。屏幕 y 向下为正,所以 dy 直接配 +up
+        let step = rotation * Vec3::new(-dx, dy, 0.0) * (2.0 * radius);
+        self.target = (self.target + step).clamp_length_max(radius * PAN_LIMIT);
+    }
+
+    /// 缩放。`factor` 是**乘上去**的:滚轮一格约 1.1,双指捏合传两次触点距离的比值。
+    ///
+    /// 投影是正交的(见 [`orbit_view`]),所以「拉近」就是把取景余量按比例收紧,
+    /// 相机不用动 —— `frame` 里传的是 `PADDING / zoom`。
+    pub fn zoom_by(&mut self, factor: f32) {
+        if !factor.is_finite() || factor <= 0.0 {
+            return;
+        }
+        self.zoom = (self.zoom * factor).clamp(ZOOM_MIN, ZOOM_MAX);
     }
 
     /// 画布底色(0~1)。网页上的画布不能透明,所以这块底得自己画 ——
@@ -303,10 +361,13 @@ impl Preview {
         };
     }
 
-    /// 转回正面。
+    /// 转回正面,**缩放与平移一并复位** —— 这个按钮是「我弄乱了,回到刚打开的样子」,
+    /// 只把角度归零会留下一个放大到看不出转没转、宠物还被推在角落的画面。
     pub fn recenter(&mut self) {
         self.yaw = 0.0;
         self.pitch = 0.0;
+        self.zoom = 1.0;
+        self.target = Vec3::ZERO;
     }
 
     pub fn resize(&mut self, width: u32, height: u32) {
@@ -349,8 +410,9 @@ impl Preview {
                     pet.model.motion_bounds,
                     self.yaw,
                     self.pitch,
-                    PADDING,
+                    PADDING / self.zoom,
                     aspect,
+                    self.target,
                 ),
                 light_dir: Vec3::new(-0.4, 0.8, 0.6),
                 outline_scale: 1.0,

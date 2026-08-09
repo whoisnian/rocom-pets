@@ -38,6 +38,8 @@ interface WasmPreview {
   play(name: string): boolean;
   set_face(name: string): void;
   drag(dx: number, dy: number): void;
+  pan(dx: number, dy: number): void;
+  zoom_by(factor: number): void;
   recenter(): void;
   set_background(r: number, g: number, b: number): void;
   resize(width: number, height: number): void;
@@ -78,6 +80,8 @@ export class PreviewSession {
   private abort = new AbortController();
   private observer: ResizeObserver | null = null;
   private theme: MutationObserver | null = null;
+  /** 拖动要按它的 CSS 高度折算,见 `drag`。 */
+  private canvas: HTMLCanvasElement | null = null;
   /** 已经喂进 wasm 的形态,别重复下载。 */
   private loaded = new Set<string>();
 
@@ -94,6 +98,7 @@ export class PreviewSession {
     session.pv = pv;
 
     await pv.attach(canvas);
+    session.canvas = canvas;
     session.watchSize(canvas);
     session.watchTheme(canvas);
 
@@ -139,8 +144,27 @@ export class PreviewSession {
     this.pv?.set_face(name);
   }
 
+  /**
+   * 转视角。传 CSS 像素的位移,**在这里统一折算成「占画布高度的比例」**再进 wasm。
+   *
+   * 折算放在这一层是因为只有这儿同时知道两种尺寸:指针事件给的是 CSS 像素,而
+   * `canvas.width` 是 `watchSize` 按 `devicePixelRatio` 配出来的设备像素。以前 wasm 那边
+   * 拿设备像素去除 CSS 像素,2 倍屏上转速正好只有一半。两轴都除**高度**,于是斜着拖跟手。
+   */
   drag(dx: number, dy: number) {
-    this.pv?.drag(dx, dy);
+    const h = this.canvas?.clientHeight || 1;
+    this.pv?.drag(dx / h, dy / h);
+  }
+
+  /** 平移轨道中心。单位同 `drag`。 */
+  pan(dx: number, dy: number) {
+    const h = this.canvas?.clientHeight || 1;
+    this.pv?.pan(dx / h, dy / h);
+  }
+
+  /** 缩放。`factor` 相乘,>1 是拉近;超出范围由 wasm 那边夹住。 */
+  zoomBy(factor: number) {
+    this.pv?.zoom_by(factor);
   }
 
   recenter() {
@@ -158,6 +182,7 @@ export class PreviewSession {
     this.pv?.free();
     this.pv = null;
     this.zip = null;
+    this.canvas = null;
   }
 
   private start() {

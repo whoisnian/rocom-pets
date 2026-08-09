@@ -1381,7 +1381,23 @@ fn upload_texture(
 /// 桌宠只绕 Y 转、画布也一定是正方的,所以这里没有俯仰与宽高比;
 /// 网页预览要拖着看,走 [`orbit_view`]。
 pub fn orthographic_view(bounds: (Vec3, Vec3), yaw: f32, padding: f32) -> Mat4 {
-    orbit_view(bounds, yaw, 0.0, padding, 1.0)
+    orbit_view(bounds, yaw, 0.0, padding, 1.0, Vec3::ZERO)
+}
+
+/// 取景半径:包围盒最长边的一半,乘上余量。
+///
+/// 取最长边而不是对角线:对角线会把瘦高的模型框得过松,宠物在画面里缩成一小团。
+/// 单独提出来是因为网页预览要拿它换算「拖一像素等于世界里多远」——**正交投影下
+/// 画面高度正好是 `2 * radius`**,两处各写一遍迟早对不上。
+pub fn framing_radius(bounds: (Vec3, Vec3), padding: f32) -> f32 {
+    let extent = bounds.1 - bounds.0;
+    extent.x.max(extent.y).max(extent.z) * 0.5 * padding
+}
+
+/// 观察角 → 相机朝向。`pitch` 在这里夹紧,调用方不必自己管。
+pub fn orbit_rotation(yaw: f32, pitch: f32) -> glam::Quat {
+    glam::Quat::from_rotation_y(yaw)
+        * glam::Quat::from_rotation_x(pitch.clamp(-MAX_PITCH, MAX_PITCH))
 }
 
 /// 同上,外加**俯仰**与**画布宽高比** —— 网页预览那块 canvas 可以拖、也不一定是正方的。
@@ -1389,14 +1405,21 @@ pub fn orthographic_view(bounds: (Vec3, Vec3), yaw: f32, padding: f32) -> Mat4 {
 /// `pitch` 正值是从上往下看。**夹在 ±80° 内**:到极点时 `look_at` 的上方向会和视线共线,
 /// 矩阵直接退化成一片空白。宽高比只放宽横向,竖向那半径不动,于是不论画布多宽,
 /// 宠物在画面里的**高度**是一样的 —— 拖窗口大小时它不会跟着忽大忽小。
-pub fn orbit_view(bounds: (Vec3, Vec3), yaw: f32, pitch: f32, padding: f32, aspect: f32) -> Mat4 {
+///
+/// `target` 是**世界坐标里的**轨道中心偏移(网页预览的平移)。存世界坐标而不是屏幕偏移,
+/// 是因为平移完再转视角时,被推到一边的宠物应当待在原地,而不是跟着镜头甩。
+pub fn orbit_view(
+    bounds: (Vec3, Vec3),
+    yaw: f32,
+    pitch: f32,
+    padding: f32,
+    aspect: f32,
+    target: Vec3,
+) -> Mat4 {
     let (min, max) = bounds;
-    let center = (min + max) * 0.5;
-    let extent = max - min;
-    // 取最长边而不是对角线:对角线会把瘦高的模型框得过松,宠物在画面里缩成一小团
-    let radius = extent.x.max(extent.y).max(extent.z) * 0.5 * padding;
-    let pitch = pitch.clamp(-MAX_PITCH, MAX_PITCH);
-    let rotation = glam::Quat::from_rotation_y(yaw) * glam::Quat::from_rotation_x(pitch);
+    let center = (min + max) * 0.5 + target;
+    let radius = framing_radius(bounds, padding);
+    let rotation = orbit_rotation(yaw, pitch);
     let eye = center + rotation * Vec3::new(0.0, 0.0, radius * 2.0);
     let view = glam::camera::rh::view::look_at_mat4(eye, center, Vec3::Y);
     let half_w = radius * aspect.max(0.01);
@@ -1455,24 +1478,24 @@ mod tests {
     fn orbit_clamps_pitch_and_only_widens_horizontally() {
         let bounds = (Vec3::new(-1.0, -1.0, -1.0), Vec3::new(1.0, 1.0, 1.0));
         // 竖直方向的投影比例不受宽高比影响
-        let square = orbit_view(bounds, 0.0, 0.0, 1.0, 1.0);
-        let wide = orbit_view(bounds, 0.0, 0.0, 1.0, 2.0);
+        let square = orbit_view(bounds, 0.0, 0.0, 1.0, 1.0, Vec3::ZERO);
+        let wide = orbit_view(bounds, 0.0, 0.0, 1.0, 2.0, Vec3::ZERO);
         assert!((square.y_axis.y - wide.y_axis.y).abs() < 1e-6, "高度该一样");
         assert!(wide.x_axis.x.abs() < square.x_axis.x.abs(), "横向该放宽");
 
         // 俯仰给到超过 90° 也不能让矩阵烂掉(NaN / 全零)
-        let over = orbit_view(bounds, 0.3, 3.0, 1.0, 1.5);
+        let over = orbit_view(bounds, 0.3, 3.0, 1.0, 1.5, Vec3::ZERO);
         assert!(over.to_cols_array().iter().all(|v| v.is_finite()));
         assert_eq!(
             over,
-            orbit_view(bounds, 0.3, MAX_PITCH, 1.0, 1.5),
+            orbit_view(bounds, 0.3, MAX_PITCH, 1.0, 1.5, Vec3::ZERO),
             "该夹到上限"
         );
 
         // 不给俯仰与宽高比时,就是原来那个正方取景
         assert_eq!(
             orthographic_view(bounds, 0.7, 1.15),
-            orbit_view(bounds, 0.7, 0.0, 1.15, 1.0)
+            orbit_view(bounds, 0.7, 0.0, 1.15, 1.0, Vec3::ZERO)
         );
     }
 
@@ -1492,5 +1515,46 @@ mod tests {
             Some([0.0, 1.0, 2.0, 2.0])
         );
         assert_eq!(posed_object_bounds(&[], &matrices), None);
+    }
+
+    /// 网页预览的缩放没有动相机,而是把取景余量按比例收紧(`web.rs` 里传的是
+    /// `PADDING / zoom`)—— 投影是正交的,这么做和「拉近」等价。这条测试钉住那个比例:
+    /// 余量减半,同一个点在裁剪空间里就该走到大约两倍远。
+    #[test]
+    fn tightening_the_padding_makes_the_pet_fill_more_of_the_frame() {
+        let bounds = (Vec3::splat(-1.0), Vec3::splat(1.0));
+        let ndc_y = |padding: f32| {
+            let clip = orbit_view(bounds, 0.0, 0.0, padding, 1.0, Vec3::ZERO)
+                * Vec3::new(0.0, 1.0, 0.0).extend(1.0);
+            clip.y / clip.w
+        };
+
+        let wide = ndc_y(1.15);
+        let tight = ndc_y(1.15 / 2.0);
+        assert!(
+            (tight / wide - 2.0).abs() < 0.01,
+            "余量减半应当正好等于放大两倍,实得 {wide} → {tight}"
+        );
+    }
+
+    /// 平移要**精确跟手**:把轨道中心沿屏幕上方推「一个画面高」(正交下就是 `2 * radius`),
+    /// 原来在正中的那个点就该正好落到画面下边缘 —— NDC 里走 2.0。差一点都会表现成
+    /// 「拖得比手快 / 比手慢」,而这正是 web.rs 里 `pan` 那个换算的依据。
+    #[test]
+    fn panning_one_screen_height_moves_the_subject_exactly_one_screen() {
+        let bounds = (Vec3::splat(-1.0), Vec3::splat(1.0));
+        let padding = 1.15;
+        let radius = framing_radius(bounds, padding);
+        let ndc_y = |target: Vec3| {
+            let clip = orbit_view(bounds, 0.0, 0.0, padding, 1.0, target) * Vec3::ZERO.extend(1.0);
+            clip.y / clip.w
+        };
+
+        assert!(ndc_y(Vec3::ZERO).abs() < 1e-6, "没平移时中心就在画面正中");
+        let one_screen = ndc_y(Vec3::Y * 2.0 * radius);
+        assert!(
+            (one_screen + 2.0).abs() < 1e-5,
+            "中心上移一个画面高,画面里那个点就该反向走过整整一屏(NDC 满程 2.0),实得 {one_screen}"
+        );
     }
 }

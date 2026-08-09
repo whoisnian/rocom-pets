@@ -1,3 +1,4 @@
+import { memo } from "react";
 import { Download, Eye, Flag, TriangleAlert } from "lucide-react";
 import type { AssetStat, Pack, SpriteSheet } from "../../shared/types.ts";
 import type { PackHit } from "@/lib/search.ts";
@@ -16,7 +17,22 @@ interface Props {
   onReport: (pack: Pack) => void;
 }
 
-export function PackCard({ hit, sheet, stat, onOpen, onPreview, onDownload, onReport }: Props) {
+/**
+ * **memo 过**:换排序时两百张卡片的内容一个字都没变,变的只是顺序。不 memo 的话
+ * 每张卡都要重跑一遍(每张里有三个 Radix Tooltip,各自带 context 与 effect),
+ * 一次换序就是六百个 tooltip 重建 —— 那才是切排序时卡住的地方,排序本身不到 1ms。
+ *
+ * 代价是所有回调都必须在上游稳住引用(见 App.tsx 里的 `reportPack`)。
+ */
+export const PackCard = memo(function PackCard({
+  hit,
+  sheet,
+  stat,
+  onOpen,
+  onPreview,
+  onDownload,
+  onReport,
+}: Props) {
   const { pack, formHits } = hit;
   const pending = !pack.sha256;
   const downloads = stat?.downloads ?? 0;
@@ -34,6 +50,9 @@ export function PackCard({ hit, sheet, stat, onOpen, onPreview, onDownload, onRe
     <div
       className={cn(
         "group flex flex-col rounded-xl border bg-card shadow-xs transition-shadow hover:shadow-md",
+        // 视口外的卡片跳过样式/布局/绘制。一屏放得下六七张,其余一百九十多张不必参与
+        // 每次重排的布局计算;`contain-intrinsic-size` 给个占位高度,不然滚动条会乱跳
+        "[contain-intrinsic-size:auto_13rem] [content-visibility:auto]",
         reports > 0 && "border-[color-mix(in_oklab,var(--warning)_45%,var(--border))]",
       )}
     >
@@ -122,4 +141,4 @@ export function PackCard({ hit, sheet, stat, onOpen, onPreview, onDownload, onRe
       </div>
     </div>
   );
-}
+});

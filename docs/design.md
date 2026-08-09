@@ -2381,8 +2381,23 @@ missing_clips = ["hide"]
 
 ### Phase 7 — 打磨与分发(进行中)
 
+**切排序不再卡住(2026-08-09)** —— 换一次排序,主线程被一块 133~179ms 的 long task 独占
+(headless Chromium + 生产构建,201 张卡片实测);改完 49~74ms,零 long task。
+
+- **排序本身从来不是瓶颈**:201 个包排一次 0.3ms。真正的开销是 201 张卡片全量重渲染,
+  每张里三个 Radix Tooltip,各带 context 与 effect —— 一次换序六百个 tooltip 重建。
+  `memo` 掉 `PackCard`,换序就只动顺序,卡片一个都不重跑;代价是回调必须在上游 `useCallback` 稳住。
+- **搜索与排序拆成两个 memo**。合在一起时换排序也要重扫一遍 607 个形态名,更要命的是
+  `searchPacks` 每次都产出新的 hit 对象,下游 `memo` 一张也拦不住。
+- 换序放进 `useTransition`(下拉立刻收起,重排可打断),输入框走 `useDeferredValue`。
+- `Intl.Collator` 复用一个实例:`localeCompare` 每调一次都现建一个 collator,
+  按名称排 0.306ms → 0.149ms。省的绝对值不大,但是白捡的。
+- 卡片加 `content-visibility: auto` + `contain-intrinsic-size`,视口外的不参与布局与绘制。
+- 顺带:**无图鉴号的一律沉到末尾**,不管按哪一列排。它们的占位是「000」,按图鉴号排时
+  正好顶在第一页最前面,而那 22 个是游戏里查不到号的边角料。
+
 **下载站的浏览器预览(2026-08-09)** —— 卡片上点「预览」,在网页里直接看这只宠物:
-换形态、挑表情、点按钮做动作、拖着转视角,默认站着待机。
+换形态、挑表情、点按钮做动作、拖着转视角、右键平移、滚轮缩放,默认站着待机。
 
 - **同一份渲染代码**,不是另做一套。为此把 crate 拆成 lib + bin(`src/lib.rs`):
   跟平台无关的 11000 行(`pet`/`pack`/`stage`/`persona`/`assets`/`act`/`sprite`/`audio`)
@@ -2397,6 +2412,25 @@ missing_clips = ["hide"]
   只取当前形态那一份(中位 2.9MB,整包是 6.8MB)。前端那个最小 zip 读取器见 web/README。
 - **相机能拖**:桌宠只绕 Y 转、画布恒为正方,预览要俯仰也要宽高比,
   加了 `pet::orbit_view`(原来那个 `orthographic_view` 变成它 pitch=0/aspect=1 的调用)。
+- **缩放与平移(2026-08-09 补)**,绑定照常见的模型查看器(three.js `OrbitControls`、
+  `<model-viewer>`、Sketchfab)来:左键拖转视角,**右键 / 中键 / Shift+左键拖平移**,滚轮缩放;
+  触屏单指转、双指同时管缩放(间距)与平移(中点)。缩放 0.5×~5×,「复位」把角度、缩放、
+  平移一起还原。
+  - 投影是正交的,所以**缩放不动相机**,只把取景余量按比例收紧(`orbit_view` 收到
+    `PADDING / zoom`);**平移改的是轨道中心**,而且存**世界坐标**——存屏幕偏移的话,
+    平移完再转视角,被推到一边的宠物会跟着镜头甩。
+  - 「一个画面高」在正交下正好是 `2 * radius`,于是把指针位移折算成**画布高度的比例**后,
+    平移精确跟手,拉近了也不会突然变快。这条有测试钉着(`gpu.rs` 的
+    `panning_one_screen_height_moves_the_subject_exactly_one_screen`)。
+  - 平移夹在 1.5 个取景半径内;换形态时归零(偏移是按上一只的半径算的,新的一只可能
+    小得多,不清的话切过去第一眼人就在画面外)。缩放不清 —— 那是「想看多近」,跟哪只无关。
+  - **两处单位的坑**:① `drag` 原先拿 `config.width/height`(设备像素)去除指针位移
+    (CSS 像素),2 倍屏上转速正好只有一半;② 横向除宽、纵向除高,724×352 的画布上竖直
+    方向快一倍,斜着拖不跟手。现在两轴都按**画布 CSS 高度**折算,折算放在 `preview.ts`
+    ——只有那一层同时知道两种尺寸。
+  - 滚轮得是原生监听 + `passive: false`:React 的 `onWheel` 挂在根容器上且被动,
+    在里面 `preventDefault` 只会换来一句警告,表现是缩放的同时弹窗跟着滚。右键要拦
+    `contextmenu`,中键要拦 **`mousedown`**(拦 `pointerdown` 挡不住 Windows 的自动滚动)。
 - **只支持 WebGPU**:骨骼矩阵是只读 storage buffer,WebGL2 没有。检测不到就不加载,
   弹窗里给一句说明。想补 WebGL2 的话关节数中位 56、最大 149,塞 uniform 数组够用。
 - 两处坑记在 §1:着色器那句非均匀控制流里的 `textureSample`(Dawn 直接拒),
