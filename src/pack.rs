@@ -309,6 +309,23 @@ struct RawMaterial {
     matcap_masked_rim: Option<[f32; 4]>,
     #[serde(default)]
     matcap_masked_surface: Option<[f32; 4]>,
+    /// `M_FairyBall_BallFront` 的目标 PS 52626 分支(沙漏/水晶球的玻璃壳)。
+    #[serde(default)]
+    fairy_ball: bool,
+    #[serde(default)]
+    fairy_matcap_tex: Option<PathBuf>,
+    #[serde(default)]
+    fairy_base: Option<[f32; 4]>,
+    #[serde(default)]
+    fairy_matcap_color: Option<[f32; 4]>,
+    #[serde(default)]
+    fairy_rim_dark: Option<[f32; 4]>,
+    #[serde(default)]
+    fairy_rim_light: Option<[f32; 4]>,
+    #[serde(default)]
+    fairy_main: Option<[f32; 4]>,
+    #[serde(default)]
+    fairy_shape: Option<[f32; 4]>,
 }
 
 #[derive(Deserialize)]
@@ -469,6 +486,8 @@ pub struct Material {
     pub fake_fluid: Option<FakeFluid>,
     /// `M_P_MatCap_Masked` 的不透明 MatCap 外壳。
     pub matcap_masked: Option<MatcapMasked>,
+    /// `M_FairyBall_BallFront` 的半透明玻璃壳。
+    pub fairy_ball: Option<FairyBall>,
 }
 
 /// `M_ShuiMu_ByIn` 的材质局部链。字段顺序对应 71636 的原始参数；`noise.z` 是
@@ -542,6 +561,23 @@ pub struct MatcapMasked {
     pub rim_shape: [f32; 4],
     /// [Flat intensity, Flat ratio, MainBright, max(Xray,Common_Xray)]
     pub surface_shape: [f32; 4],
+}
+
+/// 沙漏 / 水晶球外面那层玻璃壳(`M_FairyBall_BallFront`,全库 5 个材质)。
+/// 目标 PS 52626 只采一张贴图,就是 MatCap;它不出固有色、也不吃光照。
+#[derive(Clone)]
+pub struct FairyBall {
+    pub matcap: Option<PathBuf>,
+    /// `BaseColor`:rgb 是加在 MatCap 上的底色,a 与 `Opacity` 相加是覆盖率的底。
+    pub base_color: [f32; 4],
+    /// `MatCapColor`:rgb 乘 MatCap,a 是 MatCap 亮度换算成覆盖率的增益。
+    pub matcap_color: [f32; 4],
+    pub rim_dark: [f32; 4],
+    pub rim_light: [f32; 4],
+    /// [MainColor.rgb, MainBright]
+    pub main_color: [f32; 4],
+    /// [RimArea, RimSmoothness, Opacity, 1](末位是这一族的开关)
+    pub shape: [f32; 4],
 }
 
 /// 特效层(火焰/水壳/光晕)的画法参数,全部来自游戏材质。
@@ -1083,6 +1119,17 @@ impl Pack {
                                     surface_shape: mat
                                         .matcap_masked_surface
                                         .unwrap_or([1.0, 0.0, 1.0, 0.0]),
+                                }),
+                                fairy_ball: mat.fairy_ball.then(|| FairyBall {
+                                    matcap: mat.fairy_matcap_tex.map(|rel| root.join(rel)),
+                                    base_color: mat.fairy_base.unwrap_or([1.0, 1.0, 1.0, 0.0]),
+                                    matcap_color: mat
+                                        .fairy_matcap_color
+                                        .unwrap_or([1.0, 1.0, 1.0, 0.1]),
+                                    rim_dark: mat.fairy_rim_dark.unwrap_or([1.0; 4]),
+                                    rim_light: mat.fairy_rim_light.unwrap_or([1.0; 4]),
+                                    main_color: mat.fairy_main.unwrap_or([1.0; 4]),
+                                    shape: mat.fairy_shape.unwrap_or([2.0, 0.05, 0.0, 1.0]),
                                 }),
                             },
                         )

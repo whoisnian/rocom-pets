@@ -52,6 +52,17 @@ public record MatcapMaskedMaterial(
     float[] RimShape,
     float[] SurfaceShape);
 
+/// `M_FairyBall_BallFront` 的目标 PS 52626 输入(沙漏/水晶球那层玻璃壳)。
+/// 这一族只采一张贴图,就是 `Matcap`;其余全是这几个参数。
+public record FairyBallMaterial(
+    string? Matcap,
+    float[] BaseColor,
+    float[] MatcapColor,
+    float[] RimDarkColor,
+    float[] RimLightColor,
+    float[] MainColor,
+    float[] Shape);
+
 /// 一个材质槽写进 manifest 的内容:运行时按 glb 里的材质名查这张表。
 public record MaterialEntry(
     string Name,
@@ -162,6 +173,7 @@ public record MaterialEntry(
     YutuEarMaterial? YutuEar,
     FakeFluidMaterial? FakeFluid,
     MatcapMaskedMaterial? MatcapMasked,
+    FairyBallMaterial? FairyBall,
     /// 配套 `_Ol` 描边材质算出来的描边宽度(米);0 = 不画。见 `Materials.OutlineWidthOf`。
     float OutlineWidth = 0f,
     /// 按画家序画(不写深度),见 `MaterialInfo.IsPaintOrder`。
@@ -458,6 +470,18 @@ public static class Manifest
                         parts.Add($"matcap_masked_selection = [{string.Join(", ", masked.SelectionColor.Select(Num))}]");
                         parts.Add($"matcap_masked_rim = [{string.Join(", ", masked.RimShape.Select(Num))}]");
                         parts.Add($"matcap_masked_surface = [{string.Join(", ", masked.SurfaceShape.Select(Num))}]");
+                    }
+                    if (mat.FairyBall is { } fairy)
+                    {
+                        parts.Add("fairy_ball = true");
+                        if (fairy.Matcap is not null)
+                            parts.Add($"fairy_matcap_tex = {Quote(fairy.Matcap)}");
+                        parts.Add($"fairy_base = [{string.Join(", ", fairy.BaseColor.Select(Num))}]");
+                        parts.Add($"fairy_matcap_color = [{string.Join(", ", fairy.MatcapColor.Select(Num))}]");
+                        parts.Add($"fairy_rim_dark = [{string.Join(", ", fairy.RimDarkColor.Select(Num))}]");
+                        parts.Add($"fairy_rim_light = [{string.Join(", ", fairy.RimLightColor.Select(Num))}]");
+                        parts.Add($"fairy_main = [{string.Join(", ", fairy.MainColor.Select(Num))}]");
+                        parts.Add($"fairy_shape = [{string.Join(", ", fairy.Shape.Select(Num))}]");
                     }
                     // 每个键只许出现一次:重复键 TOML 直接解析失败(opacity/flow 都踩过)
                     parts.Add($"opacity = {Num(mat.Opacity)}");

@@ -79,6 +79,7 @@ struct MaterialParams {
     // `M_P_Object_Trans`:[场景深度距离(米),开启强度,走目标 Low 局部链,SoftEdge]
     depth_fade: vec4<f32>,
     // [MI_P_Object_XiaoYou, M_Gra_Yutu_Ear_Lighting, MI_P_FakeFulid, M_P_MatCap_Masked]
+    // 第五族 `M_FairyBall_BallFront` 的开关在 `family11.w`(这一行满了,见 gpu.rs)。
     family_flags: vec4<f32>,
     xiaoyou_base1: vec4<f32>,
     xiaoyou_base2: vec4<f32>,
@@ -90,7 +91,7 @@ struct MaterialParams {
     // [FlowNoseInt1,FlowNoiseInt2,Star_RG_Int,Star_RG_TwinkleSpeed]
     xiaoyou_shape: vec4<f32>,
     xiaoyou_star_uv: vec4<f32>,
-    // YutuEar / FakeFulid / MatCapMasked 互斥复用的原始参数区。
+    // YutuEar / FakeFulid / MatCapMasked / FairyBall 互斥复用的原始参数区。
     family0: vec4<f32>,
     family1: vec4<f32>,
     family2: vec4<f32>,
@@ -1046,6 +1047,61 @@ fn shade_matcap_masked(in: VsOut) -> vec4<f32> {
     return vec4<f32>(encode_linear_color(max(surface, vec3<f32>(0.0))), 1.0);
 }
 
+/// `M_FairyBall_BallFront` 的目标 ES3.1 PS 52626 —— 沙漏 / 水晶球外面那层玻璃壳。
+/// 这一族在 cooked 包里**只有一个 resource**(没有静态开关),所以不存在挑排列的问题。
+///
+/// **它不出固有色、也不吃光照**:整条链只采一张贴图,就是 MatCap(52626 第 80 行是
+/// 全 shader 唯一的 `sample`)。颜色 = `MatCapColor.rgb × MatCap + BaseColor.rgb`,
+/// 覆盖率 = `亮度(MatCap) × MatCap.a × MatCapColor.a + (BaseColor.a + Opacity)`,
+/// 再叠一层按 `N·L` 在暗/亮两色之间取的边缘光。matcap26(等一等鸭那把)是张中间近黑、
+/// 边上一圈亮的玻璃球图 —— 所以实机看到的正是「中间透得见紫沙、轮廓一圈白」。
+///
+/// **两层在这一族恒等于零,照抄进来只是白费指令,所以不写**:
+/// - 第 89–90 行的 `lerp(色, SelectionColor.rgb, SelectionColor.a)` 是编辑器选中色,
+///   运行时 alpha = 0;
+/// - 第 28–44 行那整条 Fresnel 发光层的总强度是 `FresnelIntensity`,根默认 0 且
+///   五个实例一个都没覆盖 —— 整层乘 0。
+fn shade_fairy_ball(in: VsOut) -> vec4<f32> {
+    let n = normalize(in.normal);
+    let ndv = max(dot(n, view_direction()), 0.0);
+
+    // 第 45–56 行:`smoothstep(0.5 + 小, 0.5 + 大, pow(1 - N·V, 小))`。指数与低边取的是
+    // **同一个** scalar 槽,高边是另一个;哪个是 `RimArea`、哪个是 `RimSmoothness` 见
+    // exporter/Materials.cs 的 `FairyBallShape`(cooked 参数表那两格的名字对不上,按实机截图定)。
+    // 汇编那句 `div 1, (高 - 低)` 在两者相等时是 ±inf → saturate 出一个硬阶跃(逗逗就是
+    // 这么写的,两个都填 0.5);这里用 `max(…, 1e-4)` 得到同样的极窄过渡,同时不产生 NaN。
+    // 求幂那步汇编是 `log → mul → exp`,再拿 `movc` 把「底 ≤ 0」那一格顶成 0(不然 log(0)
+    // 是 -inf);指数**不夹**:落陨星兔那份填的就是 0,而 `pow(x, 0) = 1` 正是原式的值。
+    let rim_lo = 0.5 + material.family11.y;
+    let rim_hi = 0.5 + material.family11.x;
+    let rim_fresnel = 1.0 - ndv;
+    let rim_base = select(pow(max(rim_fresnel, 1e-6), material.family11.y),
+                          0.0, rim_fresnel <= 0.0);
+    let rim_t = saturate((rim_base - rim_lo) / max(rim_hi - rim_lo, 1e-4));
+    let rim = rim_t * rim_t * (3.0 - 2.0 * rim_t);
+
+    // 第 82–88 行:边缘光色按 `N·L` 在 RimDark/RimLight 之间取,rgb 再乘它自己的 alpha;
+    // 这一层的覆盖率是 `saturate(rim × 该 alpha)`,颜色按同一个系数混到 MatCap 层上。
+    let ndl = saturate(dot(n, normalize(camera.light_dir)));
+    let rim_color = mix(material.family2, material.family3, ndl);
+    let rim_alpha = saturate(rim * rim_color.w);
+
+    // 第 80–81 行。MatCap 是 sRGB 资源,硬件那道解码在这儿补回来;UV 与其余 MatCap 同一条
+    // (实机是 `cross(视线, 视空间法线)`,正交投影下退化成 `(Nv.x, -Nv.y)`,见 `matcap_uv`)。
+    let mc = textureSample(base_color, base_sampler, matcap_uv(n));
+    let mc_rgb = srgb_to_linear(mc.rgb);
+    var color = material.family1.rgb * mc_rgb + material.family0.rgb;
+    color = mix(color, rim * rim_color.rgb * rim_color.w, rim_alpha);
+    // 第 91、94 行:先夹到非负,再乘 `MainColor × MainBright`(五个实例都是白 × 1)。
+    color = max(color, vec3<f32>(0.0)) * material.family4.rgb * material.family4.w;
+
+    // 第 99–102 行。亮度权重就是汇编里那三个常数;末尾那次 `add_sat` 才是唯一的饱和。
+    let mc_alpha = dot(mc_rgb, vec3<f32>(0.3, 0.59, 0.11)) * mc.a * material.family1.w;
+    let floor_alpha = material.family0.w + material.family11.z;
+    let alpha = saturate(mc_alpha + floor_alpha + rim_alpha);
+    return vec4<f32>(encode_linear_color(color) * alpha, alpha);
+}
+
 fn shade_main(in: VsOut, depth_coverage: f32) -> vec4<f32> {
     if material.family_flags.x > 0.5 {
         return shade_xiaoyou(in);
@@ -1058,6 +1114,9 @@ fn shade_main(in: VsOut, depth_coverage: f32) -> vec4<f32> {
     }
     if material.family_flags.w > 0.5 {
         return shade_matcap_masked(in);
+    }
+    if material.family11.w > 0.5 {
+        return shade_fairy_ball(in);
     }
     // 表情:脸那两个槽的贴图是 2×4 的图集,网格 UV 落在左上那一格,
     // 换表情就是整格地偏一下(flags.x = 1 表示图集脸)。其余材质偏移量恒为 0 ——

@@ -1420,11 +1420,11 @@ Idle(44)/Run(34)/JumpFall(71)动了,最大的一条是灵狐二阶 —— 它的
 **改完全库只有一个材质的 `opacity` 变了**(`MI_Com_YaJiJi1Ar_004_Fx`,1 → 0),
 其余 200 个包一位不动 —— 这条改动是外科手术式的,不是把判据整片翻过来。
 
-**没做的**:实机的玻璃壳还有一层很淡的白色高光与蓝边(`MatCapColor` 是蓝的),
-我们这儿现在是**全透**。原因是 `shade_main` 里玻璃族那段对 `!alpha_is_opacity` 的材质
-直接拿 `Opacity` 覆盖 alpha,把上一行刚 `max` 进去的 rim/MatCap 冲掉了;要接上得改成
-`max(Opacity, rim, matcap)`,而那会同时改到全库 47 个 `opacity = 0` 的半透材质
-(现在它们是不可见的),得先逐个对着实机看。用户报的「实心白挡住沙子」已经没有了。
+**当时没做、后来做了的**:实机的玻璃壳还有一层很淡的白色高光与蓝边(`MatCapColor` 是蓝的),
+这一步改完是**全透**。当时判断「要接上得把通用玻璃分支的 `alpha = clamp(Opacity)` 改成
+`max(Opacity, rim, matcap)`,那会牵动全库 47 个 `opacity = 0` 的半透材质」——
+**这个前提是错的**:`M_FairyBall_BallFront` 压根不是通用玻璃族的一支,不该走那条分支。
+后来照汇编把它做成了独立的第五族,只碰 5 个材质,见下面「沙漏的玻璃壳」那节。
 
 ### 这一轮的闸门与指标(2026-08-09)
 
@@ -1550,6 +1550,68 @@ vorbis 编静音本来就几乎不花钱。**没做**,省得多一个会误伤�
 算颜色**不能拿正则抠数字**:Tailwind v4 的调色板是 `oklch()`,`getComputedStyle` 就原样回
 `oklch(0.21 0.006 286 / 0.4)`,按 `rgb()` 读出来是 0.21/255 —— 画出来近乎纯黑(踩过)。
 让 2D 画布替我们解析,什么语法都认。
+
+### 沙漏的玻璃壳:`M_FairyBall_BallFront` 按汇编做成第五个原生族(2026-08-09)
+
+接上面「沙漏是实心白的」那条留的尾巴 —— 那次只把 `Opacity` 改对(实心白 → 全透),
+实机那层**很淡的白边**还没有。当时以为要动通用玻璃分支里的 `alpha = clamp(Opacity)`,
+而那会牵动全库 47 个 `opacity = 0` 的半透材质。**这个前提是错的**:这一族根本不该走
+通用玻璃分支,它是**另一张材质图**。
+
+拿 `docs/shader.md` 那条流水线把它取下来了:`MI_Com_YaJiJi1Ar_004_Fx` 在 cooked 包里
+**只有一个 resource**(`50D3FA87…`,没有静态开关 ⇒ 不存在挑排列的问题),对应 PS **52626**,
+103 行、**只有一句 `sample`**。整条链是:
+
+```text
+rim   = smoothstep(0.5 + 小, 0.5 + 大, pow(1 - N·V, 小))       ← 45..56 行
+rimC  = lerp(RimDarkColor, RimLightColor, saturate(N·L))       ← 82..84
+rimA  = saturate(rim × rimC.a)                                 ← 86
+色    = lerp(MatCapColor.rgb × MatCap + BaseColor.rgb,
+            rim × rimC.rgb × rimC.a, rimA) × MainColor × MainBright   ← 80..94
+α     = saturate(亮度(MatCap) × MatCap.a × MatCapColor.a
+                 + (BaseColor.a + Opacity) + rimA)              ← 99..102
+```
+
+**「不出固有色、不吃光照」是这一族的全部性格**:`N·L` 只用来在边缘光的暗/亮两色之间选,
+基色贴图(那些实例绑的是 1×1 的 `TestResMaskTex01`)一次都没被采样过。
+实机那圈白边其实主要来自 **MatCap 本身**:等一等鸭用的 `matcap26` 是一张「中间近黑、
+外圈一环亮」的玻璃球图,亮度直接当覆盖率 —— 所以中间透得见紫沙、轮廓一圈白,
+而且亮块偏左上(matcap 的高光块就在左上),与实机截图逐处对得上。
+
+两层照抄进来会是白费指令,所以没写:第 89–90 行的 `lerp(色, SelectionColor)` 是编辑器
+选中色(运行时 `SelectionColor.a = 0`);第 28–44 行整条 Fresnel 发光层的总强度是
+`FresnelIntensity`,**根默认 0 且五个实例一个都没覆盖**。
+
+**两个 Rim 标量的名字与 cooked 参数表对不上,按实机截图定。** 汇编里指数与低边取的是
+**同一个** scalar 槽、高边是另一个;按 cooked `UniformScalarParameters` 的名字配
+(槽 0 = `RimSmoothness`、槽 1 = `RimArea`),五个实例全都是 `RimArea > RimSmoothness`,
+低边恒大于高边 ⇒ smoothstep 整个反过来 ⇒ `rim` 在球面上恒 ≈ 1 ⇒ 壳是一坨不透明的白 ——
+那正是用户最早报的现象,而实机截图里沙子清清楚楚。所以取另一种配对:
+**指数与低边是小的那个,高边是大的那个**。那张表的其余 7 个标量
+(`HardLineColMul` / `FresnelExponent` / `FresnelBoost` / `FresnelIntensity` /
+`FresnelBaseMin` / `FresnelSoftTohard` / `MainBright`)逐个与汇编里的位置对得上,
+所以错位只在这两格。
+
+MatCap 的 UV 不必另做:实机是 `cross(视线, 视空间法线) × .5 + .5`,我们是正交投影 ⇒
+视线恒为 (0,0,1) ⇒ 退化成 `(Nv.x, -Nv.y) × .5 + .5`,与 `matcap_uv()` 逐项相同。
+
+落地上有两处要绕开既有判据:① MatCap 走这一族自己的贴图槽(`fairy_matcap_tex`),
+**不借用通用的 `matcap_tex`** —— 后者还兼着「半透件要不要补一层不透明描边壳」的判据
+(见 gpu.rs 的 `outline_draws`),借用会给落陨星兔的水晶球凭空垫一层实心壳;
+② 这一族有两个材质**没有基色贴图**,不挡的话会被当成纯特效层走 `fs_effect`,
+所以 `model.rs` 里那串「不是专用族才建 effect」要把它也算上。
+
+族开关放在 `family11.w`:`family_flags` 那一行四格已经满了,而前四族最多用到 `family10`,
+`family11` 全库恒为 0,正好既当它的参数(`[RimArea, RimSmoothness, Opacity, 1]`)又当判据。
+
+**改完全库只有 4 个包、5 个材质的 manifest 变了**(等一等鸭、落陨星兔 ×2、逗逗、白发懒人),
+其余 197 个包一位不动。这 5 个原来是**看不见的**,现在各自是:沙漏的玻璃壳、水晶球外壳、
+奇梦咪的眼镜片、瞌睡王的鼻涕泡。
+
+**指标对这条是盲的。** `cmp_shots.py` 里等一等鸭那一行改前改后**一位不差**
+(0.99 / 0.073 / 1.19 / 0.96):它按取景盒渲,那个姿势下沙漏被身体挡住,而调色板距离本来就
+只看整只的主色。同 `MI_P_FakeFulid` 那次一样,验收靠裁图对着实机看。
+`sweep.py` 607 个形态照旧 失败 0 / 空白 0 / 过曝 3。
 
 ## 2. 技术选型
 

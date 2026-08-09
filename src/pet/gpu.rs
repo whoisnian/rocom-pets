@@ -111,6 +111,8 @@ struct MaterialUniform {
     /// `M_P_Object_Trans` 场景深度淡化:[距离(米),开启强度,-,-]
     depth_fade: [f32; 4],
     /// [XiaoYou, YutuEar, FakeFluid, MatcapMasked]；每项对应一个原生材质分支。
+    /// **第五族 FairyBall 的开关不在这儿,在 `family11.w`** —— 这一行已经满了,而前四族
+    /// 最多用到 `family10`,`family11` 全库恒为 0,正好拿来既当它的参数又当判据。
     family_flags: [f32; 4],
     xiaoyou_base1: [f32; 4],
     xiaoyou_base2: [f32; 4],
@@ -120,7 +122,7 @@ struct MaterialUniform {
     xiaoyou_noise_flow: [f32; 4],
     xiaoyou_shape: [f32; 4],
     xiaoyou_star_uv: [f32; 4],
-    /// 三套互斥的原生材质族共用参数区；解释由 family_flags.y/z/w 决定。
+    /// 四套互斥的原生材质族共用参数区；解释由 family_flags.y/z/w 与 family11.w 决定。
     family0: [f32; 4],
     family1: [f32; 4],
     family2: [f32; 4],
@@ -472,6 +474,10 @@ impl PetGpu {
                         .as_ref()
                         .and_then(|m| m.matcap.as_ref())
                 })
+                // FairyBall 的 MatCap 也走这个槽:它是那一族唯一的贴图,而通用
+                // `matcap_tex` 槽不能借用 —— `material.matcap.is_some()` 还兼着
+                // 「半透件要不要补一层描边壳」的判据(见下面 `outline_draws`)。
+                .or_else(|| material.fairy_ball.as_ref().and_then(|f| f.matcap.as_ref()))
                 .unwrap_or_else(|| match (&material.base_color, &material.effect) {
                     (Some(image), _) => image,
                     (None, Some(effect)) => effect.mask.as_ref().unwrap_or(&white),
@@ -651,6 +657,14 @@ impl PetGpu {
                 family[4] = m.selection_color;
                 family[5] = m.rim_shape;
                 family[6] = m.surface_shape;
+            } else if let Some(f) = &material.fairy_ball {
+                family[0] = f.base_color;
+                family[1] = f.matcap_color;
+                family[2] = f.rim_dark;
+                family[3] = f.rim_light;
+                family[4] = f.main_color;
+                // 形状与开关同格:`shape.w` 恒为 1,着色器据此认这一族。
+                family[11] = f.shape;
             }
             // 旧包没有 `outline_width` ⇒ 用全库模态值 0.13 × 300。这比旧包自己当年那条
             // 「包围盒对角线 × 0.004」更接近实机(魔力猫 1.79 厘米 vs 0.39 厘米)。

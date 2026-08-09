@@ -606,6 +606,13 @@ FormReport ExportForm(
                 info.MatcapMaskedSelectionColor, info.MatcapMaskedRimShape,
                 info.MatcapMaskedSurfaceShape)
             : null;
+        var fairyBall = info.IsFairyBall
+            ? new FairyBallMaterial(
+                ExportEffectTexture(info.FairyBallMatcap),
+                info.FairyBallBaseColor, info.FairyBallMatcapColor,
+                info.FairyBallRimDark, info.FairyBallRimLight,
+                info.FairyBallMainColor, info.FairyBallShape)
+            : null;
         materials.Add(new MaterialEntry(name, baseColor, info.IsFacePatch,
             info.OpacityMaskClipValue, info.BlendMode.ToString(), info.ParentChain,
             info.Tint, info.Opacity, info.Glow, info.Flow, maskFile, noiseFile, info.MaskIsMatcap,
@@ -637,7 +644,8 @@ FormReport ExportForm(
             info.XiaoYouBaseColor1, info.XiaoYouBaseColor2,
             info.XiaoYouFlowColor1, info.XiaoYouFlowColor2, info.XiaoYouStarColor,
             info.XiaoYouNoiseFlow, info.XiaoYouShape, info.XiaoYouStarUv,
-            yutuEar, fakeFluid, matcapMasked, info.OutlineWidth ?? 0f, info.IsPaintOrder));
+            yutuEar, fakeFluid, matcapMasked, fairyBall,
+            info.OutlineWidth ?? 0f, info.IsPaintOrder));
 
         if (info.StarTexture is not null && ExportEffectTexture(info.StarTexture) is { } starTex
             && (starLayer is null || (info.IsFakeTrans && !starFromFakeTrans)))

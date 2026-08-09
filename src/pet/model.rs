@@ -131,6 +131,8 @@ pub struct Material {
     pub fake_fluid: Option<FakeFluid>,
     /// `M_P_MatCap_Masked` 的不透明 MatCap 外壳。
     pub matcap_masked: Option<MatcapMasked>,
+    /// `M_FairyBall_BallFront` 的半透明玻璃壳。
+    pub fairy_ball: Option<FairyBall>,
     /// 特效层的画法(火焰/水壳/光晕)。`None` = 普通不透明材质,走主通道。
     pub effect: Option<EffectMaterial>,
 }
@@ -225,6 +227,17 @@ pub struct MatcapMasked {
     pub selection_color: [f32; 4],
     pub rim_shape: [f32; 4],
     pub surface_shape: [f32; 4],
+}
+
+pub struct FairyBall {
+    /// 目标 PS 52626 唯一的贴图(t0),sRGB 颜色资源。
+    pub matcap: Option<Image>,
+    pub base_color: [f32; 4],
+    pub matcap_color: [f32; 4],
+    pub rim_dark: [f32; 4],
+    pub rim_light: [f32; 4],
+    pub main_color: [f32; 4],
+    pub shape: [f32; 4],
 }
 
 pub struct Image {
@@ -495,7 +508,8 @@ impl Model {
                 let effect = (spec.base_color.is_none()
                     && spec.yutu_ear.is_none()
                     && spec.fake_fluid.is_none()
-                    && spec.matcap_masked.is_none())
+                    && spec.matcap_masked.is_none()
+                    && spec.fairy_ball.is_none())
                 .then(|| EffectMaterial {
                     tint: spec.effect.tint,
                     opacity: spec.effect.opacity,
@@ -639,6 +653,15 @@ impl Model {
                         selection_color: m.selection_color,
                         rim_shape: m.rim_shape,
                         surface_shape: m.surface_shape,
+                    }),
+                    fairy_ball: spec.fairy_ball.as_ref().map(|f| FairyBall {
+                        matcap: f.matcap.as_deref().and_then(|p| load_texture(p, true)),
+                        base_color: f.base_color,
+                        matcap_color: f.matcap_color,
+                        rim_dark: f.rim_dark,
+                        rim_light: f.rim_light,
+                        main_color: f.main_color,
+                        shape: f.shape,
                     }),
                     effect,
                 });

@@ -266,6 +266,76 @@ public record MaterialInfo(
         Math.Max(RootScalar("Xray", 0f), RootScalar("Common_Xray", 0f)),
     ];
 
+    /// 沙漏 / 水晶球外面那层玻璃壳(等一等鸭、落陨星兔、逗逗、白发懒人,全库 5 个材质)。
+    ///
+    /// **它不是 `M_P_Object_Trans` 的一支**:自己一张材质图、自己一套参数名
+    /// (`RimArea`/`RimSmoothness`/`MatCapColor`/`RimDarkColor`),而且**整条链上没有固有色、
+    /// 也不吃光照** —— 目标 PS 52626(整族只有一个 cooked resource,没有静态开关)只采一张
+    /// 贴图,就是 MatCap。原来它落在通用半透那条路上,`Opacity` 一项就决定了画成实心还是全透,
+    /// 两头都不对:兜 1 是一坨白(挡住沙子),取根默认 0 是整层看不见。
+    public bool IsFairyBall =>
+        ParentChain.Any(p => p.Equals("M_FairyBall_BallFront", StringComparison.OrdinalIgnoreCase));
+
+    /// MatCap 查找表。这一族**不看 `是否使用MatCap` 开关**(它压根没有静态开关),
+    /// MatCap 是它唯一的贴图,无条件要。
+    public string? FairyBallMatcap => IsFairyBall ? FirstTexture("MatCap") : null;
+
+    /// PS 52626 第 81 行 `MatCapColor.rgb × MatCap + BaseColor.rgb`;两个 alpha 也都有用:
+    /// `MatCapColor.a` 是 MatCap 亮度换算成覆盖率的增益,`BaseColor.a` 与 `Opacity` 相加是底。
+    public float[] FairyBallBaseColor =>
+        FirstVector("BaseColor")
+        ?? RootDefaults?.Vectors.GetValueOrDefault("BaseColor")
+        ?? [1f, 1f, 1f, 0f];
+
+    public float[] FairyBallMatcapColor =>
+        FirstVector("MatCapColor")
+        ?? RootDefaults?.Vectors.GetValueOrDefault("MatCapColor")
+        ?? [1f, 1f, 1f, 0.1f];
+
+    /// 边缘光的暗/亮两色,第 83–84 行按 `N·L` 在两者之间取;alpha 是这一层自己的覆盖率。
+    public float[] FairyBallRimDark =>
+        FirstVector("RimDarkColor")
+        ?? RootDefaults?.Vectors.GetValueOrDefault("RimDarkColor")
+        ?? [1f, 1f, 1f, 1f];
+
+    public float[] FairyBallRimLight =>
+        FirstVector("RimLightColor")
+        ?? RootDefaults?.Vectors.GetValueOrDefault("RimLightColor")
+        ?? [1f, 1f, 1f, 1f];
+
+    /// 第 94 行的整体色,`MainColor.rgb`(xyz)+ `MainBright`(w)。五个实例都是白 × 1。
+    public float[] FairyBallMainColor
+    {
+        get
+        {
+            var main = FirstVector("MainColor")
+                       ?? RootDefaults?.Vectors.GetValueOrDefault("MainColor")
+                       ?? [1f, 1f, 1f, 1f];
+            return [main[0], main[1], main[2], RootScalar("MainBright", 1f)];
+        }
+    }
+
+    /// 边缘光的形状 + 覆盖率的底:`[RimArea, RimSmoothness, Opacity, 1]`。
+    /// 最后一位是这一族的开关(运行时放在 `family11.w`,见 gpu.rs)。
+    ///
+    /// **两个 Rim 标量的名字与 cooked 参数表对不上,这里按实机截图定。** 汇编第 45–53 行是
+    /// `smoothstep(0.5 + P1, 0.5 + P0, pow(1 - N·V, P1))` —— 指数与低边同一个参数、高边是
+    /// 另一个。按 cooked `UniformScalarParameters` 的名字配(槽 0 = RimSmoothness、
+    /// 槽 1 = RimArea),五个实例全都是 `RimArea > RimSmoothness`,低边恒大于高边、
+    /// smoothstep 整个反过来,结果在球面上恒 ≈ 1 —— 壳会是一坨不透明的白。
+    /// 而实机截图里等一等鸭那个沙漏的紫沙清清楚楚(只有轮廓一圈白边),所以取另一种配对:
+    /// **指数与低边是小的那个(`RimSmoothness`),高边是大的那个(`RimArea`)**。
+    /// 那张表的其余 7 个标量(`HardLineColMul`/`FresnelExponent`/`FresnelBoost`/
+    /// `FresnelIntensity`/`FresnelBaseMin`/`FresnelSoftTohard`/`MainBright`)逐个与汇编里的
+    /// 位置对得上,所以错位只在这两格。
+    public float[] FairyBallShape =>
+    [
+        RootScalar("RimArea", 2f),
+        RootScalar("RimSmoothness", 0.05f),
+        Opacity,
+        1f,
+    ];
+
     public string? YutuBubbleTexture => IsYutuEar ? FirstTexture("Bubble Texture") : null;
     public string? YutuDistortTexture => IsYutuEar
         ? RootDefaults?.Textures.GetValueOrDefault("DistortTex") : null;
