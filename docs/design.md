@@ -1523,6 +1523,34 @@ vorbis 编静音本来就几乎不花钱。**没做**,省得多一个会误伤�
 (按名字只能给一个),以及不受「那边收录了哪些」的限制。
 命中率 **包 168→196 / 201、形态 369→573 / 607**。
 
+### 着色器里那句 `textureSample` 一直在非均匀控制流里(2026-08-09)
+
+给下载站做浏览器预览时,Dawn(Chromium 151)**当场判整份 shader 非法**:
+
+    error: 'textureSample' must only be called from uniform control flow
+      let band = textureSample(noise_tex, base_sampler, scrolled).rgb;
+    note: control flow depends on possibly non-uniform value
+      if id < material.mask_id.x || id > material.mask_id.y {
+    note: return value of 'textureSample' may be non-uniform
+      let id = textureSample(mask_id_tex, base_sampler, uv).a;
+
+`flow_band`(卷动色带)原来是「先采 ID 遮罩、按它决定要不要早返回,再采色带」——
+而 `textureSample` 自己算 mip 层级,要靠同一个 quad 里四个像素的导数,**只能在均匀控制流里调**。
+把两次采样都提到分支外面、拿采到的值再决定要不要用,结果一样,而且到哪儿都合法。
+
+**naga 那边只当警告放过去了**,所以桌面版一直没露馅 —— 但那儿的 mip 选择同样是未定义的,
+这不是「为了浏览器让步」,是本来就写错了。改完 `sweep.py` 一位不动。
+
+### 网页画布一定是不透明的(2026-08-09)
+
+`wgpu` 的 WebGPU 后端只报 `alpha_modes = [Opaque]`(实测 Chromium 151,尽管 WebGPU 规范里
+有 `premultiplied`)。所以预览的清屏色得自己给:前端把弹窗那块的 CSS 背景色算出来传进 wasm,
+深浅主题都对得上。
+
+算颜色**不能拿正则抠数字**:Tailwind v4 的调色板是 `oklch()`,`getComputedStyle` 就原样回
+`oklch(0.21 0.006 286 / 0.4)`,按 `rgb()` 读出来是 0.21/255 —— 画出来近乎纯黑(踩过)。
+让 2D 画布替我们解析,什么语法都认。
+
 ## 2. 技术选型
 
 **结论：Rust + wgpu + 自写平台窗口层。**
@@ -2290,6 +2318,30 @@ missing_clips = ["hide"]
 `WM_TIMER` 在鼠标忙的时候会不会被饿死(它是低优先级合成消息)。
 
 ### Phase 7 — 打磨与分发(进行中)
+
+**下载站的浏览器预览(2026-08-09)** —— 卡片上点「预览」,在网页里直接看这只宠物:
+换形态、挑表情、点按钮做动作、拖着转视角,默认站着待机。
+
+- **同一份渲染代码**,不是另做一套。为此把 crate 拆成 lib + bin(`src/lib.rs`):
+  跟平台无关的 11000 行(`pet`/`pack`/`stage`/`persona`/`assets`/`act`/`sprite`/`audio`)
+  两个目标都编,平台外壳(窗口/托盘/配置窗口/离屏)按 `cfg(not(target_arch = "wasm32"))` 排除。
+  动作清单、降级表(`stage::fallbacks`)、表情图集都直接复用 —— 网页上能点的动作
+  就是装上之后点得动的那些。
+- **原生依赖以前是无条件的**,`ksni`/`zbus`(Linux 托盘)连 Windows 版都编,而 wasm 上
+  `errno` 直接 `compile_error!`。挪进 target 段之后三个目标都干净。
+- **没有文件系统**:资产由 JS 逐个喂进 `assets::memory`,键是那条「虚拟路径」——
+  当初为了读 `.rkpet` 留的那道缝,正好让 `Pack::load`/`Model::load` 一行不改就能跑。
+- **点开才加载**:wasm 是动态 `import`(1.4MB,brotli 后 380KB),`.rkpet` 按 HTTP Range
+  只取当前形态那一份(中位 2.9MB,整包是 6.8MB)。前端那个最小 zip 读取器见 web/README。
+- **相机能拖**:桌宠只绕 Y 转、画布恒为正方,预览要俯仰也要宽高比,
+  加了 `pet::orbit_view`(原来那个 `orthographic_view` 变成它 pitch=0/aspect=1 的调用)。
+- **只支持 WebGPU**:骨骼矩阵是只读 storage buffer,WebGL2 没有。检测不到就不加载,
+  弹窗里给一句说明。想补 WebGL2 的话关节数中位 56、最大 149,塞 uniform 数组够用。
+- 两处坑记在 §1:着色器那句非均匀控制流里的 `textureSample`(Dawn 直接拒),
+  以及网页画布只能不透明。另有一处在前端:**Radix 的 Portal 在 layout effect 里才挂**,
+  用 `useRef` 拿画布的话 effect 第一次跑就是 `null`、依赖没变也不会再跑 ——
+  表现是弹窗开着、画布停在 300×150、既没进度也没报错。改用回调 ref 存进 state。
+- **预览不计下载数**:单开 `/api/preview/:id`,不 302 到 R2 自定义域(`fetch` 跨源要 CORS)。
 
 **Reload 分成两条(2026-08-08)**,起因是「切个形态要卡半天」:
 

@@ -74,6 +74,8 @@ debug 版(`cargo build` 不带 `--release`)保持控制台子系统。
   两个后端都已跑通:平台层(透明置顶、轮廓命中、穿透开关)见 [docs/spike-s1.md](docs/spike-s1.md),
   骨骼动画 + toon 着色见 [docs/spike-s2.md](docs/spike-s2.md);
   行为、多实体、音频与配置窗口见 design.md §9 的 Phase 1–8。
+  **这一层同时是个库**(`src/lib.rs`):跟平台无关的那 11000 行(渲染/动画/包格式/行为)
+  另编一份 wasm 给下载站的预览用(`src/web.rs`),平台外壳按 `cfg` 排除。
 - 导出器(`exporter/`)：C# + CUE4Parse，从自己的游戏 pak 生成宠物包;
   **一个图鉴号一个包**(`076-海盔虫.rkpet`,glb 含全部动作 + 贴图 + 叫声 + manifest.toml),
   归并规则与全量清单见 [docs/petindex.md](docs/petindex.md),结构见 [docs/spike-s3.md](docs/spike-s3.md)。
@@ -88,6 +90,9 @@ debug 版(`cargo build` 不带 `--release`)保持控制台子系统。
   全库 607 个形态里 **533 个有声音**(叫声 511、音效 529),音频合计 141MB。
 - 下载站(`web/`)：应用本体与宠物包的下载页,整站在 Cloudflare 上 ——
   Workers 出页面并接管 `/api/*`、R2 存文件、D1 记下载与异常标记次数、KV 按 IP + 日期去重防刷。
+  卡片上的「预览」点开能**在浏览器里直接看这只宠物**:同一份渲染代码编成 wasm,
+  可换形态与表情、点按钮做动作、拖着转视角。点开才加载(wasm 单独一个 chunk,
+  `.rkpet` 按 HTTP Range 只取当前形态),要 WebGPU。
   头像自己从解包数据拼(游戏自带的 `Icon/HeadIcon/<conf_id>.png`,按 id 直接对上
   manifest 里的形态,不引外部仓库的成品图),搜索认图鉴号、链首名与**包里任何一个形态名**。
   目录(`catalog.json`)由 `web/scripts/gen_catalog.py` 扫包目录生成 —— 算 sha256、
