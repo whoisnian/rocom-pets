@@ -24,7 +24,10 @@ namespace RocomPets.Export;
 
 public static class AnimProbe
 {
-    private const string PetsRoot = "NRC/Content/ArtRes/AnimSequence/Pets";
+    /// 探针默认查宠物那棵树;资产名写成 `NPC_01301` 时自动切到 NPC 那棵
+    /// (两棵树的目录结构一样,探针本身不用改)。
+    private static string RootOf(string asset) =>
+        asset.StartsWith("NPC_", StringComparison.OrdinalIgnoreCase) ? AssetRoots.Npc : AssetRoots.Pets;
 
     /// `--probe-anim ALL`:全库普查「一个逻辑动作名撞上几个资产」。
     /// 撞名的来源是 `Normalize` 剥掉的类别前缀 —— `World_Idle` 与 `Ride_Idle` 剥完都是 idle。
@@ -37,8 +40,8 @@ public static class AnimProbe
         foreach (var file in provider.Files.Values)
         {
             var path = file.Path;
-            if (!path.StartsWith(PetsRoot + "/", StringComparison.OrdinalIgnoreCase)) continue;
-            var tail = path[(PetsRoot.Length + 1)..];
+            if (!path.StartsWith(AssetRoots.Pets + "/", StringComparison.OrdinalIgnoreCase)) continue;
+            var tail = path[(AssetRoots.Pets.Length + 1)..];
             var slash = tail.IndexOf('/');
             if (slash < 0) continue;
             var asset = tail[..slash];
@@ -97,8 +100,7 @@ public static class AnimProbe
             onlyClip = asset[(colon + 1)..];
             asset = asset[..colon];
         }
-        var assetDir = $"{PetsRoot}/{asset}";
-        var meshName = Textures.TopLevelFiles(provider, assetDir)
+        var assetDir = $"{RootOf(asset)}/{asset}";        var meshName = Textures.TopLevelFiles(provider, assetDir)
             .Select(Path.GetFileNameWithoutExtension)
             .Where(n => n is not null && n.StartsWith("SKM_", StringComparison.Ordinal))
             .OrderByDescending(n => n!.EndsWith("_Skin", StringComparison.Ordinal))

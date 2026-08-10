@@ -252,7 +252,8 @@ public static class Manifest
                 if (audio.Voice.Count > 0)
                 {
                     sb.AppendLine();
-                    sb.AppendLine("  [forms.voice]   # 叫声:Wwise Pet_Vo_<拼音>.bnk 的事件 → ogg");
+                    sb.AppendLine(
+                        "  [forms.voice]   # 叫声:Wwise Pet_Vo_<拼音>.bnk(NPC 是 NPC_Vo_<名>)的事件 → ogg");
                     // 游戏里 -100~100 的 `voice` 属性喂给 Wwise 的 Pet_Vo_Pitch,由 RTPC 曲线变调;
                     // 这两端就是「粗嗓门」「婉转声」。Wwise 的 pitch 本身就是重采样(变调同时变速),
                     // 所以运行时按播放速率 2^(音分/1200) 放就是等价实现

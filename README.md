@@ -84,6 +84,13 @@ debug 版(`cargo build` 不带 `--release`)保持控制台子系统。
   归并规则与全量清单见 [docs/petindex.md](docs/petindex.md),结构见 [docs/spike-s3.md](docs/spike-s3.md)。
   `--index` 只列包名不碰 pak(和 `tools/petindex.py` 对账用);
   `--zip` 额外打一个 `.rkpet`、`--zip-only` 打完就删掉包目录,运行时两种都直接读。
+  **NPC 也能导**(`--npc 芙蕾雅,可丽希亚,乐乐` / `--npc-all` / `--npc-list`):
+  `Human/NPC/` 那棵资产树与 `Pets/` 逐项同构(同样的 `SKM_`+`SK_`+`Animation/`+`Mat/`+`Tex/`、
+  同样的 `Bip001-*` 骨骼命名),所以只把资产根参数化就接进来了;一个角色一个包
+  (目录名前缀 `npc-`)、一个模型目录一个形态,动作名按别名表翻成运行时那套
+  (`Happy1`→`Happy`、坐下三段→`Sleep*`),**运行时不区分 NPC 与宠物**。
+  全库 63 个有模型的角色;声音只有 14 个角色有(`NPC_Vo_<英文名>.bnk`,八种情绪,
+  内嵌在 bnk 里而不是散落的 wem)。细节与已知缺口见 design.md「NPC 也能出包」。
   动画按**场景类别前缀**挑(`World_` 大世界 > `Common_` > … > `Ride_` 骑乘),
   `--probe-anim <资产>` 打印某只的骨架、重定向模式、轨道映射与各段动画的异常平移、
   `--probe-anim ALL` 全库普查撞名 —— 待机取到骑乘那一版就是这么查出来的

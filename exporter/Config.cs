@@ -9,7 +9,24 @@ using Newtonsoft.Json.Linq;
 
 namespace RocomPets.Export;
 
-/// 一个形态(进化链上的一环)。
+/// 资产树里「一个角色一个目录」的那几棵根。宠物与 NPC **结构完全同构**
+/// (`SKM_*_Skin` + `SK_*_Skin` + `Animation/` + `Mat/` + `Tex/`,骨骼都叫 `Bip001-*`),
+/// 差的只是这一截前缀 —— 所以整条导出管线只需要把根参数化,不必分叉。
+public static class AssetRoots
+{
+    public const string Pets = "NRC/Content/ArtRes/AnimSequence/Pets";
+    public const string Npc = "NRC/Content/ArtRes/AnimSequence/Human/NPC";
+}
+
+/// 包是从哪棵资产树来的。只影响包目录名与「借动画」的兜底策略,
+/// 产物格式(manifest/glb/贴图)两者一模一样,运行时不区分。
+public enum PackKind
+{
+    Pet,
+    Npc,
+}
+
+/// 一个形态(进化链上的一环;NPC 则是同一个角色的一套外观)。
 public record Form(
     int Id,
     string Name,
@@ -21,7 +38,12 @@ public record Form(
     string MoveType,
     List<ClipInfo> Clips,
     /// 王者形态(资产名写作 `…Bo_001`)。排序时一律垫底 —— 它们的 `stage` 与普通三阶撞号。
-    bool Lord = false);
+    bool Lord = false,
+    /// 这个形态的资产落在哪棵树下。见 [`AssetRoots`]。
+    string Root = AssetRoots.Pets,
+    /// Wwise 库名(不含 `.bnk`)。宠物走拼音、由 `PinyinOf` 单独给;
+    /// NPC 的库名在配置数据里查不到,只能显式指定(见 Npc.cs 的 `VoiceBanks`)。
+    string? VoiceBank = null);
 
 /// 逻辑动作:名字取自 ANIM_ID_CONF,时长取自 ANIM_CONF(毫秒)。
 public record ClipInfo(string Logical, int AnimId, int Ms);
@@ -31,9 +53,9 @@ public record ClipInfo(string Logical, int AnimId, int Ms);
 ///
 /// 归并规则与全量清单见 docs/petindex.md,那份清单由 tools/petindex.py 生成 ——
 /// **这里是它的 C# 实现,两边的结果必须一致**(改了任一边都要跑 `tools/petindex.py --check`)。
-public record Chain(int Book, string Name, int RootId, List<Form> Forms);
+public record Chain(int Book, string Name, int RootId, List<Form> Forms, PackKind Kind = PackKind.Pet);
 
-public class GameConfig
+public partial class GameConfig
 {
     private readonly JObject _petBase;
     private readonly JObject _model;
@@ -49,10 +71,12 @@ public class GameConfig
     /// 宠物 id → 拼音。叫声的 SoundBank 按拼音命名(`Pet_Vo_MiaoMiao.bnk`),
     /// **每个形态各有一个**(点点 DianDian / 珀尔鼬 BoErYou),不是按物种。
     private readonly Dictionary<int, string> _pinyin = new();
+    /// 配置表目录。NPC 那张表(18293 行)只有导 NPC 时才读,留着路径按需加载。
+    private readonly string _binDir;
 
     public GameConfig(string parsedRoot)
     {
-        var binDir = Path.Combine(parsedRoot,
+        var binDir = _binDir = Path.Combine(parsedRoot,
             "NRC", "Content", "ScriptC", "Data", "Bin", "BinDataCompressed");
         if (!Directory.Exists(binDir))
             throw new DirectoryNotFoundException(

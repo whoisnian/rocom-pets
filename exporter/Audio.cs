@@ -39,6 +39,11 @@ public static class Audio
 {
     private const string WwiseDir = "NRC/Content/NewRoco/WwiseAudio/Windows/";
 
+    /// 本地化语音的子目录。宠物的叫声是「不说话的声音」,放在 `Windows/` 根下;
+    /// **NPC 的语音是配音,按语言分包**,放在这儿(全库 8920 个 Chinese、3 个 English,
+    /// 也就是说只有中文这一档是全的)。`.wem` 也在同一层。
+    private const string WwiseVoiceDir = WwiseDir + "Chinese/";
+
     /// 桌宠会播的动作 → Wwise 事件后缀。
     ///
     /// **键就是动作逻辑名**(`[forms.clips]` 那一张表的键),不另起一套触发点名字:
@@ -76,6 +81,30 @@ public static class Audio
         ("Skill3Loop", "Fight_Skill_3"),
     ];
 
+    /// NPC 那族库的情绪 → 运行时动作名。库名是 `NPC_Vo_<英文名>.bnk`,事件名写作
+    /// `NPC_Vo_<英文名>_<情绪>`,八种情绪(全库枚举 `Data/Audio/dataconfig_audio.bytes` 得到):
+    /// `Calm / Happy / Scorn / Shock / Anger / Fear / Sad / Shy`。
+    ///
+    /// 六种直接对得上;另外两种是判断:
+    /// - `Calm`(平静)→ `Relax`(放松),桌宠那档「歇着」的声音;
+    /// - `Scorn`(嘲讽/得意)→ `Show`(展示),这一族里最接近「显摆」的一条。
+    ///
+    /// `Shy`(害羞)运行时没有对应动作,**故意不接** —— 硬塞给别的情绪就是拿错声音配错表情。
+    /// `Alert`(警觉)与 `CallOut`(召唤)这边没有源,由运行时按 `stage::fallbacks` 退。
+    ///
+    /// 另外 NPC **没有「动作音效」那一层**:`Pet_Action_<拼音>` 的对应物
+    /// (`NPC_Motion.bnk`/`NPC_Mood.bnk`)是全角色共用的一份,不按角色分,挑不出「这个人的」。
+    private static readonly (string Key, string Emotion)[] NpcWanted =
+    [
+        ("Happy", "Happy"),
+        ("Shock", "Shock"),
+        ("Fear", "Fear"),
+        ("Sad", "Sad"),
+        ("Anger", "Anger"),
+        ("Relax", "Calm"),
+        ("Show", "Scorn"),
+    ];
+
     /// Game Parameter 名:游戏把 -100~100 的 `voice` 属性喂给它,由 RTPC 曲线实时变调。
     private const string PitchParam = "Pet_Vo_Pitch";
 
@@ -95,12 +124,12 @@ public static class Audio
         List<string> warnings)
     {
         if (!Available) return null;
-        var voiceBank = Load(provider, $"Pet_Vo_{pinyin}");
-        var sfxBank = Load(provider, $"Pet_Action_{pinyin}");
+        var voiceBank = Load(provider, WwiseDir, $"Pet_Vo_{pinyin}");
+        var sfxBank = Load(provider, WwiseDir, $"Pet_Action_{pinyin}");
 
-        var voice = Rip(provider, voiceBank, $"Pet_Vo_{pinyin}",
+        var voice = Rip(provider, voiceBank, WwiseDir, $"Pet_Vo_{pinyin}", Wanted,
             formDir, relativeDir, "voice", warnings);
-        var sfx = Rip(provider, sfxBank, $"Pet_Action_{pinyin}",
+        var sfx = Rip(provider, sfxBank, WwiseDir, $"Pet_Action_{pinyin}", Wanted,
             formDir, relativeDir, "sfx", warnings);
         if (voice.Count == 0 && sfx.Count == 0) return null;
 
@@ -112,14 +141,41 @@ public static class Audio
         return new AudioInfo(voice, sfx, low, high);
     }
 
-    private static Bank? Load(AbstractVfsFileProvider provider, string stem) =>
-        provider.TrySaveAsset($"{WwiseDir}{stem}.bnk", out var bytes) ? new Bank(bytes) : null;
+    /// 导一个 NPC 的叫声。`bank` 是库名(如 `Claria`,不含 `NPC_Vo_` 前缀与 `.bnk`)。
+    ///
+    /// 与宠物那条的两处不同:① 只有一层(没有动作音效那族库);
+    /// ② **不变调** —— `Pet_Vo_Pitch` 是给宠物嗓子用的 Game Parameter,
+    /// NPC 那族库里没有它,于是两端音分都是 0(运行时看到 0 就不重采样)。
+    public static AudioInfo? ExportNpc(
+        AbstractVfsFileProvider provider,
+        string bank,
+        string formDir,
+        string relativeDir,
+        List<string> warnings)
+    {
+        if (!Available) return null;
+        var stem = $"NPC_Vo_{bank}";
+        var voiceBank = Load(provider, WwiseVoiceDir, stem);
+        if (voiceBank is null)
+        {
+            warnings.Add($"音库 {stem}.bnk 不在 pak 里(库名写错?)");
+            return null;
+        }
+        var voice = Rip(provider, voiceBank, WwiseVoiceDir, stem, NpcWanted,
+            formDir, relativeDir, "voice", warnings);
+        return voice.Count == 0 ? null : new AudioInfo(voice, [], 0, 0);
+    }
+
+    private static Bank? Load(AbstractVfsFileProvider provider, string dir, string stem) =>
+        provider.TrySaveAsset($"{dir}{stem}.bnk", out var bytes) ? new Bank(bytes) : null;
 
     /// 把一族库里认得的事件全转成 ogg,写进 `<形态>/<sub>/`。
     private static List<AudioClip> Rip(
         AbstractVfsFileProvider provider,
         Bank? bank,
+        string wemDir,
         string eventPrefix,
+        (string Key, string Suffix)[] wanted,
         string formDir,
         string relativeDir,
         string sub,
@@ -130,7 +186,7 @@ public static class Audio
         var dir = Path.Combine(formDir, sub);
         // 同一段 wem 被两个事件共用是有的(全库 621 只里 1 只),转一次就够
         var done = new Dictionary<uint, AudioClip>();
-        foreach (var (key, suffix) in Wanted)
+        foreach (var (key, suffix) in wanted)
         {
             // 同一个事件通常挂 3 个随机变体,**取最小 id** 那条:导出要可复现
             var wems = bank.EventWems($"{eventPrefix}_{suffix}");
@@ -141,7 +197,13 @@ public static class Audio
                 clips.Add(same with { Key = key });
                 continue;
             }
-            if (!provider.TrySaveAsset($"{WwiseDir}{source}.wem", out var wem)) continue;
+            // 音频要么内嵌在库里(NPC 那族),要么是同目录下的独立文件(宠物那族)
+            var wem = bank.Wem(source);
+            if (wem is null)
+            {
+                if (!provider.TrySaveAsset($"{wemDir}{source}.wem", out var loose)) continue;
+                wem = loose;
+            }
 
             Directory.CreateDirectory(dir);
             var outPath = Path.Combine(dir, key + ".ogg");
@@ -293,6 +355,9 @@ public static class Audio
         private readonly byte[] _buf;
         private readonly Dictionary<uint, (byte Type, int Start, int End)> _objs = new();
         private readonly Dictionary<uint, List<uint>> _children = new();
+        /// 内嵌音频:sourceID → 在 `DATA` 段里的 (偏移, 长度)。见 [`Wem`]。
+        private readonly Dictionary<uint, (int Off, int Len)> _embedded = new();
+        private int _dataStart = -1;
 
         public Bank(byte[] buf)
         {
@@ -301,7 +366,12 @@ public static class Audio
             while (p < buf.Length - 8)
             {
                 var size = BitConverter.ToUInt32(buf, p + 4);
-                if (Encoding.ASCII.GetString(buf, p, 4) == "HIRC") ReadHirc(p + 8);
+                switch (Encoding.ASCII.GetString(buf, p, 4))
+                {
+                    case "HIRC": ReadHirc(p + 8); break;
+                    case "DIDX": ReadDidx(p + 8, (int)size); break;
+                    case "DATA": _dataStart = p + 8; break;
+                }
                 p += 8 + (int)size;
             }
             // 靠 directParentID 反建父子树。**别用「扫描对象体里的 4 字节、命中已知 id 就当
@@ -317,6 +387,25 @@ public static class Audio
                     list.Add(id);
                 }
             }
+        }
+
+        /// `DIDX`:12 字节一条 —— sourceID、在 `DATA` 里的偏移、长度。
+        private void ReadDidx(int off, int size)
+        {
+            for (var k = 0; k + 12 <= size; k += 12)
+                _embedded[BitConverter.ToUInt32(_buf, off + k)] =
+                    (BitConverter.ToInt32(_buf, off + k + 4), BitConverter.ToInt32(_buf, off + k + 8));
+        }
+
+        /// 内嵌在这个库里的音频。**NPC 那族库是这么打的**(`DIDX` + `DATA` 两段),
+        /// 而宠物那族的 wem 是散在 `WwiseAudio/Windows/` 下的独立文件(库里只有 `HIRC`)。
+        /// 不是内嵌的返回 null,由调用方去 VFS 里找同名 `.wem`。
+        public byte[]? Wem(uint sourceId)
+        {
+            if (_dataStart < 0 || !_embedded.TryGetValue(sourceId, out var span)) return null;
+            var start = _dataStart + span.Off;
+            if (start < 0 || span.Len < 0 || start + span.Len > _buf.Length) return null;
+            return _buf.AsSpan(start, span.Len).ToArray();
         }
 
         private void ReadHirc(int off)

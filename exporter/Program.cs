@@ -27,6 +27,10 @@ const string usage = """
     用法: rocom-pets-export --species <宠物id>[,<id>…] [选项]
 
       --species <ids>   要导的宠物(给链上任一成员即可,自动补全整条进化链)
+      --npc <名字>[,…]  按角色名导 NPC(如 芙蕾雅,可丽希亚,乐乐)。一个角色一个包、
+                        一个模型目录一个形态;动作按别名表翻译成运行时那套(见 Npc.cs)
+      --npc-all         导全部有模型的 NPC 角色
+      --npc-list        只列出有模型的 NPC 角色与它们的资产目录(不碰 pak)
       --paks <路径>     游戏 pak 目录或 .apk(默认 ~/Downloads/rocom/Paks)
       --parsed <路径>   rocom-capture 的解包根,用于读配置 JSON
                         (默认 $ROCOM_PARSED 或 ~/Downloads/rocom/parsed)
@@ -81,6 +85,9 @@ var parsedPath = Environment.GetEnvironmentVariable("ROCOM_PARSED")
 var outDir = Path.GetFullPath("packs");
 var aesKey = "0x34254D23E47299B3B7F6C4CFDE9BD0688703446D9D8F37B2EBDDDE5B06ED5ADF";
 var species = new List<int>();
+var npcNames = new List<string>();
+var npcAll = false;
+var npcList = false;
 var lodIndex = 0;
 var allClips = false;
 var noAudio = false;
@@ -102,6 +109,12 @@ for (var i = 0; i < args.Length; i++)
             foreach (var part in Next(ref i).Split(',', StringSplitOptions.RemoveEmptyEntries))
                 species.Add(int.Parse(part.Trim()));
             break;
+        case "--npc":
+            foreach (var part in Next(ref i).Split(',', StringSplitOptions.RemoveEmptyEntries))
+                npcNames.Add(part.Trim());
+            break;
+        case "--npc-all": npcAll = true; break;
+        case "--npc-list": npcList = true; break;
         case "--paks": paksPath = Next(ref i); break;
         case "--parsed": parsedPath = Next(ref i); break;
         case "--out": outDir = Path.GetFullPath(Next(ref i)); break;
@@ -124,10 +137,19 @@ for (var i = 0; i < args.Length; i++)
             return 1;
     }
 }
-if (species.Count == 0 && !all && probeAsset is null && probeAnimAsset is null && !indexOnly)
+if (species.Count == 0 && !all && npcNames.Count == 0 && !npcAll && !npcList
+    && probeAsset is null && probeAnimAsset is null && !indexOnly)
 {
-    Console.Error.WriteLine($"缺 --species(或 --all)\n{usage}");
+    Console.Error.WriteLine($"缺 --species(或 --all / --npc)\n{usage}");
     return 1;
+}
+
+// --npc-list:和 --index 一样只读配置表,不碰 pak。
+if (npcList)
+{
+    foreach (var (name, assets) in new GameConfig(parsedPath).NpcCatalog())
+        Console.WriteLine($"{name}\t{string.Join(" ", assets)}");
+    return 0;
 }
 
 // --index:只读配置表,把归并后的包列出来就走 —— **不碰 pak**,所以没有游戏安装也能跑。
@@ -222,41 +244,53 @@ if (probeAnimAsset is not null)
 // 「这个包是哪个版本导的」。用 pak 文件名+长度的哈希,不去读内容(那要几十秒)。
 var sourceVersion = Fingerprint(paksPath, provider.Files.Count);
 
-// 索引「哪些资产目录真的有动画」,按族名分组:
-// 实测 197/827 个形态自己没有 Animation/(变体资产,如 Win_ShiJiu1**Ar**_001、
-// 或换了属性前缀的 Gra_DiMo2_001),它们与同族的基础资产共用骨架与动画。
-var animIndex = BuildAnimIndex(provider);
-Console.WriteLine($"动画索引: {animIndex.Count} 个族,{animIndex.Sum(kv => kv.Value.Count)} 个带动画的资产");
-
 // 按图鉴号归并出全部包(见 Config.cs 的 `Chain`);--species 从里面挑。
 // **算一次就够** —— 归并要读三张表、遍历全部宠物,每个 --species 各算一遍是白费。
-var allPacks = config.Packs();
+// 只导 NPC 时整块都不用算。
+var wantsPets = all || species.Count > 0;
+var allPacks = wantsPets ? config.Packs() : [];
 var chainErrors = new List<string>();
 var targets = new List<Chain>();
 var seenChains = new HashSet<string>();
 var skipped = 0;
-IEnumerable<Chain> wanted;
+var wanted = new List<Chain>();
 if (all)
 {
-    wanted = allPacks;
+    wanted.AddRange(allPacks);
 }
 else
 {
-    var picked = new List<Chain>();
     foreach (var petId in species)
     {
         var hit = allPacks.FirstOrDefault(p => p.Forms.Any(f => f.Id == petId))
                   ?? allPacks.FirstOrDefault(p => p.Forms.Any(f => f.Asset == config.AssetOf(petId)));
         if (hit is null) chainErrors.Add($"宠物 {petId} 不在任何包里(未实装?占位行?)");
-        else picked.Add(hit);
+        else wanted.Add(hit);
     }
-    wanted = picked;
 }
+if (npcAll || npcNames.Count > 0)
+{
+    var names = npcAll ? config.NpcCatalog().Keys.ToList() : npcNames;
+    var npcPacks = config.NpcPacks(names, aliases: !npcAll);
+    foreach (var name in npcNames.Where(n => npcPacks.All(p => p.Name != n)))
+        chainErrors.Add($"NPC「{name}」在 NPC_CONF 里没有带模型的行(名字写错?)");
+    wanted.AddRange(npcPacks);
+}
+// 包目录名 = `<图鉴号>-<链首名>`;NPC 那批没有图鉴号,改用 `npc-<角色名>` 前缀
+// —— 既不会和 `000-` 那一档撞,导到同一个目录里也一眼看得出哪些是 NPC。
+// **图鉴号就是宠物那边的去重手段**:同名的两条链(海盔虫的「本来的样子」与「磨损的样子」)
+// 本来就是同一只宠物,归并阶段已经并成一个包了;而真的不同宠物碰了同名的(大耳帽兜、逗逗)
+// 图鉴号不同,自然分开。没有图鉴号的都记 000,那一档理论上还能撞;实测这份数据没撞,
+// 撞了就报出来别硬导。NPC 那边按角色名建包,天然不会重。
+var packDirName = new Func<Chain, string>(chain => chain.Kind == PackKind.Npc
+    ? $"npc-{SafeName(chain.Name)}"
+    : $"{chain.Book:D3}-{SafeName(chain.Name)}");
+
 foreach (var chain in wanted)
 {
-    if (!seenChains.Add($"{chain.Book:D3}-{chain.Name}")) continue;
+    if (!seenChains.Add(packDirName(chain))) continue;
     // 先按「已导出」过滤再计 limit:否则 --limit 永远只覆盖前 n 条链,分批续跑推不动
-    if (skipExisting && ChainAlreadyExported(outDir, chain))
+    if (skipExisting && ChainAlreadyExported(outDir, packDirName(chain)))
     {
         skipped++;
         continue;
@@ -266,6 +300,18 @@ foreach (var chain in wanted)
 }
 Console.WriteLine($"待导 {targets.Count} 条进化链,{targets.Sum(c => c.Forms.Count)} 个形态,并行度 {jobs}" +
                   (chainErrors.Count > 0 ? $"({chainErrors.Count} 条归链失败)" : ""));
+
+// 索引「哪些资产目录真的有动画」,按族名分组:
+// 实测 197/827 个宠物形态自己没有 Animation/(变体资产,如 Win_ShiJiu1**Ar**_001、
+// 或换了属性前缀的 Gra_DiMo2_001),它们与同族的基础资产共用骨架与动画。
+// NPC 那棵树同理(NPC_01402/02603/07402/09202/09802/09803 六个是空壳)。
+// **只给真的要导的那几棵根建**:每建一次要扫一遍 92 万条虚拟路径。
+var animIndexes = targets
+    .SelectMany(c => c.Forms.Select(f => f.Root))
+    .Distinct(StringComparer.Ordinal)
+    .ToDictionary(root => root, root => BuildAnimIndex(provider, root), StringComparer.Ordinal);
+foreach (var (root, index) in animIndexes)
+    Console.WriteLine($"动画索引 {root}: {index.Count} 个族,{index.Sum(kv => kv.Value.Count)} 个带动画的资产");
 
 var report = new StringBuilder();
 report.AppendLine($"# rocom-pets 导出报告  {DateTime.Now:yyyy-MM-dd HH:mm}");
@@ -281,12 +327,6 @@ var stopwatch = System.Diagnostics.Stopwatch.StartNew();
 // 并行导出:每条链一个任务。链之间没有共享可变状态(各写自己的包目录),
 // provider 的并行读在 rocom-capture 的解包脚本里已经压过(16 线程),这里同样只读。
 // 控制台与报告文本先按链攒着,跑完按原顺序合并 —— 并行下直接打印会交错到没法看。
-// 包目录名 = `<图鉴号>-<链首名>`。**图鉴号就是去重手段**:同名的两条链(海盔虫的
-// 「本来的样子」与「磨损的样子」)本来就是同一只宠物,归并阶段已经并成一个包了;
-// 而真的不同宠物碰了同名的(大耳帽兜、逗逗)图鉴号不同,自然分开 —— 于是原来那套
-// 「重名就追加链首 id」连同它的批次漂移问题一起没有了。
-// 没有图鉴号的都记 000,那一档理论上还能撞;实测这份数据没撞,撞了就报出来别硬导。
-var packDirName = new Func<Chain, string>(chain => $"{chain.Book:D3}-{SafeName(chain.Name)}");
 var clashes = allPacks.GroupBy(packDirName).Where(g => g.Count() > 1).ToList();
 foreach (var clash in clashes)
     Console.WriteLine($"[警告] 包名 {clash.Key} 被 {clash.Count()} 个包共用,它们会互相覆盖");
@@ -383,7 +423,10 @@ ChainResult ExportChain(Chain chain)
             foreach (var warning in formReport.Warnings) detail.AppendLine($"    [warn] {warning}");
 
             var got = formReport.Clips.Select(c => c.Logical).ToHashSet();
-            var wanted = (allClips ? form.Clips.Select(c => c.Logical) : defaultClips)
+            // 分母要跟 ExportForm 里实际去找的那张表对上:NPC 走别名表,不是宠物白名单
+            var wanted = (allClips ? form.Clips.Select(c => c.Logical)
+                    : form.Root == AssetRoots.Npc ? NpcClips.Aliases.Select(a => a.Runtime)
+                    : defaultClips)
                 .Distinct().ToList();
             var missing = wanted.Where(w => !got.Contains(w)).ToList();
             chainReport.AppendLine(
@@ -445,8 +488,9 @@ FormReport ExportForm(
     string[]? whitelist,
     string? pinyin)
 {
-    const string petsRoot = "NRC/Content/ArtRes/AnimSequence/Pets";
-    var assetDir = $"{petsRoot}/{form.Asset}";
+    // 宠物与 NPC 的资产树结构相同,差的只是这一截前缀(见 Npc.cs 开头)
+    var root = form.Root;
+    var assetDir = $"{root}/{form.Asset}";
     var warnings = new List<string>();
 
     // 网格名多数是 SKM_<资产>_Skin,但不能硬编码:枚举目录直属的 SKM_* 更稳
@@ -488,11 +532,11 @@ FormReport ExportForm(
         // 而它按族名先撞上了小黑猫 —— 39 根骨骼对 92 根,尾巴/帽子/翅膀全没轨道(僵直),
         // 对得上的那半又把**小黑猫的骨骼长度**当平移写了进去(身体缩到三分之一)。
         // 见 design.md「黑猫巫师身体偏短、尾巴笔直」。
-        var skeletonOwner = SkeletonOwner(mesh, petsRoot);
+        var skeletonOwner = SkeletonOwner(mesh, root);
         if (skeletonOwner is not null &&
             !skeletonOwner.Equals(form.Asset, StringComparison.OrdinalIgnoreCase))
         {
-            Collect($"{petsRoot}/{skeletonOwner}/Animation");
+            Collect($"{root}/{skeletonOwner}/Animation");
             if (byNormalized.Count > 0)
                 warnings.Add($"自己没有 Animation/,借用骨架所属资产 {skeletonOwner}(同一份骨架)");
         }
@@ -500,9 +544,12 @@ FormReport ExportForm(
     if (byNormalized.Count == 0)
     {
         // 再试同 anim_conf_id 的资产(配置层面的显式共享)
-        foreach (var sibling in config.AssetsSharingAnimConf(form.AnimConfId, form.Asset))
+        var sharing = root == AssetRoots.Npc
+            ? config.NpcAssetsSharingAnimConf(form.AnimConfId, form.Asset)
+            : config.AssetsSharingAnimConf(form.AnimConfId, form.Asset);
+        foreach (var sibling in sharing)
         {
-            Collect($"{petsRoot}/{sibling}/Animation");
+            Collect($"{root}/{sibling}/Animation");
             if (byNormalized.Count > 0)
             {
                 warnings.Add($"自己没有 Animation/,借用同 anim_conf {form.AnimConfId} 的 {sibling}");
@@ -515,14 +562,14 @@ FormReport ExportForm(
         // 最后才试同族资产:优先同阶段,其次任意阶段。**这一档借到的可能是另一副骨架** ——
         // 骨骼名只对上一部分,对不上的那些保持绑定姿势(僵直)。至少平移不会再串味:
         // GlbBuilder 认出「动画的骨架不是网格的骨架」后会把平移重定基到本形态的绑定姿势上。
-        var (family, stage) = FamilyOf(form.Asset);
-        if (animIndex.TryGetValue(family, out var candidates))
+        var (family, stage) = FamilyOf(form.Asset, root);
+        if (animIndexes[root].TryGetValue(family, out var candidates))
         {
             foreach (var (sibling, siblingStage) in candidates
                          .Where(c => !c.Asset.Equals(form.Asset, StringComparison.OrdinalIgnoreCase))
                          .OrderByDescending(c => c.Stage == stage))
             {
-                Collect($"{petsRoot}/{sibling}/Animation");
+                Collect($"{root}/{sibling}/Animation");
                 if (byNormalized.Count > 0)
                 {
                     warnings.Add(
@@ -533,27 +580,42 @@ FormReport ExportForm(
         }
     }
 
+    // 要找哪些动作,以及每个动作可以拿哪几个资产名去找。
+    // 宠物:逻辑名就是运行时那套,一个动作一个候选,白名单过滤;
+    // NPC:配置里的逻辑名是 `Happy1`/`Hello1`/`SitDownStart` 这种,与运行时对不上,
+    //      改走别名表(见 Npc.cs 的 `NpcClips.Aliases`)。翻译在这里做完,
+    //      写进包里的键两边一模一样,运行时不必知道有 NPC 这回事。
+    // `--all-clips`(whitelist 为 null)两边都是「配置里写了什么就找什么」,不翻译。
+    var wantedClips = whitelist is not null && root == AssetRoots.Npc
+        ? NpcClips.Aliases.Select(a => (Logical: a.Runtime, Sources: a.Sources)).ToList()
+        : form.Clips
+            .Where(c => whitelist is null || whitelist.Contains(c.Logical, StringComparer.OrdinalIgnoreCase))
+            .Select(c => (Logical: c.Logical, Sources: new[] { c.Logical }))
+            .ToList();
+
     var clips = new List<(string Logical, string Clip, UAnimSequence Sequence)>();
-    foreach (var clip in form.Clips)
+    foreach (var (logical, sources) in wantedClips)
     {
-        if (whitelist is not null && !whitelist.Contains(clip.Logical, StringComparer.OrdinalIgnoreCase))
-            continue;
-        if (!byNormalized.TryGetValue(Normalize(clip.Logical), out var chosen))
+        // 候选按优先级排,**第一个在资产里找得到的**胜出
+        var file = sources
+            .Select(s => byNormalized.TryGetValue(Normalize(s), out var hit) ? hit.Path : null)
+            .FirstOrDefault(p => p is not null);
+        if (file is null)
         {
-            warnings.Add($"动作 {clip.Logical} 在 {form.Asset}/Animation 里找不到对应资产");
+            warnings.Add($"动作 {logical} 在 {form.Asset}/Animation 里找不到对应资产" +
+                         (sources.Length > 1 ? $"(试过 {string.Join("/", sources)})" : ""));
             continue;
         }
-        var file = chosen.Path;
         try
         {
             // file 是完整虚拟路径(可能借自别的资产目录),去掉扩展名喂给加载器
             var objectPath = file[..file.LastIndexOf('.')];
-            clips.Add((clip.Logical, Path.GetFileNameWithoutExtension(file),
+            clips.Add((logical, Path.GetFileNameWithoutExtension(file),
                 fileProvider.LoadPackageObject<UAnimSequence>(objectPath)));
         }
         catch (Exception e)
         {
-            warnings.Add($"动作 {clip.Logical}({file}) 加载失败: {e.Message}");
+            warnings.Add($"动作 {logical}({file}) 加载失败: {e.Message}");
         }
     }
 
@@ -748,10 +810,19 @@ FormReport ExportForm(
         }
     }
 
-    // 音频:拿不到就是 null(39 个 bnk 查无此宠,还有形态压根没有 Pet_Vo_* 库),不算失败
-    var audio = noAudio || pinyin is null
-        ? null
-        : Audio.Export(fileProvider, pinyin, formDir, $"forms/{form.Asset}", warnings);
+    // 音频:拿不到就是 null(39 个 bnk 查无此宠,还有形态压根没有 Pet_Vo_* 库),不算失败。
+    // NPC 走另一族库(`NPC_Vo_<英文名>.bnk`,八种情绪),而且**只有十四个角色有** ——
+    // 中文名到库名的对应在解包数据里查不到,得显式给(见 Npc.cs 的 `VoiceBanks`)。
+    AudioInfo? audio = null;
+    if (!noAudio)
+    {
+        if (root == AssetRoots.Npc)
+            audio = form.VoiceBank is null
+                ? null
+                : Audio.ExportNpc(fileProvider, form.VoiceBank, formDir, $"forms/{form.Asset}", warnings);
+        else if (pinyin is not null)
+            audio = Audio.Export(fileProvider, pinyin, formDir, $"forms/{form.Asset}", warnings);
+    }
 
     var bounds = mesh.ImportedBounds;
     return new FormReport(form, written, textures, materials, glb.Length, bounds.BoxExtent.Z * 2f,
@@ -780,12 +851,12 @@ static bool MissingVertexColorIsWhite() =>
 // 规则搬去 AnimNames.cs(探针要用同一份,而顶层语句里的局部函数外面调不到)
 static string Normalize(string name) => AnimNames.Normalize(name);
 
-/// 扫一遍 VFS,找出所有「Animation/ 下有东西」的宠物资产,按族名分组。
-/// 族名 = 资产名中段去掉末尾的变体后缀(Ar)与阶段数字:
-/// `Win_ShiJiu1Ar_001` → 族 shijiu / 阶段 1;`Gra_DiMo2_001` → 族 dimo / 阶段 2。
-static Dictionary<string, List<(string Asset, int Stage)>> BuildAnimIndex(AbstractVfsFileProvider provider)
+/// 扫一遍 VFS,找出 `root` 下所有「Animation/ 里有东西」的资产,按族名分组。
+/// 族名的算法见 [`FamilyOf`],两棵树各一套。
+static Dictionary<string, List<(string Asset, int Stage)>> BuildAnimIndex(
+    AbstractVfsFileProvider provider, string root)
 {
-    const string prefix = "NRC/Content/ArtRes/AnimSequence/Pets/";
+    var prefix = root + "/";
     var assets = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
     foreach (var file in provider.Files.Values)
     {
@@ -806,7 +877,7 @@ static Dictionary<string, List<(string Asset, int Stage)>> BuildAnimIndex(Abstra
     var index = new Dictionary<string, List<(string, int)>>(StringComparer.Ordinal);
     foreach (var asset in assets)
     {
-        var (family, stage) = FamilyOf(asset);
+        var (family, stage) = FamilyOf(asset, root);
         if (family.Length == 0) continue;
         if (!index.TryGetValue(family, out var list)) index[family] = list = [];
         list.Add((asset, stage));
@@ -814,29 +885,40 @@ static Dictionary<string, List<(string Asset, int Stage)>> BuildAnimIndex(Abstra
     return index;
 }
 
-/// 网格挂的 USkeleton 落在哪个宠物资产目录下 —— 借动画时**首选**这个资产,因为
+/// 网格挂的 USkeleton 落在哪个资产目录下 —— 借动画时**首选**这个资产,因为
 /// 同一份骨架保证骨骼名与参考姿势逐根一致。读的是软引用的路径,不加载骨架资产本身。
-/// 网格自带骨架(拿不到引用)或骨架不在 Pets/ 下时返回 null。
-static string? SkeletonOwner(USkeletalMesh mesh, string petsRoot)
+/// 网格自带骨架(拿不到引用)或骨架不在 `root` 下时返回 null。
+static string? SkeletonOwner(USkeletalMesh mesh, string root)
 {
     var path = mesh.Skeleton?.ResolvedObject?.GetPathName();
-    if (path is null || !path.StartsWith(petsRoot + "/", StringComparison.OrdinalIgnoreCase)) return null;
-    var tail = path[(petsRoot.Length + 1)..];
+    if (path is null || !path.StartsWith(root + "/", StringComparison.OrdinalIgnoreCase)) return null;
+    var tail = path[(root.Length + 1)..];
     var slash = tail.IndexOf('/');
     return slash < 0 ? null : tail[..slash];
 }
 
-/// 资产名 → (族名, 阶段)。`Win_ShiJiu1Ar_001` → ("shijiu", 1)。
-static (string Family, int Stage) FamilyOf(string asset)
+/// 资产名 → (族名, 阶段)。同族之间可以互相借动画。
+///
+/// 宠物:`Win_ShiJiu1Ar_001` → ("shijiu", 1) —— 中段去掉变体后缀(Ar)与阶段数字。
+/// NPC:`NPC_07402` → ("074", 2) —— 前三位是角色、后两位是这个角色的第几套资产。
+/// 后一档实测有六个空壳(NPC_01402/02603/07402/09202/09802/09803:有 SKM 没 Animation/),
+/// 靠这条借到同角色第一套的动画。
+static (string Family, int Stage) FamilyOf(string asset, string root)
 {
+    if (root == AssetRoots.Npc)
+    {
+        var digits = asset.StartsWith("NPC_", StringComparison.OrdinalIgnoreCase) ? asset[4..] : asset;
+        if (digits.Length != 5 || !digits.All(char.IsAsciiDigit)) return ("", 0);
+        return (digits[..3], int.Parse(digits[3..]));
+    }
     var parts = asset.Split('_');
     if (parts.Length < 2) return ("", 0);
     var core = parts[1];
     // 变体后缀:Ar(骑乘/变体皮)等,去掉后才是同族
     if (core.EndsWith("Ar", StringComparison.Ordinal)) core = core[..^2];
-    var digits = new string(core.SkipWhile(c => !char.IsDigit(c)).TakeWhile(char.IsDigit).ToArray());
+    var stageDigits = new string(core.SkipWhile(c => !char.IsDigit(c)).TakeWhile(char.IsDigit).ToArray());
     var family = new string(core.TakeWhile(c => !char.IsDigit(c)).ToArray()).ToLowerInvariant();
-    return (family, int.TryParse(digits, out var stage) ? stage : 0);
+    return (family, int.TryParse(stageDigits, out var stage) ? stage : 0);
 }
 
 /// pak 目录(或 apk)的指纹:文件名 + 长度 + 挂载后的文件数。
@@ -854,16 +936,14 @@ static string Fingerprint(string paksPath, int fileCount)
     return Convert.ToHexString(hash)[..12].ToLowerInvariant();
 }
 
-/// --skip-existing 用:两种命名(裸名字 / 名字-链首id)任一存在就算导过。
-/// 去重命名依赖全量名字统计,而这个判断发生在统计之前,所以两种都查。
+/// --skip-existing 用。
 ///
 /// **目录和 `.rkpet` 都要查**:`--zip-only` 导完就没有目录了,只认目录的话
 /// 续跑会把整库重导一遍。
-static bool ChainAlreadyExported(string outDir, Chain chain)
+static bool ChainAlreadyExported(string outDir, string packDir)
 {
-    var name = $"{chain.Book:D3}-{SafeName(chain.Name)}";
-    if (File.Exists(Path.Combine(outDir, name, "manifest.toml"))) return true;
-    return File.Exists(Path.Combine(outDir, name + ".rkpet"));
+    if (File.Exists(Path.Combine(outDir, packDir, "manifest.toml"))) return true;
+    return File.Exists(Path.Combine(outDir, packDir + ".rkpet"));
 }
 
 /// 物种名直接当目录名:大多是中文,但个别名字可能带斜杠之类,做一层净化。
