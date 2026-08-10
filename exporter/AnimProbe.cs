@@ -101,7 +101,10 @@ public static class AnimProbe
         }
         var mesh = provider.LoadPackageObject<USkeletalMesh>($"{assetDir}/{meshName}");
         var skeleton = mesh.Skeleton?.Load<USkeleton>();
-        Console.WriteLine($"网格 {meshName},骨架 {skeleton?.Name ?? "(网格自带)"}");
+        // 骨架**所在的资产目录**才是「谁的动画能直接套上来」的判据(见 design.md
+        // 「黑猫巫师身体偏短」):黑猫巫师的网格挂的是 `Com_HeiMaoBo_001` 那份骨架。
+        Console.WriteLine($"网格 {meshName},骨架 {skeleton?.Name ?? "(网格自带)"}" +
+                          $" @ {mesh.Skeleton?.ResolvedObject?.GetPathName() ?? "?"}");
 
         var refSkeleton = mesh.ReferenceSkeleton;
         var names = refSkeleton.FinalRefBoneInfo.Select(b => b.Name.Text).ToArray();

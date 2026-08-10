@@ -93,12 +93,31 @@ public static class GlbBuilder
             if (!string.IsNullOrEmpty(node.Name))
                 nodes.TryAdd(node.Name, node);
 
+        // 借来的动画可能属于**另一副骨架**(见 Program.cs 的借用链)。那时动画里的平移是
+        // 源骨架的骨骼长度,照抄过来等于把本形态按源骨架的比例重新拼一遍。
+        var meshSkeleton = mesh.Skeleton?.ResolvedObject?.GetPathName();
+
         var written = new List<ClipResult>();
+        var foreignWarned = false;
         foreach (var (logical, clipName, sequence) in clips)
         {
             try
             {
-                var result = AddAnimation(model, nodes, logical, clipName, sequence, warnings);
+                var foreign = meshSkeleton is not null &&
+                              sequence.Skeleton?.ResolvedObject?.GetPathName() is { } animSkeleton &&
+                              !animSkeleton.Equals(meshSkeleton, StringComparison.OrdinalIgnoreCase);
+                // 名字对不上的骨骼**全程停在绑定姿势**(黑猫巫师的尾巴/帽子就是这么僵直的)。
+                // 这是借用的固有代价,报告里记一行数字,免得日后又要重新量一遍。
+                if (foreign && !foreignWarned)
+                {
+                    foreignWarned = true;
+                    var animBones = sequence.Skeleton?.Load<USkeleton>()?.ReferenceSkeleton
+                        .FinalRefBoneInfo.Select(b => b.Name.Text) ?? [];
+                    var joints = model.LogicalSkins.Count > 0 ? model.LogicalSkins[0].JointsCount : nodes.Count;
+                    warnings.Add($"动画借自别的骨架:{joints} 根骨骼里 {animBones.Count(nodes.ContainsKey)} 根对得上名字," +
+                                 "其余全程保持绑定姿势(平移已重定基到本形态)");
+                }
+                var result = AddAnimation(model, nodes, logical, clipName, sequence, foreign, warnings);
                 if (result is not null) written.Add(result);
             }
             catch (Exception e)
@@ -142,12 +161,17 @@ public static class GlbBuilder
         if (fixedCount == 0) warnings.Add("没有匹配到任何骨骼节点,绑定姿势未修正(动画大概率是错的)");
     }
 
+    /// `foreignSkeleton`:这段动画属于别的骨架(借来的)。那时**平移要重定基**:
+    /// 写进 glb 的是「本形态的绑定姿势 + 动画相对源参考姿势的位移」,而不是动画里的绝对值。
+    /// 这正是 UE 的 `AnimationRelative` 重定向,骨架相同时它逐位等价于照抄(差值恒为 0),
+    /// 所以只在借用时打开、不动其余 600 多个形态。
     private static ClipResult? AddAnimation(
         ModelRoot model,
         Dictionary<string, Node> nodes,
         string logical,
         string clipName,
         UAnimSequence sequence,
+        bool foreignSkeleton,
         List<string> warnings)
     {
         if (sequence.AdditiveAnimType != EAdditiveAnimationType.AAT_None)
@@ -181,6 +205,11 @@ public static class GlbBuilder
 
             var track = seq.Tracks[bone];
             var refPose = refSkeleton.FinalRefBonePose[bone];
+            // 借来的动画:平移改成「本形态绑定姿势 + 相对源参考姿势的位移」。恒定的平移轨道
+            // (绝大多数骨骼)于是正好落回绑定姿势、整条通道被丢掉,身体比例保持本形态的。
+            var rebase = foreignSkeleton
+                ? node.LocalTransform.GetDecomposed().Translation - SwapYz(refPose.Translation)
+                : Vector3.Zero;
             var rotations = new Dictionary<float, Quaternion>();
             var translations = new Dictionary<float, Vector3>();
             var scales = new Dictionary<float, Vector3>();
@@ -195,7 +224,7 @@ public static class GlbBuilder
 
                 var time = frame / fps;
                 rotations[time] = SwapYz(rotation);
-                translations[time] = SwapYz(position);
+                translations[time] = SwapYz(position) + rebase;
                 scales[time] = new Vector3(scale.X, scale.Z, scale.Y);
                 if (MathF.Abs(scale.X - 1f) > 1e-4f || MathF.Abs(scale.Y - 1f) > 1e-4f ||
                     MathF.Abs(scale.Z - 1f) > 1e-4f)

@@ -482,7 +482,24 @@ FormReport ExportForm(
     Collect(animDir);
     if (byNormalized.Count == 0)
     {
-        // 先试同 anim_conf_id 的资产(配置层面的显式共享)
+        // **最先试「这份骨架属于哪个资产」** —— 网格挂的 USkeleton 就在某个宠物资产目录下,
+        // 而同一份骨架意味着骨骼名与参考姿势逐根一致,那边的动画能原样套上、一根不漏。
+        // 黑猫巫师(`Com_HeiMao2_001`)的网格挂的是 `Com_HeiMaoBo_001` 的骨架,
+        // 而它按族名先撞上了小黑猫 —— 39 根骨骼对 92 根,尾巴/帽子/翅膀全没轨道(僵直),
+        // 对得上的那半又把**小黑猫的骨骼长度**当平移写了进去(身体缩到三分之一)。
+        // 见 design.md「黑猫巫师身体偏短、尾巴笔直」。
+        var skeletonOwner = SkeletonOwner(mesh, petsRoot);
+        if (skeletonOwner is not null &&
+            !skeletonOwner.Equals(form.Asset, StringComparison.OrdinalIgnoreCase))
+        {
+            Collect($"{petsRoot}/{skeletonOwner}/Animation");
+            if (byNormalized.Count > 0)
+                warnings.Add($"自己没有 Animation/,借用骨架所属资产 {skeletonOwner}(同一份骨架)");
+        }
+    }
+    if (byNormalized.Count == 0)
+    {
+        // 再试同 anim_conf_id 的资产(配置层面的显式共享)
         foreach (var sibling in config.AssetsSharingAnimConf(form.AnimConfId, form.Asset))
         {
             Collect($"{petsRoot}/{sibling}/Animation");
@@ -495,8 +512,9 @@ FormReport ExportForm(
     }
     if (byNormalized.Count == 0)
     {
-        // 再试同族资产:优先同阶段,其次任意阶段。骨架不匹配时 GlbBuilder 会按骨骼名对不上
-        // 直接跳过那段动画,所以借错了只会少动作,不会渲出鬼东西
+        // 最后才试同族资产:优先同阶段,其次任意阶段。**这一档借到的可能是另一副骨架** ——
+        // 骨骼名只对上一部分,对不上的那些保持绑定姿势(僵直)。至少平移不会再串味:
+        // GlbBuilder 认出「动画的骨架不是网格的骨架」后会把平移重定基到本形态的绑定姿势上。
         var (family, stage) = FamilyOf(form.Asset);
         if (animIndex.TryGetValue(family, out var candidates))
         {
@@ -794,6 +812,18 @@ static Dictionary<string, List<(string Asset, int Stage)>> BuildAnimIndex(Abstra
         list.Add((asset, stage));
     }
     return index;
+}
+
+/// 网格挂的 USkeleton 落在哪个宠物资产目录下 —— 借动画时**首选**这个资产,因为
+/// 同一份骨架保证骨骼名与参考姿势逐根一致。读的是软引用的路径,不加载骨架资产本身。
+/// 网格自带骨架(拿不到引用)或骨架不在 Pets/ 下时返回 null。
+static string? SkeletonOwner(USkeletalMesh mesh, string petsRoot)
+{
+    var path = mesh.Skeleton?.ResolvedObject?.GetPathName();
+    if (path is null || !path.StartsWith(petsRoot + "/", StringComparison.OrdinalIgnoreCase)) return null;
+    var tail = path[(petsRoot.Length + 1)..];
+    var slash = tail.IndexOf('/');
+    return slash < 0 ? null : tail[..slash];
 }
 
 /// 资产名 → (族名, 阶段)。`Win_ShiJiu1Ar_001` → ("shijiu", 1)。
