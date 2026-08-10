@@ -61,6 +61,17 @@ export interface Catalog {
   packs: Pack[];
 }
 
+/** GET /api/config 的响应。 */
+export interface SiteConfig {
+  /** 前端 Turnstile widget 的 sitekey;null 则不显示人机校验 */
+  turnstileSitekey: string | null;
+  /**
+   * R2 自定义域,如 https://files.example.com。预览据此直连取包;
+   * null 表示没配,回落到 Worker 代理的 /api/preview。
+   */
+  publicBase: string | null;
+}
+
 export interface AssetStat {
   downloads: number;
   reports: number;

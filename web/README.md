@@ -49,7 +49,7 @@ IPv4 就能反查回 IP,「原始 IP 不落盘」的保证也就没了。生产�
 ```
 
 `worker/index.ts` 里 `new URL(target.key, PUBLIC_BASE)` 的 base 必须是绝对 URL,只写域名会抛
-`Invalid URL`。这个错还不显眼:`/api/config` 的 `direct` 照样回 `true`,页面看着一切正常,
+`Invalid URL`。这个错还不显眼:`/api/config` 照样把 `publicBase` 回给前端,页面看着一切正常,
 得真点一次下载才发现。
 
 这一步不能省:
@@ -57,10 +57,82 @@ IPv4 就能反查回 IP,「原始 IP 不落盘」的保证也就没了。生产�
 - 官方明说 `*.r2.dev` **不用于生产** —— 有可变速率限制,超了返 429,带宽也会被限流;
 - 走自定义域才进你自己的 zone,才有边缘缓存、WAF 与速率限制规则可用;
 - 配上之后 `/api/dl/:id` 只回一个 302,**字节不经过 Worker**:Range、断点续传、
-  CDN 缓存全部由 R2 原生处理,Worker 的每日请求配额也不会被下载量吃掉。
+  CDN 缓存全部由 R2 原生处理,Worker 的每日请求配额也不会被下载量吃掉;
+- 预览也直连它取包(见下条),不然一次预览就是好几次 Worker 请求。
 
 没配 `PUBLIC_BASE` 时 Worker 会自己从 R2 读字节回给客户端(Range 与条件请求都实现了),
 本地开发够用,生产不要这么跑。
+
+**给桶配 CORS**(R2 → 桶 → Settings → CORS Policy)。预览是浏览器直接对自定义域发
+Range 请求的,没这一步就全被拦下:
+
+```json
+[
+  {
+    "AllowedOrigins": ["https://你的站点域"],
+    "AllowedMethods": ["GET", "HEAD"],
+    "AllowedHeaders": ["range", "if-none-match", "if-modified-since"],
+    "ExposeHeaders": ["content-range", "content-length", "accept-ranges", "etag"],
+    "MaxAgeSeconds": 86400
+  }
+]
+```
+
+两个坑:
+
+- **`ExposeHeaders` 里的 `content-range` 不能少**。`content-length` 本身是 CORS 安全响应头、
+  默认就能读,但 `content-range` 不是 —— 而 `rkpet.ts` 正是从它的分母上读对象总长的。
+  漏了它的表现是预览一开就报「这个地址不支持 Range 请求」,很难往 CORS 上想。
+- **`Range` 不在 CORS 安全请求头名单里**,所以要写进 `AllowedHeaders`,否则预检 403。
+  预检按 (来源, URL, 方法, 头) 缓存,同一个包的几次分片是同一个 URL,一次会话只付一次。
+
+改完要等一会儿才传播开 —— 刚加完立刻 curl 可能还是旧行为,别急着改回去。
+
+**给自定义域开边缘缓存。** 不开的话每次下载与预览都回源到桶所在区域(本仓库是 ENAM),
+开了之后就近 PoP 出字节 —— 实测从 ENAM 换到 HKG,RTT 408ms → 90ms,一次预览取包
+951ms → 430ms。这是所有优化里最大的一笔,但**两条规则的顺序不能反**。
+
+先加 **Transform Rule**(Rules → Transform Rules → Modify Response Header),
+匹配 `http.host eq "你的-r2-域名"`,三个动作:
+
+| 操作 | 头 | 值 |
+|---|---|---|
+| Set static | `access-control-allow-origin` | `*` |
+| Set static | `access-control-expose-headers` | `content-range, content-length, accept-ranges, etag` |
+| Remove | `vary` | — |
+
+**这一步是开缓存的前提,不是可选项。** 下载走 302 过去是顶级导航、**不带 `Origin`**,
+响应里就没有 ACAO;预览走 `fetch` 才有。开了缓存之后先来的那个请求决定边缘存的是哪一版,
+而下载远比预览频繁 —— 一次下载就能把无 ACAO 的版本灌进去,之后所有预览的跨源读取全被
+浏览器拦下。响应头改写是在**响应离开 Cloudflare 时**执行的、缓存命中也走一遍,所以把 ACAO
+钉死在出口,存的是哪一版就不重要了。删 `vary` 是因为 Cloudflare 只按 `Vary: Accept-Encoding`
+分版本,留着很可能让缓存规则根本不生效(症状:加了规则 `cf-cache-status` 还是 `DYNAMIC`)。
+
+再加 **Cache Rules**(Caching → Cache Rules),**分两条** —— 两类对象的可变性不一样:
+
+| | 匹配 | Edge TTL | Browser TTL |
+|---|---|---|---|
+| app 构建 | `starts_with(http.request.uri.path, "/app/")` | 1 year | 1 year |
+| 宠物包 | `starts_with(http.request.uri.path, "/packs/")` | 1 month | **1 day** |
+
+都要把 Cache eligibility 设成 **Eligible for cache**;匹配式再与上 `http.host eq "你的-r2-域名"`。
+
+`app/` 路径带版本号,内容永不改,随便缓存。**包不是不可变的** —— 重导之后 key 还是
+`packs/001-迪莫.rkpet`、内容变了,所以 Browser TTL 给 1 天而不是 1 年:边缘那份能手动清,
+浏览器里那份清不掉,给短一点最迟一天就自己好(在那之前用户会遇到 sha256 对不上)。
+重传包之后清边缘:
+
+```sh
+curl -X POST "https://api.cloudflare.com/client/v4/zones/<zone id>/purge_cache" \
+  -H "Authorization: Bearer <API Token>" -H "Content-Type: application/json" \
+  --data '{"files":["https://files.你的域/packs/001-%E8%BF%AA%E8%8E%AB.rkpet"]}'
+```
+
+中文要 percent-encode,和 R2 key 的编码一致,否则清了个寂寞。
+
+桶本来就是公开的(下载的 302 就往那儿跳),ACAO 钉成 `*` 之后任何来源都能读它 ——
+这和之前写死域名的区别只在防盗链,而那点防护本来也拦不住 curl。桶上那份 CORS 策略
+**继续留着**:预检(`OPTIONS`)是 R2 自己回的,不经缓存。
 
 ### 配 rclone
 
@@ -142,6 +214,26 @@ PY
 
 # 自定义域真能出字节。要的是 200 + accept-ranges —— 有这两样,302 直连那条路才成立
 curl -sI https://files.你的域/packs/001-迪莫.rkpet | head -5
+
+# CORS 配对了没有。要看到 access-control-allow-origin,以及 expose-headers 里有 content-range;
+# 少了后者预览会报「这个地址不支持 Range 请求」
+curl -sI -H 'Origin: https://你的站点域' -H 'Range: bytes=0-0' \
+  https://files.你的域/packs/001-迪莫.rkpet | grep -i 'access-control\|content-range'
+
+# 预检也得过(Range 不是 CORS 安全请求头)。要 204,不是 403
+curl -s -o /dev/null -w '%{http_code}\n' -X OPTIONS \
+  -H 'Origin: https://你的站点域' -H 'Access-Control-Request-Method: GET' \
+  -H 'Access-Control-Request-Headers: range' \
+  https://files.你的域/packs/001-迪莫.rkpet
+
+# 边缘缓存生效了没有:连打两次,第一次 MISS 第二次该 HIT
+U=https://files.你的域/packs/001-迪莫.rkpet
+for i in 1 2; do curl -s -o /dev/null -D- "$U" | grep -i 'cf-cache-status\|^age'; done
+
+# 最要紧的一条:先用**不带 Origin** 的请求把缓存灌满,再带 Origin 读 —— 必须仍有 ACAO。
+# 这条过了,才说明 Transform Rule 真的挡住了那个「下载把无 ACAO 的版本灌进缓存」的坑
+curl -s -o /dev/null "$U" && curl -s -o /dev/null -D- -H 'Origin: https://你的站点域' "$U" \
+  | grep -i 'cf-cache-status\|access-control-allow-origin'
 ```
 
 `gen_catalog.py` 还有个**演示模式**,给没有那 1.6GB 包的机器用 —— 从
@@ -259,16 +351,41 @@ D1 的自增走 `INSERT … ON CONFLICT DO UPDATE SET downloads = downloads + 1`
 
 **点开才付钱**:wasm 是动态 `import` 的,单独一个 chunk(1.4MB,brotli 后约 380KB);
 `.rkpet` 也是点开才按 HTTP Range 取,而且**只取当前那个形态**(`forms/<资产>/` 前缀,
-中位 2.9MB)—— 不是整包(中位 6.8MB)。首屏与只想下载的人一个字节都不多付。
+中位 2.9MB)—— 不是整包(中位 7.0MB)。首屏与只想下载的人一个字节都不多付。
 
-- `src/lib/rkpet.ts` —— zip over HTTP Range:尾部找 EOCD → 中央目录 → 按条目取字节 →
-  `DecompressionStream('deflate-raw')` 解。**不用现成 zip 库**:它们都要先拿到整个文件。
+- `src/lib/rkpet.ts` —— zip over HTTP Range:**一次后缀 Range**(`bytes=-66000`)同时拿到
+  尾部与总长 → 找 EOCD → 中央目录 → 把要的条目按「在包里首尾相接」分组、**一段一次 Range**
+  取回来 → `DecompressionStream('deflate-raw')` 解。**不用现成 zip 库**:它们都要先拿到整个文件。
 - `src/lib/preview.ts` —— 会话:装 wasm、喂资产、rAF 循环、跟随画布尺寸与主题色。
 - `src/components/PreviewDialog.tsx` —— 弹窗:形态/表情下拉 + 动作按钮 + 相机操作。
   相机绑定照 `OrbitControls` 那套:左键拖转视角,右键 / 中键 / Shift+左键拖平移,
   滚轮缩放(0.5×~5×);触屏单指转、双指同时缩放与平移。「复位」把角度、缩放、平移一起还原。
-- 取包走 `/api/preview/:id`,和 `/api/dl/:id` 分开:**预览不计下载数**,也不 302 到
-  R2 自定义域(`fetch` 跨源要 CORS,自己代理反而简单)。
+- 配了 `PUBLIC_BASE` 就**直连 R2 自定义域**取包(要桶上的 CORS,见〈建桶〉),没配才回落到
+  `/api/preview/:id` 由 Worker 代理。两条路都和 `/api/dl/:id` 分开 —— **预览不计下载数**。
+
+**为什么是「按连续段取」而不是「每个文件一次」**:实测(`scripts/bench_preview.mjs`)在
+高延迟链路上请求数才是墙上时间的大头 —— 短 Range 请求全程待在 TCP 慢启动里,一个卡住整批
+都得等。导出器写包时一个形态的 glb 一段、`tex/` 一段,所以渲染要用的文件天然落成 **2 段**
+(12 个包 / 35 个形态实测,最大也是 2),段内零空隙,于是 5 次请求变 2 次、**一个字节都不多下**
+(只多 8KB 左右的头部余量)。哪天导出器换了排布,分段会自然退化成更多段,不会出错。
+
+一次预览因此是 **1(开包)+ 2(一个形态)= 3 次请求**;之前是 2 + 每文件 2 次、还是串行的。
+实测 4803ms → 951ms(RTT 408ms 的链路)。
+
+**开包和装 wasm 是并发发出去的**(`PreviewSession.open`)—— 两件事互不依赖,而读中央目录
+那一次往返正好躲进 wasm(gzip 后 536KB)的下载时间里,首次预览等于白拿一个 RTT。
+下面那个脚本量不到这一段,它只跑取包那半边。
+
+改动前后的对照可以用脚本自己跑:
+
+```sh
+node scripts/bench_preview.mjs --pack 291-厉毒小萝 --runs 5
+```
+
+`A` 就是改动前的取法,`B3` 是现在的。链路抖的时候只看「最快」那列 —— 中位和最慢会被
+单次卡顿带飞。顺带一提 `B2`(每个文件一次、并发)在健康链路上比 `B3` 快那么 5~15%,
+但请求数翻倍;两者差距远小于它们相对 `A` 的差距,选哪个都行,`groupRuns` 改成
+「每个条目自成一段」就是 `B2`。
 
 出 wasm 要 `rustup target add wasm32-unknown-unknown` 与 `cargo install wasm-bindgen-cli`
 (版本对齐 `Cargo.lock` 里的 `wasm-bindgen`;版本不对时它会直接告诉你该装哪个)。

@@ -78,7 +78,7 @@ export function PreviewDialog({ pack, onOpenChange }: Props) {
     (async () => {
       try {
         const { session, forms, faces } = await PreviewSession.open(
-          previewUrl(pack.id),
+          await previewUrl(pack),
           canvas,
           setProgress,
         );

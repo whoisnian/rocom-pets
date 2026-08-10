@@ -3,7 +3,7 @@
  *
  * **wasm 是动态 import 的**,所以那 1.4MB(brotli 后约 380KB)只有真点开预览的人
  * 才会下 —— 首屏一个字节都不多。同样地,`.rkpet` 也是点开才按 Range 取,
- * 而且只取要看的那一个形态。
+ * 而且只取要看的那一个形态(2.9MB 上下,而不是整包的 7MB)。
  */
 
 import { RemoteZip, type ZipEntry } from "@/lib/rkpet.ts";
@@ -92,6 +92,14 @@ export class PreviewSession {
   ): Promise<{ session: PreviewSession; forms: FormEntry[]; faces: string[] }> {
     const session = new PreviewSession();
     const { signal } = session.abort;
+
+    // **先把开包发出去,再去装渲染器** —— 两件事互不依赖,而读中央目录那一次往返
+    // (实测约一个 RTT)正好躲进 wasm 的下载时间里,首次预览等于白拿。
+    // 先挂个空 catch:在下面 await 到它之前失败的话,不接住就是一条 unhandledrejection;
+    // 接住之后 await 该抛还是抛。
+    const opening = RemoteZip.open(url, signal);
+    opening.catch(() => {});
+
     onProgress({ done: 0, total: 1, label: "读取渲染器" });
     const wasm = await loadWasm();
     const pv = new wasm.Preview();
@@ -103,7 +111,7 @@ export class PreviewSession {
     session.watchTheme(canvas);
 
     onProgress({ done: 0, total: 1, label: "读取包目录" });
-    const zip = await RemoteZip.open(url, signal);
+    const zip = await opening;
     session.zip = zip;
 
     const manifest = zip.entries.get("manifest.toml");
@@ -119,16 +127,14 @@ export class PreviewSession {
     if (!pv || !zip) throw new Error("预览已经关了");
     if (!this.loaded.has(asset)) {
       // 一个形态的东西全在 `forms/<资产>/` 下面 —— glb、贴图、叫声都不越界,
-      // 所以按前缀取就够,不必先解 manifest 才知道要哪些文件
+      // 所以按前缀取就够,不必先解 manifest 才知道要哪些文件。
+      // 怎么取交给 `readAll`:它按在包里的相邻关系合并成几段、并发下,再切给我们。
       const entries = zip.under(`forms/${asset}/`).filter(keepForRender);
-      const total = RemoteZip.bytesOf(entries);
-      let done = 0;
-      onProgress({ done, total, label: "下载模型与贴图" });
-      for (const entry of entries) {
-        pv.put(entry.name, await zip.read(entry, this.abort.signal));
-        done += entry.compressedSize;
-        onProgress({ done, total, label: "下载模型与贴图" });
-      }
+      await zip.readAll(entries, {
+        signal: this.abort.signal,
+        onData: (name, data) => pv.put(name, data),
+        onProgress: (done, total) => onProgress({ done, total, label: "下载模型与贴图" }),
+      });
       this.loaded.add(asset);
     }
     const clips = pv.load_form(asset).map((c) => ({ name: c.name, label: c.label }));
