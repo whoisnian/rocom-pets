@@ -95,7 +95,9 @@ public static class AnimProbe
             onlyClip = asset[(colon + 1)..];
             asset = asset[..colon];
         }
-        var assetDir = $"{AssetRoots.RootOf(asset)}/{asset}";        var meshName = Textures.TopLevelFiles(provider, assetDir)            .Select(Path.GetFileNameWithoutExtension)
+        var assetDir = $"{AssetRoots.RootOf(asset)}/{asset}";
+        var meshName = Textures.TopLevelFiles(provider, assetDir)
+            .Select(Path.GetFileNameWithoutExtension)
             .Where(n => n is not null && n.StartsWith("SKM_", StringComparison.Ordinal))
             .OrderByDescending(n => n!.EndsWith("_Skin", StringComparison.Ordinal))
             .FirstOrDefault();
