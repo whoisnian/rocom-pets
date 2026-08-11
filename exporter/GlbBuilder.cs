@@ -54,7 +54,8 @@ public static class GlbBuilder
     public static (byte[] Glb, List<ClipResult> Written, List<string> Warnings) Build(
         USkeletalMesh mesh,
         IReadOnlyList<(string Logical, string Clip, UAnimSequence Sequence)> clips,
-        int lodIndex)
+        int lodIndex,
+        bool pullBackParkedBones = false)
     {
         var warnings = new List<string>();
         // **不走 `SkeletalMeshExporter`**。上游 2026-08 那次重构(`Delete duplicated classes`)
@@ -102,6 +103,11 @@ public static class GlbBuilder
         // 挂了 0 个顶点的定位骨(`locator_ball_1`、乐乐的 `Bone_Yu_01`)写歪了也看不见,
         // 而腿上写歪了就是一条腿飞出去(见 `ConstantTranslationOffenders`)。
         var skinned = SkinnedJointNames(model);
+        // 「停得太远」的判据(米):见 `ParkedThreshold`。用绑定姿势包围盒的高度,
+        // 与动画无关,所以每个形态是个定值。0 = 这一档不开(宠物那边不开,原因见下)。
+        var parked = pullBackParkedBones ? ParkedThreshold(mesh) : 0f;
+        // 被「停得太远」判据拉回绑定姿势的骨骼 → 原来偏了多远(米)。
+        var parkedBones = new Dictionary<string, float>(StringComparer.Ordinal);
         // 骨骼名 → 它在这个形态的所有动作里被「恒定挪出绑定姿势」的最大距离(米)。
         // 全形态汇总成一条警告(见 Build 末尾),不是一段动作报一条 —— 这毛病要么整只都有、
         // 要么一根都没有,按段报只会把报告刷满。
@@ -134,7 +140,7 @@ public static class GlbBuilder
                                  "其余全程保持绑定姿势(平移已重定基到本形态)");
                 }
                 var result = AddAnimation(
-                    model, nodes, logical, clipName, sequence, foreign, skinned,
+                    model, nodes, logical, clipName, sequence, foreign, skinned, parked, parkedBones,
                     suspects, shifted, trackMaps, borrowed, warnings);
                 if (result is not null) written.Add(result);
             }
@@ -145,6 +151,14 @@ public static class GlbBuilder
         }
 
 
+        if (parkedBones.Count > 0)
+        {
+            var worstParked = parkedBones.OrderByDescending(kv => kv.Value).ToList();
+            warnings.Add(
+                $"{parkedBones.Count} 根骨骼整段停在离绑定姿势 {parked * 100f:F0}cm 以外,已拉回绑定姿势:" +
+                string.Join("、", worstParked.Take(5).Select(kv => $"{kv.Key}({kv.Value * 100f:F0}cm)")) +
+                (worstParked.Count > 5 ? "…" : ""));
+        }
         if (borrowed.Count > 0)
         {
             var kinds = trackMaps.Keys.OrderBy(x => x);
@@ -228,6 +242,8 @@ public static class GlbBuilder
         UAnimSequence sequence,
         bool foreignSkeleton,
         IReadOnlySet<string> skinned,
+        float parked,
+        Dictionary<string, float> parkedBones,
         Dictionary<string, float> suspects,
         List<(string Logical, TrackShift Shift)> shifted,
         IReadOnlyDictionary<int, int[]> trackMaps,
@@ -372,6 +388,14 @@ public static class GlbBuilder
             {
                 WriteRotation(animation, node, rotations);
                 var drift = ConstantTranslationDrift(node, translations, skinned);
+                if (parked > 0f && drift > parked)
+                {
+                    // **停得太远,退回绑定姿势。** 见 `ParkedThreshold`。
+                    var bind = node.LocalTransform.GetDecomposed().Translation;
+                    foreach (var time in translations.Keys.ToList()) translations[time] = bind;
+                    parkedBones[boneName] = MathF.Max(parkedBones.GetValueOrDefault(boneName), drift);
+                    drift = 0f;
+                }
                 WriteTranslation(animation, node, translations);
                 if (drift > 0f) suspects[boneName] = MathF.Max(suspects.GetValueOrDefault(boneName), drift);
             }
@@ -565,6 +589,18 @@ public static class GlbBuilder
     ///
     /// 门槛 10cm:比它小的在桌面上那点像素里看不出来。**根骨骼那一档不排除** ——
     /// 排除它要靠猜下标,而恒定压低根骨骼(坐下)本来就是合法的,报出来让人看一眼就好。
+    /// 「停得太远」的门槛(米):**四分之一身高**,再兜一个 30cm 的下限。判据要挡住两类东西:
+    /// 美术把用不到的道具挪出画面藏起来(远行商人的武器在 10.5 米外),以及上游解码把别的骨骼
+    /// 的平移填了进来。按身高而不是绝对值 —— 同样偏 40cm,对 1.8 米的人是半条腿,
+    /// 对 40cm 的小个子是三个身子。
+    ///
+    /// **只对 NPC 开(`pullBackParkedBones`)。** 宠物那边量过:已发布的 201 个包 / 617 个形态里
+    /// 34 个形态、304 条通道会被这条碰到,而抽查下来它们是**对的** —— 伏地兽那条伸出去 57cm 的
+    /// 舌头正是这只宠物的样子,鸭吉吉挂在身上的炸弹、阿瓦鲨嘴边的小鱼也一样。宠物个头小,
+    /// 「四分之一身高」在那边太紧。
+    private static float ParkedThreshold(USkeletalMesh mesh) =>
+        MathF.Max(0.30f, mesh.ImportedBounds.BoxExtent.Z * 2f * CmToM * 0.25f);
+
     private const float SuspectOffsetM = 0.10f;
 
     private static float ConstantTranslationDrift(

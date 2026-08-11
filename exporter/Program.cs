@@ -661,7 +661,9 @@ FormReport ExportForm(
         }
     }
 
-    var (glb, written, buildWarnings) = GlbBuilder.Build(mesh, clips, lod);
+    // 「停得太远的骨骼拉回绑定姿势」只对 NPC 开,原因见 `GlbBuilder.ParkedThreshold`。
+    var (glb, written, buildWarnings) =
+        GlbBuilder.Build(mesh, clips, lod, pullBackParkedBones: root == AssetRoots.Npc);
     warnings.AddRange(buildWarnings);
 
     var formDir = Path.Combine(packDir, "forms", form.Asset);

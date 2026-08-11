@@ -136,7 +136,16 @@ public record MaterialInfo(
     /// 玻璃壳画成了实心:等一等鸭手里那个沙漏成了一坨白,把里面的紫沙整个挡住(实机是透的)。
     /// 同一个根材质的落陨星兔在实例上显式写了 `Opacity = 0`,渲出来是对的 —— 一个根材质
     /// 两种结果,差别只在「实例写没写」,这正是该问根默认的信号。
-    public float Opacity => RootScalar("Opacity", 1f);
+    /// **`M_Character_Base_TG` 例外:覆盖度写在 `Alpha` 上。** 那是 NPC 的「幽灵版」材质
+    /// (艾什莉 `NPC_02602`,材质名带 `_Gho`),实例**同时**写着 `Opacity = 0` 与 `Alpha = 0.8`,
+    /// 另有一整套 Fresnel 参数(`FresInt`/`FresExp`/`FresColorUp`/`FresColorDown`)撑那层鬼火边缘。
+    /// 按 `Opacity` 画出来整个人只剩一对眼睛 —— 全库 70 个形态扫下来唯一的「空白」。
+    /// 一个带完整基色 + 遮罩贴图的材质不可能真是 0 覆盖,那个 0 是这一族没用上的输入。
+    public float Opacity => IsCharacterGhost ? RootScalar("Alpha", 1f) : RootScalar("Opacity", 1f);
+
+    /// NPC 的「幽灵版」材质族。见 [`Opacity`]。
+    public bool IsCharacterGhost =>
+        ParentChain.Any(p => p.Equals("M_Character_Base_TG", StringComparison.OrdinalIgnoreCase));
 
     /// **基色贴图的 alpha 是不透明度还是纹路遮罩,由这个静态开关决定。**
     ///

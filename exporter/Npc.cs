@@ -127,10 +127,19 @@ public static class NpcClips
         ["FightMagicBloodUp"] = "强化", ["FightMagicBlack"] = "黑魔法", ["FightLeave"] = "退场",
     };
 
-    /// 不收进包的动作:表情/口型是**脸上的叠加曲线**,不是身体动作
-    /// (`Face_Expression_PoseAsset` 根本不是 `UAnimSequence`,加载就报错)。
+    /// 不收进「其余全收」那一批的动作。**别名表不受这里影响** ——
+    /// `CallOut` 的源就是 `Fight_CallOut`,那是运行时要用的,照旧翻过来。
+    ///
+    /// - `Face_*`:表情/口型是**脸上的叠加曲线**,不是身体动作
+    ///   (`Face_Expression_PoseAsset` 根本不是 `UAnimSequence`,加载就报错);
+    /// - `Fight_*`:战斗入场演出(出场/亮相/下令/战败/应对)。桌宠用不上,而且**它们正是
+    ///   上游 ACL 解码最容易坏的那一批** —— 罗兰的 `Fight_Command` 整条腿的平移是别的骨骼的,
+    ///   渲出来身体折叠炸开;而同一个角色的 `World_*` 一段都没坏。全量导出 70 个形态里
+    ///   11 个的身体骨报警,坏的全在这一族。**少一段动作,好过多一段炸开的。**
+    ///   真要看战斗演出就 `--all-clips`(那一档按 `ANIM_CONF` 的原始逻辑名导,不走这张表)。
     public static bool Skip(string fileName) =>
-        fileName.StartsWith("Face_", StringComparison.OrdinalIgnoreCase);
+        fileName.StartsWith("Face_", StringComparison.OrdinalIgnoreCase)
+        || fileName.StartsWith("Fight_", StringComparison.OrdinalIgnoreCase);
 
     /// 这段动作在配置窗口里叫什么。查不到就用动作名本身。
     public static string LabelOf(string logical) => Labels.GetValueOrDefault(logical, logical);
