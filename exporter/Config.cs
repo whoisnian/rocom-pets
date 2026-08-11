@@ -16,6 +16,11 @@ public static class AssetRoots
 {
     public const string Pets = "NRC/Content/ArtRes/AnimSequence/Pets";
     public const string Npc = "NRC/Content/ArtRes/AnimSequence/Human/NPC";
+
+    /// 资产名落在哪棵树下。NPC 的资产名一律是 `NPC_<五位码>`,宠物的是 `<元素>_<物种拼音>…`,
+    /// 两者不会撞 —— 探针拿到一个名字就能自己判断该去哪棵树找。
+    public static string RootOf(string asset) =>
+        asset.StartsWith("NPC_", StringComparison.OrdinalIgnoreCase) ? Npc : Pets;
 }
 
 /// 包是从哪棵资产树来的。只影响包目录名与「借动画」的兜底策略,

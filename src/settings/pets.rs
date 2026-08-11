@@ -273,13 +273,15 @@ impl SettingsApp {
     ///
     /// 点一下走 `Control::Play`:配置窗口是**另一个进程**,只能喊一声让桌宠去播。
     fn actions_row(&mut self, ui: &mut egui::Ui, slot: usize, form: &crate::pack::Form) {
-        let clips = crate::stage::RUNTIME_CLIPS;
+        // **不是固定的 RUNTIME_CLIPS**:NPC 包自带一大批固定表之外的动作(说话、抱臂、
+        // 行礼、战斗入场演出…),那张表按形态现算,顺序与桌宠那侧一致(见 `form_actions`)。
+        let clips = crate::stage::form_actions(form);
         let have = clips
             .iter()
             .filter(|(name, _)| crate::stage::has_clip(form, name))
             .count();
         let running = crate::control::is_running();
-        let mut play: Option<(usize, &'static str)> = None;
+        let mut play: Option<(usize, String)> = None;
         label(ui, "动作:");
         ui.vertical(|ui| {
             ui.horizontal(|ui| {
@@ -294,14 +296,14 @@ impl SettingsApp {
                     for (index, (name, label)) in clips.iter().enumerate() {
                         let ok = crate::stage::has_clip(form, name);
                         let button =
-                            egui::Button::new(*label).min_size(egui::vec2(74.0, theme::CONTROL_H));
+                            egui::Button::new(label.as_str()).min_size(egui::vec2(74.0, theme::CONTROL_H));
                         let response = ui.add_enabled(ok && running, button);
                         if !ok {
                             response.on_disabled_hover_text("这个形态没有这段动作");
                         } else if !running {
                             response.on_disabled_hover_text("桌宠没在跑");
                         } else if response.clicked() {
-                            play = Some((index, label));
+                            play = Some((index, label.clone()));
                         }
                         if index % 6 == 5 {
                             ui.end_row();

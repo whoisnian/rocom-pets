@@ -44,24 +44,96 @@ public static class NpcClips
     /// **`JumpFall` 与 `Skill*Loop` 没有对应,故意不给。** NPC 的 `Fight_*` 是入场演出
     /// (`Start`/`Start_Show`/`Command`),不是能按住重播的循环段,硬接上去就是每隔几秒
     /// 瞬移一次 —— 与宠物那边「只要 Loop 不要 Start/End」的理由是同一条。
-    public static readonly (string Runtime, string[] Sources)[] Aliases =
+    public static readonly (string Runtime, string[] Sources, string Label)[] Aliases =
     [
-        ("Idle", ["Idle"]),
-        ("Walk", ["Walk"]),
-        ("Run", ["Run"]),
-        ("Happy", ["Happy1", "Happy2"]),
-        ("Anger", ["Anger1", "Anger2"]),
-        ("Sad", ["Sad1", "Sad2"]),
-        ("Fear", ["Fear1", "Fear0"]),
-        ("Shock", ["Shock1", "Shock0"]),
-        ("Show", ["Hello1", "Greet1"]),
-        ("Relax", ["IdleRelax1", "IdleRelax", "CrossarmsLoop", "Crossarms"]),
-        ("Alert", ["Think", "WatchOut"]),
-        ("CallOut", ["CallOut"]),
-        ("SleepStart", ["SitDownStart", "SitDown2Start"]),
-        ("SleepLoop", ["SitDownLoop", "SitDown2Loop"]),
-        ("SleepEnd", ["SitDownEnd", "SitDown2End"]),
+        ("Idle", ["Idle"], "待机"),
+        ("Walk", ["Walk"], "行走"),
+        ("Run", ["Run"], "奔跑"),
+        ("Happy", ["Happy1", "Happy2"], "开心"),
+        ("Anger", ["Anger1", "Anger2"], "生气"),
+        ("Sad", ["Sad1", "Sad2"], "难过"),
+        ("Fear", ["Fear1", "Fear0"], "害怕"),
+        ("Shock", ["Shock1", "Shock0"], "受惊"),
+        ("Show", ["Hello1", "Greet1"], "展示"),
+        ("Relax", ["IdleRelax1", "IdleRelax", "CrossarmsLoop", "Crossarms"], "放松"),
+        ("Alert", ["Think", "WatchOut"], "警觉"),
+        ("CallOut", ["CallOut"], "召唤"),
+        ("SleepStart", ["SitDownStart", "SitDown2Start"], "入睡"),
+        ("SleepLoop", ["SitDownLoop", "SitDown2Loop"], "睡着"),
+        ("SleepEnd", ["SitDownEnd", "SitDown2End"], "醒来"),
     ];
+
+    /// 动作名 → 中文标签,给配置窗口那张动作表用。
+    ///
+    /// **上面那张别名表管的是「运行时靠它活着」的十五段;这张管的是别的全部。**
+    /// NPC 的动作比宠物丰富得多(全库 190 个名字,单个角色最多 86 段):对话有五段常规
+    /// 加七种带情绪的、姿态是「起手/循环/收手」三段一组(抱臂/叉腰/抚胸/托腮/伸手)、
+    /// 还有行礼、干杯、挣扎、晕倒、战斗入场演出。这些宠物一个都没有,所以**不必和宠物那套对齐** ——
+    /// 导出器把资产目录里**除了已经被别名表用掉的之外的每一段**都收进包,名字就用
+    /// `AnimNames.LogicalOf` 从文件名算出来的那个,标签查这张表(查不到就用名字本身)。
+    ///
+    /// 表里没列全也不影响导出,只是配置窗口里显示成英文名。
+    public static readonly Dictionary<string, string> Labels = new(StringComparer.OrdinalIgnoreCase)
+    {
+        // 情绪的第二版(第一版被别名表拿去当 Happy/Anger/Sad 了)
+        ["Happy1"] = "开心一", ["Happy2"] = "开心二",
+        ["Anger1"] = "生气一", ["Anger2"] = "生气二",
+        ["Sad1"] = "难过一", ["Sad2"] = "难过二",
+        ["Fear0"] = "害怕·轻", ["Fear1"] = "害怕",
+        ["Shock0"] = "吃惊·轻", ["Shock1"] = "吃惊",
+        ["Hello1"] = "打招呼", ["Greet1"] = "问好",
+        ["Think"] = "思索", ["Provoke"] = "挑衅", ["WatchOut"] = "警戒",
+        ["Faint"] = "晕倒", ["Die"] = "倒下",
+        ["IdleRelax"] = "歇着", ["IdleRelax1"] = "歇着",
+        // 对话:五段常规 + 七种带情绪的
+        ["Dialogue1"] = "说话一", ["Dialogue2"] = "说话二", ["Dialogue3"] = "说话三",
+        ["Dialogue4"] = "说话四", ["Dialogue5"] = "说话五",
+        ["DialogueAnger1"] = "说话·生气", ["DialogueFear1"] = "说话·害怕",
+        ["DialogueHappy1"] = "说话·开心", ["DialogueSad1"] = "说话·难过",
+        ["DialogueShock1"] = "说话·吃惊", ["DialogueThink1"] = "说话·思索",
+        ["DialogueHandOnHead1"] = "说话·挠头",
+        // 姿态:起手 / 循环 / 收手 三段一组
+        ["Crossarms"] = "抱臂", ["CrossarmsStart"] = "抱臂·起", ["CrossarmsLoop"] = "抱臂·持",
+        ["CrossarmsEnd"] = "抱臂·收",
+        ["CrossarmsGesture"] = "抱臂手势", ["CrossarmsGestureStart"] = "抱臂手势·起",
+        ["CrossarmsGestureLoop"] = "抱臂手势·持", ["CrossarmsGestureEnd"] = "抱臂手势·收",
+        ["CrossarmsGesture2"] = "抱臂手势二", ["CrossarmsGesture2End"] = "抱臂手势二·收",
+        ["HandSonhips"] = "叉腰", ["HandSonhipsStart"] = "叉腰·起",
+        ["HandSonhipsLoop"] = "叉腰·持", ["HandSonhipsEnd"] = "叉腰·收",
+        ["HandSonhipsGestureEnd"] = "叉腰手势·收",
+        ["HandOnchest"] = "抚胸", ["HandOnchestStart"] = "抚胸·起",
+        ["HandOnchestLoop"] = "抚胸·持", ["HandOnchestEnd"] = "抚胸·收",
+        ["HandOnchest2End"] = "抚胸二·收",
+        ["HandOnchin"] = "托腮", ["HandOnchinStart"] = "托腮·起",
+        ["HandOnchinLoop"] = "托腮·持", ["HandOnchinEnd"] = "托腮·收",
+        ["HandOnchin2End"] = "托腮二·收",
+        ["HandReach"] = "伸手", ["HandReachStart"] = "伸手·起",
+        ["HandReachLoop"] = "伸手·持", ["HandReachEnd"] = "伸手·收",
+        // 坐下(别名表把它接成了 Sleep*,这里是第二套)
+        ["SitDownStart"] = "坐下·起", ["SitDownLoop"] = "坐着", ["SitDownEnd"] = "起身",
+        ["SitDown2Start"] = "坐下二·起", ["SitDown2Loop"] = "坐着二", ["SitDown2End"] = "起身二",
+        // 零散的世界动作
+        ["XingLi"] = "行礼", ["XingLiStart"] = "行礼·起", ["XingLiLoop"] = "行礼·持",
+        ["XingLiEnd"] = "行礼·收",
+        ["GanBei"] = "干杯", ["ZhengZha"] = "挣扎", ["MagicBoss"] = "施法",
+        ["ItemGive"] = "递东西", ["Command"] = "下令",
+        ["RolePlayAnger"] = "扮演·生气", ["RolePlayThreaten"] = "扮演·威吓",
+        // 战斗演出(前缀留着,见 AnimNames.LogicalOf)
+        ["FightStart"] = "出场", ["FightStart2"] = "出场二",
+        ["FightStart31"] = "出场三·前", ["FightStart32"] = "出场三·后",
+        ["FightStartShow"] = "登场亮相", ["FightCommand"] = "下令",
+        ["FightLose"] = "战败", ["FightCallOut"] = "召唤", ["FightCallBack"] = "收回",
+        ["FightCallBackLose"] = "收回·败", ["FightYingDui"] = "应对",
+        ["FightMagicBloodUp"] = "强化", ["FightMagicBlack"] = "黑魔法", ["FightLeave"] = "退场",
+    };
+
+    /// 不收进包的动作:表情/口型是**脸上的叠加曲线**,不是身体动作
+    /// (`Face_Expression_PoseAsset` 根本不是 `UAnimSequence`,加载就报错)。
+    public static bool Skip(string fileName) =>
+        fileName.StartsWith("Face_", StringComparison.OrdinalIgnoreCase);
+
+    /// 这段动作在配置窗口里叫什么。查不到就用动作名本身。
+    public static string LabelOf(string logical) => Labels.GetValueOrDefault(logical, logical);
 
     /// 角色名 → Wwise 库名(`NPC_Vo_<库名>.bnk`)。
     ///

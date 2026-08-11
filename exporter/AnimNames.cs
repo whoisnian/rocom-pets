@@ -30,6 +30,22 @@ public static class AnimNames
         return string.Concat(parts).ToLowerInvariant();
     }
 
+    /// 资产文件名 → **写进包里的动作名**(保留大小写,给人看)。
+    /// `World_Crossarms_Gesture_2_End` → `CrossarmsGesture2End`;
+    /// `Fight_Start_Show` → `FightStartShow`。
+    ///
+    /// **只剥 `World_`**:大世界是「这个角色平时的样子」,那一档才是默认类别,剥掉最自然。
+    /// 其余类别(`Fight_`/`Ride_`…)留着前缀 —— 一来 `Fight_Start`/`Fight_Lose` 剥完就成了
+    /// 光秃秃的 `Start`/`Lose`,看不出是什么;二来剥完会和大世界的名字撞
+    /// (`Fight_CallOut` 与 `World_CallOut`)。
+    public static string LogicalOf(string fileName)
+    {
+        var parts = fileName.Split('_', StringSplitOptions.RemoveEmptyEntries).ToList();
+        if (parts.Count > 1 && parts[0].Equals("World", StringComparison.OrdinalIgnoreCase))
+            parts.RemoveAt(0);
+        return string.Concat(parts);
+    }
+
     /// 撞名时谁赢:数字小的赢。没有已知前缀的(`TakeOut`)与不认识的前缀(`Suits70_…`、
     /// `Bond305055_…`)垫底 —— 那些是联动/皮肤演出,更不该顶掉正经的大世界动作。
     ///

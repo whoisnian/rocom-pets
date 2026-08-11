@@ -24,11 +24,6 @@ namespace RocomPets.Export;
 
 public static class AnimProbe
 {
-    /// 探针默认查宠物那棵树;资产名写成 `NPC_01301` 时自动切到 NPC 那棵
-    /// (两棵树的目录结构一样,探针本身不用改)。
-    private static string RootOf(string asset) =>
-        asset.StartsWith("NPC_", StringComparison.OrdinalIgnoreCase) ? AssetRoots.Npc : AssetRoots.Pets;
-
     /// `--probe-anim ALL`:全库普查「一个逻辑动作名撞上几个资产」。
     /// 撞名的来源是 `Normalize` 剥掉的类别前缀 —— `World_Idle` 与 `Ride_Idle` 剥完都是 idle。
     public static void Survey(AbstractVfsFileProvider provider)
@@ -100,8 +95,7 @@ public static class AnimProbe
             onlyClip = asset[(colon + 1)..];
             asset = asset[..colon];
         }
-        var assetDir = $"{RootOf(asset)}/{asset}";        var meshName = Textures.TopLevelFiles(provider, assetDir)
-            .Select(Path.GetFileNameWithoutExtension)
+        var assetDir = $"{AssetRoots.RootOf(asset)}/{asset}";        var meshName = Textures.TopLevelFiles(provider, assetDir)            .Select(Path.GetFileNameWithoutExtension)
             .Where(n => n is not null && n.StartsWith("SKM_", StringComparison.Ordinal))
             .OrderByDescending(n => n!.EndsWith("_Skin", StringComparison.Ordinal))
             .FirstOrDefault();

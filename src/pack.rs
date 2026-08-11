@@ -335,6 +335,10 @@ struct RawClip {
     /// 走跑类动作:动画自带的位移换算出的速度(cm/s);0 表示原地循环。
     #[serde(default)]
     speed_cm_s: f32,
+    /// 中文标签。NPC 包才有:它那批动作名(`Dialogue1`/`CrossarmsLoop`)运行时不认识,
+    /// 中文名只能由导出器写进包里。宠物包没有这一项,名字直接查 `RUNTIME_CLIPS`。
+    #[serde(default)]
+    label: Option<String>,
 }
 
 fn one() -> f32 {
@@ -365,6 +369,8 @@ fn default_object_trans_soft_edge() -> f32 {
 pub struct Clip {
     pub seconds: f32,
     pub speed_cm_s: f32,
+    /// 见 [`RawClip::label`]。
+    pub label: Option<String>,
 }
 
 /// 一个材质槽该怎么画。由导出器解析游戏材质实例得出,取代原来按贴图命名约定的猜法。
@@ -959,6 +965,7 @@ impl Pack {
                             Clip {
                                 seconds: clip.ms as f32 / 1000.0,
                                 speed_cm_s: clip.speed_cm_s,
+                                label: clip.label,
                             },
                         )
                     })

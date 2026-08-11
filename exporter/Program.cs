@@ -30,6 +30,8 @@ const string usage = """
       --npc <名字>[,…]  按角色名导 NPC(如 芙蕾雅,可丽希亚,乐乐)。一个角色一个包、
                         一个模型目录一个形态;动作按别名表翻译成运行时那套(见 Npc.cs)
       --npc-all         导全部有模型的 NPC 角色
+      --npc-clips <档>  NPC 导多少动作:full(默认,资产里有多少导多少,一个形态 26~67 段)
+                        或 core(只导运行时靠它活着的那十五段)。full 的 glb 大三到四倍
       --npc-list        只列出有模型的 NPC 角色与它们的资产目录(不碰 pak)
       --paks <路径>     游戏 pak 目录或 .apk(默认 ~/Downloads/rocom/Paks)
       --parsed <路径>   rocom-capture 的解包根,用于读配置 JSON
@@ -88,6 +90,7 @@ var species = new List<int>();
 var npcNames = new List<string>();
 var npcAll = false;
 var npcList = false;
+var npcFullClips = true;
 var lodIndex = 0;
 var allClips = false;
 var noAudio = false;
@@ -114,6 +117,15 @@ for (var i = 0; i < args.Length; i++)
                 npcNames.Add(part.Trim());
             break;
         case "--npc-all": npcAll = true; break;
+        case "--npc-clips":
+            var level = Next(ref i);
+            if (level is not ("full" or "core"))
+            {
+                Console.Error.WriteLine($"--npc-clips 只认 full/core,给的是 {level}");
+                return 1;
+            }
+            npcFullClips = level == "full";
+            break;
         case "--npc-list": npcList = true; break;
         case "--paks": paksPath = Next(ref i); break;
         case "--parsed": parsedPath = Next(ref i); break;
@@ -583,20 +595,45 @@ FormReport ExportForm(
     // 要找哪些动作,以及每个动作可以拿哪几个资产名去找。
     // 宠物:逻辑名就是运行时那套,一个动作一个候选,白名单过滤;
     // NPC:配置里的逻辑名是 `Happy1`/`Hello1`/`SitDownStart` 这种,与运行时对不上,
-    //      改走别名表(见 Npc.cs 的 `NpcClips.Aliases`)。翻译在这里做完,
-    //      写进包里的键两边一模一样,运行时不必知道有 NPC 这回事。
+    //      先按别名表(`NpcClips.Aliases`)翻出运行时靠它活着的那十五段,**再把资产目录里
+    //      剩下的每一段都收进来**(名字用 `AnimNames.LogicalOf` 从文件名算,标签查
+    //      `NpcClips.Labels`)—— NPC 的动作比宠物丰富得多,没理由砍到宠物那张表的大小。
     // `--all-clips`(whitelist 为 null)两边都是「配置里写了什么就找什么」,不翻译。
-    var wantedClips = whitelist is not null && root == AssetRoots.Npc
-        ? NpcClips.Aliases.Select(a => (Logical: a.Runtime, Sources: a.Sources)).ToList()
-        : form.Clips
+    var wantedClips = new List<(string Logical, string[] Sources, string Label)>();
+    if (whitelist is not null && root == AssetRoots.Npc)
+    {
+        wantedClips.AddRange(NpcClips.Aliases);
+        // `--npc-clips full`(默认):资产目录里剩下的每一段也收进来。
+        // 别名表已经用掉的那些文件不再重复收:同一段动画在包里存两份纯属浪费
+        var taken = NpcClips.Aliases
+            .SelectMany(a => a.Sources)
+            .Select(Normalize)
+            .Where(byNormalized.ContainsKey)
+            .Select(k => byNormalized[k].Path)
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+        foreach (var (key, chosen) in byNormalized.OrderBy(kv => kv.Key, StringComparer.Ordinal))
+        {
+            if (!npcFullClips) break;
+            if (taken.Contains(chosen.Path)) continue;
+            var fileName = Path.GetFileNameWithoutExtension(chosen.Path);
+            if (NpcClips.Skip(fileName)) continue;
+            var logical = AnimNames.LogicalOf(fileName);
+            wantedClips.Add((logical, [key], NpcClips.LabelOf(logical)));
+        }
+    }
+    else
+    {
+        wantedClips.AddRange(form.Clips
             .Where(c => whitelist is null || whitelist.Contains(c.Logical, StringComparer.OrdinalIgnoreCase))
-            .Select(c => (Logical: c.Logical, Sources: new[] { c.Logical }))
-            .ToList();
+            .Select(c => (c.Logical, new[] { c.Logical }, c.Logical)));
+    }
 
     var clips = new List<(string Logical, string Clip, UAnimSequence Sequence)>();
-    foreach (var (logical, sources) in wantedClips)
+    var labels = new Dictionary<string, string>(StringComparer.Ordinal);
+    foreach (var (logical, sources, label) in wantedClips)
     {
-        // 候选按优先级排,**第一个在资产里找得到的**胜出
+        // 候选按优先级排,**第一个在资产里找得到的**胜出。上面「剩下的每一段」那批传的是
+        // 已经归一化过的键,`Normalize` 幂等,再过一遍不会变。
         var file = sources
             .Select(s => byNormalized.TryGetValue(Normalize(s), out var hit) ? hit.Path : null)
             .FirstOrDefault(p => p is not null);
@@ -606,6 +643,7 @@ FormReport ExportForm(
                          (sources.Length > 1 ? $"(试过 {string.Join("/", sources)})" : ""));
             continue;
         }
+        if (label != logical) labels[logical] = label;
         try
         {
             // file 是完整虚拟路径(可能借自别的资产目录),去掉扩展名喂给加载器
@@ -615,7 +653,11 @@ FormReport ExportForm(
         }
         catch (Exception e)
         {
-            warnings.Add($"动作 {logical}({file}) 加载失败: {e.Message}");
+            // 常见的一种:`World_HandOnchest` 这类**不带后缀的基名**其实是 Montage 而不是
+            // AnimSequence(起手/循环/收手那三段才是),加载必然失败。跳过就好,
+            // 消息里只留文件名 —— 完整虚拟路径把报告刷得没法看。
+            warnings.Add($"动作 {logical}({Path.GetFileNameWithoutExtension(file)}) 读不出来," +
+                         $"跳过: {e.Message.Split('\n')[0][..Math.Min(80, e.Message.Split('\n')[0].Length)]}");
         }
     }
 
@@ -826,7 +868,7 @@ FormReport ExportForm(
 
     var bounds = mesh.ImportedBounds;
     return new FormReport(form, written, textures, materials, glb.Length, bounds.BoxExtent.Z * 2f,
-        warnings, audio);
+        warnings, audio, labels);
 }
 
 /// 上游的 `FPackedNormal(FVector)` 是否能把向量原样存取回来。

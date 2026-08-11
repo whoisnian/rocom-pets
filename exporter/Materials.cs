@@ -88,7 +88,16 @@ public record MaterialInfo(
         // 认不出来就落进「纯特效层」那条路,拿它当形状遮罩、颜色走 `Tint`(这个材质没有)
         // ⇒ 渲成一团**没有颜色的白**,正是实机反馈里的「幽火缺少颜色」。
         // 排在 `BaseTex`/`EyeTex` 之后:两者都有时仍以通用名为准。
-        ?? Textures.Keys.FirstOrDefault(k => k.Equals("Base Color", StringComparison.OrdinalIgnoreCase));
+        ?? Textures.Keys.FirstOrDefault(k => k.Equals("Base Color", StringComparison.OrdinalIgnoreCase))
+        // **`BaseColorTex` 是 NPC 那边水晶族(`M_C_NonEnvCrystal`)的固有色入口。**
+        // 芙蕾雅(`NPC_07401`)的翅膀/角/尾巴全画在这个材质上,认不出来就落进「纯特效层」,
+        // 颜色退到 `FresnelColor` —— 而那个色的 **alpha 是 0**,于是整片几乎透明,
+        // 实机反馈里的「勉强看出轮廓、透明度过高」就是这么来的。混合模式其实是
+        // `BLEND_Opaque`,本来就该实打实地画出来。
+        ?? Textures.Keys.FirstOrDefault(k => k.Equals("BaseColorTex", StringComparison.OrdinalIgnoreCase))
+        // 眼睛族(`M_C_Eyes`)的瞳孔贴图。和 `EyeTex` 一样是**带透明背景的小面片**,
+        // 见 `IsFacePatch`。
+        ?? Textures.Keys.FirstOrDefault(k => k.Equals("PupilTex", StringComparison.OrdinalIgnoreCase));
 
     /// 基色贴图的对象路径;没有就是纯特效材质。
     public string? BaseColorTexture => BaseColorParam is { } p ? Textures[p] : null;
@@ -96,7 +105,8 @@ public record MaterialInfo(
     /// 是不是贴脸的小面片(眼/嘴)。它的贴图是**带透明背景的表情图集**,alpha 是真遮罩,
     /// 渲的时候要按阈值剔;本体贴图的 alpha 是美术塞的遮罩通道,不能拿来剔(会把身体啃掉)。
     public bool IsFacePatch =>
-        BaseColorParam?.Equals("EyeTex", StringComparison.OrdinalIgnoreCase) == true;
+        BaseColorParam?.Equals("EyeTex", StringComparison.OrdinalIgnoreCase) == true
+        || BaseColorParam?.Equals("PupilTex", StringComparison.OrdinalIgnoreCase) == true;
 
     /// 特效层的主色。这些材质没有基色贴图,固有色写在颜色参数里:
     /// 火焰是 `Color01`(火花实测 (6, 0.8, 0) —— R>1 的 HDR 橙,说明是加色发光),

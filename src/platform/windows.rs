@@ -861,17 +861,25 @@ impl App {
 
     /// 配置窗口的动作表点了一下:让第 `slot` 只播那段动作。
     fn play_clip(&mut self, slot: u32, clip: u32) {
-        let Some((name, label)) = crate::stage::RUNTIME_CLIPS.get(clip as usize) else {
+        // 下标对的是**这个形态自己的**那张动作表(固定表 + 它多出来的),
+        // 不是全局的 RUNTIME_CLIPS —— NPC 包里那批动作全在固定表之外。
+        let name = self.stages.iter().find_map(|stage| {
+            stage
+                .slots
+                .get(slot as usize)
+                .and_then(|id| stage.stage.action_at(*id, clip as usize))
+        });
+        let Some(name) = name else {
             return;
         };
         let mut played = false;
         for stage in &mut self.stages {
             if let Some(id) = stage.slots.get(slot as usize) {
-                played |= stage.stage.play_clip(*id, name);
+                played |= stage.stage.play_clip(*id, &name);
             }
         }
         log::info!(
-            "手动播 {label}{}",
+            "手动播 {name}{}",
             if played { "" } else { "(这只没有这段)" }
         );
         for index in 0..self.stages.len() {

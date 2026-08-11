@@ -188,7 +188,10 @@ public record FormReport(
     float HeightCm,
     List<string> Warnings,
     /// 叫声与动作音效;null = 这个形态两族库都没有(或者外部工具不在)。
-    AudioInfo? Audio = null);
+    AudioInfo? Audio = null,
+    /// 动作名 → 中文标签。只有和动作名不同的才在里面(宠物那边一条都没有:
+    /// 它的动作名就是运行时那套,中文名写在运行时的 `RUNTIME_CLIPS` 里)。
+    Dictionary<string, string>? ClipLabels = null);
 
 public static class Manifest
 {
@@ -241,9 +244,14 @@ public static class Manifest
                       $", root_motion_cm = {Num(clip.RootMotionCm)}" +
                       $", speed_cm_s = {Num(clip.Seconds > 0 ? clip.RootMotionCm / clip.Seconds : 0f)}"
                     : "";
+                // 中文标签:NPC 那批动作名(`Dialogue1`/`CrossarmsLoop`)运行时不认识,
+                // 配置窗口要拿它显示。没有就不写,运行时退用动作名本身。
+                var label = report.ClipLabels?.GetValueOrDefault(clip.Logical) is { } text
+                    ? $", label = {Quote(text)}"
+                    : "";
                 sb.AppendLine(
                     $"  {ClipKey(clip.Logical)} = {{ clip = {Quote(clip.Logical)}, " +
-                    $"ms = {(int)MathF.Round(clip.Seconds * 1000f)}, frames = {clip.Frames}{extra} }}");
+                    $"ms = {(int)MathF.Round(clip.Seconds * 1000f)}, frames = {clip.Frames}{extra}{label} }}");
             }
 
             if (report.Audio is { } audio)

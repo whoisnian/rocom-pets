@@ -188,6 +188,50 @@ pub fn has_clip(form: &crate::pack::Form, name: &str) -> bool {
     form.clip(name).is_some() || fallbacks(name).iter().any(|alt| form.clip(alt).is_some())
 }
 
+/// 配置窗口那张动作表的**顺序**,也是 [`crate::control::Control::Play`] 的下标。
+///
+/// 前面是固定的 [`RUNTIME_CLIPS`](这个形态没有的也占位,界面置灰),后面接这个形态
+/// **自己多出来的**动作 —— NPC 包里那批(说话五段、抱臂/叉腰/托腮的起手循环收手、
+/// 行礼、干杯、战斗入场演出……),宠物包一条都没有。
+///
+/// **两个进程各算一次,必须算出同一份**:配置窗口按 `pack::Form` 的键算,桌宠按模型里
+/// 的动画名算(见 `Stage::action_at`)。两边同一套规则、同一批名字(manifest 的
+/// `[forms.clips]` 就是 glb 里写进去的那些),所以下标对得上。排序用 `sort` 定死顺序,
+/// 不能靠 HashMap 的遍历序。
+fn order_actions(mut extra: Vec<String>) -> Vec<String> {
+    extra.sort();
+    RUNTIME_CLIPS
+        .iter()
+        .map(|(name, _)| (*name).to_string())
+        .chain(extra)
+        .collect()
+}
+
+/// 这个形态能点的动作:`(动作名, 显示名)`。顺序见 [`order_actions`]。
+pub fn form_actions(form: &crate::pack::Form) -> Vec<(String, String)> {
+    let fixed: std::collections::HashSet<&str> =
+        RUNTIME_CLIPS.iter().map(|(name, _)| *name).collect();
+    let extra = form
+        .clips
+        .keys()
+        .filter(|name| !fixed.contains(name.as_str()))
+        .cloned()
+        .collect();
+    order_actions(extra)
+        .into_iter()
+        .map(|name| {
+            // 固定那张表的中文名写在 RUNTIME_CLIPS 里;多出来的那批由包自己带
+            let label = RUNTIME_CLIPS
+                .iter()
+                .find(|(n, _)| *n == name)
+                .map(|(_, l)| (*l).to_string())
+                .or_else(|| form.clip(&name).and_then(|c| c.label.clone()))
+                .unwrap_or_else(|| name.clone());
+            (name, label)
+        })
+        .collect()
+}
+
 /// 在模型里找一段动作,找不到就按降级表退。
 ///
 /// `pub` 是给下载站的预览用的(`web.rs`):网页上「有哪些动作能点」必须和桌面上
@@ -1284,6 +1328,24 @@ impl Stage {
         }
     }
 
+    /// 配置窗口那张动作表的第 `index` 项叫什么。顺序与 [`form_actions`] 一致 ——
+    /// 那边按 manifest 的键算,这边按模型里的动画名算,两批名字本来就是同一批。
+    pub fn action_at(&self, id: EntityId, index: usize) -> Option<String> {
+        let Some(Actor::Pet(pet)) = self.entity(id).map(|e| &e.actor) else {
+            return None;
+        };
+        let fixed: std::collections::HashSet<&str> =
+            RUNTIME_CLIPS.iter().map(|(name, _)| *name).collect();
+        let extra = pet
+            .model
+            .clips
+            .iter()
+            .map(|c| c.name.clone())
+            .filter(|name| !fixed.contains(name.as_str()))
+            .collect();
+        order_actions(extra).into_iter().nth(index)
+    }
+
     /// 手动播一段动作(配置窗口那张动作表点出来的)。
     ///
     /// 走的是**和受惊/摸头同一条路**(`React`):播完自己回待机,也会打断正在演的那场。
@@ -2236,6 +2298,7 @@ mod home_tests {
                 crate::pack::Clip {
                     seconds: 1.0,
                     speed_cm_s: 0.0,
+                    label: None,
                 },
             );
         }
@@ -3424,6 +3487,40 @@ mod rate_tests {
 #[cfg(test)]
 mod behaviour_tests {
     use super::*;
+
+    /// 配置窗口与桌宠**两个进程**各算一次动作表,下标必须对得上(`Control::Play` 只传数字)。
+    /// 这里钉住那份顺序:固定表原样打头、多出来的按名字排在后面。
+    #[test]
+    fn the_action_table_puts_the_fixed_clips_first_then_the_extras_sorted() {
+        let mut clips = std::collections::HashMap::new();
+        // 故意乱序插入,并混进固定表里已有的 Idle —— 它不该被当成「多出来的」再来一遍
+        for name in ["Zebra", "Idle", "Dialogue2", "Dialogue1", "Alpha"] {
+            clips.insert(
+                name.to_string(),
+                crate::pack::Clip {
+                    seconds: 1.0,
+                    speed_cm_s: 0.0,
+                    label: Some(format!("标签{name}")),
+                },
+            );
+        }
+        let form = crate::pack::Form::for_test(clips);
+        let actions = form_actions(&form);
+
+        let fixed: Vec<&str> = RUNTIME_CLIPS.iter().map(|(name, _)| *name).collect();
+        let got: Vec<&str> = actions.iter().map(|(name, _)| name.as_str()).collect();
+        assert_eq!(&got[..fixed.len()], &fixed[..], "固定表必须原样打头");
+        assert_eq!(
+            &got[fixed.len()..],
+            &["Alpha", "Dialogue1", "Dialogue2", "Zebra"],
+            "多出来的按名字排序,且不重复收录固定表里已有的 Idle"
+        );
+
+        // 固定表那几段的中文名来自 RUNTIME_CLIPS;多出来的用包自带的标签
+        assert_eq!(actions[0], ("Idle".into(), "待机".into()));
+        let dialogue1 = actions.iter().find(|(n, _)| n == "Dialogue1").unwrap();
+        assert_eq!(dialogue1.1, "标签Dialogue1");
+    }
 
     fn pet_stage() -> Stage {
         let model = Model::for_test(&[

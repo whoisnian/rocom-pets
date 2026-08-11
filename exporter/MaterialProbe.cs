@@ -36,7 +36,7 @@ public static class MaterialProbe
     /// 以及**基色贴图有多少落在资产目录之外**(= 共享贴图,原来按命名约定接不到的那批)。
     public static void Survey(AbstractVfsFileProvider provider, int limit)
     {
-        const string petsRoot = "NRC/Content/ArtRes/AnimSequence/Pets";
+        const string petsRoot = AssetRoots.Pets;
         var assets = provider.Files.Values
             .Select(f => f.Path)
             .Where(p => p.StartsWith(petsRoot + "/", StringComparison.OrdinalIgnoreCase))
@@ -245,7 +245,7 @@ public static class MaterialProbe
     /// **名字在根材质里存不存在**。
     private static void SurveyOutlines(AbstractVfsFileProvider provider)
     {
-        const string petsRoot = "NRC/Content/ArtRes/AnimSequence/Pets";
+        const string petsRoot = AssetRoots.Pets;
         var files = provider.Files.Values
             .Select(f => f.Path)
             .Where(p => p.StartsWith(petsRoot + "/", StringComparison.OrdinalIgnoreCase)
@@ -396,7 +396,8 @@ public static class MaterialProbe
             DumpProperties(obj, "  ");
             return;
         }
-        const string petsRoot = "NRC/Content/ArtRes/AnimSequence/Pets";
+        // 宠物与 NPC 两棵树同构,按资产名前缀挑(见 Npc.cs)
+        var petsRoot = AssetRoots.RootOf(asset);
         var assetDir = $"{petsRoot}/{asset}";
 
         // 先看这只宠物的资产目录里都有什么,材质到底放在哪
