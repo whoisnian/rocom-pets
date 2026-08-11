@@ -79,6 +79,9 @@ struct MaterialUniform {
     matcap_color: [f32; 4],
     /// 自发光:`Emitter Color`(rgb,线性)+ `Emitter Intensity`(a)。a = 0 时整层不画。
     emissive: [f32; 4],
+    /// [自发光/辉光那层的遮罩走 `emissive_mask_tex`(0/1), -, -, -]。
+    /// 0 = 走基色 alpha(宠物那条老路)。见 pet.wgsl 的 `detail_mask`。
+    emissive_mask: [f32; 4],
     // ⚠ 字段顺序必须和 pet.wgsl 的 `MaterialParams` 逐个对齐:uniform 是按偏移读的,
     // 顺序错了不会报错,只会静默取到旁边那个字段的值(rim/main 曾经就是这么对调的)。
     /// 边缘光颜色
@@ -389,6 +392,16 @@ impl PetGpu {
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                     count: None,
                 },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 11,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
             ],
         });
         // 半透明通道读取第一遍不透明几何留下的场景深度。原
@@ -539,6 +552,15 @@ impl PetGpu {
                 &material.name,
                 material.ramp.as_ref().unwrap_or(&white),
             );
+            // 兜底那张是**白**图,B = 1 ⇒ 遮罩恒 1 —— 与「没有这张贴图就退回老行为」
+            // 一致(老行为是基色 alpha,NPC 之外那些包的 alpha 也普遍是 1)。
+            // 真正决定走哪条路的是 `has_emissive_mask`,见下面 `family[3].w`。
+            let emissive_mask_view = upload_texture(
+                device,
+                queue,
+                &material.name,
+                material.emissive_mask.as_ref().unwrap_or(&white),
+            );
             let has = |v: bool| if v { 1.0 } else { 0.0 };
             let rgb = |c: [f32; 3]| [c[0], c[1], c[2], 0.0];
             let mask_id = |m: &super::model::Material| {
@@ -687,6 +709,7 @@ impl PetGpu {
                         has(material.matcap.is_some()),
                     ],
                     emissive: [0.0, 0.0, 0.0, 0.0], // 纯特效层不走这一层
+                    emissive_mask: [0.0; 4],
                     star: [
                         material.star_tiling[0],
                         material.star_tiling[1],
@@ -791,6 +814,7 @@ impl PetGpu {
                         material.emissive[2],
                         material.emissive_intensity,
                     ],
+                    emissive_mask: [has(material.emissive_mask.is_some()), 0.0, 0.0, 0.0],
                     star: [
                         material.star_tiling[0],
                         material.star_tiling[1],
@@ -901,6 +925,10 @@ impl PetGpu {
                     wgpu::BindGroupEntry {
                         binding: 10,
                         resource: wgpu::BindingResource::Sampler(&clamp_sampler),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 11,
+                        resource: wgpu::BindingResource::TextureView(&emissive_mask_view),
                     },
                 ],
             }));

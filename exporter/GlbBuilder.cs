@@ -51,11 +51,16 @@ public static class GlbBuilder
     public static Quaternion SwapYz(FQuat q) => new(-q.X, -q.Z, -q.Y, q.W);
 
     /// 导出网格 glb,再把 `clips`(逻辑名 → AnimSequence)加成动画通道。
+    /// 眼睛族那套逐眼 UV 变换的一份参数(见 `Materials.MaterialInfo.EyeUvLeft`)。
+    /// `Left`/`Right` 都是 `[缩放H, 缩放V, 平移H, 平移V]`。
+    public readonly record struct EyeUv(float[] Left, float[] Right, float OffsetScale);
+
     public static (byte[] Glb, List<ClipResult> Written, List<string> Warnings) Build(
         USkeletalMesh mesh,
         IReadOnlyList<(string Logical, string Clip, UAnimSequence Sequence)> clips,
         int lodIndex,
-        bool pullBackParkedBones = false)
+        bool pullBackParkedBones = false,
+        IReadOnlyDictionary<string, EyeUv>? eyeUv = null)
     {
         var warnings = new List<string>();
         // **不走 `SkeletalMeshExporter`**。上游 2026-08 那次重构(`Delete duplicated classes`)
@@ -90,6 +95,7 @@ public static class GlbBuilder
 
         var model = ModelRoot.ParseGLB(lod.Data);
         FixBindPose(model, mesh, warnings);
+        if (eyeUv is { Count: > 0 }) BakeEyeUv(model, eyeUv, warnings);
         var nodes = new Dictionary<string, Node>(StringComparer.Ordinal);
         foreach (var node in model.LogicalNodes)
             if (!string.IsNullOrEmpty(node.Name))
@@ -198,6 +204,79 @@ public static class GlbBuilder
         using var stream = new MemoryStream();
         model.WriteGLB(stream);
         return (stream.ToArray(), written, warnings);
+    }
+
+    /// **把眼睛族在着色器里做的那步 UV 变换烘进 UV0。**
+    ///
+    /// NPC 的两颗眼球在网格里各占**半张贴图**(左眼 u∈[0,0.5]、右眼 u∈[0.5,1]),而瞳孔
+    /// 贴图上只画了**一只、居中**。照 UV0 原样采,两只眼睛各自只取到瞳孔靠内的那一小条,
+    /// 于是一整套 NPC 全是内斜视 —— 实机反馈的第一条。
+    ///
+    /// 游戏那边由 `M_C_Eyes` 的像素着色器补上这一步(目标 PS 51613):
+    ///
+    /// ```text
+    /// mul r1.xy, v3.xyxx, l(2.0, 1.0, 0, 0)    ← u 平铺 2、v 不动。**2 是字面量**
+    /// frc r1.xy, r1.xyxx
+    /// add r1.xy, r1.xyxx, l(-0.5, -0.5, 0, 0)
+    /// ge  r0.w, l(0.5), v3.x                   ← u ≤ 0.5 选「右」那组参数
+    /// …
+    /// mad r1.xy, r1.xyxx, r1.zwzz, l(0.5, 0.5, 0, 0)   ← ×(1+缩放)后移回
+    /// mul r2.x, r2.w, cb6[28].x                ← 平移H × UVOffsetScale
+    /// add r1.xy, r1.xyxx, -r2.xyxx
+    /// ```
+    ///
+    /// **烘进顶点是安全的**:整段只与顶点的 UV 有关,不含任何运行时状态;而且两颗眼球在
+    /// UV 上是两个互不相交的岛(实测露西亚:[0.015,0.484] 与 [0.515,0.984],外加两片
+    /// 12 顶点的高光小面片都落在 [0.011,0.032]),没有三角形跨 u=0.5 那道缝。
+    /// 烘完 `verify_glb.py`/`sweep.py` 看到的就是实机的样子,运行时也不必为这一族开分支。
+    private static void BakeEyeUv(
+        ModelRoot model, IReadOnlyDictionary<string, EyeUv> eyeUv, List<string> warnings)
+    {
+        // **这一片的 UV0 不能是和别的片共用的那一份。** 上游给每个 section 各写一份顶点
+        // (实测眼睛那片 152 个顶点、身体 5428,accessor 各一条),但共用是 glTF 完全合法的
+        // 写法 —— 真共用了还照改,就是把身体的 UV 一起翻倍。宁可不改也不能改坏。
+        var shared = model.LogicalMeshes
+            .SelectMany(m => m.Primitives)
+            .Where(pr => pr.Material?.Name is not { } n || !eyeUv.ContainsKey(n))
+            .Select(pr => pr.GetVertexAccessor("TEXCOORD_0")?.LogicalIndex)
+            .Where(i => i is not null)
+            .ToHashSet();
+
+        foreach (var mesh in model.LogicalMeshes)
+        foreach (var primitive in mesh.Primitives)
+        {
+            var name = primitive.Material?.Name;
+            if (name is null || !eyeUv.TryGetValue(name, out var p)) continue;
+            var accessor = primitive.GetVertexAccessor("TEXCOORD_0");
+            if (accessor is null)
+            {
+                warnings.Add($"{name}: 眼睛族材质但这一片没有 UV0,跳过瞳孔 UV 修正");
+                continue;
+            }
+            if (shared.Contains(accessor.LogicalIndex))
+            {
+                warnings.Add($"{name}: 这一片的 UV0 与非眼睛材质共用一条 accessor,跳过瞳孔 UV 修正");
+                continue;
+            }
+            var uv = accessor.AsVector2Array();
+            for (var i = 0; i < uv.Count; i++)
+            {
+                var (u, v) = (uv[i].X, uv[i].Y);
+                // 左右两组参数按**原 u** 分,不是按烘完的
+                var side = u <= 0.5f ? p.Right : p.Left;
+                var t = new Vector2(u * 2f, v);
+                t = new Vector2(t.X - MathF.Floor(t.X), t.Y - MathF.Floor(t.Y));
+                uv[i] = new Vector2(
+                    (t.X - 0.5f) * (1f + side[0]) + 0.5f - side[2] * p.OffsetScale,
+                    (t.Y - 0.5f) * (1f + side[1]) + 0.5f - side[3]);
+            }
+            // **改完必须重算 accessor 的 min/max。** 那两个数是 glTF 的必填元数据,
+            // SharpGLTF 在 `WriteGLB` 时会拿它校验,对不上直接抛
+            // `Accessor[79] memory: Value[0] is out of bounds` —— 踩过一次:
+            // 全量 70 个形态里 11 个当场导不出来(乐乐/万事通/罗兰…),
+            // 而剩下 59 个恰好因为烘完的范围仍落在原区间里,一声不吭地过了。
+            accessor.UpdateBounds();
+        }
     }
 
     /// 用正确的四元数映射改写骨骼节点旋转,并重算 inverseBindMatrices(见文件头的上游 bug 说明)。

@@ -147,6 +147,70 @@ public record MaterialInfo(
     public bool IsCharacterGhost =>
         ParentChain.Any(p => p.Equals("M_Character_Base_TG", StringComparison.OrdinalIgnoreCase));
 
+    /// NPC 的眼睛族(`M_C_Eyes`)。**它的 u 在着色器里被写死平铺 2**,见 `EyeUv`。
+    public bool IsCharacterEyes =>
+        ParentChain.Any(p => p.Equals("M_C_Eyes", StringComparison.OrdinalIgnoreCase));
+
+    /// 眼睛族那套逐眼 UV 变换的参数,顺序 `[缩放H, 缩放V, 平移H, 平移V]`。
+    ///
+    /// **左右是按 UV 分的,不是按顶点位置。** 目标 PS 51613:
+    /// `ge r0.w, l(0.5), v3.x` 之后在 `cb6[6]`(右眼那组,`MoveH` 还乘了 −1)与
+    /// `cb6[7]`(左眼那组)之间选 —— 也就是 **u ≤ 0.5 的那半张贴图属于「右」**。
+    /// 两个槽的表达式字节码分别是 `scalar[4..7]`(`R_*`)与 `scalar[0..3]`(`L_*`),
+    /// 全库实例这八个数都是 0,所以实际只剩下平铺那一步;仍照公式搬出来,免得哪只不是 0。
+    public float[] EyeUvRight =>
+    [
+        RootScalar("R_ScaleHorizontal", 0f), RootScalar("R_ScaleVertical", 0f),
+        -RootScalar("R_MoveHorizontal", 0f), RootScalar("R_MoveVertical", 0f),
+    ];
+
+    public float[] EyeUvLeft =>
+    [
+        RootScalar("L_ScaleHorizontal", 0f), RootScalar("L_ScaleVertical", 0f),
+        RootScalar("L_MoveHorizontal", 0f), RootScalar("L_MoveVertical", 0f),
+    ];
+
+    /// **`UVOffsetScale` 是「眼球看向哪儿」那个平移的增益,不是平铺。** 名字容易读反:
+    /// 汇编里 `mul r2.x, r2.w, cb6[28].x` —— 它只乘 `MoveH`,平铺那一步用的是写死的字面量 2。
+    /// (`cb6[28].x` 配到 `scalar-slot[8]` = `scalar-param[8]` = `UVOffsetScale`,
+    /// 槽位算法见 docs/shader.md:标量从 `cb6[向量数]` 起四个一组打包。)
+    public float EyeUvOffsetScale => RootScalar("UVOffsetScale", 1f);
+
+    /// **NPC 那边自发光/辉光两层的遮罩:`MatID` 贴图的 B 通道。**
+    ///
+    /// 宠物那边这两层的遮罩是基色 alpha(见 pet.wgsl 里 `detail_mask` 那段,查实于
+    /// `M_P_Object` 的 PS 68952)。`M_C_Object` 是另一张材质图,遮罩换了地方 ——
+    /// 目标 Low PS 49710:
+    ///
+    /// ```text
+    /// sample r1.yzw, v2.xyxx, t3.wyxz, s2   ← t3 = MatID;r1.z = R、r1.y = G、r1.w = B
+    /// mad    r0.z, 1-r1.z, l(5.0), l(1.0)   ← 材质 ID = 1 + 5×(1−R),取 1..5 五档
+    /// …
+    /// add     r1.z, r1.w, l(-0.04)          ← B 通道
+    /// mul_sat r1.z, r1.z, l(1.1111)         ← 和宠物那边同一个重映射
+    /// mul     r4.xyz, r1.z, cb6[5].xyzx     ← × Emitter Color
+    /// mul     r5.xyz, r1.z, cb6[3].xyzx     ← × Glow Color × Glow Intensity
+    /// mul     r4.xyz, r4.xyzx, cb6[28].y    ← × Emitter Intensity
+    /// ```
+    ///
+    /// 「t3 就是 MatID」不是猜的:紧接着那步 `1 + 5×(1−R)` 与这一族的
+    /// `ColorID2..5`/`RampID2..5`/`SpecIntensity2..5` 五档一一对应,而实测 `T_*_ID` 的 R
+    /// 恰好只有 0/76/127/178/255 五个台阶(露西亚 92% 的像素落在其中四个上)。
+    ///
+    /// **为什么非改不可**:NPC 的基色贴图 alpha 恒为 1(全库量过),照宠物那条路走,
+    /// 遮罩恒等于 1 ⇒ 整片刷满。恩佐(`NPC_09601`)身体写着白 × 5、白树的 `_Im` 白 × 3、
+    /// 露西亚品红 × 10,渲出来就是实机反馈里的「除脸和武器外纯白」「偏紫」。
+    /// 而这三张 `_ID` 的 B 通道 93.7~100% 是 0 —— 该亮的只有恩佐袍子上那几处符文
+    /// (0.73% 的像素)。
+    public string? EmissiveMaskTexture =>
+        IsCharacterFamily ? FirstTexture("MatID") : null;
+
+    /// NPC 那套材质图(`M_C_*`)。自发光遮罩换了地方,见 [`EmissiveMaskTexture`]。
+    /// **认根材质,不认资产目录**:恩佐的 `_Im2` 挂的是宠物那张 `M_P_Object`,
+    /// 它照旧走基色 alpha。
+    public bool IsCharacterFamily =>
+        ParentChain.Any(p => p.StartsWith("M_C_", StringComparison.OrdinalIgnoreCase));
+
     /// **基色贴图的 alpha 是不透明度还是纹路遮罩,由这个静态开关决定。**
     ///
     /// 本体贴图的 alpha 平时是美术塞的纹路遮罩(绝不能拿来剔像素);但 `Opacity or OpacityMask`

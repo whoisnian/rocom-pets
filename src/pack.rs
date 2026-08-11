@@ -146,6 +146,11 @@ struct RawMaterial {
     emissive: Option<[f32; 3]>,
     #[serde(default)]
     emissive_intensity: f32,
+    /// 自发光/辉光两层的遮罩贴图(取 B 通道)。NPC 那族(`M_C_*`)才有;
+    /// 没有就退回基色 alpha,也就是宠物那条老路。见 exporter/Materials.cs 的
+    /// `EmissiveMaskTexture`。
+    #[serde(default)]
+    emissive_mask_tex: Option<String>,
     #[serde(default = "default_rim_power")]
     rim_power: f32,
     #[serde(default = "default_rim_soft_edge")]
@@ -435,6 +440,11 @@ pub struct Material {
     /// 白 × 0.5 是 (43,15.6,9.0),实机 (96,23,9)),已撤回。
     pub emissive: [f32; 3],
     pub emissive_intensity: f32,
+    /// **NPC 那族(`M_C_*`)的遮罩换了地方**:不是基色 alpha,而是 `MatID` 贴图的 **B 通道**
+    /// (`M_C_Object` 的 Low PS 49710)。它们的基色 alpha 恒为 1,照老路走等于遮罩恒 1、
+    /// 整片刷满 —— 恩佐白 × 5、露西亚品红 × 10 就是这么糊上去的。
+    /// None = 宠物那条老路。
+    pub emissive_mask: Option<PathBuf>,
     /// 边缘光的衰减次数。**小于 1 = 整片泛色**(幽星光的球 0.35),不是一圈细边。
     pub rim_power: f32,
     pub rim_soft_edge: f32,
@@ -1009,6 +1019,7 @@ impl Pack {
                                 rim_intensity: mat.rim_intensity,
                                 emissive: mat.emissive.unwrap_or([0.0; 3]),
                                 emissive_intensity: mat.emissive_intensity,
+                                emissive_mask: mat.emissive_mask_tex.map(|rel| root.join(rel)),
                                 rim_power: mat.rim_power,
                                 rim_soft_edge: mat.rim_soft_edge,
                                 highlight_offset: mat.highlight_offset.unwrap_or([0.0; 3]),

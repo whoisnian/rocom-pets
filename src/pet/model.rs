@@ -86,6 +86,8 @@ pub struct Material {
     /// 自发光色(线性)+ 强度;强度 0 = 不画。见 pack.rs。
     pub emissive: [f32; 3],
     pub emissive_intensity: f32,
+    /// 自发光/辉光那层的遮罩贴图(取 B 通道);None = 退回基色 alpha。见 `pack::Material`。
+    pub emissive_mask: Option<Image>,
     pub rim_power: f32,
     pub rim_soft_edge: f32,
     pub highlight_offset: [f32; 3],
@@ -552,6 +554,11 @@ impl Model {
                     rim_intensity: spec.rim_intensity,
                     emissive: spec.emissive,
                     emissive_intensity: spec.emissive_intensity,
+                    // MatID 是数据贴图,按线性字节读
+                    emissive_mask: spec
+                        .emissive_mask
+                        .as_deref()
+                        .and_then(|p| load_texture(p, true)),
                     rim_power: spec.rim_power,
                     rim_soft_edge: spec.rim_soft_edge,
                     highlight_offset: spec.highlight_offset,

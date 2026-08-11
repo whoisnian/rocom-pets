@@ -177,7 +177,10 @@ public record MaterialEntry(
     /// 配套 `_Ol` 描边材质算出来的描边宽度(米);0 = 不画。见 `Materials.OutlineWidthOf`。
     float OutlineWidth = 0f,
     /// 按画家序画(不写深度),见 `MaterialInfo.IsPaintOrder`。
-    bool PaintOrder = false);
+    bool PaintOrder = false,
+    /// 自发光/辉光两层的遮罩贴图(取 **B 通道**);null = 走宠物那条老路,用基色 alpha。
+    /// 见 `MaterialInfo.EmissiveMaskTexture`。
+    string? EmissiveMask = null);
 
 public record FormReport(
     Form Form,
@@ -342,6 +345,11 @@ public static class Manifest
                         parts.Add($"emissive = [{Num(ec[0])}, {Num(ec[1])}, {Num(ec[2])}]");
                         parts.Add($"emissive_intensity = {Num(mat.EmissiveIntensity)}");
                     }
+                    // **发一整族,不是只发有自发光的那些。** 同一个遮罩还喂着 `Glow Color ×
+                    // Glow Intensity`(汇编里两条 `mul` 挨着,见 `EmissiveMaskTexture`),
+                    // 而那一项是逐材质的;只发前者会让辉光那层继续拿基色 alpha(恒 1)当遮罩。
+                    if (mat.EmissiveMask is not null)
+                        parts.Add($"emissive_mask_tex = {Quote(mat.EmissiveMask)}");
                     if (mat.RimIntensity > 1 && mat.RimColor is { } rc)
                     {
                         parts.Add($"rim_color = [{Num(rc[0])}, {Num(rc[1])}, {Num(rc[2])}]");

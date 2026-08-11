@@ -50,6 +50,8 @@ struct MaterialParams {
     matcap_color: vec4<f32>,
     // 自发光:`Emitter Color`(rgb,线性)+ `Emitter Intensity`(a);a = 0 时整层不画
     emissive: vec4<f32>,
+    // [自发光/辉光那层的遮罩走 emissive_mask_tex, -, -, -];0 = 走基色 alpha
+    emissive_mask: vec4<f32>,
     rim_color: vec4<f32>,
     // HighLight Offset(xyz,已换成 glTF Y-up)+ HighLightSpecPow
     highlight: vec4<f32>,
@@ -129,6 +131,9 @@ struct MaterialParams {
 @group(1) @binding(8) var light_mask_tex: texture_2d<f32>;
 @group(1) @binding(9) var ramp_tex: texture_2d<f32>;
 @group(1) @binding(10) var ramp_sampler: sampler;
+// NPC 那族(`M_C_*`)自发光/辉光两层的遮罩(`MatID`,遮罩在 **B** 里);
+// 没有就是 1×1 白图,由 `material.emissive_mask.x` 决定用不用它。见 `detail_mask`。
+@group(1) @binding(11) var emissive_mask_tex: texture_2d<f32>;
 // 第一遍不透明材质留下的场景深度；半透明材质按原 shader 的
 // `OpacityDepthDistance` 计算与后方实体/背景的距离。
 @group(2) @binding(0) var scene_depth: texture_depth_2d;
@@ -1207,7 +1212,28 @@ fn shade_main(in: VsOut, depth_coverage: f32) -> vec4<f32> {
     // 基色 alpha 的那个重映射:`Glow Color × Glow Intensity` 与 `Emitter Color ×
     // Emitter Intensity` 两层共用它当遮罩(水灵 Low PS 68952 第 60~65 行与第 145 行,
     // 两条都是 `颜色 × 这个遮罩`,而且**都进发光累加器 r1**、在光照之后才相加)。
-    let detail_mask = saturate((line - 0.04) * 1.1111);
+    //
+    // **NPC 那族(`M_C_*`)遮罩不在这儿,在 `MatID` 贴图的 B 通道。** 是另一张材质图,
+    // 结构一样、遮罩换了来源(`M_C_Object` 的 Low PS 49710,重映射的两个常数一模一样):
+    //
+    //     sample  r1.yzw, v2.xyxx, t3.wyxz, s2   ← t3 = MatID,r1.w = B
+    //     add     r1.z, r1.w, l(-0.04)
+    //     mul_sat r1.z, r1.z, l(1.1111)
+    //     mul     r4.xyz, r1.z, cb6[5].xyzx     ← Emitter Color
+    //     mul     r5.xyz, r1.z, cb6[3].xyzx     ← Glow Color × Glow Intensity
+    //
+    // 认得出 t3 是 MatID,靠的是紧接着那步 `材质ID = 1 + 5×(1−R)`(五档,对得上这一族的
+    // `ColorID2..5`/`RampID2..5`),而实测 `T_*_ID` 的 R 就只有 0/76/127/178/255 五个台阶。
+    //
+    // **这一条不改就是整片刷白**:NPC 的基色贴图 alpha 恒为 1,按上面那条走遮罩恒等于 1。
+    // 恩佐(`NPC_09601`)身体写着白 × 5、白树的 `_Im` 白 × 3、露西亚品红 × 10 —— 实机反馈的
+    // 「除脸和武器外纯白」「偏紫」全是这么来的;而那三张 `_ID` 的 B 有 93.7~100% 是 0,
+    // 真该亮的只有恩佐袍子上那 0.73% 的符文。
+    let mask_source = select(
+        line,
+        textureSample(emissive_mask_tex, base_sampler, in.uv).b,
+        material.emissive_mask.x > 0.5);
+    let detail_mask = saturate((mask_source - 0.04) * 1.1111);
     // 加上去的光。**不透明层不叠 MatCap**——游戏那边靠遮罩通道选择性反射,
     // 无条件叠会把宠物冲白(试过,整只发白),而 toon 着色本身对着截图已经够像。
     //

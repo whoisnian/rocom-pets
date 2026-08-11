@@ -661,9 +661,21 @@ FormReport ExportForm(
         }
     }
 
+    // 材质:哪个槽画哪张贴图、alpha 该不该当遮罩剔。这一步取代原来的命名约定猜法
+    // (实测全量 2043 个槽里 258 个猜错或猜不到,详见 docs/design.md §1)。
+    // **必须在建 glb 之前**:眼睛族那步 UV 变换要烘进顶点,见 `GlbBuilder.BakeEyeUv`。
+    var resolved = Materials.Load(mesh, warnings);
+    var eyeUv = resolved
+        .Where(kv => kv.Value.Resolved && kv.Value.IsCharacterEyes)
+        .ToDictionary(
+            kv => kv.Key,
+            kv => new GlbBuilder.EyeUv(
+                kv.Value.EyeUvLeft, kv.Value.EyeUvRight, kv.Value.EyeUvOffsetScale),
+            StringComparer.Ordinal);
+
     // 「停得太远的骨骼拉回绑定姿势」只对 NPC 开,原因见 `GlbBuilder.ParkedThreshold`。
-    var (glb, written, buildWarnings) =
-        GlbBuilder.Build(mesh, clips, lod, pullBackParkedBones: root == AssetRoots.Npc);
+    var (glb, written, buildWarnings) = GlbBuilder.Build(
+        mesh, clips, lod, pullBackParkedBones: root == AssetRoots.Npc, eyeUv: eyeUv);
     warnings.AddRange(buildWarnings);
 
     var formDir = Path.Combine(packDir, "forms", form.Asset);
@@ -672,9 +684,6 @@ FormReport ExportForm(
     var texDir = Path.Combine(formDir, "tex");
     var textures = Textures.Export(fileProvider, assetDir, texDir, warnings);
 
-    // 材质:哪个槽画哪张贴图、alpha 该不该当遮罩剔。这一步取代原来的命名约定猜法
-    // (实测全量 2043 个槽里 258 个猜错或猜不到,详见 docs/design.md §1)。
-    var resolved = Materials.Load(mesh, warnings);
     // **材质资产全部悬空 = 这只宠物没做完。** 实测 13 个形态如此,而且都是未实装的:
     // 4 个名字里直接带「占位」,全部 legal_petbase / completeness 皆空,id 集中在最新未上线段。
     // 与其猜贴图硬渲出来,不如照「这个形态这版本没做」处理(和缺 SKM 那条一样)。
@@ -779,7 +788,8 @@ FormReport ExportForm(
             info.XiaoYouFlowColor1, info.XiaoYouFlowColor2, info.XiaoYouStarColor,
             info.XiaoYouNoiseFlow, info.XiaoYouShape, info.XiaoYouStarUv,
             yutuEar, fakeFluid, matcapMasked, fairyBall,
-            info.OutlineWidth ?? 0f, info.IsPaintOrder));
+            info.OutlineWidth ?? 0f, info.IsPaintOrder,
+            ExportEffectTexture(info.EmissiveMaskTexture)));
 
         if (info.StarTexture is not null && ExportEffectTexture(info.StarTexture) is { } starTex
             && (starLayer is null || (info.IsFakeTrans && !starFromFakeTrans)))
