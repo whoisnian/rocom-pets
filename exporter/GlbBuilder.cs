@@ -28,6 +28,7 @@ using CUE4Parse_Conversion.Animations;
 using CUE4Parse_Conversion.Dto;
 using CUE4Parse_Conversion.Formats.Meshes;
 using CUE4Parse_Conversion.Options;
+using CUE4Parse_Conversion.Writers.ActorX.Structs.Animations;
 using SharpGLTF.Schema2;
 using SharpGLTF.Transforms;
 
@@ -97,6 +98,21 @@ public static class GlbBuilder
         // 源骨架的骨骼长度,照抄过来等于把本形态按源骨架的比例重新拼一遍。
         var meshSkeleton = mesh.Skeleton?.ResolvedObject?.GetPathName();
 
+        // 真的有肉挂在上面的骨骼。用来判断「这根骨骼的平移写错了要不要紧」——
+        // 挂了 0 个顶点的定位骨(`locator_ball_1`、乐乐的 `Bone_Yu_01`)写歪了也看不见,
+        // 而腿上写歪了就是一条腿飞出去(见 `ConstantTranslationOffenders`)。
+        var skinned = SkinnedJointNames(model);
+        // 骨骼名 → 它在这个形态的所有动作里被「恒定挪出绑定姿势」的最大距离(米)。
+        // 全形态汇总成一条警告(见 Build 末尾),不是一段动作报一条 —— 这毛病要么整只都有、
+        // 要么一根都没有,按段报只会把报告刷满。
+        var suspects = new Dictionary<string, float>(StringComparer.Ordinal);
+        // 中招的动作 → 错位起点与位数(见 `DetectTrackShift`)。同样是整形态汇总一条。
+        var shifted = new List<(string Logical, TrackShift Shift)>();
+        // 这个资产里别的动作带来的**真轨道映射**(轨道数 → 每条轨道属于哪根骨骼),
+        // 用来修「轨道数少于骨骼数、映射却是恒等」那批。见 `BorrowTrackMap`。
+        var trackMaps = CollectTrackMaps(clips, mesh.ReferenceSkeleton.FinalRefBoneInfo.Length);
+        var borrowed = new List<string>();
+
         var written = new List<ClipResult>();
         var foreignWarned = false;
         foreach (var (logical, clipName, sequence) in clips)
@@ -117,13 +133,52 @@ public static class GlbBuilder
                     warnings.Add($"动画借自别的骨架:{joints} 根骨骼里 {animBones.Count(nodes.ContainsKey)} 根对得上名字," +
                                  "其余全程保持绑定姿势(平移已重定基到本形态)");
                 }
-                var result = AddAnimation(model, nodes, logical, clipName, sequence, foreign, warnings);
+                var result = AddAnimation(
+                    model, nodes, logical, clipName, sequence, foreign, skinned,
+                    suspects, shifted, trackMaps, borrowed, warnings);
                 if (result is not null) written.Add(result);
             }
             catch (Exception e)
             {
                 warnings.Add($"动作 {logical}({clipName}) 加入失败: {e.Message}");
             }
+        }
+
+
+        if (borrowed.Count > 0)
+        {
+            var kinds = trackMaps.Keys.OrderBy(x => x);
+            warnings.Add(
+                $"{borrowed.Count} 段动画的轨道映射被上游读成了恒等(轨道数少于骨骼数时那是不可能的)," +
+                $"已换用同资产别的动作带的真映射(轨道数 {string.Join("/", kinds)} 各一份," +
+                "见 GlbBuilder.BorrowTrackMap)");
+        }
+        if (shifted.Count > 0)
+        {
+            var k = shifted[0].Shift.K;
+            var from = shifted.Min(x => x.Shift.Start);
+            warnings.Add(
+                $"{shifted.Count} 段动画的骨骼数据从第 {from} 根起整体错位 {k} 位" +
+                "(上游 CUE4Parse 的 ACL 解码,见 GlbBuilder.DetectTrackShift),已按错位量搬回");
+        }
+
+        // **有肉的骨骼被「恒定地」挪出了绑定姿势。**
+        // 恒定 = 这段动画根本没在移动它,那这个偏移就不是动作,而是「动画里记的骨骼位置
+        // 和这个网格的不一样」—— 照抄过来就是那块肉被拉飞。
+        //
+        // 这是上面那条错位修正的**兜底哨兵**:错位修完之后可丽希亚只剩一根
+        // (`Bone_R_UpperArm_Twist2`,16cm,看不出来),修之前是 17 根、最大 115cm。
+        // 别的形态本来就只有裙摆/救生圈那几根小幅命中。**只报不改** —— 单看「恒定偏移」
+        // 判不出对错:可丽希亚坐下那一段(`SleepLoop`)的根骨骼就是恒定压低 68cm,那是对的。
+        // 报出来让人去渲一张看看,好过悄悄猜错。
+        if (suspects.Count > 0)
+        {
+            var worst = suspects.OrderByDescending(kv => kv.Value).ToList();
+            warnings.Add(
+                $"{suspects.Count} 根有蒙皮的骨骼被恒定挪出绑定姿势,最大 {worst[0].Value * 100f:F0}cm:" +
+                string.Join("、", worst.Take(5).Select(kv => $"{kv.Key}({kv.Value * 100f:F0}cm)")) +
+                (worst.Count > 5 ? "…" : "") +
+                " —— 动画没在动它们,多半是上游解码填了别的骨骼的平移;超过一个骨节长度的那几根会被拉飞");
         }
 
         using var stream = new MemoryStream();
@@ -172,6 +227,11 @@ public static class GlbBuilder
         string clipName,
         UAnimSequence sequence,
         bool foreignSkeleton,
+        IReadOnlySet<string> skinned,
+        Dictionary<string, float> suspects,
+        List<(string Logical, TrackShift Shift)> shifted,
+        IReadOnlyDictionary<int, int[]> trackMaps,
+        List<string> borrowed,
         List<string> warnings)
     {
         if (sequence.AdditiveAnimType != EAdditiveAnimationType.AAT_None)
@@ -191,6 +251,30 @@ public static class GlbBuilder
         var fps = seq.FramesPerSecond > 0 ? seq.FramesPerSecond : 30f;
         var refSkeleton = set.Skeleton.ReferenceSkeleton;
 
+        // 这根骨骼的数据在 `seq.Tracks` 的第几格;-1 = 没有,保持绑定姿势。
+        // 三条来源,按可信度排:①同资产别的动作带来的**真映射**;②`DetectTrackShift` 的推断;
+        // ③什么都不做(`FindTrackForBoneIndex`)。见 `BorrowTrackMap` 与 `DetectTrackShift`。
+        var boneCount = refSkeleton.FinalRefBoneInfo.Length;
+        var sourceOf = BorrowTrackMap(sequence, boneCount, trackMaps);
+        var shift = new TrackShift(0, 0);
+        var borrowedMap = sourceOf is not null;
+        if (sourceOf is not null)
+        {
+            borrowed.Add(logical);
+        }
+        else
+        {
+            // 上游 ACL 解码从某根骨骼起整体错位(见 `DetectTrackShift`):往回搬 K 位。
+            // 这毛病是**按资产**的(中招的资产每一段动画都中),所以汇总成一条,不是一段报一条。
+            shift = DetectTrackShift(sequence, seq, refSkeleton);
+            if (shift.Any) shifted.Add((logical, shift));
+            sourceOf = new int[boneCount];
+            for (var bone = 0; bone < boneCount; bone++)
+                sourceOf[bone] = shift.Any
+                    ? shift.SourceOf(bone)
+                    : sequence.FindTrackForBoneIndex(bone) < 0 ? -1 : bone;
+        }
+
         var animation = model.CreateAnimation(logical);
         var rootStart = FVector.ZeroVector;
         var rootEnd = FVector.ZeroVector;
@@ -201,9 +285,39 @@ public static class GlbBuilder
             // 骨架资产的骨骼数可以多于网格(喵喵:47 vs 44,多出的是末端 Nub),按名字对齐
             var boneName = refSkeleton.FinalRefBoneInfo[bone].Name.Text;
             if (!nodes.TryGetValue(boneName, out var node)) continue;
-            if (sequence.FindTrackForBoneIndex(bone) < 0) continue; // 无轨道 = 保持绑定姿势
 
-            var track = seq.Tracks[bone];
+            // 错位时这根骨骼改读别处的轨道;压根没数据的(-1)保持绑定姿势。
+            // **不能再拿 `FindTrackForBoneIndex(bone) < 0` 当「没数据」**:轨道表比骨骼少几条时
+            // 它对末尾那几根恒返回 -1,而借来的映射说它们的数据就在最后几条轨道里 ——
+            // 菲尔特的整条右小腿(`R-Calf`/`R-Foot`/`R-Toe0`)就是这么被整段丢掉的。
+            var source = bone < sourceOf.Length ? sourceOf[bone] : -1;
+            var track = source >= 0 && source < seq.Tracks.Count ? seq.Tracks[source] : null;
+            // **缩放那一路没跟着错位。** ACL 把旋转/平移/缩放分三份存,三份各自把「整段恒定」的
+            // 轨道剔掉;道具骨的旋转平移恒定(被剔了)而缩放不是(要靠它藏起来),于是缩放那份
+            // 没被压缩、下标仍然对着骨骼序。所以错位的动作里,**旋转平移读 `source`、缩放读 `bone`**。
+            //
+            // 这不是推的,是量出来的。菲尔特(`NPC_01401`)那 49 段错位动作,每一段都恰好
+            // 给两根骨骼写缩放,值分毫不差地固定在 0.0978 与 0.0976;而按错位读会落到
+            // `Bone032` 与 **`Bip001-L-Calf`** 上 —— 左小腿缩成十分之一,靴子整只不见,
+            // 正是实机反馈的「待机少了左脚」。三条证据说那两个值属于 75/77 号骨骼
+            // (`Bone_Bottle01` 与 `Bone_Spoon01`):
+            //   ① 干杯(`GanBei`,映射本来就对的一段)里 `Bone_Bottle01` 的缩放**就是 0.0978**;
+            //   ② 另外 21 段映射正确的动作里,`Bone032` 与 `L-Calf` 一次都没被缩放过 ——
+            //      真是它俩的话不会 49 段全有、21 段全无;
+            //   ③ `World_ShaoZi_Idle`(「拿着勺子」的待机,87 条轨道、映射正确)**不缩放任何骨骼**,
+            //      而普通 `World_Idle` 缩放 77 号 —— 一个拿着勺子、一个把勺子藏起来,正好对上。
+            var scaleTrack = source == bone || bone >= seq.Tracks.Count ? null : seq.Tracks[bone];
+            // 道具骨自己**没有**旋转/平移轨道(压缩器整条剔掉了),但缩放那一格有 ——
+            // 那正是「这一段把它藏起来」的开关,不能连它一起跳过,否则酒瓶和勺子会一直挂在身上。
+            //
+            // **只在这段动作的映射被修过时才捞**(`corrected`),而且**只写缩放那一条**:
+            // 没修过的动作里 `FindTrackForBoneIndex < 0` 就是「这根骨骼没有数据」的正解,
+            // 照捞会把两样东西弄坏 —— ① 借来别人骨架的动画里,`Tracks[骨骼]` 那一格未必是这根
+            // 骨骼的;② 顺手写出去的平移是**动画骨架的参考姿势**,与本网格的绑定姿势不一样,
+            // 于是一根本来不该动的骨骼被挪走。多西三阶(`Mac_DuoXi3_001`,借的动画)实测就是
+            // 这样:不设这道门会多出 23 条平移通道 + 39 条缩放通道,而它一段动作都没被修过。
+            var corrected = borrowedMap || shift.Any;
+            if (track is null && !(corrected && scaleTrack is { KeyScale.Length: > 0 })) continue;
             var refPose = refSkeleton.FinalRefBonePose[bone];
             // 借来的动画:平移改成「本形态绑定姿势 + 相对源参考姿势的位移」。恒定的平移轨道
             // (绝大多数骨骼)于是正好落回绑定姿势、整条通道被丢掉,身体比例保持本形态的。
@@ -220,7 +334,17 @@ public static class GlbBuilder
                 var rotation = refPose.Rotation;
                 var position = refPose.Translation;
                 var scale = FVector.OneVector;
-                track.GetBoneTransform(frame, frames, ref rotation, ref position, ref scale);
+                track?.GetBoneTransform(frame, frames, ref rotation, ref position, ref scale);
+                // **缩放不跟着错位走** —— 见 `scaleTrack`。旋转/平移已经从 `track` 拿到了,
+                // 这一步只把 scale 覆盖成本骨骼那一格的。
+                if (scaleTrack is not null)
+                {
+                    var ignoredRotation = refPose.Rotation;
+                    var ignoredPosition = refPose.Translation;
+                    scale = FVector.OneVector;
+                    scaleTrack.GetBoneTransform(
+                        frame, frames, ref ignoredRotation, ref ignoredPosition, ref scale);
+                }
 
                 var time = frame / fps;
                 rotations[time] = SwapYz(rotation);
@@ -240,8 +364,17 @@ public static class GlbBuilder
             // 体积优化:绝大多数骨骼在一段动画里只转不移,平移/缩放轨道全程恒定。
             // 恒定且等于绑定姿势 → 整条通道不写;恒定但不等 → 只写一个关键帧。
             // 实测这一步把喵喵链的 glb 从 4–6.5MB 压到 1MB 上下。
-            WriteRotation(animation, node, rotations);
-            WriteTranslation(animation, node, translations);
+            //
+            // **只为缩放捞回来的那些骨骼(`track is null`)只写缩放**:它们的旋转/平移压根
+            // 没有数据,这里手上那份是**动画骨架的参考姿势** —— 与本网格的绑定姿势不一定相等,
+            // 写出去就是把一根不该动的骨骼挪走。
+            if (track is not null)
+            {
+                WriteRotation(animation, node, rotations);
+                var drift = ConstantTranslationDrift(node, translations, skinned);
+                WriteTranslation(animation, node, translations);
+                if (drift > 0f) suspects[boneName] = MathF.Max(suspects.GetValueOrDefault(boneName), drift);
+            }
             if (scaled) WriteScale(animation, node, scales);
             matched++;
         }
@@ -257,6 +390,223 @@ public static class GlbBuilder
     }
 
     public static bool IsInPlace(float rootMotionCm) => rootMotionCm < InPlaceThresholdCm;
+
+    /// **同一个资产里,别的动作带着一份真映射。**
+    ///
+    /// `TrackToSkeletonMapTable` 是「第 i 条轨道属于哪根骨骼」的权威答案。压缩器会把整段恒定的
+    /// 骨骼(道具、末端 Nub)整条丢掉,于是轨道数少于骨骼数、映射非恒等 —— 这种动作 CUE4Parse
+    /// 处理得**是对的**(菲尔特的 `World_Walk` 双脚俱全)。
+    ///
+    /// 坏的是另一种:**轨道数少于骨骼数,映射却是恒等的**。那在语义上说不通(恒等 = 丢掉的是
+    /// 末尾那几根),而数据也说它是错的。菲尔特(`NPC_01401`,87 根骨骼)一眼可见:
+    ///
+    /// | 轨道数 | 映射 | 段数 | |
+    /// | --- | --- | --- | --- |
+    /// | 87 | 恒等 | 16 | 一根不少,对 |
+    /// | 84 | 非恒等 | 6 | 丢了 `Bone_Bottle01`/`Bone_Cork01`/`Bone_Spoon01` 三根道具骨,对 |
+    /// | 84 | **恒等** | **67** | **坏的** —— `World_Idle` 在里面 |
+    /// | 79 | 非恒等 | 1 | |
+    ///
+    /// 那 6 段给出的映射是 `轨75→骨78, 轨76→骨79(L-Thigh), … 轨83→骨86(R-Toe0)`,
+    /// 而坏掉的 `World_Idle` 的**数据恰好也是这个排布**(逐根比首帧:轨79 的旋转与
+    /// `L-Toe0` 的参考姿势差 1°、轨80 与 `R-Thigh` 差 12°、轨83 与 `R-Toe0` 差 1°,
+    /// 没有第二根骨骼能对上)。两条独立证据指同一份映射,所以直接借过来用。
+    ///
+    /// **按轨道数配对,不是按资产一份。** 同一个资产不同动作丢的骨骼数不一样:
+    /// 可丽希亚(109 根)有 107 条的一族(丢右臂两根 twist)与 106 条的一族(丢的是另外三根),
+    /// 各自的映射不同、但**同一个轨道数下的映射完全一致**(107 条那 6 段逐条相同,
+    /// 106 条那 4 段也是)。所以键取轨道数;同一个键下两段不一致就整条作废(宁可退回推断)。
+    ///
+    /// **宠物库里也有**(这条不是 NPC 专用):全库 201 个包 / 617 个形态重导逐字节比,
+    /// 权杖-Ⅱ(`Mac_QuanZhangll2_001`)命中这条、瞌睡王与钨丝贝贝命中下面那条推断,
+    /// 三只的渲图都是改好 —— 瞌睡王身上那根竖着的灰板子没了,另外两只原先被撑爆的包围盒
+    /// 把宠物挤成画面里一小点。其余 614 个形态逐字节不变。
+    ///
+    /// 返回「骨骼 → 该读第几条轨道」;null = 这段动作不需要借(映射本来就对,或者借不到)。
+    private static int[]? BorrowTrackMap(
+        UAnimSequence sequence, int boneCount, IReadOnlyDictionary<int, int[]> trackMaps)
+    {
+        var map = sequence.GetTrackMap();
+        // 轨道数与骨骼数一致,或者映射本来就是非恒等的 —— 两种都不用管
+        if (map.Length >= boneCount) return null;
+        for (var i = 0; i < map.Length; i++)
+            if (map[i].BoneTreeIndex != i)
+                return null;
+        if (!trackMaps.TryGetValue(map.Length, out var good)) return null;
+
+        var sourceOf = new int[boneCount];
+        Array.Fill(sourceOf, -1);
+        for (var track = 0; track < good.Length; track++)
+            if (good[track] >= 0 && good[track] < boneCount)
+                sourceOf[good[track]] = track;
+        return sourceOf;
+    }
+
+    /// 收集这个资产里**可信的**轨道映射:轨道数 → 「第 i 条轨道属于哪根骨骼」。
+    /// 只收非恒等的那些(恒等的要么本来就对、要么正是要修的那种);同一个轨道数下
+    /// 两段给的映射不一致就把这个键作废。
+    private static Dictionary<int, int[]> CollectTrackMaps(
+        IReadOnlyList<(string Logical, string Clip, UAnimSequence Sequence)> clips, int boneCount)
+    {
+        var maps = new Dictionary<int, int[]>();
+        var rejected = new HashSet<int>();
+        foreach (var (_, _, sequence) in clips)
+        {
+            FTrackToSkeletonMap[] map;
+            try { map = sequence.GetTrackMap(); }
+            catch { continue; }
+            if (map.Length >= boneCount) continue;
+            var bones = map.Select(m => m.BoneTreeIndex).ToArray();
+            if (bones.Select((b, i) => b == i).All(x => x)) continue;   // 恒等:不可信
+            if (rejected.Contains(map.Length)) continue;
+            if (!maps.TryGetValue(map.Length, out var seen)) maps[map.Length] = bones;
+            else if (!seen.SequenceEqual(bones)) { maps.Remove(map.Length); rejected.Add(map.Length); }
+        }
+        return maps;
+    }
+
+    /// **上游 ACL 解码从某根骨骼起整体错位**:从哪根开始、错几位。
+    ///
+    /// 症状(可丽希亚 `NPC_01301`,用 `--probe-anim NPC_01301:World_Idle` 逐根摊开量到的):
+    /// 从骨骼 81 起,**骨骼 N 拿到的是骨骼 N+2 的整份数据**(旋转与平移都是)。
+    /// 平移那一半特别好认 —— 后面这批骨骼在动画里本来就不平移,于是
+    /// 「骨骼 N 的平移恰好等于骨骼 N+2 的**参考姿势**」:`Bip001-L-Thigh` 拿到 `Bip001-L-Foot` 的、
+    /// `Bip001-R-Foot` 拿到 `locator_ball_1` 的(右脚被摆到 100cm 外,整条腿甩出体外)。
+    /// 旋转那一半从数值上看不出规律,但把数据整体移回 2 位之后,腿部旋转与**同一个角色的
+    /// 另一套资产**(`NPC_10801`,同一份 biped、同样的站立待机)的差从 106~179° 掉到 0.0~1.5°,
+    /// 骨骼 83 以后 23 根的中位差 68.1° → 0.8°。这个资产的 86 段动画全部如此。
+    ///
+    /// **不是我们这侧的索引问题**,排除法做完了:网格与骨架的骨骼数都是 109、参考姿势逐根一致,
+    /// 轨道映射是恒等的 107 条,`Tracks` 按骨骼序排(CUE4Parse 三条填充路径都是
+    /// `for boneIndex in 0..BoneCount` + `FindTrackForBoneIndex`)。错在
+    /// `CUE4Parse-Natives` 的 `nReadACLData` —— ACL 那侧的轨道数与 UE 的轨道表对不上,
+    /// 从某处起整体差了 2 条。
+    ///
+    /// **判据要求「整批一致」而不是「某一根可疑」**:从后往前找「平移恰好等于后面第 k 根的
+    /// 参考姿势」的骨骼,至少要有 [`ShiftMinBones`] 根**能判别**的(那两个参考姿势不相同,
+    /// 否则说明不了问题)。单根撞上是巧合,二十几根同一个 k 不是。真的恒定平移
+    /// (可丽希亚坐下时根骨骼恒定压低 68cm,骨骼 1)落在区间外,不会被误伤。
+    ///
+    /// 中间**允许 [`ShiftGapTolerance`] 根说不清的**:错位区间里也有本来就在动的骨骼
+    /// (可丽希亚的披风 `Bone_cloak_001`、右臂的两根 twist),它们的真值不是参考姿势,
+    /// 判别不出来。不留这点余地的话扫描会停在 86,而真正的起点是 81 ——
+    /// 少修的那几根正是右上臂那两根 twist(与另一套资产比差 121~125°)。
+    ///
+    /// 修法:区间起点往后第 k 根开始,每根骨骼改读**前面第 k 根**的轨道(旋转+平移+缩放一起),
+    /// 起点那 k 根(ACL 那侧丢掉的两条,数据根本没解出来)退回自己的参考姿势。
+    private const int ShiftMinBones = 3;
+    private const int ShiftMaxDistance = 4;
+    private const int ShiftGapTolerance = 3;
+
+    /// `Start` 起、错 `K` 位。`K == 0` 表示没有错位。
+    private readonly record struct TrackShift(int Start, int K)
+    {
+        public bool Any => K > 0;
+
+        /// 这根骨骼该读哪根骨骼的轨道;返回 -1 表示「没有可信数据,用自己的参考姿势」。
+        public int SourceOf(int bone)
+        {
+            if (K == 0 || bone < Start) return bone;
+            return bone < Start + K ? -1 : bone - K;
+        }
+    }
+
+    private static TrackShift DetectTrackShift(
+        UAnimSequence sequence, CAnimSequence seq, FReferenceSkeleton refSkeleton)
+    {
+        var count = Math.Min(refSkeleton.FinalRefBoneInfo.Length, seq.Tracks.Count);
+        var pose = refSkeleton.FinalRefBonePose;
+        // 每根骨骼首帧解出来的平移(没轨道的记 null)。判别只看首帧就够 ——
+        // 要求整段连续区间一致,巧合撞不出来。
+        var first = new FVector?[count];
+        for (var bone = 0; bone < count; bone++)
+        {
+            if (sequence.FindTrackForBoneIndex(bone) < 0) continue;
+            var rotation = pose[bone].Rotation;
+            var position = pose[bone].Translation;
+            var scale = FVector.OneVector;
+            seq.Tracks[bone].GetBoneTransform(0, Math.Max(seq.NumFrames, 1), ref rotation, ref position, ref scale);
+            first[bone] = position;
+        }
+
+        static bool Same(FVector a, FVector b) => (a - b).SizeSquared() <= 1e-4f;
+
+        var best = new TrackShift(0, 0);
+        var bestScore = 0;
+        for (var k = 1; k <= ShiftMaxDistance; k++)
+        {
+            // 从最后往前扫,记住最靠前的那次「判别性命中」;中间允许几根说不清的
+            var start = -1;
+            var discriminating = 0;
+            var gap = 0;
+            for (var i = count - k - 1; i >= 0; i--)
+            {
+                if (first[i] is not { } value) break;   // 没轨道:到头了
+                if (!Same(pose[i + k].Translation, pose[i].Translation)
+                    && Same(value, pose[i + k].Translation))
+                {
+                    discriminating++;
+                    start = i;
+                    gap = 0;
+                }
+                else if (++gap > ShiftGapTolerance) break;
+            }
+            if (start >= 0 && discriminating >= ShiftMinBones && discriminating > bestScore)
+            {
+                bestScore = discriminating;
+                best = new TrackShift(start, k);
+            }
+        }
+        return best;
+    }
+
+    /// 这根骨骼在这段动画里被「恒定挪出绑定姿势」多远(米);不算数就返回 0。
+    /// 判据的来由见 `Build` 末尾那段说明。
+    ///
+    /// 门槛 10cm:比它小的在桌面上那点像素里看不出来。**根骨骼那一档不排除** ——
+    /// 排除它要靠猜下标,而恒定压低根骨骼(坐下)本来就是合法的,报出来让人看一眼就好。
+    private const float SuspectOffsetM = 0.10f;
+
+    private static float ConstantTranslationDrift(
+        Node node, Dictionary<float, Vector3> translations, IReadOnlySet<string> skinned)
+    {
+        if (node.Name is null || !skinned.Contains(node.Name)) return 0f;
+        var first = translations.First().Value;
+        if (!translations.Values.All(v => Close(v, first))) return 0f;   // 在动 = 是真动作
+        var drift = (first - node.LocalTransform.GetDecomposed().Translation).Length();
+        return drift > SuspectOffsetM ? drift : 0f;
+    }
+
+    /// 真的有顶点权重挂在上面的骨骼名。定位骨/道具挂点权重为 0,写歪了也看不见。
+    private static IReadOnlySet<string> SkinnedJointNames(ModelRoot model)
+    {
+        var names = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var mesh in model.LogicalMeshes)
+            foreach (var primitive in mesh.Primitives)
+            {
+                var joints = primitive.GetVertexAccessor("JOINTS_0")?.AsVector4Array();
+                var weights = primitive.GetVertexAccessor("WEIGHTS_0")?.AsVector4Array();
+                if (joints is null || weights is null) continue;
+                var skin = model.LogicalSkins.Count > 0 ? model.LogicalSkins[0] : null;
+                if (skin is null) continue;
+                for (var v = 0; v < joints.Count && v < weights.Count; v++)
+                {
+                    var j = joints[v];
+                    var w = weights[v];
+                    Span<float> js = [j.X, j.Y, j.Z, j.W];
+                    Span<float> ws = [w.X, w.Y, w.Z, w.W];
+                    for (var k = 0; k < 4; k++)
+                    {
+                        if (ws[k] <= 0.01f) continue;
+                        var index = (int)js[k];
+                        if (index < 0 || index >= skin.JointsCount) continue;
+                        var name = skin.GetJoint(index).Joint.Name;
+                        if (!string.IsNullOrEmpty(name)) names.Add(name);
+                    }
+                }
+            }
+        return names;
+    }
 
     /// 关键帧值相等的判定阈值:位置单位是米,1e-5 ≈ 0.01mm,旋转是单位四元数分量。
     private const float KeyEpsilon = 1e-5f;
