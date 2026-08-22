@@ -188,12 +188,247 @@ public record FormReport(
     float HeightCm,
     List<string> Warnings,
     /// 叫声与动作音效;null = 这个形态两族库都没有(或者外部工具不在)。
-    AudioInfo? Audio = null);
+    AudioInfo? Audio = null,
+    /// 异色材质表(键是**默认**槽的材质名,glb 里用的就是它)。空 = 这个形态没有异色。
+    List<MaterialEntry>? ShinyMaterialsOrNull = null)
+{
+    /// 异色材质表,永远不为 null。
+    public List<MaterialEntry> ShinyMaterials => ShinyMaterialsOrNull ?? [];
+}
 
 public static class Manifest
 {
     /// manifest 格式版本;运行时 ABI 版本单独走,便于格式没变但语义变了的情况。
     private const int Schema = 1;
+
+    /// 写一节材质表。**两处共用**:默认外观写 `[forms.materials]`,异色写
+    /// `[forms.shiny_materials]` —— 异色是换整套材质,字段与默认那套逐个相同,
+    /// 只是值来自 `<资产>/Yise/Mat/` 那一份(见 `Shiny`)。
+    private static void AppendMaterials(StringBuilder sb, string header, List<MaterialEntry> materials)
+    {
+        if (materials.Count == 0) return;
+        sb.AppendLine();
+        sb.AppendLine(header);
+        foreach (var mat in materials)
+        {
+            var parts = new List<string>();
+            if (mat.BaseColor is not null) parts.Add($"base_color = {Quote(mat.BaseColor)}");
+            parts.Add($"mask_alpha = {(mat.MaskAlpha ? "true" : "false")}");
+            parts.Add($"mask_clip = {Num(mat.MaskClip)}");
+            parts.Add($"blend = {Quote(mat.Blend)}");
+            if (mat.Translucent) parts.Add("translucent = true");
+            // **逐材质写**(不是「有才写」):运行时对旧包没有这个字段时得退回老行为,
+            // 只有明确写出来才敢按它开关描边。`outline` 是开关、`outline_width` 是宽度
+            // (米),同一个来源算出来的两面 —— 前者留着是因为旧包只有它。
+            parts.Add($"outline = {(mat.OutlineWidth > 0f ? "true" : "false")}");
+            parts.Add($"outline_width = {Num(mat.OutlineWidth)}");
+            if (mat.PaintOrder) parts.Add("paint_order = true");
+            // 星点/MatCap/边缘光对所有材质都可能有
+            if (mat.StarTexture is not null)
+            {
+                parts.Add($"star_tex = {Quote(mat.StarTexture)}");
+                parts.Add($"star_tiling = [{Num(mat.StarTiling[0])}, {Num(mat.StarTiling[1])}]");
+                parts.Add($"stick_intensity = {Num(mat.StickIntensity)}");
+                if (mat.StarFakeTrans) parts.Add("star_fake_trans = true");
+                // **不能只在 `StarFakeTrans` 时写。** 那个标记只有 `_Fx` 有,而身体是
+                // `_By` 画的 —— 只发给 `_Fx` 的话 `_By` 退回兜底值 [0,0,1,1],
+                // 于是仍走 UV0、强度 1.0:星点贴在身上、而且浓三十倍(踩过)。
+                // 星点层本来就是跨材质统一的,这套参数跟着一起发。
+                parts.Add($"noise_uv = [{string.Join(", ", mat.NoiseUv.Select(Num))}]");
+                if (mat.StarColor is { } sc)
+                    parts.Add($"star_color = [{Num(sc[0])}, {Num(sc[1])}, {Num(sc[2])}]");
+            }
+            if (mat.MatcapTexture is not null && !mat.MaskIsMatcap)
+            {
+                parts.Add($"matcap_tex = {Quote(mat.MatcapTexture)}");
+                if (mat.MatcapColor is { } mc)
+                    parts.Add($"matcap_color = [{Num(mc[0])}, {Num(mc[1])}, {Num(mc[2])}]");
+            }
+            // **只认 `Rim Intensity` 大于 1 的。** 这一族的强度普遍写着 1,那更像是
+            // 「没动过的默认值」而不是「开了边缘光」:曜星光那两颗球写着强度 1 + 绿色
+            // `Rim LightColor`,实机里它们是橙的和紫的,照着画怎么都不对。
+            // 全量 946 个带边缘光的材质里只有 3 个强度大于 1(暮星辰的裙子 = 3,青色边)。
+            if (mat.EmissiveColor is { } ec)
+            {
+                parts.Add($"emissive = [{Num(ec[0])}, {Num(ec[1])}, {Num(ec[2])}]");
+                parts.Add($"emissive_intensity = {Num(mat.EmissiveIntensity)}");
+            }
+            if (mat.RimIntensity > 1 && mat.RimColor is { } rc)
+            {
+                parts.Add($"rim_color = [{Num(rc[0])}, {Num(rc[1])}, {Num(rc[2])}]");
+                parts.Add($"rim_intensity = {Num(mat.RimIntensity)}");
+            }
+            // 半透族的输出覆盖率不是贴图 alpha 一项:实机的 ES3.1/Low shader
+            // 还会与高光取 max，再按场景深度差补一层 depth-fade。距离是 UE 厘米。
+            if (mat.Translucent)
+            {
+                parts.Add($"rim_power = {Num(mat.RimPower)}");
+                parts.Add($"rim_soft_edge = {Num(mat.RimSoftEdge)}");
+                parts.Add($"highlight_offset = [{string.Join(", ", mat.HighlightOffset.Select(Num))}]");
+                parts.Add($"highlight_color = [{string.Join(", ", mat.HighlightSpecColor.Select(Num))}]");
+                parts.Add($"highlight_power = {Num(mat.HighlightSpecPower)}");
+                parts.Add($"highlight_intensity = {Num(mat.HighlightSpecIntensity)}");
+                parts.Add($"force_default_opacity = {Num(mat.ForceUseDefaultOpacity)}");
+                parts.Add($"opacity_depth_distance = {Num(mat.OpacityDepthDistance)}");
+                parts.Add($"open_depth_distance = {Num(mat.OpenDepthDistance)}");
+            }
+            if (mat.ObjectTransLow)
+            {
+                parts.Add("object_trans_low = true");
+                if (mat.ObjectTransLightMaskTexture is not null)
+                    parts.Add($"light_mask_tex = {Quote(mat.ObjectTransLightMaskTexture)}");
+                if (mat.ObjectTransRampTexture is not null)
+                    parts.Add($"ramp_tex = {Quote(mat.ObjectTransRampTexture)}");
+                parts.Add($"object_trans_soft_edge = {Num(mat.ObjectTransSoftEdge)}");
+                parts.Add($"main_color = [{Num(mat.ObjectTransMainColor[0])}, " +
+                          $"{Num(mat.ObjectTransMainColor[1])}, {Num(mat.ObjectTransMainColor[2])}]");
+                parts.Add($"main_bright = {Num(mat.ObjectTransMainBright)}");
+            }
+            if (mat.WaterColor1 is { } w1)
+            {
+                parts.Add($"water_color1 = [{string.Join(", ", w1.Select(Num))}]");
+                if (mat.WaterColor2 is { } w2)
+                    parts.Add($"water_color2 = [{string.Join(", ", w2.Select(Num))}]");
+                if (mat.WaterMain is { } wm)
+                    parts.Add($"water_main = [{string.Join(", ", wm.Select(Num))}]");
+                parts.Add($"water_caustics = [{string.Join(", ", mat.WaterCaustics.Select(Num))}]");
+                parts.Add($"water_shape = [{string.Join(", ", mat.WaterShape.Select(Num))}]");
+                // caustics 走 `noise_tex` 那个槽(水体材质有基色,但没有色带,槽是空的)。
+                // **这一行必须在这儿,不能靠下面「BaseColor is null」那支** —— 水体有基色。
+                if (mat.NoiseTexture is not null)
+                    parts.Add($"noise_tex = {Quote(mat.NoiseTexture)}");
+            }
+            if (mat.FlowTexture is not null)
+            {
+                parts.Add($"flow_tex = {Quote(mat.FlowTexture)}");
+                parts.Add($"flow_power = {Num(mat.FlowPower)}");
+                parts.Add($"flow = [{string.Join(", ", mat.Flow.Select(Num))}]");
+                if (mat.MaskIdTexture is not null)
+                {
+                    parts.Add($"mask_id_tex = {Quote(mat.MaskIdTexture)}");
+                    parts.Add($"mask_id_range = [{Num(mat.MaskIdRange[0])}, {Num(mat.MaskIdRange[1])}]");
+                }
+            }
+            if (mat.InteriorTexture is not null)
+            {
+                parts.Add($"interior_tex = {Quote(mat.InteriorTexture)}");
+                if (mat.InteriorColor is { } ic)
+                    parts.Add($"interior_color = [{Num(ic[0])}, {Num(ic[1])}, {Num(ic[2])}]");
+                parts.Add($"refraction = {Num(mat.Refraction)}");
+                parts.Add($"refract_depth = {Num(mat.RefractDepth)}");
+                parts.Add($"flicker = [{Num(mat.FlickerSpeed)}, {Num(mat.FlickerPower)}]");
+            }
+            if (mat.GlassyInner)
+            {
+                parts.Add("glassy_inner = true");
+                parts.Add($"glassy_flow1 = [{string.Join(", ", mat.GlassyFlowColor01.Select(Num))}]");
+                parts.Add($"glassy_flow2 = [{string.Join(", ", mat.GlassyFlowColor02.Select(Num))}]");
+                parts.Add($"glassy_fresnel = [{string.Join(", ", mat.GlassyFresnelColor.Select(Num))}]");
+                parts.Add($"glassy_noise = [{string.Join(", ", mat.GlassyNoiseParams.Select(Num))}]");
+                parts.Add($"glassy_mask = [{string.Join(", ", mat.GlassyMaskParams.Select(Num))}]");
+            }
+            if (mat.XiaoYou)
+            {
+                // 目标 PS 的 t3。XiaoYou 有 MainTex 基色，不能落到下面仅限纯特效
+                // (`BaseColor is null`) 的 noise_tex 输出分支；漏掉时运行时会绑白图，
+                // flow 永远停在第二个（青色）端点。
+                if (mat.NoiseTexture is not null)
+                    parts.Add($"noise_tex = {Quote(mat.NoiseTexture)}");
+                parts.Add("xiaoyou = true");
+                parts.Add($"xiaoyou_base1 = [{string.Join(", ", mat.XiaoYouBaseColor1.Select(Num))}]");
+                parts.Add($"xiaoyou_base2 = [{string.Join(", ", mat.XiaoYouBaseColor2.Select(Num))}]");
+                parts.Add($"xiaoyou_flow1 = [{string.Join(", ", mat.XiaoYouFlowColor1.Select(Num))}]");
+                parts.Add($"xiaoyou_flow2 = [{string.Join(", ", mat.XiaoYouFlowColor2.Select(Num))}]");
+                parts.Add($"xiaoyou_star_color = [{string.Join(", ", mat.XiaoYouStarColor.Select(Num))}]");
+                parts.Add($"xiaoyou_noise_flow = [{string.Join(", ", mat.XiaoYouNoiseFlow.Select(Num))}]");
+                parts.Add($"xiaoyou_shape = [{string.Join(", ", mat.XiaoYouShape.Select(Num))}]");
+                parts.Add($"xiaoyou_star_uv = [{string.Join(", ", mat.XiaoYouStarUv.Select(Num))}]");
+            }
+            if (mat.YutuEar is { } yutu)
+            {
+                parts.Add("yutu_ear = true");
+                if (yutu.BubbleTexture is not null)
+                    parts.Add($"yutu_bubble_tex = {Quote(yutu.BubbleTexture)}");
+                if (yutu.DistortTexture is not null)
+                    parts.Add($"yutu_distort_tex = {Quote(yutu.DistortTexture)}");
+                if (yutu.FlowTexture is not null)
+                    parts.Add($"yutu_flow_tex = {Quote(yutu.FlowTexture)}");
+                parts.Add($"yutu_bubble_color = [{string.Join(", ", yutu.BubbleColor.Select(Num))}]");
+                parts.Add($"yutu_flow_color = [{string.Join(", ", yutu.FlowColor.Select(Num))}]");
+                parts.Add($"yutu_fresnel_color = [{string.Join(", ", yutu.FresnelColor.Select(Num))}]");
+                parts.Add($"yutu_inner_color = [{string.Join(", ", yutu.InnerColor.Select(Num))}]");
+                parts.Add($"yutu_overall_color = [{string.Join(", ", yutu.OverallColor.Select(Num))}]");
+                parts.Add($"yutu_ramp_color = [{string.Join(", ", yutu.RampColor.Select(Num))}]");
+                parts.Add($"yutu_top_color = [{string.Join(", ", yutu.TopColor.Select(Num))}]");
+                parts.Add($"yutu_bubble_shape = [{string.Join(", ", yutu.BubbleShape.Select(Num))}]");
+                parts.Add($"yutu_flow_shape = [{string.Join(", ", yutu.FlowShape.Select(Num))}]");
+                parts.Add($"yutu_light_shape = [{string.Join(", ", yutu.LightShape.Select(Num))}]");
+                parts.Add($"yutu_top_shape = [{string.Join(", ", yutu.TopShape.Select(Num))}]");
+            }
+            if (mat.FakeFluid is { } fluid)
+            {
+                parts.Add("fake_fluid = true");
+                parts.Add($"fluid_edge_color = [{string.Join(", ", fluid.EdgeColor.Select(Num))}]");
+                parts.Add($"fluid_fresnel_color = [{string.Join(", ", fluid.FresnelColor.Select(Num))}]");
+                parts.Add($"fluid_plane_color = [{string.Join(", ", fluid.PlaneColor.Select(Num))}]");
+                parts.Add($"fluid_gradient1 = [{string.Join(", ", fluid.Gradient1.Select(Num))}]");
+                parts.Add($"fluid_gradient2 = [{string.Join(", ", fluid.Gradient2.Select(Num))}]");
+                parts.Add($"fluid_height_tiling = [{string.Join(", ", fluid.HeightTiling.Select(Num))}]");
+                parts.Add($"fluid_plane_axis = [{string.Join(", ", fluid.PlaneAxis.Select(Num))}]");
+                parts.Add($"fluid_plane_center = [{string.Join(", ", fluid.PlaneCenter.Select(Num))}]");
+                parts.Add($"fluid_body_shape = [{string.Join(", ", fluid.BodyShape.Select(Num))}]");
+                parts.Add($"fluid_gradient_shape = [{string.Join(", ", fluid.GradientShape.Select(Num))}]");
+                parts.Add($"fluid_top_shape = [{string.Join(", ", fluid.TopShape.Select(Num))}]");
+            }
+            if (mat.MatcapMasked is { } masked)
+            {
+                parts.Add("matcap_masked = true");
+                parts.Add($"matcap_masked_base = [{string.Join(", ", masked.BaseColor.Select(Num))}]");
+                parts.Add($"matcap_masked_light_ramp = [{string.Join(", ", masked.LightRampColor.Select(Num))}]");
+                parts.Add($"matcap_masked_flat = [{string.Join(", ", masked.FlatEmissiveColor.Select(Num))}]");
+                parts.Add($"matcap_masked_main = [{string.Join(", ", masked.MainColor.Select(Num))}]");
+                parts.Add($"matcap_masked_selection = [{string.Join(", ", masked.SelectionColor.Select(Num))}]");
+                parts.Add($"matcap_masked_rim = [{string.Join(", ", masked.RimShape.Select(Num))}]");
+                parts.Add($"matcap_masked_surface = [{string.Join(", ", masked.SurfaceShape.Select(Num))}]");
+            }
+            if (mat.FairyBall is { } fairy)
+            {
+                parts.Add("fairy_ball = true");
+                if (fairy.Matcap is not null)
+                    parts.Add($"fairy_matcap_tex = {Quote(fairy.Matcap)}");
+                parts.Add($"fairy_base = [{string.Join(", ", fairy.BaseColor.Select(Num))}]");
+                parts.Add($"fairy_matcap_color = [{string.Join(", ", fairy.MatcapColor.Select(Num))}]");
+                parts.Add($"fairy_rim_dark = [{string.Join(", ", fairy.RimDarkColor.Select(Num))}]");
+                parts.Add($"fairy_rim_light = [{string.Join(", ", fairy.RimLightColor.Select(Num))}]");
+                parts.Add($"fairy_main = [{string.Join(", ", fairy.MainColor.Select(Num))}]");
+                parts.Add($"fairy_shape = [{string.Join(", ", fairy.Shape.Select(Num))}]");
+            }
+            // 每个键只许出现一次:重复键 TOML 直接解析失败(opacity/flow 都踩过)
+            parts.Add($"opacity = {Num(mat.Opacity)}");
+            // 基色 alpha 就是不透明度(见 MaterialInfo.AlphaIsOpacity)
+            if (mat.AlphaIsOpacity) parts.Add("alpha_opacity = true");
+            // 父链对所有材质都记:它是「这一族该怎么画」的唯一线索
+            // (如 `M_FX_Fire_Mat` = 火焰、`..._Trans_XingGuang_WPO` = 需要顶点位移的纱)
+            parts.Add($"parents = [{string.Join(", ", mat.ParentChain.Select(Quote))}]");
+            if (mat.BaseColor is null)
+            {
+                // 特效层:主色 + 卷动 + 遮罩/噪声,运行时靠这些近似画出火焰/水壳/光晕
+                if (mat.Tint is { } t)
+                    parts.Add($"tint = [{Num(t[0])}, {Num(t[1])}, {Num(t[2])}, {Num(t[3])}]");
+                parts.Add($"glow = {Num(mat.Glow)}");
+                if (mat.FlowTexture is null)
+                    parts.Add($"flow = [{string.Join(", ", mat.Flow.Select(Num))}]");
+                if (mat.MaskTexture is not null)
+                {
+                    parts.Add($"mask_tex = {Quote(mat.MaskTexture)}");
+                    if (mat.MaskIsMatcap) parts.Add("mask_matcap = true");
+                }
+                if (mat.NoiseTexture is not null) parts.Add($"noise_tex = {Quote(mat.NoiseTexture)}");
+            }
+            sb.AppendLine($"  {ClipKey(mat.Name)} = {{ {string.Join(", ", parts)} }}");
+        }
+    }
+
     private const int RuntimeAbi = 1;
 
     public static string Render(Chain chain, List<FormReport> forms, int lodIndex, string sourceVersion)
@@ -285,229 +520,13 @@ public static class Manifest
                         $"size = [{tex.Width}, {tex.Height}] }}");
             }
 
-            if (report.Materials.Count > 0)
-            {
-                sb.AppendLine();
-                sb.AppendLine("  [forms.materials]   # glb 里的材质名 → 原材质贴图、混合模式与专用着色参数");
-                foreach (var mat in report.Materials)
-                {
-                    var parts = new List<string>();
-                    if (mat.BaseColor is not null) parts.Add($"base_color = {Quote(mat.BaseColor)}");
-                    parts.Add($"mask_alpha = {(mat.MaskAlpha ? "true" : "false")}");
-                    parts.Add($"mask_clip = {Num(mat.MaskClip)}");
-                    parts.Add($"blend = {Quote(mat.Blend)}");
-                    if (mat.Translucent) parts.Add("translucent = true");
-                    // **逐材质写**(不是「有才写」):运行时对旧包没有这个字段时得退回老行为,
-                    // 只有明确写出来才敢按它开关描边。`outline` 是开关、`outline_width` 是宽度
-                    // (米),同一个来源算出来的两面 —— 前者留着是因为旧包只有它。
-                    parts.Add($"outline = {(mat.OutlineWidth > 0f ? "true" : "false")}");
-                    parts.Add($"outline_width = {Num(mat.OutlineWidth)}");
-                    if (mat.PaintOrder) parts.Add("paint_order = true");
-                    // 星点/MatCap/边缘光对所有材质都可能有
-                    if (mat.StarTexture is not null)
-                    {
-                        parts.Add($"star_tex = {Quote(mat.StarTexture)}");
-                        parts.Add($"star_tiling = [{Num(mat.StarTiling[0])}, {Num(mat.StarTiling[1])}]");
-                        parts.Add($"stick_intensity = {Num(mat.StickIntensity)}");
-                        if (mat.StarFakeTrans) parts.Add("star_fake_trans = true");
-                        // **不能只在 `StarFakeTrans` 时写。** 那个标记只有 `_Fx` 有,而身体是
-                        // `_By` 画的 —— 只发给 `_Fx` 的话 `_By` 退回兜底值 [0,0,1,1],
-                        // 于是仍走 UV0、强度 1.0:星点贴在身上、而且浓三十倍(踩过)。
-                        // 星点层本来就是跨材质统一的,这套参数跟着一起发。
-                        parts.Add($"noise_uv = [{string.Join(", ", mat.NoiseUv.Select(Num))}]");
-                        if (mat.StarColor is { } sc)
-                            parts.Add($"star_color = [{Num(sc[0])}, {Num(sc[1])}, {Num(sc[2])}]");
-                    }
-                    if (mat.MatcapTexture is not null && !mat.MaskIsMatcap)
-                    {
-                        parts.Add($"matcap_tex = {Quote(mat.MatcapTexture)}");
-                        if (mat.MatcapColor is { } mc)
-                            parts.Add($"matcap_color = [{Num(mc[0])}, {Num(mc[1])}, {Num(mc[2])}]");
-                    }
-                    // **只认 `Rim Intensity` 大于 1 的。** 这一族的强度普遍写着 1,那更像是
-                    // 「没动过的默认值」而不是「开了边缘光」:曜星光那两颗球写着强度 1 + 绿色
-                    // `Rim LightColor`,实机里它们是橙的和紫的,照着画怎么都不对。
-                    // 全量 946 个带边缘光的材质里只有 3 个强度大于 1(暮星辰的裙子 = 3,青色边)。
-                    if (mat.EmissiveColor is { } ec)
-                    {
-                        parts.Add($"emissive = [{Num(ec[0])}, {Num(ec[1])}, {Num(ec[2])}]");
-                        parts.Add($"emissive_intensity = {Num(mat.EmissiveIntensity)}");
-                    }
-                    if (mat.RimIntensity > 1 && mat.RimColor is { } rc)
-                    {
-                        parts.Add($"rim_color = [{Num(rc[0])}, {Num(rc[1])}, {Num(rc[2])}]");
-                        parts.Add($"rim_intensity = {Num(mat.RimIntensity)}");
-                    }
-                    // 半透族的输出覆盖率不是贴图 alpha 一项:实机的 ES3.1/Low shader
-                    // 还会与高光取 max，再按场景深度差补一层 depth-fade。距离是 UE 厘米。
-                    if (mat.Translucent)
-                    {
-                        parts.Add($"rim_power = {Num(mat.RimPower)}");
-                        parts.Add($"rim_soft_edge = {Num(mat.RimSoftEdge)}");
-                        parts.Add($"highlight_offset = [{string.Join(", ", mat.HighlightOffset.Select(Num))}]");
-                        parts.Add($"highlight_color = [{string.Join(", ", mat.HighlightSpecColor.Select(Num))}]");
-                        parts.Add($"highlight_power = {Num(mat.HighlightSpecPower)}");
-                        parts.Add($"highlight_intensity = {Num(mat.HighlightSpecIntensity)}");
-                        parts.Add($"force_default_opacity = {Num(mat.ForceUseDefaultOpacity)}");
-                        parts.Add($"opacity_depth_distance = {Num(mat.OpacityDepthDistance)}");
-                        parts.Add($"open_depth_distance = {Num(mat.OpenDepthDistance)}");
-                    }
-                    if (mat.ObjectTransLow)
-                    {
-                        parts.Add("object_trans_low = true");
-                        if (mat.ObjectTransLightMaskTexture is not null)
-                            parts.Add($"light_mask_tex = {Quote(mat.ObjectTransLightMaskTexture)}");
-                        if (mat.ObjectTransRampTexture is not null)
-                            parts.Add($"ramp_tex = {Quote(mat.ObjectTransRampTexture)}");
-                        parts.Add($"object_trans_soft_edge = {Num(mat.ObjectTransSoftEdge)}");
-                        parts.Add($"main_color = [{Num(mat.ObjectTransMainColor[0])}, " +
-                                  $"{Num(mat.ObjectTransMainColor[1])}, {Num(mat.ObjectTransMainColor[2])}]");
-                        parts.Add($"main_bright = {Num(mat.ObjectTransMainBright)}");
-                    }
-                    if (mat.WaterColor1 is { } w1)
-                    {
-                        parts.Add($"water_color1 = [{string.Join(", ", w1.Select(Num))}]");
-                        if (mat.WaterColor2 is { } w2)
-                            parts.Add($"water_color2 = [{string.Join(", ", w2.Select(Num))}]");
-                        if (mat.WaterMain is { } wm)
-                            parts.Add($"water_main = [{string.Join(", ", wm.Select(Num))}]");
-                        parts.Add($"water_caustics = [{string.Join(", ", mat.WaterCaustics.Select(Num))}]");
-                        parts.Add($"water_shape = [{string.Join(", ", mat.WaterShape.Select(Num))}]");
-                        // caustics 走 `noise_tex` 那个槽(水体材质有基色,但没有色带,槽是空的)。
-                        // **这一行必须在这儿,不能靠下面「BaseColor is null」那支** —— 水体有基色。
-                        if (mat.NoiseTexture is not null)
-                            parts.Add($"noise_tex = {Quote(mat.NoiseTexture)}");
-                    }
-                    if (mat.FlowTexture is not null)
-                    {
-                        parts.Add($"flow_tex = {Quote(mat.FlowTexture)}");
-                        parts.Add($"flow_power = {Num(mat.FlowPower)}");
-                        parts.Add($"flow = [{string.Join(", ", mat.Flow.Select(Num))}]");
-                        if (mat.MaskIdTexture is not null)
-                        {
-                            parts.Add($"mask_id_tex = {Quote(mat.MaskIdTexture)}");
-                            parts.Add($"mask_id_range = [{Num(mat.MaskIdRange[0])}, {Num(mat.MaskIdRange[1])}]");
-                        }
-                    }
-                    if (mat.InteriorTexture is not null)
-                    {
-                        parts.Add($"interior_tex = {Quote(mat.InteriorTexture)}");
-                        if (mat.InteriorColor is { } ic)
-                            parts.Add($"interior_color = [{Num(ic[0])}, {Num(ic[1])}, {Num(ic[2])}]");
-                        parts.Add($"refraction = {Num(mat.Refraction)}");
-                        parts.Add($"refract_depth = {Num(mat.RefractDepth)}");
-                        parts.Add($"flicker = [{Num(mat.FlickerSpeed)}, {Num(mat.FlickerPower)}]");
-                    }
-                    if (mat.GlassyInner)
-                    {
-                        parts.Add("glassy_inner = true");
-                        parts.Add($"glassy_flow1 = [{string.Join(", ", mat.GlassyFlowColor01.Select(Num))}]");
-                        parts.Add($"glassy_flow2 = [{string.Join(", ", mat.GlassyFlowColor02.Select(Num))}]");
-                        parts.Add($"glassy_fresnel = [{string.Join(", ", mat.GlassyFresnelColor.Select(Num))}]");
-                        parts.Add($"glassy_noise = [{string.Join(", ", mat.GlassyNoiseParams.Select(Num))}]");
-                        parts.Add($"glassy_mask = [{string.Join(", ", mat.GlassyMaskParams.Select(Num))}]");
-                    }
-                    if (mat.XiaoYou)
-                    {
-                        // 目标 PS 的 t3。XiaoYou 有 MainTex 基色，不能落到下面仅限纯特效
-                        // (`BaseColor is null`) 的 noise_tex 输出分支；漏掉时运行时会绑白图，
-                        // flow 永远停在第二个（青色）端点。
-                        if (mat.NoiseTexture is not null)
-                            parts.Add($"noise_tex = {Quote(mat.NoiseTexture)}");
-                        parts.Add("xiaoyou = true");
-                        parts.Add($"xiaoyou_base1 = [{string.Join(", ", mat.XiaoYouBaseColor1.Select(Num))}]");
-                        parts.Add($"xiaoyou_base2 = [{string.Join(", ", mat.XiaoYouBaseColor2.Select(Num))}]");
-                        parts.Add($"xiaoyou_flow1 = [{string.Join(", ", mat.XiaoYouFlowColor1.Select(Num))}]");
-                        parts.Add($"xiaoyou_flow2 = [{string.Join(", ", mat.XiaoYouFlowColor2.Select(Num))}]");
-                        parts.Add($"xiaoyou_star_color = [{string.Join(", ", mat.XiaoYouStarColor.Select(Num))}]");
-                        parts.Add($"xiaoyou_noise_flow = [{string.Join(", ", mat.XiaoYouNoiseFlow.Select(Num))}]");
-                        parts.Add($"xiaoyou_shape = [{string.Join(", ", mat.XiaoYouShape.Select(Num))}]");
-                        parts.Add($"xiaoyou_star_uv = [{string.Join(", ", mat.XiaoYouStarUv.Select(Num))}]");
-                    }
-                    if (mat.YutuEar is { } yutu)
-                    {
-                        parts.Add("yutu_ear = true");
-                        if (yutu.BubbleTexture is not null)
-                            parts.Add($"yutu_bubble_tex = {Quote(yutu.BubbleTexture)}");
-                        if (yutu.DistortTexture is not null)
-                            parts.Add($"yutu_distort_tex = {Quote(yutu.DistortTexture)}");
-                        if (yutu.FlowTexture is not null)
-                            parts.Add($"yutu_flow_tex = {Quote(yutu.FlowTexture)}");
-                        parts.Add($"yutu_bubble_color = [{string.Join(", ", yutu.BubbleColor.Select(Num))}]");
-                        parts.Add($"yutu_flow_color = [{string.Join(", ", yutu.FlowColor.Select(Num))}]");
-                        parts.Add($"yutu_fresnel_color = [{string.Join(", ", yutu.FresnelColor.Select(Num))}]");
-                        parts.Add($"yutu_inner_color = [{string.Join(", ", yutu.InnerColor.Select(Num))}]");
-                        parts.Add($"yutu_overall_color = [{string.Join(", ", yutu.OverallColor.Select(Num))}]");
-                        parts.Add($"yutu_ramp_color = [{string.Join(", ", yutu.RampColor.Select(Num))}]");
-                        parts.Add($"yutu_top_color = [{string.Join(", ", yutu.TopColor.Select(Num))}]");
-                        parts.Add($"yutu_bubble_shape = [{string.Join(", ", yutu.BubbleShape.Select(Num))}]");
-                        parts.Add($"yutu_flow_shape = [{string.Join(", ", yutu.FlowShape.Select(Num))}]");
-                        parts.Add($"yutu_light_shape = [{string.Join(", ", yutu.LightShape.Select(Num))}]");
-                        parts.Add($"yutu_top_shape = [{string.Join(", ", yutu.TopShape.Select(Num))}]");
-                    }
-                    if (mat.FakeFluid is { } fluid)
-                    {
-                        parts.Add("fake_fluid = true");
-                        parts.Add($"fluid_edge_color = [{string.Join(", ", fluid.EdgeColor.Select(Num))}]");
-                        parts.Add($"fluid_fresnel_color = [{string.Join(", ", fluid.FresnelColor.Select(Num))}]");
-                        parts.Add($"fluid_plane_color = [{string.Join(", ", fluid.PlaneColor.Select(Num))}]");
-                        parts.Add($"fluid_gradient1 = [{string.Join(", ", fluid.Gradient1.Select(Num))}]");
-                        parts.Add($"fluid_gradient2 = [{string.Join(", ", fluid.Gradient2.Select(Num))}]");
-                        parts.Add($"fluid_height_tiling = [{string.Join(", ", fluid.HeightTiling.Select(Num))}]");
-                        parts.Add($"fluid_plane_axis = [{string.Join(", ", fluid.PlaneAxis.Select(Num))}]");
-                        parts.Add($"fluid_plane_center = [{string.Join(", ", fluid.PlaneCenter.Select(Num))}]");
-                        parts.Add($"fluid_body_shape = [{string.Join(", ", fluid.BodyShape.Select(Num))}]");
-                        parts.Add($"fluid_gradient_shape = [{string.Join(", ", fluid.GradientShape.Select(Num))}]");
-                        parts.Add($"fluid_top_shape = [{string.Join(", ", fluid.TopShape.Select(Num))}]");
-                    }
-                    if (mat.MatcapMasked is { } masked)
-                    {
-                        parts.Add("matcap_masked = true");
-                        parts.Add($"matcap_masked_base = [{string.Join(", ", masked.BaseColor.Select(Num))}]");
-                        parts.Add($"matcap_masked_light_ramp = [{string.Join(", ", masked.LightRampColor.Select(Num))}]");
-                        parts.Add($"matcap_masked_flat = [{string.Join(", ", masked.FlatEmissiveColor.Select(Num))}]");
-                        parts.Add($"matcap_masked_main = [{string.Join(", ", masked.MainColor.Select(Num))}]");
-                        parts.Add($"matcap_masked_selection = [{string.Join(", ", masked.SelectionColor.Select(Num))}]");
-                        parts.Add($"matcap_masked_rim = [{string.Join(", ", masked.RimShape.Select(Num))}]");
-                        parts.Add($"matcap_masked_surface = [{string.Join(", ", masked.SurfaceShape.Select(Num))}]");
-                    }
-                    if (mat.FairyBall is { } fairy)
-                    {
-                        parts.Add("fairy_ball = true");
-                        if (fairy.Matcap is not null)
-                            parts.Add($"fairy_matcap_tex = {Quote(fairy.Matcap)}");
-                        parts.Add($"fairy_base = [{string.Join(", ", fairy.BaseColor.Select(Num))}]");
-                        parts.Add($"fairy_matcap_color = [{string.Join(", ", fairy.MatcapColor.Select(Num))}]");
-                        parts.Add($"fairy_rim_dark = [{string.Join(", ", fairy.RimDarkColor.Select(Num))}]");
-                        parts.Add($"fairy_rim_light = [{string.Join(", ", fairy.RimLightColor.Select(Num))}]");
-                        parts.Add($"fairy_main = [{string.Join(", ", fairy.MainColor.Select(Num))}]");
-                        parts.Add($"fairy_shape = [{string.Join(", ", fairy.Shape.Select(Num))}]");
-                    }
-                    // 每个键只许出现一次:重复键 TOML 直接解析失败(opacity/flow 都踩过)
-                    parts.Add($"opacity = {Num(mat.Opacity)}");
-                    // 基色 alpha 就是不透明度(见 MaterialInfo.AlphaIsOpacity)
-                    if (mat.AlphaIsOpacity) parts.Add("alpha_opacity = true");
-                    // 父链对所有材质都记:它是「这一族该怎么画」的唯一线索
-                    // (如 `M_FX_Fire_Mat` = 火焰、`..._Trans_XingGuang_WPO` = 需要顶点位移的纱)
-                    parts.Add($"parents = [{string.Join(", ", mat.ParentChain.Select(Quote))}]");
-                    if (mat.BaseColor is null)
-                    {
-                        // 特效层:主色 + 卷动 + 遮罩/噪声,运行时靠这些近似画出火焰/水壳/光晕
-                        if (mat.Tint is { } t)
-                            parts.Add($"tint = [{Num(t[0])}, {Num(t[1])}, {Num(t[2])}, {Num(t[3])}]");
-                        parts.Add($"glow = {Num(mat.Glow)}");
-                        if (mat.FlowTexture is null)
-                            parts.Add($"flow = [{string.Join(", ", mat.Flow.Select(Num))}]");
-                        if (mat.MaskTexture is not null)
-                        {
-                            parts.Add($"mask_tex = {Quote(mat.MaskTexture)}");
-                            if (mat.MaskIsMatcap) parts.Add("mask_matcap = true");
-                        }
-                        if (mat.NoiseTexture is not null) parts.Add($"noise_tex = {Quote(mat.NoiseTexture)}");
-                    }
-                    sb.AppendLine($"  {ClipKey(mat.Name)} = {{ {string.Join(", ", parts)} }}");
-                }
-            }
+            AppendMaterials(sb,
+                "  [forms.materials]   # glb 里的材质名 → 原材质贴图、混合模式与专用着色参数",
+                report.Materials);
+            // 异色:同一个 glb、同一批材质名,查的是另一张表。没有异色的形态整节不写。
+            AppendMaterials(sb,
+                "  [forms.shiny_materials]   # 异色(MDT_SHINING):换成 Yise/Mat/ 那一套材质",
+                report.ShinyMaterials);
 
             if (report.Warnings.Count > 0)
             {

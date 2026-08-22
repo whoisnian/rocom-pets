@@ -51,6 +51,9 @@ struct RawForm {
     clips: HashMap<String, RawClip>,
     #[serde(default)]
     materials: HashMap<String, RawMaterial>,
+    /// `[forms.shiny_materials]`:异色那一套。**旧包没有这一节** ⇒ 空表 = 这只没有异色。
+    #[serde(default)]
+    shiny_materials: HashMap<String, RawMaterial>,
     #[serde(default)]
     voice: Option<RawVoice>,
     /// `[forms.sfx]`:动作音效层,键与 `[forms.voice]`、`[forms.clips]` 同一套。
@@ -641,6 +644,27 @@ pub struct Form {
     /// glb 里的材质名 → 该画什么。**载入模型必需**,空的话 `Model::load` 直接报错
     /// (旧版导出的包没有这一节,重导即可)。
     pub materials: HashMap<String, Material>,
+    /// 异色那一套材质,**键与 `materials` 完全相同**(glb 里的材质名是默认那套)。
+    /// 空 = 这个形态没有异色 —— 全库只有一小部分有(游戏里也是),见 `Form::has_shiny`。
+    pub shiny_materials: HashMap<String, Material>,
+}
+
+impl Form {
+    /// 这个形态有没有异色。**多数没有** —— 游戏里也是:异色要美术另做一套材质与贴图,
+    /// 全库 `MODEL_CONF` 3297 行里只有 177 行的 `shiny_icon` 与普通图不同。
+    /// 界面上据此决定「异色」这一档给不给点。
+    pub fn has_shiny(&self) -> bool {
+        !self.shiny_materials.is_empty()
+    }
+
+    /// 该按哪一张材质表画。异色那档在包里就是另一套材质,`Model::load` 拿它当唯一来源。
+    pub fn materials_for(&self, shiny: bool) -> &HashMap<String, Material> {
+        if shiny && self.has_shiny() {
+            &self.shiny_materials
+        } else {
+            &self.materials
+        }
+    }
 }
 
 /// 一个形态的声音。**两层**:嗓子发出来的叫声,和身体动静的音效 ——
@@ -666,6 +690,184 @@ pub struct VoiceClip {
 }
 
 /// manifest 里那一节音频表 → 包内绝对路径。两层各调一次。
+/// `[forms.materials]` / `[forms.shiny_materials]` → 运行时的材质表。
+///
+/// **两节共用一套字段**:异色是换整套材质,不是另一种着色,所以每一条的形状与默认那套
+/// 逐个相同,只是值来自 `<资产>/Yise/Mat/`。见导出器的 `Shiny`。
+fn material_table(root: &Path, raw: HashMap<String, RawMaterial>) -> HashMap<String, Material> {
+    raw.into_iter()
+        .map(|(name, mat)| {
+            (
+                // 键统一小写:材质名在「资产文件名」与「对象名」之间大小写会漂
+                // (喵呜是 MiaoMiao/Miaomiao、魔力猫反过来),查表必须不区分大小写
+                name.to_ascii_lowercase(),
+                Material {
+                    base_color: mat.base_color.map(|rel| root.join(rel)),
+                    mask_alpha: mat.mask_alpha,
+                    face: mat.parents.iter().any(|p| p.contains("P_Eyes")),
+                    face_cards: mat.parents.iter().any(|p| p.contains("P_Eyes_Mesh")),
+                    glassy_target: is_glassy_target(&name, &mat.parents),
+                    effect: Effect {
+                        // 没给主色就用白,至少形体在
+                        tint: mat.tint.unwrap_or([1.0; 4]),
+                        opacity: mat.opacity,
+                        glow: mat.glow,
+                        flow: mat.flow.unwrap_or([0.0, 0.0, 1.0, 1.0]),
+                        mask: mat.mask_tex.clone().map(|rel| root.join(rel)),
+                        noise: mat.noise_tex.map(|rel| root.join(rel)),
+                        mask_matcap: mat.mask_matcap,
+                    },
+                    translucent: mat.translucent,
+                    outline: mat.outline,
+                    outline_width: mat.outline_width,
+                    paint_order: mat.paint_order,
+                    opacity: mat.opacity,
+                    star: mat.star_tex.map(|rel| root.join(rel)),
+                    star_fake_trans: mat.star_fake_trans,
+                    star_tiling: mat.star_tiling.unwrap_or([1.0, 1.0]),
+                    star_color: mat.star_color.unwrap_or([1.0; 3]),
+                    stick_intensity: mat.stick_intensity,
+                    matcap: mat.matcap_tex.map(|rel| root.join(rel)),
+                    matcap_color: mat.matcap_color.unwrap_or([1.0; 3]),
+                    rim_color: mat.rim_color.unwrap_or([1.0; 3]),
+                    rim_intensity: mat.rim_intensity,
+                    emissive: mat.emissive.unwrap_or([0.0; 3]),
+                    emissive_intensity: mat.emissive_intensity,
+                    rim_power: mat.rim_power,
+                    rim_soft_edge: mat.rim_soft_edge,
+                    highlight_offset: mat.highlight_offset.unwrap_or([0.0; 3]),
+                    highlight_color: mat.highlight_color.unwrap_or([1.0; 3]),
+                    highlight_power: mat.highlight_power,
+                    highlight_intensity: mat.highlight_intensity,
+                    force_default_opacity: mat.force_default_opacity,
+                    opacity_depth_distance: mat.opacity_depth_distance,
+                    open_depth_distance: mat.open_depth_distance,
+                    object_trans_low: mat.object_trans_low,
+                    light_mask: mat.light_mask_tex.map(|rel| root.join(rel)),
+                    ramp: mat.ramp_tex.map(|rel| root.join(rel)),
+                    object_trans_soft_edge: mat.object_trans_soft_edge,
+                    main_color: mat.main_color.unwrap_or([1.0; 3]),
+                    main_bright: mat.main_bright,
+                    noise_uv: mat.noise_uv.unwrap_or([0.0, 0.0, 1.0, 1.0]),
+                    alpha_opacity: mat.alpha_opacity,
+                    flow: mat.flow_tex.map(|rel| root.join(rel)),
+                    flow_uv: mat.flow.unwrap_or([0.0, 0.0, 1.0, 1.0]),
+                    flow_power: mat.flow_power,
+                    mask_id: mat.mask_id_tex.map(|rel| root.join(rel)),
+                    mask_id_range: mat.mask_id_range.unwrap_or([0.0, 1.0]),
+                    interior: mat.interior_tex.map(|rel| root.join(rel)),
+                    interior_color: mat.interior_color.unwrap_or([1.0; 3]),
+                    refraction: mat.refraction,
+                    refract_depth: mat.refract_depth,
+                    flicker: mat.flicker.unwrap_or([0.3, 5.0]),
+                    glassy_inner: mat.glassy_inner.then(|| GlassyInner {
+                        flow1: mat.glassy_flow1.unwrap_or([1.0; 4]),
+                        flow2: mat.glassy_flow2.unwrap_or([1.0; 4]),
+                        fresnel: mat.glassy_fresnel.unwrap_or([1.0; 4]),
+                        // 旧包若只带开关而缺数组,退回游戏根材质的原始默认值。
+                        noise: mat.glassy_noise.unwrap_or([-0.1, 1.0, 0.2, 30.0]),
+                        mask: mat.glassy_mask.unwrap_or([1.0, 0.7, 0.1, 0.0]),
+                    }),
+                    xiaoyou: mat.xiaoyou.then(|| XiaoYou {
+                        base1: mat.xiaoyou_base1.unwrap_or([0.0, 0.0, 0.0, 1.0]),
+                        base2: mat.xiaoyou_base2.unwrap_or([0.0, 0.0, 0.0, 1.0]),
+                        flow1: mat.xiaoyou_flow1.unwrap_or([0.0, 0.0, 0.0, 1.0]),
+                        flow2: mat.xiaoyou_flow2.unwrap_or([0.0, 0.0, 0.0, 1.0]),
+                        star_color: mat.xiaoyou_star_color.unwrap_or([0.0; 4]),
+                        noise_flow: mat.xiaoyou_noise_flow.unwrap_or([0.0; 4]),
+                        shape: mat.xiaoyou_shape.unwrap_or([1.0, 1.0, 1.0, 0.0]),
+                        star_uv: mat.xiaoyou_star_uv.unwrap_or([1.0, 0.0, 1.0, 0.0]),
+                    }),
+                    yutu_ear: mat.yutu_ear.then(|| YutuEar {
+                        bubble: mat.yutu_bubble_tex.map(|rel| root.join(rel)),
+                        distort: mat.yutu_distort_tex.map(|rel| root.join(rel)),
+                        flow: mat.yutu_flow_tex.map(|rel| root.join(rel)),
+                        bubble_color: mat
+                            .yutu_bubble_color
+                            .unwrap_or([0.0, 0.508735, 1.0, 1.0]),
+                        flow_color: mat.yutu_flow_color.unwrap_or([1.0, 1.0, 1.0, 0.0]),
+                        fresnel_color: mat
+                            .yutu_fresnel_color
+                            .unwrap_or([1.0, 1.0, 1.0, 0.0]),
+                        inner_color: mat.yutu_inner_color.unwrap_or([1.0; 4]),
+                        overall_color: mat
+                            .yutu_overall_color
+                            .unwrap_or([1.0, 1.0, 1.0, 0.0]),
+                        ramp_color: mat.yutu_ramp_color.unwrap_or([1.0, 1.0, 1.0, 0.0]),
+                        top_color: mat.yutu_top_color.unwrap_or([0.0; 4]),
+                        bubble_shape: mat
+                            .yutu_bubble_shape
+                            .unwrap_or([0.05, 0.05, 5.0, 0.2]),
+                        flow_shape: mat
+                            .yutu_flow_shape
+                            .unwrap_or([0.1, -0.5, 1.0, 0.8]),
+                        light_shape: mat
+                            .yutu_light_shape
+                            .unwrap_or([0.3, 1.0, 1.0, 0.0]),
+                        top_shape: mat.yutu_top_shape.unwrap_or([0.0, 0.0, 1.0, 0.0]),
+                    }),
+                    fake_fluid: mat.fake_fluid.then(|| FakeFluid {
+                        edge_color: mat.fluid_edge_color.unwrap_or([1.0; 4]),
+                        fresnel_color: mat
+                            .fluid_fresnel_color
+                            .unwrap_or([1.0, 1.0, 1.0, 0.0]),
+                        plane_color: mat.fluid_plane_color.unwrap_or([1.0; 4]),
+                        gradient1: mat.fluid_gradient1.unwrap_or([1.0; 4]),
+                        gradient2: mat.fluid_gradient2.unwrap_or([1.0; 4]),
+                        height_tiling: mat
+                            .fluid_height_tiling
+                            .unwrap_or([1.0, 1.0, 0.0, 0.0]),
+                        plane_axis: mat
+                            .fluid_plane_axis
+                            .unwrap_or([0.0, 0.0, 1.0, 1.0]),
+                        plane_center: mat.fluid_plane_center.unwrap_or([0.0; 4]),
+                        body_shape: mat
+                            .fluid_body_shape
+                            .unwrap_or([5.0, 0.8, 0.1, 5.0]),
+                        gradient_shape: mat
+                            .fluid_gradient_shape
+                            .unwrap_or([0.5, 0.01, 0.3, 0.2]),
+                        top_shape: mat
+                            .fluid_top_shape
+                            .unwrap_or([0.3, 0.05, 1.0, 30.0]),
+                    }),
+                    matcap_masked: mat.matcap_masked.then(|| MatcapMasked {
+                        matcap: mat.mask_tex.map(|rel| root.join(rel)),
+                        base_color: mat
+                            .matcap_masked_base
+                            .unwrap_or([1.0, 1.0, 1.0, 0.0]),
+                        light_ramp: mat
+                            .matcap_masked_light_ramp
+                            .unwrap_or([1.0, 1.0, 1.0, 0.0]),
+                        flat_emissive: mat.matcap_masked_flat.unwrap_or([1.0; 4]),
+                        main_color: mat.matcap_masked_main.unwrap_or([1.0; 4]),
+                        selection_color: mat
+                            .matcap_masked_selection
+                            .unwrap_or([0.0; 4]),
+                        rim_shape: mat
+                            .matcap_masked_rim
+                            .unwrap_or([0.4, 0.3, 0.0, 3.0]),
+                        surface_shape: mat
+                            .matcap_masked_surface
+                            .unwrap_or([1.0, 0.0, 1.0, 0.0]),
+                    }),
+                    fairy_ball: mat.fairy_ball.then(|| FairyBall {
+                        matcap: mat.fairy_matcap_tex.map(|rel| root.join(rel)),
+                        base_color: mat.fairy_base.unwrap_or([1.0, 1.0, 1.0, 0.0]),
+                        matcap_color: mat
+                            .fairy_matcap_color
+                            .unwrap_or([1.0, 1.0, 1.0, 0.1]),
+                        rim_dark: mat.fairy_rim_dark.unwrap_or([1.0; 4]),
+                        rim_light: mat.fairy_rim_light.unwrap_or([1.0; 4]),
+                        main_color: mat.fairy_main.unwrap_or([1.0; 4]),
+                        shape: mat.fairy_shape.unwrap_or([2.0, 0.05, 0.0, 1.0]),
+                    }),
+                },
+            )
+        })
+        .collect()
+}
+
 fn sound_files(root: &Path, raw: HashMap<String, RawVoiceClip>) -> HashMap<String, VoiceClip> {
     raw.into_iter()
         .map(|(key, clip)| {
@@ -700,6 +902,7 @@ impl Form {
             clips,
             voice: None,
             materials: HashMap::new(),
+            shiny_materials: HashMap::new(),
         }
     }
 }
@@ -984,179 +1187,8 @@ impl Pack {
                         )
                     })
                     .collect(),
-                materials: form
-                    .materials
-                    .into_iter()
-                    .map(|(name, mat)| {
-                        (
-                            // 键统一小写:材质名在「资产文件名」与「对象名」之间大小写会漂
-                            // (喵呜是 MiaoMiao/Miaomiao、魔力猫反过来),查表必须不区分大小写
-                            name.to_ascii_lowercase(),
-                            Material {
-                                base_color: mat.base_color.map(|rel| root.join(rel)),
-                                mask_alpha: mat.mask_alpha,
-                                face: mat.parents.iter().any(|p| p.contains("P_Eyes")),
-                                face_cards: mat.parents.iter().any(|p| p.contains("P_Eyes_Mesh")),
-                                glassy_target: is_glassy_target(&name, &mat.parents),
-                                effect: Effect {
-                                    // 没给主色就用白,至少形体在
-                                    tint: mat.tint.unwrap_or([1.0; 4]),
-                                    opacity: mat.opacity,
-                                    glow: mat.glow,
-                                    flow: mat.flow.unwrap_or([0.0, 0.0, 1.0, 1.0]),
-                                    mask: mat.mask_tex.clone().map(|rel| root.join(rel)),
-                                    noise: mat.noise_tex.map(|rel| root.join(rel)),
-                                    mask_matcap: mat.mask_matcap,
-                                },
-                                translucent: mat.translucent,
-                                outline: mat.outline,
-                                outline_width: mat.outline_width,
-                                paint_order: mat.paint_order,
-                                opacity: mat.opacity,
-                                star: mat.star_tex.map(|rel| root.join(rel)),
-                                star_fake_trans: mat.star_fake_trans,
-                                star_tiling: mat.star_tiling.unwrap_or([1.0, 1.0]),
-                                star_color: mat.star_color.unwrap_or([1.0; 3]),
-                                stick_intensity: mat.stick_intensity,
-                                matcap: mat.matcap_tex.map(|rel| root.join(rel)),
-                                matcap_color: mat.matcap_color.unwrap_or([1.0; 3]),
-                                rim_color: mat.rim_color.unwrap_or([1.0; 3]),
-                                rim_intensity: mat.rim_intensity,
-                                emissive: mat.emissive.unwrap_or([0.0; 3]),
-                                emissive_intensity: mat.emissive_intensity,
-                                rim_power: mat.rim_power,
-                                rim_soft_edge: mat.rim_soft_edge,
-                                highlight_offset: mat.highlight_offset.unwrap_or([0.0; 3]),
-                                highlight_color: mat.highlight_color.unwrap_or([1.0; 3]),
-                                highlight_power: mat.highlight_power,
-                                highlight_intensity: mat.highlight_intensity,
-                                force_default_opacity: mat.force_default_opacity,
-                                opacity_depth_distance: mat.opacity_depth_distance,
-                                open_depth_distance: mat.open_depth_distance,
-                                object_trans_low: mat.object_trans_low,
-                                light_mask: mat.light_mask_tex.map(|rel| root.join(rel)),
-                                ramp: mat.ramp_tex.map(|rel| root.join(rel)),
-                                object_trans_soft_edge: mat.object_trans_soft_edge,
-                                main_color: mat.main_color.unwrap_or([1.0; 3]),
-                                main_bright: mat.main_bright,
-                                noise_uv: mat.noise_uv.unwrap_or([0.0, 0.0, 1.0, 1.0]),
-                                alpha_opacity: mat.alpha_opacity,
-                                flow: mat.flow_tex.map(|rel| root.join(rel)),
-                                flow_uv: mat.flow.unwrap_or([0.0, 0.0, 1.0, 1.0]),
-                                flow_power: mat.flow_power,
-                                mask_id: mat.mask_id_tex.map(|rel| root.join(rel)),
-                                mask_id_range: mat.mask_id_range.unwrap_or([0.0, 1.0]),
-                                interior: mat.interior_tex.map(|rel| root.join(rel)),
-                                interior_color: mat.interior_color.unwrap_or([1.0; 3]),
-                                refraction: mat.refraction,
-                                refract_depth: mat.refract_depth,
-                                flicker: mat.flicker.unwrap_or([0.3, 5.0]),
-                                glassy_inner: mat.glassy_inner.then(|| GlassyInner {
-                                    flow1: mat.glassy_flow1.unwrap_or([1.0; 4]),
-                                    flow2: mat.glassy_flow2.unwrap_or([1.0; 4]),
-                                    fresnel: mat.glassy_fresnel.unwrap_or([1.0; 4]),
-                                    // 旧包若只带开关而缺数组,退回游戏根材质的原始默认值。
-                                    noise: mat.glassy_noise.unwrap_or([-0.1, 1.0, 0.2, 30.0]),
-                                    mask: mat.glassy_mask.unwrap_or([1.0, 0.7, 0.1, 0.0]),
-                                }),
-                                xiaoyou: mat.xiaoyou.then(|| XiaoYou {
-                                    base1: mat.xiaoyou_base1.unwrap_or([0.0, 0.0, 0.0, 1.0]),
-                                    base2: mat.xiaoyou_base2.unwrap_or([0.0, 0.0, 0.0, 1.0]),
-                                    flow1: mat.xiaoyou_flow1.unwrap_or([0.0, 0.0, 0.0, 1.0]),
-                                    flow2: mat.xiaoyou_flow2.unwrap_or([0.0, 0.0, 0.0, 1.0]),
-                                    star_color: mat.xiaoyou_star_color.unwrap_or([0.0; 4]),
-                                    noise_flow: mat.xiaoyou_noise_flow.unwrap_or([0.0; 4]),
-                                    shape: mat.xiaoyou_shape.unwrap_or([1.0, 1.0, 1.0, 0.0]),
-                                    star_uv: mat.xiaoyou_star_uv.unwrap_or([1.0, 0.0, 1.0, 0.0]),
-                                }),
-                                yutu_ear: mat.yutu_ear.then(|| YutuEar {
-                                    bubble: mat.yutu_bubble_tex.map(|rel| root.join(rel)),
-                                    distort: mat.yutu_distort_tex.map(|rel| root.join(rel)),
-                                    flow: mat.yutu_flow_tex.map(|rel| root.join(rel)),
-                                    bubble_color: mat
-                                        .yutu_bubble_color
-                                        .unwrap_or([0.0, 0.508735, 1.0, 1.0]),
-                                    flow_color: mat.yutu_flow_color.unwrap_or([1.0, 1.0, 1.0, 0.0]),
-                                    fresnel_color: mat
-                                        .yutu_fresnel_color
-                                        .unwrap_or([1.0, 1.0, 1.0, 0.0]),
-                                    inner_color: mat.yutu_inner_color.unwrap_or([1.0; 4]),
-                                    overall_color: mat
-                                        .yutu_overall_color
-                                        .unwrap_or([1.0, 1.0, 1.0, 0.0]),
-                                    ramp_color: mat.yutu_ramp_color.unwrap_or([1.0, 1.0, 1.0, 0.0]),
-                                    top_color: mat.yutu_top_color.unwrap_or([0.0; 4]),
-                                    bubble_shape: mat
-                                        .yutu_bubble_shape
-                                        .unwrap_or([0.05, 0.05, 5.0, 0.2]),
-                                    flow_shape: mat
-                                        .yutu_flow_shape
-                                        .unwrap_or([0.1, -0.5, 1.0, 0.8]),
-                                    light_shape: mat
-                                        .yutu_light_shape
-                                        .unwrap_or([0.3, 1.0, 1.0, 0.0]),
-                                    top_shape: mat.yutu_top_shape.unwrap_or([0.0, 0.0, 1.0, 0.0]),
-                                }),
-                                fake_fluid: mat.fake_fluid.then(|| FakeFluid {
-                                    edge_color: mat.fluid_edge_color.unwrap_or([1.0; 4]),
-                                    fresnel_color: mat
-                                        .fluid_fresnel_color
-                                        .unwrap_or([1.0, 1.0, 1.0, 0.0]),
-                                    plane_color: mat.fluid_plane_color.unwrap_or([1.0; 4]),
-                                    gradient1: mat.fluid_gradient1.unwrap_or([1.0; 4]),
-                                    gradient2: mat.fluid_gradient2.unwrap_or([1.0; 4]),
-                                    height_tiling: mat
-                                        .fluid_height_tiling
-                                        .unwrap_or([1.0, 1.0, 0.0, 0.0]),
-                                    plane_axis: mat
-                                        .fluid_plane_axis
-                                        .unwrap_or([0.0, 0.0, 1.0, 1.0]),
-                                    plane_center: mat.fluid_plane_center.unwrap_or([0.0; 4]),
-                                    body_shape: mat
-                                        .fluid_body_shape
-                                        .unwrap_or([5.0, 0.8, 0.1, 5.0]),
-                                    gradient_shape: mat
-                                        .fluid_gradient_shape
-                                        .unwrap_or([0.5, 0.01, 0.3, 0.2]),
-                                    top_shape: mat
-                                        .fluid_top_shape
-                                        .unwrap_or([0.3, 0.05, 1.0, 30.0]),
-                                }),
-                                matcap_masked: mat.matcap_masked.then(|| MatcapMasked {
-                                    matcap: mat.mask_tex.map(|rel| root.join(rel)),
-                                    base_color: mat
-                                        .matcap_masked_base
-                                        .unwrap_or([1.0, 1.0, 1.0, 0.0]),
-                                    light_ramp: mat
-                                        .matcap_masked_light_ramp
-                                        .unwrap_or([1.0, 1.0, 1.0, 0.0]),
-                                    flat_emissive: mat.matcap_masked_flat.unwrap_or([1.0; 4]),
-                                    main_color: mat.matcap_masked_main.unwrap_or([1.0; 4]),
-                                    selection_color: mat
-                                        .matcap_masked_selection
-                                        .unwrap_or([0.0; 4]),
-                                    rim_shape: mat
-                                        .matcap_masked_rim
-                                        .unwrap_or([0.4, 0.3, 0.0, 3.0]),
-                                    surface_shape: mat
-                                        .matcap_masked_surface
-                                        .unwrap_or([1.0, 0.0, 1.0, 0.0]),
-                                }),
-                                fairy_ball: mat.fairy_ball.then(|| FairyBall {
-                                    matcap: mat.fairy_matcap_tex.map(|rel| root.join(rel)),
-                                    base_color: mat.fairy_base.unwrap_or([1.0, 1.0, 1.0, 0.0]),
-                                    matcap_color: mat
-                                        .fairy_matcap_color
-                                        .unwrap_or([1.0, 1.0, 1.0, 0.1]),
-                                    rim_dark: mat.fairy_rim_dark.unwrap_or([1.0; 4]),
-                                    rim_light: mat.fairy_rim_light.unwrap_or([1.0; 4]),
-                                    main_color: mat.fairy_main.unwrap_or([1.0; 4]),
-                                    shape: mat.fairy_shape.unwrap_or([2.0, 0.05, 0.0, 1.0]),
-                                }),
-                            },
-                        )
-                    })
-                    .collect(),
+                materials: material_table(root, form.materials),
+                shiny_materials: material_table(root, form.shiny_materials),
             })
             .collect::<Vec<_>>();
         if forms.is_empty() {

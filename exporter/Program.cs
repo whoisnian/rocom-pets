@@ -452,6 +452,196 @@ ChainResult ExportChain(Chain chain)
     }
 }
 
+/// 把解出来的材质表摊成 manifest 的 `[[forms.materials]]` 条目,顺手把每个材质要用的
+/// 贴图补导到 `texDir`。
+///
+/// **提出来是为了给异色复用**:异色是换整套材质(`<资产>/Yise/Mat/` 那一份),
+/// 走的就是这同一条链 —— 同样的父链判定、同样的特效族、同样的星点层统一。
+/// 唯一的差别在调用方:异色那次传的是另一组 `resolved`,出来之后再把名字改回
+/// 默认槽的名字(glb 里的材质名是默认那套,见 `ShinyMaterials`)。
+static List<MaterialEntry> BuildMaterials(
+    AbstractVfsFileProvider fileProvider,
+    Dictionary<string, MaterialInfo> resolved,
+    string assetName,
+    string texDir,
+    List<TextureFile> textures,
+    List<string> warnings)
+{
+    var materials = new List<MaterialEntry>();
+    // 这个形态的星点遮罩(见下面统一那一段):优先用「假半透」族给的那张,它是宠物自己的
+    // 星点图(幽星光一族 = `T_Ill_XingGuang1_001_Fx_D`);没有才退用共享的 `StarStickTex`。
+    (string Tex, float[] Tiling, float[]? Color, float[] NoiseUv)? starLayer = null;
+    var starFromFakeTrans = false;
+    // 平铺数单独挑一份:见下面统一那一段末尾的说明 —— 贴图跟着「假半透」那份走,
+    // 平铺数则跟着**实例里显式覆盖过**的那份走(两者不一定在同一个材质上)。
+    float[]? explicitTiling = null;
+    foreach (var (name, info) in resolved)
+    {
+        // 个别槽悬空:不写进材质表,运行时会跳过那一片(总比拿别的贴图硬凑好)
+        if (!info.Resolved) continue;
+        // 游戏自带的描边材质我们不用(自己按法线外扩画描边)
+        if (name.EndsWith("_Ol", StringComparison.OrdinalIgnoreCase)) continue;
+        string? baseColor = null;
+        if (info.BaseColorTexture is { } objectPath)
+        {
+            // 基色贴图可能不在本资产的 Tex/ 下(共享图集/别的槽的贴图),那就补导一份
+            var file = Textures.ExportByObjectPath(fileProvider, objectPath, texDir, textures, warnings);
+            // 路径写成**包内相对**(和上面的 model 字段一致),运行时是拿包目录去 join 的;
+            // 注意别跟 [forms.textures] 那节的 form 内相对路径搞混
+            if (file is not null) baseColor = $"forms/{assetName}/tex/{file}";
+            else warnings.Add($"材质 {name} 的基色贴图导不出来: {objectPath}");
+        }
+        // 特效层没有固有色贴图,靠主色 + 遮罩/噪声近似;那两张贴图要补导出来
+        string? maskFile = null;
+        string? noiseFile = null;
+        if (baseColor is null)
+        {
+            maskFile = ExportEffectTexture(info.MaskTexture);
+            noiseFile = ExportEffectTexture(info.NoiseTexture);
+        }
+        else if (info.WaterColor1 is not null || info.IsXiaoYou)
+        {
+            // 水体预设的 caustics 也走 `noise_tex` 那个槽(它有基色,但没有色带,槽是空的)
+            noiseFile = ExportEffectTexture(info.NoiseTexture);
+        }
+        var yutuEar = info.IsYutuEar
+            ? new YutuEarMaterial(
+                maskFile, noiseFile, ExportEffectTexture(info.YutuFlowTexture),
+                info.YutuBubbleColor, info.YutuFlowColor, info.YutuFresnelColor,
+                info.YutuInnerColor, info.YutuOverallColor, info.YutuRampColor, info.YutuTopColor,
+                info.YutuBubbleShape, info.YutuFlowShape, info.YutuLightShape, info.YutuTopShape)
+            : null;
+        var fakeFluid = info.IsFakeFluid
+            ? new FakeFluidMaterial(
+                info.FluidEdgeColor, info.FluidFresnelColor, info.FluidPlaneColor,
+                info.FluidGradient1, info.FluidGradient2, info.FluidHeightTiling,
+                info.FluidPlaneAxis, info.FluidPlaneCenter, info.FluidBodyShape,
+                info.FluidGradientShape, info.FluidTopShape)
+            : null;
+        var matcapMasked = info.IsMatcapMasked
+            ? new MatcapMaskedMaterial(
+                info.MatcapMaskedBaseColor, info.MatcapMaskedLightRamp,
+                info.MatcapMaskedFlatEmissive, info.MatcapMaskedMainColor,
+                info.MatcapMaskedSelectionColor, info.MatcapMaskedRimShape,
+                info.MatcapMaskedSurfaceShape)
+            : null;
+        var fairyBall = info.IsFairyBall
+            ? new FairyBallMaterial(
+                ExportEffectTexture(info.FairyBallMatcap),
+                info.FairyBallBaseColor, info.FairyBallMatcapColor,
+                info.FairyBallRimDark, info.FairyBallRimLight,
+                info.FairyBallMainColor, info.FairyBallShape)
+            : null;
+        materials.Add(new MaterialEntry(name, baseColor, info.IsFacePatch,
+            info.OpacityMaskClipValue, info.BlendMode.ToString(), info.ParentChain,
+            info.Tint, info.Opacity, info.Glow, info.Flow, maskFile, noiseFile, info.MaskIsMatcap,
+            info.IsTranslucent,
+            ExportEffectTexture(info.StarTexture), info.StarTiling, info.StarColor, info.StickIntensity,
+            info.IsFakeTrans,
+            info.MaskIsMatcap ? null : ExportEffectTexture(info.MatcapTexture), info.MatcapColor,
+            info.RimColor, info.RimIntensity, info.EmissiveColor, info.EmissiveIntensity,
+            info.RimPower, info.RimSoftEdge,
+            info.HighlightOffset, info.HighlightSpecColor,
+            info.HighlightSpecPower, info.HighlightSpecIntensity, info.ForceUseDefaultOpacity,
+            info.OpacityDepthDistance, info.OpenDepthDistance,
+            info.IsObjectTransLow,
+            ExportEffectTexture(info.ObjectTransLightMaskTexture),
+            ExportEffectTexture(info.ObjectTransRampTexture),
+            info.ObjectTransSoftEdge, info.ObjectTransMainColor, info.ObjectTransMainBright,
+            info.AlphaIsOpacity,
+            ExportEffectTexture(info.FlowTexture), info.FlowPower,
+            ExportEffectTexture(info.MaskIdTexture), info.MaskIdRange,
+            info.WaterColor1, info.WaterColor2, info.WaterMain,
+            info.WaterCaustics, info.WaterShape,
+            ExportEffectTexture(info.InteriorTexture), info.InteriorColor,
+            info.Refraction, info.RefractDepth, info.FlickerSpeed, info.FlickerPower,
+            info.NoiseUv,
+            info.IsGlassyInner,
+            info.GlassyFlowColor01, info.GlassyFlowColor02, info.GlassyFresnelColor,
+            info.GlassyNoiseParams, info.GlassyMaskParams,
+            info.IsXiaoYou,
+            info.XiaoYouBaseColor1, info.XiaoYouBaseColor2,
+            info.XiaoYouFlowColor1, info.XiaoYouFlowColor2, info.XiaoYouStarColor,
+            info.XiaoYouNoiseFlow, info.XiaoYouShape, info.XiaoYouStarUv,
+            yutuEar, fakeFluid, matcapMasked, fairyBall,
+            info.OutlineWidth ?? 0f, info.IsPaintOrder));
+
+        if (info.StarTexture is not null && ExportEffectTexture(info.StarTexture) is { } starTex
+            && (starLayer is null || (info.IsFakeTrans && !starFromFakeTrans)))
+        {
+            // 假半透族的平铺该用 `Mat_NoiseTilingX/Y`(5 / 2.5),不是 `StarStickTiling`(4)。
+            var tile = info.IsFakeTrans && info.NoiseTiling[0] > 0f && info.NoiseTiling[1] > 0f
+                ? info.NoiseTiling : info.StarTiling;
+            starLayer = (starTex, tile, info.StarColor, info.NoiseUv);
+            starFromFakeTrans = info.IsFakeTrans;
+        }
+        // 实例上**显式覆盖过**的 `StarStickTiling`(不是继承来的根默认 4)优先。
+        // 曜星光就是这种情形:5.3 写在 `_By` 上,而星点贴图来自 `_Fx`(假半透那份),
+        // 只按贴图那一份挑会把 5.3 丢掉、退回根默认 4。
+        if (info.Scalars.ContainsKey("StarStickTiling") || info.Vectors.ContainsKey("StarStickTiling"))
+            explicitTiling ??= info.StarTiling;
+
+        string? ExportEffectTexture(string? objectPath)
+        {
+            if (objectPath is null) return null;
+            var file = Textures.ExportByObjectPath(fileProvider, objectPath, texDir, textures, warnings);
+            return file is null ? null : $"forms/{assetName}/tex/{file}";
+        }
+    }
+
+    // **一个形态只有一份星点遮罩,而且盖在整只宠物上。** 各材质自己写的贴图与平铺数并不一致
+    // (暮星辰:裙子是共享的 `Tex_PetGlassyStar_004`、身体是自己的 `Fx_D`),照各自的画就成了
+    // 两种星点两种密度叠在一只宠物上。那两颗球身上的星星也是这层 —— 球的基色在图集里是
+    // **一片平色圆盘**,星形完全来自这层(所以幽星光一颗球是星、另一颗是圆点)。
+    //
+    // 这是我们的简化:游戏那边**每个材质各有一份**(各自的 cb),靠静态开关与遮罩通道决定
+    // 要不要画。真按每材质走要先解出那些开关,现在还做不到。
+    //
+    // 贴图与颜色跟「假半透」那份走(它是宠物自己的星点图);**平铺数单独挑**,跟着实例里
+    // 显式覆盖过的那份走 —— 两者不一定在同一个材质上(见上面 `explicitTiling`)。
+    //
+    // **但不是所有材质都刷**:只刷**自己就开着这一层**的(`StarTexture is not null`,
+    // 判据见 `Materials.StarTexture`:美术显式设了向量 `StarStickTiling`,或者是假半透族)。
+    //
+    // ~~原来的判据是「图里有这一层」(`GraphHasStickLayer`)~~ —— **那道门太松,是个 bug**:
+    // 根默认里就有 `Stick_Intensity`,于是 `M_P_Object` 族的每个材质都过,包括从来没开过
+    // 这一层的白身体。春兔实机报的「身上几乎看不到星点」就是这么来的:它只有 `_Fx`
+    // (半透的耳朵/披风)显式写了 `StarStickTiling = (4,4)`,`_By` 一个星点参数都没覆盖过
+    // (探针:全是「根num」),却被这里刷上了整层星点,渲出来一身四角星。
+    // 统一的本意是「一只宠物别出现两种星点两种密度」,不是「给没开的材质开一层」。
+    if (starLayer is { } star)
+    {
+        var tiling = explicitTiling ?? star.Tiling;
+        var hasLayer = resolved
+            .Where(kv => kv.Value.Resolved && kv.Value.StarTexture is not null)
+            .Select(kv => kv.Key)
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+        for (var i = 0; i < materials.Count; i++)
+        {
+            if (!hasLayer.Contains(materials[i].Name)) continue;
+            // XiaoYou 的 StarTex 是该材质自身 PS 的 t4，并不属于通用 Stick 星点层；
+            // 跨材质统一会把中间层的专用星图误换成另一个 Fx 遮罩。
+            if (materials[i].XiaoYou) continue;
+            materials[i] = materials[i] with
+            {
+                StarTexture = star.Tex,
+                StarTiling = tiling,
+                StarColor = star.Color,
+                // 坐标系/滚动/浓度跟着星点层一起统一发,否则 `_By` 拿不到(见 Manifest.cs)。
+                // **但只在星点层来自假半透族时发** —— 这套参数是那一族的,
+                // 另一族走 `StarStickTex` + 自己的公式,误套过去会让全库过曝 5 → 11(踩过)。
+                NoiseUv = starFromFakeTrans ? star.NoiseUv : [0f, 0f, 1f, 1f],
+                // **`StarFakeTrans` 不在这里统一** —— 它是**按材质**的:
+                // 汇编里带四段渐变的三条 shader(23766 / 27803 / 34270,V=116)全部来自
+                // `_By`(`MI_P_Object` 那一族),而 `_Fx`(`FakeTrans`)的 shader 一条都没有。
+                // 两族公式不同,所以这个标记必须跟着材质自己的父链走。
+            };
+        }
+    }
+
+    return materials;
+}
+
 FormReport ExportForm(
     AbstractVfsFileProvider fileProvider,
     Form form,
@@ -591,176 +781,18 @@ FormReport ExportForm(
         throw new InvalidOperationException(
             $"{form.Asset} 的材质资产在 pak 里全部缺失(疑似未实装的宠物)");
 
-    var materials = new List<MaterialEntry>();
-    // 这个形态的星点遮罩(见下面统一那一段):优先用「假半透」族给的那张,它是宠物自己的
-    // 星点图(幽星光一族 = `T_Ill_XingGuang1_001_Fx_D`);没有才退用共享的 `StarStickTex`。
-    (string Tex, float[] Tiling, float[]? Color, float[] NoiseUv)? starLayer = null;
-    var starFromFakeTrans = false;
-    // 平铺数单独挑一份:见下面统一那一段末尾的说明 —— 贴图跟着「假半透」那份走,
-    // 平铺数则跟着**实例里显式覆盖过**的那份走(两者不一定在同一个材质上)。
-    float[]? explicitTiling = null;
-    foreach (var (name, info) in resolved)
+    var materials = BuildMaterials(fileProvider, resolved, form.Asset, texDir, textures, warnings);
+
+    // 异色(`MDT_SHINING`):清单挂在宠物蓝图的 `DiffMaterials` 上,内容是
+    // `<资产>/Yise/Mat/` 那一套。**多数宠物没有**,拿不到就是空表,不是错误。
+    // 走的是和默认材质完全相同的那条链,只是 `resolved` 换成另一组。
+    var shinyMaterials = new List<MaterialEntry>();
+    var shinySources = Shiny.Materials(fileProvider, form.Blueprint, warnings);
+    if (shinySources.Count > 0)
     {
-        // 个别槽悬空:不写进材质表,运行时会跳过那一片(总比拿别的贴图硬凑好)
-        if (!info.Resolved) continue;
-        // 游戏自带的描边材质我们不用(自己按法线外扩画描边)
-        if (name.EndsWith("_Ol", StringComparison.OrdinalIgnoreCase)) continue;
-        string? baseColor = null;
-        if (info.BaseColorTexture is { } objectPath)
-        {
-            // 基色贴图可能不在本资产的 Tex/ 下(共享图集/别的槽的贴图),那就补导一份
-            var file = Textures.ExportByObjectPath(fileProvider, objectPath, texDir, textures, warnings);
-            // 路径写成**包内相对**(和上面的 model 字段一致),运行时是拿包目录去 join 的;
-            // 注意别跟 [forms.textures] 那节的 form 内相对路径搞混
-            if (file is not null) baseColor = $"forms/{form.Asset}/tex/{file}";
-            else warnings.Add($"材质 {name} 的基色贴图导不出来: {objectPath}");
-        }
-        // 特效层没有固有色贴图,靠主色 + 遮罩/噪声近似;那两张贴图要补导出来
-        string? maskFile = null;
-        string? noiseFile = null;
-        if (baseColor is null)
-        {
-            maskFile = ExportEffectTexture(info.MaskTexture);
-            noiseFile = ExportEffectTexture(info.NoiseTexture);
-        }
-        else if (info.WaterColor1 is not null || info.IsXiaoYou)
-        {
-            // 水体预设的 caustics 也走 `noise_tex` 那个槽(它有基色,但没有色带,槽是空的)
-            noiseFile = ExportEffectTexture(info.NoiseTexture);
-        }
-        var yutuEar = info.IsYutuEar
-            ? new YutuEarMaterial(
-                maskFile, noiseFile, ExportEffectTexture(info.YutuFlowTexture),
-                info.YutuBubbleColor, info.YutuFlowColor, info.YutuFresnelColor,
-                info.YutuInnerColor, info.YutuOverallColor, info.YutuRampColor, info.YutuTopColor,
-                info.YutuBubbleShape, info.YutuFlowShape, info.YutuLightShape, info.YutuTopShape)
-            : null;
-        var fakeFluid = info.IsFakeFluid
-            ? new FakeFluidMaterial(
-                info.FluidEdgeColor, info.FluidFresnelColor, info.FluidPlaneColor,
-                info.FluidGradient1, info.FluidGradient2, info.FluidHeightTiling,
-                info.FluidPlaneAxis, info.FluidPlaneCenter, info.FluidBodyShape,
-                info.FluidGradientShape, info.FluidTopShape)
-            : null;
-        var matcapMasked = info.IsMatcapMasked
-            ? new MatcapMaskedMaterial(
-                info.MatcapMaskedBaseColor, info.MatcapMaskedLightRamp,
-                info.MatcapMaskedFlatEmissive, info.MatcapMaskedMainColor,
-                info.MatcapMaskedSelectionColor, info.MatcapMaskedRimShape,
-                info.MatcapMaskedSurfaceShape)
-            : null;
-        var fairyBall = info.IsFairyBall
-            ? new FairyBallMaterial(
-                ExportEffectTexture(info.FairyBallMatcap),
-                info.FairyBallBaseColor, info.FairyBallMatcapColor,
-                info.FairyBallRimDark, info.FairyBallRimLight,
-                info.FairyBallMainColor, info.FairyBallShape)
-            : null;
-        materials.Add(new MaterialEntry(name, baseColor, info.IsFacePatch,
-            info.OpacityMaskClipValue, info.BlendMode.ToString(), info.ParentChain,
-            info.Tint, info.Opacity, info.Glow, info.Flow, maskFile, noiseFile, info.MaskIsMatcap,
-            info.IsTranslucent,
-            ExportEffectTexture(info.StarTexture), info.StarTiling, info.StarColor, info.StickIntensity,
-            info.IsFakeTrans,
-            info.MaskIsMatcap ? null : ExportEffectTexture(info.MatcapTexture), info.MatcapColor,
-            info.RimColor, info.RimIntensity, info.EmissiveColor, info.EmissiveIntensity,
-            info.RimPower, info.RimSoftEdge,
-            info.HighlightOffset, info.HighlightSpecColor,
-            info.HighlightSpecPower, info.HighlightSpecIntensity, info.ForceUseDefaultOpacity,
-            info.OpacityDepthDistance, info.OpenDepthDistance,
-            info.IsObjectTransLow,
-            ExportEffectTexture(info.ObjectTransLightMaskTexture),
-            ExportEffectTexture(info.ObjectTransRampTexture),
-            info.ObjectTransSoftEdge, info.ObjectTransMainColor, info.ObjectTransMainBright,
-            info.AlphaIsOpacity,
-            ExportEffectTexture(info.FlowTexture), info.FlowPower,
-            ExportEffectTexture(info.MaskIdTexture), info.MaskIdRange,
-            info.WaterColor1, info.WaterColor2, info.WaterMain,
-            info.WaterCaustics, info.WaterShape,
-            ExportEffectTexture(info.InteriorTexture), info.InteriorColor,
-            info.Refraction, info.RefractDepth, info.FlickerSpeed, info.FlickerPower,
-            info.NoiseUv,
-            info.IsGlassyInner,
-            info.GlassyFlowColor01, info.GlassyFlowColor02, info.GlassyFresnelColor,
-            info.GlassyNoiseParams, info.GlassyMaskParams,
-            info.IsXiaoYou,
-            info.XiaoYouBaseColor1, info.XiaoYouBaseColor2,
-            info.XiaoYouFlowColor1, info.XiaoYouFlowColor2, info.XiaoYouStarColor,
-            info.XiaoYouNoiseFlow, info.XiaoYouShape, info.XiaoYouStarUv,
-            yutuEar, fakeFluid, matcapMasked, fairyBall,
-            info.OutlineWidth ?? 0f, info.IsPaintOrder));
-
-        if (info.StarTexture is not null && ExportEffectTexture(info.StarTexture) is { } starTex
-            && (starLayer is null || (info.IsFakeTrans && !starFromFakeTrans)))
-        {
-            // 假半透族的平铺该用 `Mat_NoiseTilingX/Y`(5 / 2.5),不是 `StarStickTiling`(4)。
-            var tile = info.IsFakeTrans && info.NoiseTiling[0] > 0f && info.NoiseTiling[1] > 0f
-                ? info.NoiseTiling : info.StarTiling;
-            starLayer = (starTex, tile, info.StarColor, info.NoiseUv);
-            starFromFakeTrans = info.IsFakeTrans;
-        }
-        // 实例上**显式覆盖过**的 `StarStickTiling`(不是继承来的根默认 4)优先。
-        // 曜星光就是这种情形:5.3 写在 `_By` 上,而星点贴图来自 `_Fx`(假半透那份),
-        // 只按贴图那一份挑会把 5.3 丢掉、退回根默认 4。
-        if (info.Scalars.ContainsKey("StarStickTiling") || info.Vectors.ContainsKey("StarStickTiling"))
-            explicitTiling ??= info.StarTiling;
-
-        string? ExportEffectTexture(string? objectPath)
-        {
-            if (objectPath is null) return null;
-            var file = Textures.ExportByObjectPath(fileProvider, objectPath, texDir, textures, warnings);
-            return file is null ? null : $"forms/{form.Asset}/tex/{file}";
-        }
-    }
-
-    // **一个形态只有一份星点遮罩,而且盖在整只宠物上。** 各材质自己写的贴图与平铺数并不一致
-    // (暮星辰:裙子是共享的 `Tex_PetGlassyStar_004`、身体是自己的 `Fx_D`),照各自的画就成了
-    // 两种星点两种密度叠在一只宠物上。那两颗球身上的星星也是这层 —— 球的基色在图集里是
-    // **一片平色圆盘**,星形完全来自这层(所以幽星光一颗球是星、另一颗是圆点)。
-    //
-    // 这是我们的简化:游戏那边**每个材质各有一份**(各自的 cb),靠静态开关与遮罩通道决定
-    // 要不要画。真按每材质走要先解出那些开关,现在还做不到。
-    //
-    // 贴图与颜色跟「假半透」那份走(它是宠物自己的星点图);**平铺数单独挑**,跟着实例里
-    // 显式覆盖过的那份走 —— 两者不一定在同一个材质上(见上面 `explicitTiling`)。
-    //
-    // **但不是所有材质都刷**:只刷**自己就开着这一层**的(`StarTexture is not null`,
-    // 判据见 `Materials.StarTexture`:美术显式设了向量 `StarStickTiling`,或者是假半透族)。
-    //
-    // ~~原来的判据是「图里有这一层」(`GraphHasStickLayer`)~~ —— **那道门太松,是个 bug**:
-    // 根默认里就有 `Stick_Intensity`,于是 `M_P_Object` 族的每个材质都过,包括从来没开过
-    // 这一层的白身体。春兔实机报的「身上几乎看不到星点」就是这么来的:它只有 `_Fx`
-    // (半透的耳朵/披风)显式写了 `StarStickTiling = (4,4)`,`_By` 一个星点参数都没覆盖过
-    // (探针:全是「根num」),却被这里刷上了整层星点,渲出来一身四角星。
-    // 统一的本意是「一只宠物别出现两种星点两种密度」,不是「给没开的材质开一层」。
-    if (starLayer is { } star)
-    {
-        var tiling = explicitTiling ?? star.Tiling;
-        var hasLayer = resolved
-            .Where(kv => kv.Value.Resolved && kv.Value.StarTexture is not null)
-            .Select(kv => kv.Key)
-            .ToHashSet(StringComparer.OrdinalIgnoreCase);
-        for (var i = 0; i < materials.Count; i++)
-        {
-            if (!hasLayer.Contains(materials[i].Name)) continue;
-            // XiaoYou 的 StarTex 是该材质自身 PS 的 t4，并不属于通用 Stick 星点层；
-            // 跨材质统一会把中间层的专用星图误换成另一个 Fx 遮罩。
-            if (materials[i].XiaoYou) continue;
-            materials[i] = materials[i] with
-            {
-                StarTexture = star.Tex,
-                StarTiling = tiling,
-                StarColor = star.Color,
-                // 坐标系/滚动/浓度跟着星点层一起统一发,否则 `_By` 拿不到(见 Manifest.cs)。
-                // **但只在星点层来自假半透族时发** —— 这套参数是那一族的,
-                // 另一族走 `StarStickTex` + 自己的公式,误套过去会让全库过曝 5 → 11(踩过)。
-                NoiseUv = starFromFakeTrans ? star.NoiseUv : [0f, 0f, 1f, 1f],
-                // **`StarFakeTrans` 不在这里统一** —— 它是**按材质**的:
-                // 汇编里带四段渐变的三条 shader(23766 / 27803 / 34270,V=116)全部来自
-                // `_By`(`MI_P_Object` 那一族),而 `_Fx`(`FakeTrans`)的 shader 一条都没有。
-                // 两族公式不同,所以这个标记必须跟着材质自己的父链走。
-            };
-        }
+        var shinyResolved = Shiny.Resolve(shinySources, warnings);
+        shinyMaterials = BuildMaterials(
+            fileProvider, shinyResolved, form.Asset, texDir, textures, warnings);
     }
 
     // 音频:拿不到就是 null(39 个 bnk 查无此宠,还有形态压根没有 Pet_Vo_* 库),不算失败
@@ -770,7 +802,7 @@ FormReport ExportForm(
 
     var bounds = mesh.ImportedBounds;
     return new FormReport(form, written, textures, materials, glb.Length, bounds.BoxExtent.Z * 2f,
-        warnings, audio);
+        warnings, audio, shinyMaterials);
 }
 
 /// 上游的 `FPackedNormal(FVector)` 是否能把向量原样存取回来。

@@ -217,7 +217,11 @@ impl Assets {
         if let Some(model) = self.models.get(&key) {
             return Ok(Arc::clone(model));
         }
-        let mut model = Model::load(&form.model, &form.materials)?;
+        // 异色换的是整套材质,包里已经是换好的那一份 —— 换一张材质表就够了。
+        let mut model = Model::load(
+            &form.model,
+            form.materials_for(mutation == Some(Mutation::Shiny)),
+        )?;
         model.mutation = mutation;
         // 异色不在这里 —— 它是换整套材质,包里就已经是换好的那一份。
         if let Some(mutation) = mutation.filter(|m| *m != Mutation::Shiny) {

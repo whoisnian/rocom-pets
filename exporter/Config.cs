@@ -21,7 +21,9 @@ public record Form(
     string MoveType,
     List<ClipInfo> Clips,
     /// 王者形态(资产名写作 `…Bo_001`)。排序时一律垫底 —— 它们的 `stage` 与普通三阶撞号。
-    bool Lord = false);
+    bool Lord = false,
+    /// 宠物蓝图(`MODEL_CONF.path`)。**异色的材质清单挂在它上面**,见 `Shiny`。
+    string Blueprint = "");
 
 /// 逻辑动作:名字取自 ANIM_ID_CONF,时长取自 ANIM_CONF(毫秒)。
 public record ClipInfo(string Logical, int AnimId, int Ms);
@@ -394,7 +396,8 @@ public class GameConfig
         return new Form(
             id, name, stage, asset, modelConfId, animConfId, scale,
             row["move_type"]?.Value<string>() ?? "",
-            ClipsOf(animConfId), lord);
+            ClipsOf(animConfId), lord,
+            model["path"]?.Value<string>() ?? "");
     }
 
     private static string? ExtractAsset(string path)

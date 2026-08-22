@@ -925,6 +925,28 @@ public static class Materials
     /// 的 `Mat/` 里只有描边材质,本体材质根本不在那儿;还有些资产把材质放在 `Yise/Mat/`
     /// (异色变体)之类的子目录。网格的 `Materials` 数组是权威来源:它按槽序给出材质对象,
     /// 不管对象存在哪个包里。实测这一改把 13 个「材质表为空」的形态全救回来了。
+    /// 解析一个材质实例(顺父链合并 + 补根默认 + 描边宽度)。
+    ///
+    /// **`key` 与 `material.Name` 可以不同**:异色走的是另一套材质,但要按**默认槽**的
+    /// 对象名登记 —— glb 里的材质名是默认那套(见 `Shiny`)。
+    public static MaterialInfo ResolveInstance(string key, UMaterialInstance material)
+    {
+        var roots = RootMaterial.Of(material);
+        var info = Resolve(key, material) with
+        {
+            RootDefaults = roots,
+            OutlineWidth = OutlineWidthOf(material),
+        };
+        // **实例没覆盖混合模式时,用根材质自己的。** 实例侧的 `BLEND_Opaque` 是 0,
+        // 与「没写」不可区分(见 `Resolve` 里那条注释),所以直接挂在根材质上的
+        // 材质会被一律当成不透明 —— 幽火的 `M_Gho_XiaoYou_GhostFire` 就是这样,
+        // 于是外层壳把里面那层小水滴整个盖住(实机是两层)。
+        if (info.BlendMode == EBlendMode.BLEND_Opaque
+            && roots.BlendMode != EBlendMode.BLEND_Opaque)
+            info = info with { BlendMode = roots.BlendMode, OpacityMaskClipValue = roots.MaskClip };
+        return info;
+    }
+
     public static Dictionary<string, MaterialInfo> Load(
         USkeletalMesh mesh,
         List<string> warnings)
@@ -949,23 +971,7 @@ public static class Materials
                 // 喵呜的文件是 `MI_Gra_MiaoMiao2_001_By`、对象名是 `…Miaomiao2…`,魔力猫正好反过来。
                 // glb 里的材质名取的是对象名,键不一致运行时就查不到 → 整只宠物一片都画不出来。
                 var key = material.Name;
-                if (!string.IsNullOrEmpty(key))
-                {
-                    var roots = RootMaterial.Of(material);
-                    var info = Resolve(key, material) with
-                    {
-                        RootDefaults = roots,
-                        OutlineWidth = OutlineWidthOf(material),
-                    };
-                    // **实例没覆盖混合模式时,用根材质自己的。** 实例侧的 `BLEND_Opaque` 是 0,
-                    // 与「没写」不可区分(见 `Resolve` 里那条注释),所以直接挂在根材质上的
-                    // 材质会被一律当成不透明 —— 幽火的 `M_Gho_XiaoYou_GhostFire` 就是这样,
-                    // 于是外层壳把里面那层小水滴整个盖住(实机是两层)。
-                    if (info.BlendMode == EBlendMode.BLEND_Opaque
-                        && roots.BlendMode != EBlendMode.BLEND_Opaque)
-                        info = info with { BlendMode = roots.BlendMode, OpacityMaskClipValue = roots.MaskClip };
-                    result[key] = info;
-                }
+                if (!string.IsNullOrEmpty(key)) result[key] = ResolveInstance(key, material);
             }
             catch (Exception e)
             {

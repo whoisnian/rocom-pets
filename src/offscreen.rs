@@ -50,7 +50,8 @@ pub fn render(request: &Request) -> Result<()> {
     let glb = locate_glb(&request.pack, request.form.as_deref())?;
     // 材质表是必需的(贴图与 alpha 语义都由它定)。调试渲图必须走和运行时同一条路径,
     // 否则「渲出来对不对」验的不是运行时的行为。
-    let spec = load_materials(&request.pack, &glb)
+    let want_shiny = request.mutation.as_deref() == Some("异色");
+    let spec = load_materials(&request.pack, &glb, want_shiny)
         .with_context(|| format!("{:?} 里找不到这个形态的材质表,重导一次包", request.pack))?;
     let mut model = Model::load(&glb, &spec)?;
     if let Some(text) = &request.mutation {
@@ -595,6 +596,7 @@ fn write_sheet(out: &Path, size: u32, tiles: &[(String, Vec<u8>)]) -> Result<()>
 fn load_materials(
     pack: &Path,
     glb: &Path,
+    shiny: bool,
 ) -> Option<std::collections::HashMap<String, crate::pack::Material>> {
     let dir = if pack.extension().is_some_and(|e| e == "glb") {
         // 裸 glb:往上两级找包目录(forms/<资产>/model.glb)
@@ -605,7 +607,8 @@ fn load_materials(
     let loaded = crate::pack::Pack::load(dir).ok()?;
     let asset = glb.parent()?.file_name()?.to_str()?;
     let form = loaded.forms.iter().find(|f| f.asset == asset)?;
-    (!form.materials.is_empty()).then(|| form.materials.clone())
+    let table = form.materials_for(shiny);
+    (!table.is_empty()).then(|| table.clone())
 }
 
 fn locate_glb(pack: &Path, form: Option<&str>) -> Result<PathBuf> {
