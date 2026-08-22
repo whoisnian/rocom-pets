@@ -142,6 +142,10 @@ pub struct SettingsApp {
     status: Status,
     /// 桌宠退出时会通过它叫这个窗口一起关(见 [`CloseRequest`])。
     close: CloseRequest,
+    /// 炫彩共享贴图导好了没有(包目录旁边的 `glassy/`)。**开窗时看一次就够** ——
+    /// 它是导出器的产物,不会在窗口开着的时候冒出来。缺了就把「炫彩」那一档置灰,
+    /// 并在旁边写清楚该跑什么命令,而不是让人选一个点了没反应的选项。
+    glassy_ready: bool,
 }
 
 /// 起配置窗口。`config_path` / `packs_dir` 由 main 按与桌宠**完全一样**的规则定出来 ——
@@ -190,6 +194,7 @@ impl SettingsApp {
         packs_dir: Option<PathBuf>,
         page: SettingsPage,
     ) -> Self {
+        let packs_dir_probe = packs_dir.clone();
         let mut app = Self {
             roster_path: config_path.as_deref().map(Roster::path_beside),
             config_path,
@@ -207,6 +212,8 @@ impl SettingsApp {
             page: Page::Packs,
             status: Status::default(),
             close: CloseRequest::default(),
+            glassy_ready: crate::pet::glassy::default_assets_dir(packs_dir_probe.as_deref())
+                .is_some_and(|dir| crate::pet::glassy::assets_ready(&dir)),
         };
         app.reload_from_disk();
         app.status.ok(idle_status());
