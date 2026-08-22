@@ -79,6 +79,16 @@ debug 版(`cargo build` 不带 `--release`)保持控制台子系统。
   行为、多实体、音频与配置窗口见 design.md §9 的 Phase 1–8。
   **这一层同时是个库**(`src/lib.rs`):跟平台无关的那 11000 行(渲染/动画/包格式/行为)
   另编一份 wasm 给下载站的预览用(`src/web.rs`),平台外壳按 `cfg` 排除。
+- 外观变异(`src/pet/glassy.rs`)：游戏里那两种稀有外观都做了 —— **异色**(`MDT_SHINING`)
+  是美术另做的一整套材质(蓝图的 `DiffMaterials` → `Yise/Mat/`),导出器一起导进包;
+  **炫彩**(`MDT_GLASS`)是往原材质上开一个动态开关 `GlassySwitch` 再覆盖几个参数,
+  照那条排列的 shader 汇编复刻(折射 → 相对包围盒中心的屏幕 UV →
+  `RedChannel×R + GreenChannel×G` → 按固有色亮度调制 → 星点层 → 整层替换)。
+  配置窗口里逐只挑:**原样 / 异色 / 炫彩**,炫彩再分**常规 / 隐藏 / 赛季**三档,
+  常规那档自己选配色(39 组 × 4 种粒子 = 156 种,编号与游戏一致)。
+  炫彩的贴图是全库共用的,单独导一份放在包目录旁边(`--glassy`,3.6MB),
+  **已经导好的包不用重导**。机制、逆向过程与「哪些数是读出来的、哪些还没定名」
+  见 [docs/design.md](docs/design.md)「异色与炫彩:两件不同的事」。
 - 导出器(`exporter/`)：C# + CUE4Parse，从自己的游戏 pak 生成宠物包;
   **一个图鉴号一个包**(`076-海盔虫.rkpet`,glb 含全部动作 + 贴图 + 叫声 + manifest.toml),
   归并规则与全量清单见 [docs/petindex.md](docs/petindex.md),结构见 [docs/spike-s3.md](docs/spike-s3.md)。
@@ -185,8 +195,9 @@ KTX2 贴图,那是另一件事(见 design.md 横向待办)。
   「导入目录…」选解开的包目录)—— 原生文件对话框没有「文件和目录都行」这个模式。
   **没有文件拖放**:winit 0.30 的 Wayland 后端没实现它(x11 与 windows 后端有),
   与其在一个平台上能用、另一个平台上默默没反应,不如两边都只留这两个按钮;
-- **活跃宠物**:侧栏逐只展开,每只可改形态、大小、性格、参与叫声(嗓音是个能打字的
-  数值框,−100~100,旁边一个「重掷」)、记住上次落脚点;底下是这只的**动作表** —— 一格一个动作,
+- **活跃宠物**:侧栏逐只展开,每只可改形态、**外观**(原样 / 异色 / 炫彩,见上)、大小、
+  性格、参与叫声(嗓音是个能打字的数值框,−100~100,旁边一个「重掷」)、记住上次落脚点;
+  底下是这只的**动作表** —— 一格一个动作,
   这个形态没有的置灰,**点一下就在桌面上当场播一次**;
 - **常用配置**:目标帧率、整体大小、叫声音量、启动就穿透。
 
@@ -248,6 +259,7 @@ cargo run --release -- --render packs/喵喵 --bench 600      # 离屏渲宠物 
 git -C "$CUE4PARSE_DIR" apply exporter/patches/*.patch      # 导出前必做:修上游法线与顶点色导出 bug
 dotnet run --project exporter -- --species 3001 --out packs # 导一条进化链
 dotnet run --project exporter -- --all --zip-only --skip-existing --out packs  # 全量导(可分批续跑)
+dotnet run --project exporter -- --glassy --out packs       # 炫彩共享贴图(导一次,放包目录旁边)
 python tools/verify_glb.py packs/喵喵 --clips Idle,Walk     # 渲图验证
 uv run --with numpy --with pillow python tools/sweep.py    # 回归闸门:全库三个数不许变差
 uv run --with lz4 python scripts/glsldump.py <安卓 shader 库> --index   # shader 逆向(见 docs/shader.md)
