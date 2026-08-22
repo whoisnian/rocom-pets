@@ -144,6 +144,11 @@ pub fn run(options: Options) -> Result<()> {
     let control_hwnd = create_control_window()?;
 
     let (control_tx, control_rx) = channel();
+    // 炫彩共享贴图在包目录**旁边**,建 `Assets` 时就定下来(建角色之前必须已经有)。
+    let mut assets = Assets::default();
+    if let Some(dir) = crate::pet::glassy::default_assets_dir(options.packs_dir.as_deref()) {
+        assets.set_glassy_dir(dir);
+    }
     let app = App {
         instance,
         gpu: None,
@@ -154,7 +159,7 @@ pub fn run(options: Options) -> Result<()> {
         config_path: options.config_path,
         sprite: crate::sprite::Sprite::test_pattern(192),
         sprite_mode,
-        assets: Assets::default(),
+        assets,
         audio: if options.volume > 0.0 {
             Audio::open(options.volume)
         } else {

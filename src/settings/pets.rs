@@ -380,6 +380,10 @@ mod tests {
             voice_value: Some(-37.0),
             remember: true,
             home_x: Some(0.62),
+            mutation: Some(crate::pet::Mutation::Common {
+                color: 33,
+                particle: 3,
+            }),
         };
         options.write_into(&mut slot);
         assert_eq!(PetOptions::from_slot(&slot), options);

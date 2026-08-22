@@ -39,6 +39,9 @@ const string usage = """
                         只打印动画的调查信息:骨架的平移重定向模式、各段动画里整只跑偏的
                         骨骼;给 ALL 则全库普查「剥掉类别前缀之后哪些逻辑名撞了」
       --index           只列出归并后的包名与形态构成(不碰 pak,不导东西)
+      --glassy          只导炫彩要用的**共享**贴图到 <--out>/glassy(不导宠物)。
+                        炫彩不换材质,它覆盖的 MainTex/StarStickTex 是全库共用的,
+                        所以单独一份、放在包目录旁边;导一次就够,加了新赛季款再跑
       --limit <n>       配合 --all:只导前 n 条链(试跑用)
       --skip-existing   跳过已经有 manifest.toml 的包(增量重跑)
       -j <n>            并行度(默认 CPU 核数;每个并行任务会同时持有一个形态的数据,
@@ -93,6 +96,7 @@ var jobs = Environment.ProcessorCount;
 var probeAsset = (string?)null;
 var probeAnimAsset = (string?)null;
 var indexOnly = false;
+var glassyOnly = false;
 
 for (var i = 0; i < args.Length; i++)
 {
@@ -118,13 +122,15 @@ for (var i = 0; i < args.Length; i++)
         case "--probe-material": probeAsset = Next(ref i); break;
         case "--probe-anim": probeAnimAsset = Next(ref i); break;
         case "--index": indexOnly = true; break;
+        case "--glassy": glassyOnly = true; break;
         case "-h" or "--help": Console.WriteLine(usage); return 0;
         default:
             Console.Error.WriteLine($"未知参数: {args[i]}\n{usage}");
             return 1;
     }
 }
-if (species.Count == 0 && !all && probeAsset is null && probeAnimAsset is null && !indexOnly)
+if (species.Count == 0 && !all && probeAsset is null && probeAnimAsset is null && !indexOnly
+    && !glassyOnly)
 {
     Console.Error.WriteLine($"缺 --species(或 --all)\n{usage}");
     return 1;
@@ -216,6 +222,15 @@ if (probeAnimAsset is not null)
 {
     AnimProbe.Run(provider, probeAnimAsset);
     return 0;
+}
+
+if (glassyOnly)
+{
+    var glassyDir = Path.Combine(outDir, "glassy");
+    var count = Glassy.Export(provider, parsedPath, glassyDir);
+    Console.WriteLine($"炫彩共享贴图: {count} 张 → {glassyDir}");
+    Console.WriteLine("把它放到宠物包目录**旁边**(…/rocom-pets/glassy),运行时按名字取。");
+    return count > 0 ? 0 : 1;
 }
 
 // 源指纹:同一版本的 pak 组合应当稳定,换版本就会变。写进 manifest 便于日后排查

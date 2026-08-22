@@ -39,6 +39,11 @@ pub struct Request {
     pub fade_probe: bool,
     /// >0 时跑这么多帧测平均耗时(含 CPU 采样 + 上传 + 绘制)。
     pub bench: u32,
+    /// 外观变异,写法同 `roster.toml` 的 `mutation`(`异色` / `炫彩:3/33` / `炫彩:黑白`)。
+    /// 炫彩要有共享素材目录,见 `--glassy-dir`。
+    pub mutation: Option<String>,
+    /// 炫彩共享贴图目录;不给就按包目录旁边推。
+    pub glassy_dir: Option<PathBuf>,
 }
 
 pub fn render(request: &Request) -> Result<()> {
@@ -47,7 +52,26 @@ pub fn render(request: &Request) -> Result<()> {
     // 否则「渲出来对不对」验的不是运行时的行为。
     let spec = load_materials(&request.pack, &glb)
         .with_context(|| format!("{:?} 里找不到这个形态的材质表,重导一次包", request.pack))?;
-    let model = Model::load(&glb, &spec)?;
+    let mut model = Model::load(&glb, &spec)?;
+    if let Some(text) = &request.mutation {
+        let mutation = crate::pet::Mutation::from_config(text)
+            .with_context(|| format!("认不得的 --mutation「{text}」"))?;
+        model.mutation = Some(mutation);
+        // 异色是换整套材质(包里就换好了),这里只有炫彩要现套。
+        if mutation != crate::pet::Mutation::Shiny {
+            let dir = request
+                .glassy_dir
+                .clone()
+                .or_else(|| crate::pet::glassy::default_assets_dir(request.pack.parent()))
+                .context("找不到炫彩素材目录,用 --glassy-dir 指过来")?;
+            model.apply_glassy(mutation, &dir);
+            anyhow::ensure!(
+                model.glassy.is_some(),
+                "{dir:?} 里缺炫彩贴图,跑一次 `rocom-pets-export --glassy`"
+            );
+        }
+    }
+    let model = model;
     log::info!(
         "{}: {} 顶点 / {} 三角 / {} 关节 / {} 段动作",
         glb.display(),

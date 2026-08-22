@@ -337,6 +337,9 @@ pub struct Model {
     /// 选中的炫彩外观(`None` = 原样)。**异色不在这儿** —— 异色是换整套材质,
     /// 包里就已经是换好的那一份了,模型这边看不出区别。见 `pet::glassy`。
     pub glassy: Option<GlassySkin>,
+    /// 这份模型套的是哪一种外观。**当缓存键用** —— `source` 只认到 (包, 形态),
+    /// 同一个形态的原样版与几种炫彩版是不同的 GPU 资源,不能共用一份。
+    pub mutation: Option<super::glassy::Mutation>,
 }
 
 /// 一份炫彩外观:解析好的着色参数,加上它要用的两张**共享**贴图。
@@ -791,6 +794,7 @@ impl Model {
             motion_bounds,
             face_cards,
             glassy: None,
+            mutation: None,
         })
     }
 
@@ -858,6 +862,37 @@ fn load_texture(path: &Path, _mask_alpha: bool) -> Option<Image> {
         height,
         rgba,
     })
+}
+
+impl Model {
+    /// 给这份模型套上一个炫彩外观。两张共享贴图从 `assets_dir` 里按名字取
+    /// (见 `glassy::assets_dir`);任一张缺了就整个不套 —— 只套一半会得到一只
+    /// 花纹全白或者没有闪片的宠物,比原样更难看出哪里不对。
+    ///
+    /// 异色不走这里:那是换整套材质,包里就已经换好了。
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn apply_glassy(&mut self, mutation: super::glassy::Mutation, assets_dir: &Path) {
+        self.mutation = Some(mutation);
+        self.glassy = mutation.render().and_then(|render| {
+            let load = |name: &str| load_texture(&assets_dir.join(format!("{name}.png")), true);
+            match (load(render.main_tex), load(render.star_tex)) {
+                (Some(main_tex), Some(star_tex)) => Some(GlassySkin {
+                    render,
+                    main_tex,
+                    star_tex,
+                }),
+                _ => {
+                    log::warn!(
+                        "炫彩素材不全({} / {}),这只按原样画 —— 跑一次 \
+                         `rocom-pets-export --glassy` 导出到 {assets_dir:?}",
+                        render.main_tex,
+                        render.star_tex
+                    );
+                    None
+                }
+            }
+        });
+    }
 }
 
 /// alpha 里到底有没有「线条」信息。
@@ -1303,6 +1338,7 @@ impl Model {
             // 也没有网格脸
             face_cards: Vec::new(),
             glassy: None,
+            mutation: None,
         }
     }
 }

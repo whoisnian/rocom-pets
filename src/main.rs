@@ -64,6 +64,8 @@ stage 模式(不给参数时读配置文件,首次运行会生成模板;
   --yaw <度>         观察角,0 = 正面(宠物朝 +Z)
   --no-fade          不额外渲「淡化中点」那一格
   --bench <帧数>     跑这么多帧测平均出帧耗时
+  --mutation <写法>  外观变异:`异色`、`炫彩:<粒子id>/<配色id>`、`炫彩:<隐藏款名>`
+  --glassy-dir <目录> 炫彩共享贴图目录(默认按包目录旁边的 glassy/ 找)
   -o, --out <文件>   输出 PNG(默认 pet-render.png)
   -h, --help         本帮助
 ";
@@ -226,6 +228,8 @@ fn run() -> anyhow::Result<()> {
                     out: PathBuf::from("pet-render.png"),
                     fade_probe: true,
                     bench: 0,
+                    mutation: None,
+                    glassy_dir: None,
                 });
             }
             // --pack 可以是路径也可以是包名,到下面统一解析
@@ -276,6 +280,10 @@ fn run() -> anyhow::Result<()> {
                     "--time" => request.time = next("--time", &mut args)?.parse()?,
                     "--no-fade" => request.fade_probe = false,
                     "--bench" => request.bench = next("--bench", &mut args)?.parse()?,
+                    "--mutation" => request.mutation = Some(next("--mutation", &mut args)?),
+                    "--glassy-dir" => {
+                        request.glassy_dir = Some(PathBuf::from(next("--glassy-dir", &mut args)?));
+                    }
                     "-o" | "--out" => request.out = PathBuf::from(next("--out", &mut args)?),
                     unknown => anyhow::bail!("未知参数 {unknown}\n{USAGE}"),
                 }

@@ -24,6 +24,8 @@ const HEADER: &str = "\
 # voice       参与叫声,不写 = 参与
 # voice_value 嗓音 −100~100,不写 = 0(原调);配置窗口里可以重掷
 # remember    记住落脚点;home_x 是运行时写的「上次站在可走范围的百分之几」
+# mutation    外观变异:`异色`,或 `炫彩:<粒子id>/<配色id>`(如 `炫彩:3/33`)、
+#             `炫彩:<隐藏款名>`(黑白/暗夜拾光/狂欢怪谈/铅字幻梦)
 #
 # 除 pack 外都可以不写,不写就是默认。
 
@@ -58,6 +60,10 @@ pub struct Slot {
     /// 记住落脚点;不写 = 不记(每次上台重新摆)。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remember: Option<bool>,
+    /// 外观变异:`异色`,或 `炫彩:<粒子id>/<配色id>`、`炫彩:<隐藏款名>`。
+    /// 不写 = 原样。写法与取值见 `pet::glassy::Mutation::from_config`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mutation: Option<String>,
     /// 上次站在可走范围的百分之几(0~1)。**运行时写的**,存比例而不是像素 ——
     /// 换了分辨率或多显示器时像素值毫无意义。
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -75,6 +81,7 @@ impl Slot {
             voice: None,
             voice_value: None,
             remember: None,
+            mutation: None,
             home_x: None,
         }
     }
@@ -147,6 +154,7 @@ mod tests {
                     voice: Some(false),
                     voice_value: Some(-37.0),
                     remember: Some(true),
+                    mutation: Some("炫彩:3/33".into()),
                     home_x: Some(0.62),
                 },
                 Slot::new("/abs/path/波波拉".into(), None),
@@ -159,6 +167,7 @@ mod tests {
         // 全默认的那只除了 pack 什么都不该写:存档要能一眼看出谁被调过
         assert_eq!(text.matches("scale").count(), 1, "{text}");
         assert_eq!(text.matches("persona").count(), 1, "{text}");
+        assert_eq!(text.matches("mutation").count(), 1, "{text}");
     }
 
     #[test]
@@ -172,6 +181,7 @@ mod tests {
         assert_eq!(roster.pets[0], Slot::new("喵喵".into(), None));
         assert_eq!(roster.pets[1].scale, None);
         assert_eq!(roster.pets[1].persona, None);
+        assert_eq!(roster.pets[1].mutation, None);
     }
 
     #[test]

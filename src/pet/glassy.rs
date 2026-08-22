@@ -163,7 +163,7 @@ pub const STICK_COVER_BIAS: f32 = 0.0;
 pub const GLASS_BLEND_WEIGHT: f32 = 1.0;
 
 /// 玩家在配置窗口里选的外观。`None` = 原样。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Mutation {
     /// 异色:换整套 `Yise/Mat/` 材质。只有包里带异色材质的形态给得出。
     Shiny,
@@ -267,6 +267,55 @@ impl Mutation {
         }
     }
 
+    /// 存进 `roster.toml` 的写法。三种形态:
+    ///
+    /// ```toml
+    /// mutation = "异色"
+    /// mutation = "炫彩:3/33"   # 粒子 3(方块)· 配色 33(亮X暗 - 浅紫橙),编号与游戏一致
+    /// mutation = "炫彩:黑白"
+    /// ```
+    ///
+    /// 常规炫彩存**编号**而不是名字:名字是配置表里的展示文本,换版本可能改;
+    /// 编号是协议里的东西,而且和游戏 UI 上看到的一致,对得上账。
+    /// 隐藏款反过来存名字 —— 那四条的 id(1/2/3/**1000**)没有规律,写名字才看得懂。
+    pub fn to_config(&self) -> String {
+        match self {
+            Mutation::Shiny => "异色".to_string(),
+            Mutation::Common { color, particle } => format!("炫彩:{particle}/{color}"),
+            Mutation::Hidden { id } => format!(
+                "炫彩:{}",
+                hidden_by_id(*id).map_or_else(|| id.to_string(), |h| h.name.to_string())
+            ),
+        }
+    }
+
+    /// `to_config` 的逆。认不出来返回 `None` —— 调用方该**报错**而不是默默按原样画:
+    /// 配置里拼错了要让人看见,这和 config.rs 对未知键的态度一致。
+    pub fn from_config(s: &str) -> Option<Self> {
+        let s = s.trim();
+        if s == "异色" {
+            return Some(Mutation::Shiny);
+        }
+        let rest = s.strip_prefix("炫彩:")?.trim();
+        if let Some((particle, color)) = rest.split_once('/') {
+            return Some(Mutation::Common {
+                color: color.trim().parse().ok()?,
+                particle: particle.trim().parse().ok()?,
+            });
+        }
+        // 隐藏款:先按名字找,再容一手直接写 id 的。
+        HIDDEN
+            .iter()
+            .find(|h| h.name == rest)
+            .map(|h| Mutation::Hidden { id: h.id })
+            .or_else(|| {
+                rest.parse()
+                    .ok()
+                    .filter(|id| hidden_by_id(*id).is_some())
+                    .map(|id| Mutation::Hidden { id })
+            })
+    }
+
     /// 解析成 shader 输入。异色返回 `None`(它不走这条路)。
     pub fn render(&self) -> Option<GlassyRender> {
         match self {
@@ -304,6 +353,44 @@ impl Mutation {
             }
         }
     }
+}
+
+/// 炫彩素材目录:包目录**旁边**的 `glassy/`(`…/rocom-pets/glassy`)。
+///
+/// 为什么不放进宠物包:这几张图是**全库共用**的(常规炫彩的 `MainTex` 就一张
+/// `Tex_PetGlassy_007_D`,粒子图四张),塞进 201 个包里要多背 120MB;而做成一份共享目录,
+/// 已经导好的包不用重导也能用上炫彩。由 `rocom-pets-export --glassy` 导出。
+///
+/// 也不打进二进制:隐藏款那几张噪声图加起来 3MB 出头,会把 18MB 的产物顶到 21MB,
+/// 而且**素材不该进代码仓库**(本仓库只有代码与导出器)。
+#[cfg(not(target_arch = "wasm32"))]
+pub fn assets_dir(packs_dir: &std::path::Path) -> std::path::PathBuf {
+    packs_dir
+        .parent()
+        .map_or_else(|| std::path::PathBuf::from("glassy"), |p| p.join("glassy"))
+}
+
+/// 炫彩素材目录,`packs_dir` 没给时退回默认包目录旁边。
+///
+/// 两处都拿不到(比如 Windows 上连 `%LOCALAPPDATA%` 都没有)就返回 `None` ——
+/// 那时炫彩画不出来,`Model::apply_glassy` 会在日志里说清楚。
+#[cfg(not(target_arch = "wasm32"))]
+pub fn default_assets_dir(packs_dir: Option<&std::path::Path>) -> Option<std::path::PathBuf> {
+    match packs_dir {
+        Some(dir) => Some(assets_dir(dir)),
+        None => crate::pack::Pack::default_dir().map(|d| assets_dir(&d)),
+    }
+}
+
+/// 素材齐不齐。缺了就该把炫彩那几档在界面上禁掉并说清楚要跑什么命令 ——
+/// 让用户看着一个点不出效果的选项,比直接说「素材没导」更糟。
+#[cfg(not(target_arch = "wasm32"))]
+pub fn assets_ready(dir: &std::path::Path) -> bool {
+    let mut needed: Vec<&str> = vec![DEFAULT_MAIN_TEX];
+    needed.extend(PARTICLES.iter().map(|p| p.tex));
+    needed
+        .iter()
+        .all(|name| dir.join(format!("{name}.png")).exists())
 }
 
 impl Clone for GlassyParams {
@@ -392,6 +479,35 @@ mod tests {
         assert_eq!(r.params.global_refraction, 0.0001);
         assert_eq!(r.params.global_depth, 100.0);
         assert_eq!(r.params.main_tex_tiling, 3.0);
+    }
+
+    #[test]
+    fn config_strings_round_trip() {
+        for m in [
+            Mutation::Shiny,
+            Mutation::Common {
+                color: 33,
+                particle: 3,
+            },
+            Mutation::Hidden { id: 1000 },
+            Mutation::Hidden { id: 3 },
+        ] {
+            let text = m.to_config();
+            assert_eq!(Mutation::from_config(&text), Some(m), "{text}");
+        }
+        // 写法要看得懂 —— 这两条是文档里给用户看的样子。
+        assert_eq!(
+            Mutation::Common {
+                color: 33,
+                particle: 3
+            }
+            .to_config(),
+            "炫彩:3/33"
+        );
+        assert_eq!(Mutation::Hidden { id: 1000 }.to_config(), "炫彩:黑白");
+        // 认不出来的要说不认识,不能悄悄退成「没有变异」。
+        assert_eq!(Mutation::from_config("炫彩:不存在的款"), None);
+        assert_eq!(Mutation::from_config("闪光"), None);
     }
 
     #[test]

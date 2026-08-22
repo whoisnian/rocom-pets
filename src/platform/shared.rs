@@ -15,7 +15,7 @@ use anyhow::Result;
 
 use crate::pack::{Form, Pack};
 use crate::persona::Persona;
-use crate::pet::{Model, PetGpu};
+use crate::pet::{Model, Mutation, PetGpu};
 use crate::render::Gpu;
 use crate::roster::{Roster, Slot};
 use crate::stage::{Actor, EntityId, PetActor, PetBuild, VoiceBank};
@@ -43,6 +43,8 @@ pub struct PetOptions {
     pub remember: bool,
     /// 上次站在可走范围的百分之几(0~1)。**运行时写的**,配置窗口只读不改。
     pub home_x: Option<f32>,
+    /// 外观变异:异色或某一种炫彩。`None` = 原样。见 `pet::glassy`。
+    pub mutation: Option<Mutation>,
 }
 
 /// 大小倍数的上下限。太小看不清,太大挡住半个屏幕 —— 两头都不是「桌宠」了。
@@ -61,6 +63,7 @@ impl Default for PetOptions {
             voice_value: None,
             remember: false,
             home_x: None,
+            mutation: None,
         }
     }
 }
@@ -88,6 +91,15 @@ impl PetOptions {
                 .map(|v| v.clamp(*VOICE_RANGE.start(), *VOICE_RANGE.end())),
             remember: slot.remember.unwrap_or(false),
             home_x: slot.home_x.filter(|v| v.is_finite()).map(|v| v.clamp(0.0, 1.0)),
+            // 认不出来的写法只警告、按原样上台 —— 这一层的规矩是「存档坏了不拦住桌宠」
+            // (见 roster.rs 的模块头),和 config.toml 那边「拼错要报错」是两套。
+            mutation: slot.mutation.as_deref().and_then(|text| {
+                let parsed = Mutation::from_config(text);
+                if parsed.is_none() {
+                    log::warn!("认不得的 mutation「{text}」,这只按原样画");
+                }
+                parsed
+            }),
         }
     }
 
@@ -100,6 +112,7 @@ impl PetOptions {
         slot.remember = self.remember.then_some(true);
         // 不记落脚点就把记下的那个也清掉,免得下次勾上时跳回一个很旧的位置
         slot.home_x = self.remember.then_some(self.home_x).flatten();
+        slot.mutation = self.mutation.map(|m| m.to_config());
     }
 }
 
@@ -121,11 +134,18 @@ impl Member {
 /// 三张表同一把键(glb 路径 = 包 + 形态),同一套「没人用就清掉」:
 /// `Arc::strong_count == 1` 说明只剩缓存自己持有。不清的话每访问一个形态就永久多占几 MB
 /// (模型一两百 MB、叫声几 MB)。
+/// 模型与 GPU 资源的缓存键。**同一个形态套上不同的外观就是不同的一份** ——
+/// 炫彩改的是材质 uniform 与两张贴图,都烘在 `PetGpu` 里,不能和原样那份共用。
+/// 声音不受外观影响,所以 `voices` 仍按 glb 路径单独存。
+type ModelKey = (PathBuf, Option<Mutation>);
+
 #[derive(Default)]
 pub struct Assets {
-    models: HashMap<PathBuf, Arc<Model>>,
-    pet_gpus: HashMap<PathBuf, Arc<PetGpu>>,
+    models: HashMap<ModelKey, Arc<Model>>,
+    pet_gpus: HashMap<ModelKey, Arc<PetGpu>>,
     voices: HashMap<PathBuf, Arc<VoiceBank>>,
+    /// 炫彩共享贴图所在目录(包目录旁边的 `glassy/`)。由平台层在建任何角色之前填。
+    glassy_dir: Option<PathBuf>,
     /// 画布边长的上限 = GPU 的最大 2D 纹理边长。GPU 起来之后由平台层填(见 `set_max_canvas`)。
     max_canvas: Option<u32>,
     /// 最近用过的形态(glb 路径),最近的排最前。`prune` 靠它决定留哪几份,见那里的说明。
@@ -184,25 +204,42 @@ impl Assets {
         self.max_canvas = Some(limit);
     }
 
+    /// 告诉它去哪儿找炫彩共享贴图。**建任何角色之前调**;不调就等于没有炫彩素材,
+    /// 选了炫彩的宠物会按原样画并在日志里说清楚缺什么。
+    pub fn set_glassy_dir(&mut self, dir: PathBuf) {
+        self.glassy_dir = Some(dir);
+    }
+
     /// 取这个形态的模型:缓存里有就直接共享,没有才读盘。
-    pub fn model(&mut self, form: &Form) -> Result<Arc<Model>> {
+    pub fn model(&mut self, form: &Form, mutation: Option<Mutation>) -> Result<Arc<Model>> {
         self.touch(&form.model);
-        if let Some(model) = self.models.get(&form.model) {
+        let key = (form.model.clone(), mutation);
+        if let Some(model) = self.models.get(&key) {
             return Ok(Arc::clone(model));
         }
-        let model = Arc::new(Model::load(&form.model, &form.materials)?);
-        self.models.insert(form.model.clone(), Arc::clone(&model));
+        let mut model = Model::load(&form.model, &form.materials)?;
+        model.mutation = mutation;
+        // 异色不在这里 —— 它是换整套材质,包里就已经是换好的那一份。
+        if let Some(mutation) = mutation.filter(|m| *m != Mutation::Shiny) {
+            match &self.glassy_dir {
+                Some(dir) => model.apply_glassy(mutation, dir),
+                None => log::warn!("没有炫彩素材目录,{} 按原样画", form.name),
+            }
+        }
+        let model = Arc::new(model);
+        self.models.insert(key, Arc::clone(&model));
         Ok(model)
     }
 
     /// 取这个形态的 GPU 资源(管线/顶点缓冲/贴图)。每实体独立的只有画布。
     pub fn pet_gpu(&mut self, gpu: &Gpu, model: &Arc<Model>) -> Result<Arc<PetGpu>> {
-        if let Some(cached) = self.pet_gpus.get(&model.source) {
+        // 键要带外观:同一个形态的原样版与几种炫彩版烘出来的贴图/uniform 不一样。
+        let key = (model.source.clone(), model.mutation);
+        if let Some(cached) = self.pet_gpus.get(&key) {
             return Ok(Arc::clone(cached));
         }
         let built = Arc::new(PetGpu::new(&gpu.device, &gpu.queue, model, gpu.format())?);
-        self.pet_gpus
-            .insert(model.source.clone(), Arc::clone(&built));
+        self.pet_gpus.insert(key, Arc::clone(&built));
         Ok(built)
     }
 
@@ -249,8 +286,10 @@ impl Assets {
     pub fn prune(&mut self) {
         let keep: Vec<PathBuf> = self.recent.iter().take(KEEP_RECENT).cloned().collect();
         let live = |path: &PathBuf, cached: usize| cached > 1 || keep.contains(path);
-        self.models.retain(|k, v| live(k, Arc::strong_count(v)));
-        self.pet_gpus.retain(|k, v| live(k, Arc::strong_count(v)));
+        // 模型/GPU 那两份的键带外观,留哪几份仍按 glb 路径判 —— 同一个形态的几种外观
+        // 一起留、一起丢,`recent` 才不用跟着长出外观这一维。
+        self.models.retain(|k, v| live(&k.0, Arc::strong_count(v)));
+        self.pet_gpus.retain(|k, v| live(&k.0, Arc::strong_count(v)));
         self.voices.retain(|k, v| live(k, Arc::strong_count(v)));
         self.recent.truncate(KEEP_RECENT);
     }
@@ -276,7 +315,7 @@ impl Assets {
         // 一起放大才不会出现「个头大了却还是原来的步幅」那种滑步
         let mut px_per_cm = px_per_cm * options.scale;
         let t_model = std::time::Instant::now();
-        let model = self.model(form)?;
+        let model = self.model(form, options.mutation)?;
         let d_model = t_model.elapsed();
         // 两个包围盒各管一件事:**尺寸**按绑定姿势(站姿高度不能随动作变),
         // **取景**按动作包围盒(否则伸手/张翅/跳跃会被画布裁掉,见 model.rs 的 motion_bounds)
