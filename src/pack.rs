@@ -358,6 +358,22 @@ fn default_object_trans_soft_edge() -> f32 {
     0.5
 }
 
+/// 炫彩刷在哪些材质上 —— 见 `Material::glassy_target`。
+///
+/// 客户端那边给的是**材质槽后缀**清单 `{"by", "by0", …, "by9"}`,而我们手上是材质名
+/// (`MI_Gra_Miaomiao1_001_By`),两者的对应关系就是「名字以 `_<后缀>` 结尾」。
+/// 大小写不能较真:同一只宠物的材质名在资产文件名与对象名之间会漂(`MiaoMiao`/`Miaomiao`)。
+fn is_glassy_target(name: &str, parents: &[String]) -> bool {
+    let lower = name.to_ascii_lowercase();
+    let suffix_ok = lower.strip_suffix("_by").is_some()
+        || lower
+            .rsplit_once("_by")
+            .is_some_and(|(_, tail)| tail.len() == 1 && tail.as_bytes()[0].is_ascii_digit());
+    // `M_P_Object` 会同时匹配 `M_P_Object_Trans` 等派生族,这正是想要的:
+    // 那一族(不透明与半透)都带 `GlassySwitch`。
+    suffix_ok && parents.iter().any(|p| p.contains("M_P_Object"))
+}
+
 // manifest 是契约的一部分:这些字段现在还没人读(形态切换/行为要用),但照着 schema
 // 解出来放着,比等到要用时再补解析更省事
 #[allow(dead_code)]
@@ -386,6 +402,11 @@ pub struct Material {
     /// **我们原来把它当普通图集脸画,于是八张一起画** —— 乖乖鹄一家的
     /// 「眉毛、眼睛、腮红搅在一起」就是这么来的。选哪张见 persona.rs 的 `Expression::card`。
     pub face_cards: bool,
+    /// 炫彩要刷在这个槽上吗。**判据照抄客户端**:`PetMutationUtils.SetGlassyDiffMutation`
+    /// 只取后缀 `by` / `by0..by9` 的材质,再加一道父链闸 —— `GlassySwitch` 这个动态开关
+    /// 只存在于 `M_P_Object` 那一族(全库 898 个材质),眼睛走的 `M_P_Eyes` 一族没有它,
+    /// 刷上去只会把脸糊掉。
+    pub glassy_target: bool,
     /// 只在 `base_color` 为 None 时有效。
     pub effect: Effect,
     /// 半透。**有基色的材质也可能是半透**:暮星辰的裙子与那两个球都是,
@@ -976,6 +997,7 @@ impl Pack {
                                 mask_alpha: mat.mask_alpha,
                                 face: mat.parents.iter().any(|p| p.contains("P_Eyes")),
                                 face_cards: mat.parents.iter().any(|p| p.contains("P_Eyes_Mesh")),
+                                glassy_target: is_glassy_target(&name, &mat.parents),
                                 effect: Effect {
                                     // 没给主色就用白,至少形体在
                                     tint: mat.tint.unwrap_or([1.0; 4]),

@@ -7,7 +7,7 @@ use anyhow::Result;
 use glam::{Mat4, Vec3};
 use wgpu::util::DeviceExt;
 
-use super::model::{Model, Vertex};
+use super::model::{GlassySkin, Model, Vertex};
 
 pub const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 
@@ -138,6 +138,52 @@ struct MaterialUniform {
     /// 描边:[沿法线外扩多少米, -, -, -]。**逐材质**(游戏里也是),见
     /// `pack::MaterialSpec::outline_width`。
     outline: [f32; 4],
+    /// 炫彩。字段顺序与 pet.wgsl 的 `MaterialParams` 尾部逐个对齐;含义见 `pet::glassy`。
+    /// `glassy_red.w` 是模式:0 不画 / 1 常规 / 2 隐藏。
+    glassy_red: [f32; 4],
+    glassy_green: [f32; 4],
+    glassy_p0: [f32; 4],
+    glassy_p1: [f32; 4],
+    glassy_stick0: [f32; 4],
+    glassy_stick1: [f32; 4],
+    glassy_stick2: [f32; 4],
+    glassy_stick3: [f32; 4],
+}
+
+/// 把选中的炫彩摊成 uniform 的那 8 个 vec4。`None`(或这个槽不刷炫彩)时全零 ——
+/// `glassy_red.w = 0` 就是 shader 里的「不画」。
+fn glassy_uniform(skin: Option<&GlassySkin>, target: bool) -> [[f32; 4]; 8] {
+    let Some(skin) = skin.filter(|_| target) else {
+        return [[0.0; 4]; 8];
+    };
+    let r = &skin.render;
+    let p = &r.params;
+    let mode = if r.use_stick_colors { 2.0 } else { 1.0 };
+    [
+        [r.red_channel[0], r.red_channel[1], r.red_channel[2], mode],
+        [
+            r.green_channel[0],
+            r.green_channel[1],
+            r.green_channel[2],
+            p.star_intensity,
+        ],
+        [
+            p.global_refraction,
+            p.global_depth,
+            p.main_tex_tiling,
+            p.normal_effect_amount,
+        ],
+        [
+            p.main_tex_flow_x,
+            p.main_tex_flow_y,
+            r.star_stick_tiling,
+            p.base_color_detail,
+        ],
+        r.stick_colors[0],
+        r.stick_colors[1],
+        r.stick_colors[2],
+        r.stick_colors[3],
+    ]
 }
 
 /// 本体贴图 alpha 里那层曾经使用的加性白色补偿。
@@ -389,6 +435,27 @@ impl PetGpu {
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                     count: None,
                 },
+                // 炫彩的两张共享贴图(`MainTex` / `StarStickTex`)。没选炫彩时绑 1×1 白图。
+                wgpu::BindGroupLayoutEntry {
+                    binding: 11,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 12,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
             ],
         });
         // 半透明通道读取第一遍不透明几何留下的场景深度。原
@@ -539,6 +606,21 @@ impl PetGpu {
                 &material.name,
                 material.ramp.as_ref().unwrap_or(&white),
             );
+            // 炫彩的两张共享贴图。**只给真会刷炫彩的槽上传** —— 眼睛那两个槽拿到也用不上,
+            // 白图不占什么显存。
+            let glassy_skin = model.glassy.as_ref().filter(|_| material.glassy_target);
+            let glassy_main_view = upload_texture(
+                device,
+                queue,
+                &material.name,
+                glassy_skin.map_or(&white, |s| &s.main_tex),
+            );
+            let glassy_star_view = upload_texture(
+                device,
+                queue,
+                &material.name,
+                glassy_skin.map_or(&white, |s| &s.star_tex),
+            );
             let has = |v: bool| if v { 1.0 } else { 0.0 };
             let rgb = |c: [f32; 3]| [c[0], c[1], c[2], 0.0];
             let mask_id = |m: &super::model::Material| {
@@ -669,6 +751,8 @@ impl PetGpu {
             // 旧包没有 `outline_width` ⇒ 用全库模态值 0.13 × 300。这比旧包自己当年那条
             // 「包围盒对角线 × 0.004」更接近实机(魔力猫 1.79 厘米 vs 0.39 厘米)。
             let outline_width = material.outline_width.unwrap_or(DEFAULT_OUTLINE_WIDTH);
+            // 炫彩只刷在 `by*` 那几个槽上 —— 判据与游戏一致,见 `pack::Material::glassy_target`。
+            let glassy = glassy_uniform(model.glassy.as_ref(), material.glassy_target);
             let uniform = match &material.effect {
                 Some(effect) => MaterialUniform {
                     tint: effect.tint,
@@ -743,6 +827,14 @@ impl PetGpu {
                     family10: family[10],
                     family11: family[11],
                     outline: [outline_width, 0.0, 0.0, 0.0],
+                    glassy_red: glassy[0],
+                    glassy_green: glassy[1],
+                    glassy_p0: glassy[2],
+                    glassy_p1: glassy[3],
+                    glassy_stick0: glassy[4],
+                    glassy_stick1: glassy[5],
+                    glassy_stick2: glassy[6],
+                    glassy_stick3: glassy[7],
                 },
                 // 有基色的材质:params.x/.z 说明 alpha 怎么解释
                 // (x=1 镂空遮罩、z=1 不透明度,都为 0 则是线条遮罩)
@@ -847,6 +939,14 @@ impl PetGpu {
                     family10: family[10],
                     family11: family[11],
                     outline: [outline_width, 0.0, 0.0, 0.0],
+                    glassy_red: glassy[0],
+                    glassy_green: glassy[1],
+                    glassy_p0: glassy[2],
+                    glassy_p1: glassy[3],
+                    glassy_stick0: glassy[4],
+                    glassy_stick1: glassy[5],
+                    glassy_stick2: glassy[6],
+                    glassy_stick3: glassy[7],
                 },
             };
             let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -901,6 +1001,14 @@ impl PetGpu {
                     wgpu::BindGroupEntry {
                         binding: 10,
                         resource: wgpu::BindingResource::Sampler(&clamp_sampler),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 11,
+                        resource: wgpu::BindingResource::TextureView(&glassy_main_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 12,
+                        resource: wgpu::BindingResource::TextureView(&glassy_star_view),
                     },
                 ],
             }));

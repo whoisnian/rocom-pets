@@ -12,6 +12,7 @@ use anyhow::{Context, Result, bail};
 use glam::{Mat4, Quat, Vec3};
 
 use super::anim::Pose;
+use super::glassy::GlassyRender;
 use crate::pack::Material as PackMaterial;
 
 /// 顶点布局:位置/法线/UV/关节索引/权重/顶点色。与 pet.wgsl 的 `@location` 一一对应。
@@ -54,6 +55,8 @@ pub struct Material {
     /// 这张脸是**八张重叠的表情卡**(`M_P_Eyes_Mesh`),不是偏 UV 的图集。
     /// 见 pack.rs 的 `Material::face_cards` 与 `Model::face_cards`。
     pub face_cards: bool,
+    /// 炫彩刷在这个槽上,见 pack.rs 的 `Material::glassy_target`。
+    pub glassy_target: bool,
     /// 基色贴图(RGBA8),路径来自 manifest 的材质表;读失败才是 None,渲染时用白色兜底。
     pub base_color: Option<Image>,
     /// 贴图 alpha 是**镂空遮罩**(眼/嘴的表情图集)还是**线条遮罩**(本体的纹路)。
@@ -240,6 +243,7 @@ pub struct FairyBall {
     pub shape: [f32; 4],
 }
 
+#[derive(Clone)]
 pub struct Image {
     pub width: u32,
     pub height: u32,
@@ -330,6 +334,20 @@ pub struct Model {
     /// 卡是按需做的,缺号不少见 —— 觅觅蝠一/三阶没有 1 号、蝴蝶陶陶三阶没有 5 号。
     /// 想要的那号不在这儿就得退档,否则整张脸一个像素都不画(眼睛直接消失)。
     pub face_cards: Vec<u32>,
+    /// 选中的炫彩外观(`None` = 原样)。**异色不在这儿** —— 异色是换整套材质,
+    /// 包里就已经是换好的那一份了,模型这边看不出区别。见 `pet::glassy`。
+    pub glassy: Option<GlassySkin>,
+}
+
+/// 一份炫彩外观:解析好的着色参数,加上它要用的两张**共享**贴图。
+///
+/// 贴图不在宠物包里 —— `MainTex`(常规炫彩用 `Tex_PetGlassy_007_D`)与各粒子图是全库共用的,
+/// 由导出器的 `--glassy` 单独导一份放在包目录旁边,见 `assets::glassy_dir`。
+#[derive(Clone)]
+pub struct GlassySkin {
+    pub render: GlassyRender,
+    pub main_tex: Image,
+    pub star_tex: Image,
 }
 
 impl Model {
@@ -533,6 +551,7 @@ impl Model {
                     base_color,
                     face: spec.face,
                     face_cards: spec.face_cards,
+                    glassy_target: spec.glassy_target,
                     cutout: spec.mask_alpha,
                     line_detail,
                     translucent: spec.translucent,
@@ -771,6 +790,7 @@ impl Model {
             bounds,
             motion_bounds,
             face_cards,
+            glassy: None,
         })
     }
 
@@ -1282,6 +1302,7 @@ impl Model {
             motion_bounds: (Vec3::new(-0.5, 0.0, -0.5), Vec3::new(0.5, 1.0, 0.5)),
             // 也没有网格脸
             face_cards: Vec::new(),
+            glassy: None,
         }
     }
 }

@@ -106,6 +106,20 @@ struct MaterialParams {
     family11: vec4<f32>,
     // 描边:[沿法线外扩多少米, -, -, -]
     outline: vec4<f32>,
+    // ── 炫彩(`GlassySwitch` 那条分支)。整套推导见 src/pet/glassy.rs。
+    // `RedChannel`(rgb)+ 模式:0 不画 / 1 常规炫彩 / 2 隐藏炫彩(用四段渐变着色)
+    glassy_red: vec4<f32>,
+    // `GreenChannel`(rgb)+ `StarIntensity`
+    glassy_green: vec4<f32>,
+    // [GlobalRefraction, GlobalDepth(米), MainTexTiling, NormalEffectAmount]
+    glassy_p0: vec4<f32>,
+    // [MainTexFlowSpeedX, MainTexFlowSpeedY, StarStickTiling, BaseColorDetail]
+    glassy_p1: vec4<f32>,
+    // `StickRandomColor01..04`,只有隐藏炫彩用
+    glassy_stick0: vec4<f32>,
+    glassy_stick1: vec4<f32>,
+    glassy_stick2: vec4<f32>,
+    glassy_stick3: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> camera: Camera;
@@ -129,6 +143,10 @@ struct MaterialParams {
 @group(1) @binding(8) var light_mask_tex: texture_2d<f32>;
 @group(1) @binding(9) var ramp_tex: texture_2d<f32>;
 @group(1) @binding(10) var ramp_sampler: sampler;
+// 炫彩的两张**共享**贴图:`MainTex`(花纹)与 `StarStickTex`(粒子)。
+// 不在宠物包里,由导出器的 `--glassy` 单独导;没选炫彩时是 1×1 白图。
+@group(1) @binding(11) var glassy_main_tex: texture_2d<f32>;
+@group(1) @binding(12) var glassy_star_tex: texture_2d<f32>;
 // 第一遍不透明材质留下的场景深度；半透明材质按原 shader 的
 // `OpacityDepthDistance` 计算与后方实体/背景的距离。
 @group(2) @binding(0) var scene_depth: texture_depth_2d;
@@ -306,6 +324,25 @@ const GLASS_MATCAP_GAIN: f32 = 1.0;
 /// **那两条测量都是在显示空间做的**(量的是截图像素),搬进线性后要换算:
 /// `旧² / EXPOSURE` = 0.16² / 0.4816 ≈ 0.0532。换算保持观感等值,原来那两条测量的效力也保留。
 const GLASS_RIM_GAIN: f32 = 0.0532;
+
+/// 炫彩折射 UV 的屏幕参考尺度。**这条链上唯一一个标定值**,其余(折射率、march 深度、
+/// 平铺、卷动速度、法线量、亮度门指数)全部读自游戏参数。
+///
+/// 它替的是原 PS 里那个「除以物体→世界矩阵的最大轴缩放」——那是 UE 的 actor 缩放,
+/// 我们这边没有对应物(模型已经在世界空间)。改成按物体投影尺度归一化之后,两者只差
+/// 一个常数倍;这个常数就落在这里。1.0 时花纹偏大、4.0 起偏碎,2.0 是对着实机截图目视定的。
+const GLASSY_SCREEN_REF: f32 = 2.0;
+/// 星点覆盖率的偏置(汇编 `cb6[62].x`)。根默认 0 ⇒ 覆盖率就是那条平滑多项式本身。
+/// 见 `glassy::STICK_COVER_BIAS` 对「槽位没对上名字」那条的说明。
+const GLASSY_STICK_BIAS: f32 = 0.0;
+/// `MutationRimColor` —— lua 里写死的 `FLinearColor(0.6, 0.6, 0.6, 1)`。
+const GLASSY_RIM_COLOR: vec3<f32> = vec3<f32>(0.6, 0.6, 0.6);
+/// 边缘光的叠加量。原 PS 里这一项还乘着 `cb6[58].x`(槽位未定名),所以只能标定;
+/// 取值与玻璃族那条 `GLASS_RIM_GAIN` 同量级 —— 两者都是「线性空间里的一圈薄光」。
+const GLASSY_RIM_GAIN: f32 = 0.0532;
+/// `BlendWeight`,材质里读出来是 1.0(不衰减)。留成常量是为了让「整层替换」这件事
+/// 在代码里看得见 —— 它一旦不是 1,炫彩就该回混原着色。
+const GLASSY_BLEND_WEIGHT: f32 = 1.0;
 /// 输出前软肩的白点(extended Reinhard);<= 0 关闭,退回硬削顶。见 `fs_main` 末尾。
 ///
 /// **它解开了一个卡了很久的死结。** 之前两次都撞到同一堵墙:想把亮度比从 0.83 拉到 1.0,
@@ -1102,6 +1139,83 @@ fn shade_fairy_ball(in: VsOut) -> vec4<f32> {
     return vec4<f32>(encode_linear_color(color) * alpha, alpha);
 }
 
+/// 炫彩(游戏里 `MDT_GLASS`)。**照 `GlassySwitch = true` 那条 shader 排列写的**,
+/// 不是观察出来的近似 —— 排列怎么找到的、每一步对应哪几行汇编,见 `src/pet/glassy.rs`
+/// 的模块注释与 docs/design.md「炫彩那条 shader 分支」。
+///
+/// `mode`(`glassy_red.w`):0 = 不画、1 = 常规炫彩、2 = 隐藏/赛季炫彩。
+///
+/// 传进来的 `base` 是这个材质的**固有色**(线性),`shaded` 是原本要输出的着色结果。
+/// 返回值直接顶替 `shaded` —— 原 PS 尾部那两次 lerp 在本作的参数下都退化成「整层替换」:
+/// `cb6[62].x`(星点偏置)根默认 0 ⇒ 第一次 lerp 系数恒为 1;
+/// `cb6[62].y` = `BlendWeight` = 1.0 ⇒ 第二次也是 1。
+/// 原宠物的明暗结构靠第 ⑤ 步那道亮度门保留下来,不靠回混。
+fn glassy_layer(in: VsOut, base: vec3<f32>, shaded: vec3<f32>) -> vec3<f32> {
+    let mode = material.glassy_red.w;
+    if mode < 0.5 {
+        return shaded;
+    }
+    let n = normalize(in.normal);
+
+    // ① 折射。`GlobalRefraction` 直接就是 `refract()` 的 eta(汇编 `cb6[58].z`,
+    //    判别式为负时整支置零 —— 与 `refract_direction` 的行为一致)。
+    let incident = -view_direction();
+    let refracted = refract_direction(incident, n, material.glassy_p0.x);
+    // `GlobalDepth` 是游戏单位(厘米),我们的模型是米。
+    let hit = in.world_pos + refracted * (material.glassy_p0.y * 0.01);
+
+    // ② 屏幕空间 UV,**相对物体中心**。原 PS 把折射落点与包围盒中心各投影一次再相减,
+    //    所以花纹是跟着宠物走的,不是钉在屏幕上;这一步弄反过就会得到"蒙在镜头前"的观感。
+    let hit_clip = camera.view_proj * vec4<f32>(hit, 1.0);
+    let center_clip = camera.view_proj * vec4<f32>(camera.object_bounds.xyz, 1.0);
+    let hit_ndc = hit_clip.xy / max(hit_clip.w, 1e-4);
+    let center_ndc = center_clip.xy / max(center_clip.w, 1e-4);
+    // 原 PS 的除数是物体→世界矩阵的最大轴缩放(`max(|col0|,|col1|,|col2|)`),那是 UE 的
+    // actor 缩放;我们这边模型已经在世界空间、没有那个矩阵,改用**物体自身的投影尺度**
+    // 归一化 —— 语义相同(把偏移换算到"物体的多少分之一"),而且与画布分辨率无关。
+    let object_span = max(camera.object_bounds.w, 1e-4);
+    let span_clip = max(abs(center_clip.w), 1e-4);
+    let uv_offset = (hit_ndc - center_ndc) * (span_clip / object_span) * GLASSY_SCREEN_REF;
+    var uv = uv_offset * 0.25 * material.glassy_p0.z + vec2<f32>(0.5);
+    uv += fract(camera.time * material.glassy_p1.xy);
+    // ③ 法线扰动:偏移量是法线在投影矩阵 z 列上的分量 × `NormalEffectAmount`,
+    //    u/v **同一个标量**(汇编 `mad r0.xy, -r0.x, cb6[60].x, r2.xyxx`)。
+    uv -= dot(n, camera_forward_direction()) * material.glassy_p0.w;
+
+    // ④ 着色。这两行是整条链的核心,`RedChannel`/`GreenChannel` 就是玩家选的那两个颜色。
+    let pattern = textureSample(glassy_main_tex, base_sampler, uv);
+    var glass = material.glassy_red.rgb * pattern.r + material.glassy_green.rgb * pattern.g;
+    let star_intensity = material.glassy_green.w;
+    glass *= star_intensity;
+
+    // ⑤ 按固有色亮度调制。`mean ≤ 0` 时整片归零(汇编那条 `ge` + `movc`),
+    //    否则 `min(pow(mean, BaseColorDetail), 1)`。炫彩之所以还看得出原宠物的
+    //    明暗结构,全靠这一步。
+    let mean = (base.r + base.g + base.b) * 0.3333;
+    let detail = select(min(pow(max(mean, 0.0), material.glassy_p1.w), 1.0), 0.0, mean <= 0.0);
+    glass *= detail;
+
+    // ⑥ 星点层。相位公式与既有的 `stick_layer` 逐字相同(`1.1 × lerp(|sin θ|,|cos θ|, g)`,
+    //    θ = `frac(time × 0.25) × 2π`)—— 两条排列共用同一段材质图。
+    //    这里的 RGB **不是颜色**:g 给相位、r 给阈值、b 给幅度,颜色全来自参数。
+    let star = textureSample(glassy_star_tex, base_sampler, in.uv * material.glassy_p1.z);
+    let theta = fract(camera.time * STAR_PHASE_SPEED) * 6.2831855;
+    let k = 1.1 * mix(abs(sin(theta)), abs(cos(theta)), star.g);
+    let t = saturate((star.b * (k - star.r) - 0.01) * 25.0);
+    let cover = t * t * (3.0 - 2.0 * t);
+    // 汇编里星点色只有**一个** cb 槽(`cb6[49]`),不是四段渐变 —— 四段渐变是另一族
+    // (假半透的 `_Fx`)的做法。隐藏款的 `StickRandomColor01..04` 配置里给了四个,
+    // 这条排列只消费得到第一个,所以这里只接 01;其余三个留在数据里备查。
+    // 常规炫彩一个都不覆盖 ⇒ 用材质根默认的白,实机观感也确实是白亮的小闪片。
+    let star_color = select(vec3<f32>(1.0), material.glassy_stick0.rgb, mode > 1.5);
+    glass = mix(glass, star_intensity * star_color, saturate(cover + GLASSY_STICK_BIAS));
+
+    // ⑦ 边缘光。`MutationRimColor` 是 lua 里写死的 (0.6, 0.6, 0.6)。
+    glass += GLASSY_RIM_COLOR * pow(facing_ratio(n), 3.0) * GLASSY_RIM_GAIN;
+
+    return mix(shaded, glass, GLASSY_BLEND_WEIGHT);
+}
+
 fn shade_main(in: VsOut, depth_coverage: f32) -> vec4<f32> {
     if material.family_flags.x > 0.5 {
         return shade_xiaoyou(in);
@@ -1367,6 +1481,9 @@ fn shade_main(in: VsOut, depth_coverage: f32) -> vec4<f32> {
     // `sqrt(alpha)`，例如 alpha=.2 会按约 .45 的强度盖住内层；同时 glow 又完全没乘
     // alpha。两处都与游戏的 BLEND_Translucent 顺序相反，会系统性冲亮所有透明壳。
     var combined = body + glow + stick_add;
+    // 炫彩整层盖在最后:游戏那边也是这个位置(`lerp(原着色, 玻璃色, BlendWeight)`),
+    // 而且它**替换**而不是叠加 —— 原着色只通过 `surface_albedo` 的亮度参与调制。
+    combined = glassy_layer(in, surface_albedo, combined);
     if exact_object_trans {
         // PS 尾部 cb6[29].xyz，覆盖基色与高光在内的整条材质颜色。
         combined *= material.tint.rgb;
