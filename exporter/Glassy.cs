@@ -9,7 +9,7 @@
 //
 // 所以它们**不进宠物包**:塞进 201 个包要多背 120MB,而做成包目录旁边的一份 `glassy/`
 // 共享目录只要 3.7MB,已经导好的包也不用重导就能用上炫彩。
-// 运行时按名字取,见 `src/pet/glassy.rs` 的 `assets_dir`。
+// 构建时由 rocom-pets 的 build.rs 烘进二进制,运行时按名字取(`pet::glassy::embedded`)。
 
 using CUE4Parse.FileProvider.Vfs;
 using Newtonsoft.Json.Linq;

@@ -233,7 +233,10 @@ if (glassyOnly)
     var glassyDir = Path.Combine(outDir, "glassy");
     var count = Glassy.Export(provider, parsedPath, glassyDir);
     Console.WriteLine($"炫彩共享贴图: {count} 张 → {glassyDir}");
-    Console.WriteLine("把它放到宠物包目录**旁边**(…/rocom-pets/glassy),运行时按名字取。");
+    // 运行时**不读这个目录**,它只是给构建脚本看的 —— 见 rocom-pets 的 build.rs。
+    Console.WriteLine("这些图不进宠物包,由 build.rs 在**构建时**烘进二进制:");
+    Console.WriteLine("  重新 cargo build 一次就带上了(不必改任何源文件);");
+    Console.WriteLine("  导到别处时用 ROCOM_GLASSY_DIR=<这个目录> cargo build 指路。");
     return count > 0 ? 0 : 1;
 }
 

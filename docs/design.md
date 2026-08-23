@@ -1976,9 +1976,45 @@ endif
 
 烘的时机是**构建期**(`build.rs`),来源是构建那台机器上自己导出来的那一份 ——
 仓库仍然只有代码与导出器,**不含任何游戏素材**(README 末尾那条规矩)。找的顺序是
-`$ROCOM_GLASSY_DIR` → `<仓库>/packs/glassy` → 默认数据目录旁边的 `glassy/`;
-一个都没有就烘 0 张,构建照样成功,只是运行时「炫彩」那一档是灰的。
+`$ROCOM_GLASSY_DIR` → `<仓库>/packs/glassy` → `<默认包目录>/glassy` → 默认数据目录旁边的
+`glassy/`;一个都没有就烘 0 张,构建照样成功,只是运行时「炫彩」那一档是灰的。
 `ROCOM_GLASSY_DIR=` (空)是**明确不烘**,要一个小二进制时用。
+
+##### 「先编译、后导包」曾经叫不醒构建脚本(2026-08-23 修)
+
+现场是:运行时说「这个二进制没带炫彩素材」,而 `cargo build --release` **什么都不做**。
+两个 bug 叠在一起,各修一半都不够:
+
+1. **`rerun-if-changed` 只在「找到了」的分支里登记。** 空烘一次之后,记下来的重跑触发器
+   就只剩 `ROCOM_GLASSY_DIR` 一条 —— 素材后来出现在磁盘上,cargo 也不知道该重跑,
+   于是永远是空的。(可以直接查:`cat target/release/build/rocom-pets-*/output`。)
+2. **候选路径漏了最自然的那一处。** 导出器写的是 `<out>/glassy`,而 `--out` 大多数人
+   就指着放包的那个目录 ⇒ 素材落在 `…/rocom-pets/packs/glassy`,而 build.rs 当时只看
+   `…/rocom-pets/glassy`(包目录**旁边**)。两处都要看。
+
+**第一版的修法是错的,而且换了个更难受的毛病:**「候选路径一律登记,不管存不存在」——
+cargo 把指向**不存在**路径的 `rerun-if-changed` 当成永远是脏的,于是构建脚本每次都重跑、
+整个 crate 跟着重编,`cargo run --release` 每次要等两分多钟。查证一句话就够:
+
+```sh
+CARGO_LOG=cargo::core::compiler::fingerprint=trace cargo build --release
+#   stale: missing "/home/…/packs/glassy"
+#   dirty: FsStatusOutdated(StaleItem(MissingFile { path: … }))
+```
+
+**也不能改成登记父目录**:三个候选的父目录不是包目录就是它的上一级,而 cargo 对目录是
+**递归**看 mtime 的(拿一个最小 crate 实测过:改子目录深处的文件照样触发)——
+那就变成「每导一个宠物包赔一次两分钟重编」,比原来还糟。
+
+最后的规矩是**只登记真实存在的路径**:稳态(素材在)下变动照样叫得醒,空构建 0.2 秒。
+代价只剩「素材从无到有」那一次叫不醒,用
+`ROCOM_GLASSY_DIR=<那个 glassy 目录> cargo build` 过去 —— 那是 env 触发器,一定叫得醒,
+而且这条命令就写在找不到素材时的 warning 里。
+
+顺带把「没找到」这件事从沉默改成 `cargo:warning`。这一条**故意**要每次构建都重放 ——
+它描述的是二进制的一个持续状态(没有素材),不是一次性事件;想关掉有
+`ROCOM_GLASSY_DIR=`(空)这个明确表态的开关。导出器那句「把它放到宠物包目录旁边」
+也是旧话(那还是运行时读目录的年代),改成「重新 `cargo build` 一次就带上了」。
 
 导出器**正常导包时就顺带写出** `<out>/glassy`(13 张、零点几秒,`--no-glassy` 可关),
 所以两种顺序都不需要额外命令:先导后编 ⇒ 烘进去了;先编后导 ⇒ 重编一次就有。
