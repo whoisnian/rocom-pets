@@ -1174,10 +1174,15 @@ fn glassy_layer(in: VsOut, base: vec3<f32>, shaded: vec3<f32>) -> vec3<f32> {
     //
     //    **赛季那一族的金属环画在门外面**(汇编里门做完之后才做),所以这里不能直接返回:
     //    门只挡玻璃色那一半。挡错了整圈银色扑克花纹会被切碎、胳膊与肩膀上那圈直接没有。
+    //
+    //    **门只当值用,不当分支用。** 门外那条 `return shaded` 曾经是条快路,可它让底下
+    //    所有 `textureSample` 落进「依赖非一致值的控制流」——  WGSL 规定带隐式导数的采样
+    //    只能在一致控制流里调,浏览器(Tint)据此**整份 shader 拒编**,网页预览连一只
+    //    普通宠物都画不出来(桌面的 naga 放行,所以只有网页会炸)。
+    //    删掉它是**逐字等价**的:第 ⑧ 步本来就写着 `select(shaded, …, gated)`,
+    //    而金属那一步的 `season_metal_zone` 在非赛季材质上恒为 0。那条快路只省了
+    //    「整个 quad 都在门外」时的几次采样,不值得拿整个网页端去换。
     let gated = textureSample(glassy_id_tex, base_sampler, in.uv).a >= GLASSY_MIN_ID;
-    if !gated && !season {
-        return shaded;
-    }
     let n = normalize(in.normal);
 
     // ① 折射。`cb6[58].z` 的 preshader 是 `1 / GlobalRefraction`,倒数在 CPU 侧算好了

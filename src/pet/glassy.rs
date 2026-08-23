@@ -427,6 +427,40 @@ impl Mutation {
         !self.shiny && self.glassy.is_none()
     }
 
+    /// 画成这样要用到哪几张**共享贴图**(不带目录与扩展名)。
+    ///
+    /// **异色不在其中**:那是包里另一套材质,贴图跟着形态一起下,不走共享素材这条路。
+    ///
+    /// 浏览器版按这份名单去 `fetch`(见 [`shared`]);桌面版用不着 ——
+    /// 烘进来的是全部 13 张,要么都在要么都不在。
+    pub fn shared_assets(&self) -> Vec<&'static str> {
+        let Some(glassy) = self.glassy else {
+            return Vec::new();
+        };
+        let Some(render) = glassy.render() else {
+            return Vec::new();
+        };
+        let mut out = vec![render.main_tex, render.star_tex];
+        // 赛季款还可能落到 `SeasonMutation` 那条路上:那一族里 `_By1`(手臂/肩甲/尖塔)
+        // 不自带花纹图,退回共享的那张(见 `Model::load` 里 `flow_noise` 的 `or_else`)。
+        // 只有赛季款要多带这一张 —— 常驻款的 `main_tex` 本来就是它。
+        if matches!(glassy, Glassy::Hidden { id } if hidden_by_id(id).is_some_and(|h| h.season))
+            && !out.contains(&DEFAULT_MAIN_TEX)
+        {
+            out.push(DEFAULT_MAIN_TEX);
+        }
+        out.dedup();
+        out
+    }
+
+    /// 这几张里还缺哪些。空 = 现在就画得出来。
+    pub fn missing_assets(&self) -> Vec<&'static str> {
+        self.shared_assets()
+            .into_iter()
+            .filter(|name| !has_shared(name))
+            .collect()
+    }
+
     /// 给人看的名字,如「异色 · 四角星 · 亮X暗 - 浅紫橙」。
     pub fn label(&self) -> String {
         match (self.shiny, self.glassy) {
@@ -507,17 +541,86 @@ pub fn embedded(name: &str) -> Option<&'static [u8]> {
         .map(|(_, bytes)| *bytes)
 }
 
+/// 浏览器里那份共享素材:**运行时喂进来**,不烘进 wasm。
+///
+/// 网页预览是点开才下的一个 chunk,把 13 张图(3.6MB)烘进去等于让每个点开预览的人
+/// 都先付这 3.6MB —— 而其中最大的一张(铅字幻梦的流动噪声)自己就有 2MB,多数人一次
+/// 也用不上。改成**按需取**:前端问 [`Mutation::missing_assets`] 要名单、`fetch` 回来喂 `put_shared`,
+/// 挑一次常规炫彩只多下两张(约 250KB)。
+///
+/// 和包一样是「谁部署谁提供」:导出器把这些图写在 `<out>/glassy`,部署时和 `packs/`
+/// 一起传上去(见 web/README.md)。没传就取不到,前端把炫彩那几档禁掉。
+#[cfg(target_arch = "wasm32")]
+mod runtime_store {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    use std::sync::OnceLock;
+
+    fn table() -> &'static Mutex<HashMap<String, Vec<u8>>> {
+        static TABLE: OnceLock<Mutex<HashMap<String, Vec<u8>>>> = OnceLock::new();
+        TABLE.get_or_init(Default::default)
+    }
+
+    pub fn put(name: &str, bytes: Vec<u8>) {
+        if let Ok(mut map) = table().lock() {
+            map.insert(name.to_string(), bytes);
+        }
+    }
+
+    pub fn get(name: &str) -> Option<Vec<u8>> {
+        table().lock().ok()?.get(name).cloned()
+    }
+
+    pub fn has(name: &str) -> bool {
+        table().lock().is_ok_and(|map| map.contains_key(name))
+    }
+}
+
+/// 喂一张共享贴图进来(浏览器专用,见 [`runtime_store`])。
+#[cfg(target_arch = "wasm32")]
+pub fn put_shared(name: &str, bytes: Vec<u8>) {
+    runtime_store::put(name, bytes);
+}
+
+/// 按名字取一张共享贴图,从构建期烘进来的表里借。
+///
+/// **桌面版和浏览器版唯一的分岔就是这一对函数** —— 上面那两条加载路径都只认这个入口。
+#[cfg(not(target_arch = "wasm32"))]
+pub fn shared(name: &str) -> Option<std::borrow::Cow<'static, [u8]>> {
+    embedded(name).map(std::borrow::Cow::Borrowed)
+}
+
+/// 同上,浏览器版:从运行时喂进来的表里拷一份。
+#[cfg(target_arch = "wasm32")]
+pub fn shared(name: &str) -> Option<std::borrow::Cow<'static, [u8]>> {
+    runtime_store::get(name).map(std::borrow::Cow::Owned)
+}
+
+/// 这张在不在手上。**不要用 `shared(..).is_some()` 代替** —— 浏览器那边它会把
+/// 整张图拷一份出来,只为回答一个 bool。
+#[cfg(not(target_arch = "wasm32"))]
+pub fn has_shared(name: &str) -> bool {
+    embedded(name).is_some()
+}
+
+/// 同上,浏览器版。
+#[cfg(target_arch = "wasm32")]
+pub fn has_shared(name: &str) -> bool {
+    runtime_store::has(name)
+}
+
 /// 常规炫彩要用到的贴图名(花纹 + 四种粒子)。隐藏款各带一对,单独查。
 fn common_assets() -> impl Iterator<Item = &'static str> {
     std::iter::once(DEFAULT_MAIN_TEX).chain(PARTICLES.iter().map(|p| p.tex))
 }
 
-/// 素材齐不齐。**只看烘进来的那份** —— 运行时不再找任何目录,见 `embed` 的说明。
+/// 素材齐不齐。桌面版看烘进来的那份(运行时不再找任何目录,见 `embed` 的说明),
+/// 浏览器版看已经喂进来的那份。
 ///
 /// 不齐就该把炫彩那几档在界面上禁掉并说清楚为什么:让用户看着一个点不出效果的选项,
 /// 比直接说「这个二进制没带炫彩素材」更糟。
 pub fn assets_ready() -> bool {
-    common_assets().all(|name| embedded(name).is_some())
+    common_assets().all(has_shared)
 }
 
 impl Clone for GlassyParams {
@@ -563,6 +666,56 @@ mod tests {
         assert_eq!(HIDDEN.len(), 4);
         // 常驻款只有「黑白」一条,其余三条是赛季款。
         assert_eq!(HIDDEN.iter().filter(|h| !h.season).count(), 1);
+    }
+
+    /// 网页预览按这份名单去取共享贴图(桌面版烘的是全部 13 张,用不着这个)。
+    ///
+    /// 三条各有各的道理:**异色一张都不要**(那是包里另一套材质,跟着形态一起下);
+    /// 常规炫彩只要花纹 + 挑中那种粒子**两张**(整份 3.6MB 里的 250KB);
+    /// 赛季款要**三张** —— 多的那张是 `SeasonMutation` 那一族里 `_By1`(手臂/肩甲/尖塔)
+    /// 不自带花纹图时退回的共享那张,漏了它机幕方舟的胳膊上会缺一块。
+    #[test]
+    fn only_the_textures_this_look_needs() {
+        let shiny = Mutation {
+            shiny: true,
+            glassy: None,
+        };
+        assert!(shiny.shared_assets().is_empty(), "异色不走共享素材");
+
+        let common = Mutation {
+            shiny: false,
+            glassy: Some(Glassy::Common {
+                color: 1,
+                particle: 1,
+            }),
+        };
+        assert_eq!(
+            common.shared_assets(),
+            vec![DEFAULT_MAIN_TEX, particle(1).expect("有 1 号粒子").tex]
+        );
+
+        let season = HIDDEN.iter().find(|h| h.season).expect("有赛季款");
+        let dressed = Mutation {
+            shiny: true,
+            glassy: Some(Glassy::Hidden { id: season.id }),
+        };
+        assert_eq!(
+            dressed.shared_assets(),
+            vec![season.main_tex, season.star_tex, DEFAULT_MAIN_TEX],
+            "赛季款要多带一张共享花纹图给 `_By1`"
+        );
+
+        let plain = HIDDEN.iter().find(|h| !h.season).expect("有常驻款");
+        assert_eq!(
+            Mutation {
+                shiny: false,
+                glassy: Some(Glassy::Hidden { id: plain.id }),
+            }
+            .shared_assets()
+            .len(),
+            2,
+            "常驻款自带一整套,不必回退"
+        );
     }
 
     /// 打包/解包要和客户端 `PetUtils.GetShineDataValue` 逐位一致 ——

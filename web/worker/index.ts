@@ -214,6 +214,34 @@ app.get("/api/preview/:id", async (c) => {
   return new Response(res.body, { status: res.status, headers });
 });
 
+/**
+ * 炫彩共享贴图的**回落路径**,和 `/api/preview/:id` 同一个道理:配了 `PUBLIC_BASE`
+ * 时前端直连 R2,没配(本地 `wrangler dev`)由这里代理。
+ *
+ * 这几张图不进目录(`catalog.json` 只列包与应用),所以 key 是**按名字直接拼**的 ——
+ * 那就必须自己把名字关死:`[A-Za-z0-9_]+`,不许有点也不许有斜杠。放开一个 `.`
+ * 就等于把整个桶交给客户端遍历。
+ *
+ * 整取,不支持 Range:最大的一张 2MB,分片取反而多几个往返。
+ */
+app.get("/api/glassy/:name", async (c) => {
+  const name = c.req.param("name");
+  if (!/^[A-Za-z0-9_]{1,64}$/.test(name)) {
+    return c.json({ error: "名字不合法" }, 400);
+  }
+  const object = await c.env.FILES.get(`glassy/${name}.png`);
+  // 404 是**正常情况**:部署时没传 glassy/ 就没有。前端据此把炫彩那几档禁掉,
+  // 和桌面版「这个二进制没烘炫彩素材」是同一句话
+  if (!object) return c.json({ error: `R2 里没有 glassy/${name}.png` }, 404);
+  const headers = new Headers();
+  object.writeHttpMetadata(headers);
+  headers.set("etag", object.httpEtag);
+  headers.set("content-type", "image/png");
+  // 内容按名字定死(导出器出的是同一份),放心让浏览器长期缓存
+  headers.set("cache-control", "public, max-age=31536000, immutable");
+  return new Response(object.body, { headers });
+});
+
 async function streamFromR2(env: Env, req: Request, target: Target): Promise<Response> {
   // 「这次请求要不要按 Range 回」只能看请求头 —— R2 返回的对象上 `range` 字段
   // 即使没请求分片也会被填成 {offset:0, length:size},拿它当判据会让整文件下载

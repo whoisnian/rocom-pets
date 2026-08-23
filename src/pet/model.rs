@@ -647,8 +647,8 @@ impl Model {
                                 .or_else(|| {
                                     // `_By1` 那种没写花纹图的,用共享的那张(烘在二进制里)。
                                     let name = super::glassy::DEFAULT_MAIN_TEX;
-                                    super::glassy::embedded(name)
-                                        .and_then(|b| decode_texture(b, name))
+                                    super::glassy::shared(name)
+                                        .and_then(|b| decode_texture(&b, name))
                                 }),
                             mix_mask: sm
                                 .mix_mask
@@ -999,7 +999,7 @@ impl Model {
         }
         self.glassy = mutation.glassy.and_then(|g| g.render()).and_then(|render| {
             let load = |name: &str| {
-                super::glassy::embedded(name).and_then(|bytes| decode_texture(bytes, name))
+                super::glassy::shared(name).and_then(|bytes| decode_texture(&bytes, name))
             };
             match (load(render.main_tex), load(render.star_tex)) {
                 (Some(main_tex), Some(star_tex)) => Some(GlassySkin {

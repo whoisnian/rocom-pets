@@ -72,3 +72,18 @@ export async function previewUrl(pack: Pack): Promise<string> {
   if (publicBase) return new URL(pack.key, publicBase.replace(/\/?$/, "/")).toString();
   return `/api/preview/${encodeURIComponent(pack.id)}`;
 }
+
+/**
+ * 炫彩共享贴图的地址。和 `previewUrl` 同一条规矩:配了 R2 自定义域就直连,
+ * 没配回落到 Worker 代理。
+ *
+ * **这几张图不在 `catalog.json` 里**,也不在 `.rkpet` 里 —— 它们是全库共用的
+ * (13 张 3.6MB),塞进 200 个包要多背 120MB,烘进 wasm 又会让每个点开预览的人
+ * 先付 3.6MB。所以单独放一份在桶的 `glassy/` 下,谁部署谁上传;没传就是 404,
+ * 前端把炫彩那几档禁掉(和桌面版「这个二进制没烘炫彩素材」是同一句话)。
+ */
+export async function glassyUrl(name: string): Promise<string> {
+  const { publicBase } = await fetchConfig();
+  if (publicBase) return new URL(`glassy/${name}.png`, publicBase.replace(/\/?$/, "/")).toString();
+  return `/api/glassy/${encodeURIComponent(name)}`;
+}

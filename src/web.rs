@@ -66,6 +66,104 @@ pub struct ClipInfo {
 pub struct FormInfo {
     pub asset: String,
     pub name: String,
+    /// 这个形态导了异色材质吗。**多数没有** —— 游戏里也是,得美术另做一套。
+    pub shiny: bool,
+}
+
+/// 一款隐藏/赛季炫彩。`name` 原样回传给 `set_mutation`(写法见 `Mutation::to_config`)。
+#[wasm_bindgen(getter_with_clone)]
+pub struct HiddenGlassInfo {
+    pub name: String,
+    /// 赛季款。专属贴图只给游戏指定的那几只,别的宠物走通用外观。
+    pub season: bool,
+}
+
+/// 常规炫彩的一组配色。`color1`/`color2` 是给人看的两块色(0xRRGGBB),
+/// **不是** shader 里那两个 HDR 系数 —— 后者取到 1.6,直接当颜色画会一片过曝。
+#[wasm_bindgen(getter_with_clone)]
+pub struct GlassyColorInfo {
+    pub id: u32,
+    pub name: String,
+    pub color1: u32,
+    pub color2: u32,
+}
+
+/// 常规炫彩的一种粒子。
+#[wasm_bindgen(getter_with_clone)]
+pub struct GlassyParticleInfo {
+    pub id: u32,
+    pub name: String,
+}
+
+/// 隐藏/赛季炫彩那几款,顺序照游戏自己的分法(常驻在前、赛季在后)。
+#[wasm_bindgen]
+pub fn glassy_hidden() -> Vec<HiddenGlassInfo> {
+    let mut out: Vec<HiddenGlassInfo> = crate::pet::glassy::hidden()
+        .iter()
+        .map(|h| HiddenGlassInfo {
+            name: h.name.to_string(),
+            season: h.season,
+        })
+        .collect();
+    out.sort_by_key(|h| h.season);
+    out
+}
+
+/// 常规炫彩的 39 组配色。
+#[wasm_bindgen]
+pub fn glassy_colors() -> Vec<GlassyColorInfo> {
+    crate::pet::glassy::colors()
+        .iter()
+        .map(|c| GlassyColorInfo {
+            id: c.id,
+            name: c.name.to_string(),
+            color1: c.ui_color_1,
+            color2: c.ui_color_2,
+        })
+        .collect()
+}
+
+/// 常规炫彩的 4 种粒子。
+#[wasm_bindgen]
+pub fn glassy_particles() -> Vec<GlassyParticleInfo> {
+    crate::pet::glassy::particles()
+        .iter()
+        .map(|p| GlassyParticleInfo {
+            id: p.id,
+            name: p.name.to_string(),
+        })
+        .collect()
+}
+
+/// 画成 `mutation` 这样还缺哪几张**共享贴图**(不带目录与扩展名)。
+///
+/// 网页版不把这 13 张烘进 wasm(3.6MB,而挑一次常规炫彩只用得上两张),
+/// 由前端照这份名单去取、再喂 [`Preview::put_glassy`]。见 `glassy::shared`。
+#[wasm_bindgen]
+pub fn glassy_missing(mutation: &str) -> Result<Vec<String>, JsValue> {
+    Ok(parse_mutation(mutation)?
+        .missing_assets()
+        .into_iter()
+        .map(str::to_string)
+        .collect())
+}
+
+/// 装一个形态的模型。**两个轴在这里分头落地**,和桌面版 `Assets::model` 同一条路:
+/// 异色换的是整套材质(包里已经是换好的那一份,挑一张表就够),炫彩往挑中的那套上刷一层。
+fn build_model(form: &crate::pack::Form, mutation: crate::pet::Mutation) -> Result<Arc<Model>, JsValue> {
+    let mut model = Model::load(&form.model, form.materials_for(mutation.shiny))
+        .map_err(|e| JsValue::from_str(&format!("{e:#}")))?;
+    model.apply_mutation(mutation, form.id);
+    Ok(Arc::new(model))
+}
+
+/// 认不得就报错,别默默按原样画 —— 那样「选了没反应」查不出是哪一步错了。
+fn parse_mutation(text: &str) -> Result<crate::pet::Mutation, JsValue> {
+    if text.is_empty() {
+        return Ok(crate::pet::Mutation::default());
+    }
+    crate::pet::Mutation::from_config(text)
+        .ok_or_else(|| JsValue::from_str(&format!("认不得的外观「{text}」")))
 }
 
 /// 表情。`name` 就是界面上那个中文名,回头原样传给 `set_face`。
@@ -104,6 +202,10 @@ pub struct Preview {
     /// 宠物待在原地,而不是跟着镜头甩。
     target: Vec3,
     face: Expression,
+    /// 当前这个形态的资产名。换外观要照它重建,所以得记着。
+    asset: String,
+    /// 当前这只穿的外观(异色 / 炫彩)。写法同 `roster.toml` 的 `mutation`。
+    mutation: crate::pet::Mutation,
     /// 喂给着色器的「秒」:火焰流动、星点闪烁靠它推进。
     time: f32,
     /// 清屏色。见 `attach` 里那段:网页画布只能是不透明的。
@@ -129,6 +231,8 @@ impl Preview {
             zoom: 1.0,
             target: Vec3::ZERO,
             face: crate::persona::DEFAULT_FACE,
+            asset: String::new(),
+            mutation: crate::pet::Mutation::default(),
             time: 0.0,
             // 中性灰:前端还没告诉我们主题色之前先用它,总比纯黑洞好
             background: wgpu::Color {
@@ -153,6 +257,8 @@ impl Preview {
         crate::assets::memory::clear();
         self.pack = None;
         self.pet = None;
+        self.asset = String::new();
+        self.mutation = crate::pet::Mutation::default();
         if let Some(gpu) = &mut self.gpu {
             gpu.depth_bind = None;
         }
@@ -230,6 +336,7 @@ impl Preview {
             .map(|f| FormInfo {
                 asset: f.asset.clone(),
                 name: f.name.clone(),
+                shiny: f.has_shiny(),
             })
             .collect();
         self.pack = Some(pack);
@@ -254,10 +361,7 @@ impl Preview {
             .map_err(|e| JsValue::from_str(&format!("{e:#}")))?;
         let form = &pack.forms[index];
 
-        let model = Arc::new(
-            Model::load(&form.model, &form.materials)
-                .map_err(|e| JsValue::from_str(&format!("{e:#}")))?,
-        );
+        let model = build_model(form, self.mutation)?;
         let pet = PetGpu::new(&gpu.device, &gpu.queue, &model, gpu.config.format)
             .map_err(|e| JsValue::from_str(&format!("{e:#}")))?;
         gpu.depth_bind = Some(pet.bind_scene_depth(&gpu.device, &gpu.depth));
@@ -279,11 +383,75 @@ impl Preview {
             gpu: pet,
             player,
         });
+        self.asset = asset.to_string();
         self.face = crate::persona::DEFAULT_FACE;
         // 换形态就把平移归零:偏移是按上一只的取景半径算的,新的一只可能小得多,
         // 不清的话切过去第一眼人就在画面外(缩放留着,那是「想看多近」,跟哪只无关)
         self.target = Vec3::ZERO;
         Ok(clips)
+    }
+
+    /// 喂一张炫彩共享贴图。名字不带目录与扩展名(`Tex_PetGlassy_007_D`),
+    /// 该喂哪几张问 [`glassy_missing`]。**要在 `set_mutation` 之前喂**。
+    pub fn put_glassy(&mut self, name: &str, bytes: &[u8]) {
+        crate::pet::glassy::put_shared(name, bytes.to_vec());
+    }
+
+    /// 换外观。写法同 `roster.toml` 的 `mutation`:`异色` / `炫彩:3/33` /
+    /// `炫彩:黑白`,两个轴可以用 `+` 同时带;空串 = 按包里原样画。
+    ///
+    /// **视角、缩放、正在播的那段动作都留着** —— 换外观是「这只穿另一身」,
+    /// 不是换了一只:镜头跳回去、动作从头再来,恰恰看不成前后对比。
+    ///
+    /// 素材不齐时**不静默退回原样**:那样人点了没反应,查不出是缺素材还是没做。
+    pub fn set_mutation(&mut self, text: &str) -> Result<(), JsValue> {
+        let mutation = parse_mutation(text)?;
+        if mutation == self.mutation {
+            return Ok(());
+        }
+        let missing = mutation.missing_assets();
+        if !missing.is_empty() {
+            return Err(JsValue::from_str(&format!(
+                "还差炫彩素材:{} —— 先 put_glassy 喂进来",
+                missing.join("、")
+            )));
+        }
+        let previous = std::mem::replace(&mut self.mutation, mutation);
+        if let Err(e) = self.rebuild() {
+            // 建不起来就退回上一身,别把预览停在一只画不出来的宠物上
+            self.mutation = previous;
+            let _ = self.rebuild();
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    /// 按当前的形态与外观重建这只。**接着上一身的动作与时刻播** ——
+    /// 网格与骨架没变,变的只有材质,所以段号是通用的。
+    fn rebuild(&mut self) -> Result<(), JsValue> {
+        let (Some(gpu), Some(pack)) = (self.gpu.as_mut(), self.pack.as_ref()) else {
+            return Ok(()); // 还没装宠物,记下来就行,下一次 load_form 自然带上
+        };
+        let Some(pet) = self.pet.as_ref() else {
+            return Ok(());
+        };
+        let index = pack
+            .form_index(Some(&self.asset))
+            .map_err(|e| JsValue::from_str(&format!("{e:#}")))?;
+        let (clip, at) = (pet.player.current(), pet.player.time());
+
+        let model = build_model(&pack.forms[index], self.mutation)?;
+        let built = PetGpu::new(&gpu.device, &gpu.queue, &model, gpu.config.format)
+            .map_err(|e| JsValue::from_str(&format!("{e:#}")))?;
+        gpu.depth_bind = Some(built.bind_scene_depth(&gpu.device, &gpu.depth));
+        let mut player = Player::new(&model, clip.min(model.clips.len().saturating_sub(1)));
+        player.seek(at);
+        self.pet = Some(Pet {
+            model,
+            gpu: built,
+            player,
+        });
+        Ok(())
     }
 
     /// 播一段动作。**表情跟着换** —— 和桌宠一样,正在播的那段说了算

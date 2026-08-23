@@ -3173,6 +3173,45 @@ missing_clips = ["hide"]
 3. **`config.toml` 用 `toml_edit` 写回**。那份是手写的、带一整篇说明,
    `toml::to_string` 重新序列化一遍会把注释全抹掉。`roster.toml` 不需要(它本来就归程序)。
 
+### 网页预览也能挑异色与炫彩(2026-08-23)
+
+同一份 `Mutation`、同一张配置表、同一套写法(`异色+炫彩:3/33`),前端只负责拼字符串。
+两个轴在 `web.rs::build_model` 里分头落地,和桌面版 `Assets::model` 逐字相同。
+
+**异色一分钱不多花**:那套材质与它的贴图本来就在 `forms/<资产>/` 底下,预览早就整个下了。
+所以只多了一个 `FormInfo.shiny` 字段(`Form::has_shiny`)和一个开关。
+
+**炫彩那 13 张共享贴图不烘进 wasm。** 那是点开预览才下的一个 chunk(1.5MB),
+再塞 3.6MB 进去等于让每个点开的人先付一遍,而其中最大的一张(铅字幻梦的流动噪声)
+自己就有 2MB、多数人一次也用不上。改成**问 wasm 要名单、按需 fetch**:
+`Mutation::shared_assets` 说这一身要哪几张,`glassy_missing` 滤掉手上已有的,前端取回来喂
+`put_glassy`。挑一次常规炫彩只多下两张(实测 184KB + 49KB)。于是 `glassy::embedded`
+(构建期烘的那张表)之上多了一层 `glassy::shared` / `has_shared` —— **桌面与浏览器唯一的
+分岔就在这一个函数里**,两条加载路径都只认它。
+
+素材和包一样是「谁部署谁提供」:传到桶的 `glassy/` 下(见 web/README.md 第 3b 步),
+Worker 那条回落路由 `/api/glassy/:name` **必须自己把名字关死**(`[A-Za-z0-9_]+`,
+不许有点也不许有斜杠)—— 这几张不在 `catalog.json` 里,key 是按名字直接拼的,
+放开一个 `.` 就等于把整个桶交给客户端遍历。没传就是 404,前端把炫彩那几档禁掉并说一句,
+和桌面版「这个二进制没烘炫彩素材」是同一句话。
+
+**顺带发现网页预览已经坏了一阵子。** 重编 wasm 之后浏览器整份 shader 拒编:
+
+```
+error: 'textureSample' must only be called from uniform control flow
+note: control flow depends on possibly non-uniform value: if !gated && !season
+```
+
+`glassy_layer` 门外那条 `return shaded` 是条快路,可它让底下所有 `textureSample` 落进
+「依赖非一致值的控制流」—— WGSL 规定带隐式导数的采样只能在一致控制流里调。
+**桌面的 naga 放行、浏览器的 Tint 不放行**,所以只有网页会炸,而且是**整份 shader**、
+连一只普通宠物都画不出来。删掉那条快路是逐字等价的(第 ⑧ 步本来就写着
+`select(shaded, …, gated)`,金属那步的 `season_metal_zone` 在非赛季材质上恒为 0),
+三张渲图(异色炫彩 / 赛季 / 原样)与改前**逐像素相同**。
+
+教训:**wasm 那份要跟着 shader 一起重编才看得见这类错**。`web/src/wasm/` 是生成物、
+不入仓库,改完 `pet.wgsl` 只跑桌面测试是发现不了的。
+
 **踩到的坑(都是「看起来对、跑起来错」那一类)**:
 
 - **除了宠物包那页,整个 `CentralPanel` 里一个滚动区都没有**。窗口能拉到 480 高,

@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { Loader2, RotateCcw, TriangleAlert, ZoomIn, ZoomOut } from "lucide-react";
+import { Loader2, RotateCcw, Sparkles, TriangleAlert, ZoomIn, ZoomOut } from "lucide-react";
 import type { Pack } from "../../shared/types.ts";
 import { Button } from "@/components/ui/button.tsx";
 import {
@@ -19,6 +19,7 @@ import {
   canPreview,
   type ClipEntry,
   type FormEntry,
+  type GlassyCatalog,
   type Progress,
 } from "@/lib/preview.ts";
 import { previewUrl } from "@/lib/api.ts";
@@ -31,6 +32,32 @@ interface Props {
 
 /** 点一下按钮缩放多少。约等于滚轮滚两格,少了要点很多下,多了一下就到头。 */
 const ZOOM_STEP = 1.5;
+
+/**
+ * 炫彩下拉里那两个不是隐藏款名字的档。Radix 的 `Select` 把空串留给 placeholder,
+ * 所以「不上炫彩」也得有个非空的值。隐藏款用的是它自己的中文名(回头原样进
+ * `mutation` 字符串),和这两个撞不上。
+ */
+const NO_GLASSY = "none";
+const COMMON_GLASSY = "common";
+
+/**
+ * 拼 `mutation` 字符串。**和桌面版 `Mutation::to_config` 同一套写法** ——
+ * 两个轴各写一段,同时带就用 `+` 接:`异色+炫彩:3/33`。
+ * 常规炫彩写编号(和游戏 UI 上的编号一致),隐藏款写名字(那四条的 id 没有规律)。
+ */
+function mutationText(shiny: boolean, kind: string, particle: number, color: number): string {
+  const parts: string[] = [];
+  if (shiny) parts.push("异色");
+  if (kind === COMMON_GLASSY) parts.push(`炫彩:${particle}/${color}`);
+  else if (kind !== NO_GLASSY) parts.push(`炫彩:${kind}`);
+  return parts.join("+");
+}
+
+/** 0xRRGGBB → CSS。配色下拉里那两个小方块。 */
+function swatch(rgb: number): string {
+  return `#${rgb.toString(16).padStart(6, "0")}`;
+}
 
 /** 两个触点之间的距离;不足两点记 0(= 还不能算捏合)。 */
 function spanOf(pointers: Map<number, { x: number; y: number }>): number {
@@ -67,7 +94,16 @@ export function PreviewDialog({ pack, onOpenChange }: Props) {
   const [face, setFace] = useState("");
   const [progress, setProgress] = useState<Progress | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // 外观:两个互不影响的轴(游戏里就是两个位标志,既有异色炫彩也有原色炫彩)
+  const [glassy, setGlassy] = useState<GlassyCatalog | null>(null);
+  const [shiny, setShiny] = useState(false);
+  const [kind, setKind] = useState(NO_GLASSY);
+  const [color, setColor] = useState(1);
+  const [particle, setParticle] = useState(1);
+  /** 炫彩取不到素材(部署时没传 `glassy/`)。出现过一次就把那几档一直禁着。 */
+  const [glassyError, setGlassyError] = useState<string | null>(null);
   const supported = canPreview();
+  const hasShiny = forms.find((f) => f.asset === asset)?.shiny ?? false;
 
   // 开:建会话 → 读 manifest → 装链首那个形态(默认待机)
   useEffect(() => {
@@ -77,7 +113,7 @@ export function PreviewDialog({ pack, onOpenChange }: Props) {
 
     (async () => {
       try {
-        const { session, forms, faces } = await PreviewSession.open(
+        const { session, forms, faces, glassy } = await PreviewSession.open(
           await previewUrl(pack),
           canvas,
           setProgress,
@@ -89,6 +125,7 @@ export function PreviewDialog({ pack, onOpenChange }: Props) {
         sessionRef.current = session;
         setForms(forms);
         setFaces(faces);
+        setGlassy(glassy);
         setFace(faces[0] ?? "");
         const first = forms[0]?.asset ?? "";
         setAsset(first);
@@ -109,18 +146,63 @@ export function PreviewDialog({ pack, onOpenChange }: Props) {
     };
   }, [pack, supported, canvas]);
 
-  const switchForm = useCallback(async (next: string) => {
-    const session = sessionRef.current;
-    if (!session) return;
-    setAsset(next);
-    try {
-      setClips(await session.showForm(next, setProgress));
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
-    } finally {
-      setProgress(null);
-    }
-  }, []);
+  const switchForm = useCallback(
+    async (next: string) => {
+      const session = sessionRef.current;
+      if (!session) return;
+      setAsset(next);
+      // 异色是**每个形态各自有没有**的:同一条进化链里常有前两阶有、末阶没有。
+      // 切到没有的那一阶就把这个轴放下 —— 留着开关亮着却什么也不换更糟
+      const drop = shiny && !forms.find((f) => f.asset === next)?.shiny;
+      if (drop) setShiny(false);
+      try {
+        setClips(await session.showForm(next, setProgress));
+        // 界面上放下了,wasm 那边也要跟着放下 —— 不然两边记的不是同一身,
+        // 下次改配色时才「顺手」纠正过来,中间这段时间是对不上的
+        if (drop) await session.setMutation(mutationText(false, kind, particle, color));
+      } catch (e) {
+        setError(e instanceof Error ? e.message : String(e));
+      } finally {
+        setProgress(null);
+      }
+    },
+    [forms, shiny, kind, particle, color],
+  );
+
+  /**
+   * 换外观。**共享贴图是现取的**,所以这是个异步操作:进度条打「下载炫彩素材」
+   * (常规炫彩两张约 250KB,铅字幻梦那张噪声自己就有 2MB)。
+   *
+   * 失败**不改回界面上的选择**:wasm 那边已经退回上一身了,而把下拉也拨回去会让人
+   * 以为自己没点到。底下那句红字说清楚是取不到素材。
+   */
+  const applyMutation = useCallback(
+    async (next: { shiny?: boolean; kind?: string; color?: number; particle?: number }) => {
+      const want = {
+        shiny: next.shiny ?? shiny,
+        kind: next.kind ?? kind,
+        color: next.color ?? color,
+        particle: next.particle ?? particle,
+      };
+      setShiny(want.shiny);
+      setKind(want.kind);
+      setColor(want.color);
+      setParticle(want.particle);
+      const session = sessionRef.current;
+      if (!session) return;
+      const text = mutationText(want.shiny, want.kind, want.particle, want.color);
+      try {
+        if (want.kind !== NO_GLASSY) setProgress({ done: 0, total: 1, label: "下载炫彩素材" });
+        await session.setMutation(text);
+        setGlassyError(null);
+      } catch (e) {
+        setGlassyError(e instanceof Error ? e.message : String(e));
+      } finally {
+        setProgress(null);
+      }
+    },
+    [shiny, kind, color, particle],
+  );
 
   // 和常见的模型查看器(three.js 的 OrbitControls、<model-viewer>、Sketchfab)对齐:
   // 左键拖 = 转视角,右键 / 中键 / Shift+左键 拖 = 平移中心,滚轮 = 缩放;
@@ -315,6 +397,107 @@ export function PreviewDialog({ pack, onOpenChange }: Props) {
               复位
             </Button>
           </div>
+
+          {/*
+            外观**自己一行**:上面那行已经有形态、表情和三个视角按钮,再塞四个控件
+            要挤成两行,而且「形态」和「炫彩」挨着容易让人以为是一回事。
+            两个轴互不影响 —— 游戏里就是两个位标志,既有异色炫彩,也有原色炫彩。
+          */}
+          {glassy && clips.length > 0 && (
+            <div className="mt-2 flex flex-wrap items-center gap-2">
+              {hasShiny && (
+                <Button
+                  variant={shiny ? "default" : "outline"}
+                  size="sm"
+                  aria-pressed={shiny}
+                  onClick={() => void applyMutation({ shiny: !shiny })}
+                >
+                  <Sparkles />
+                  异色
+                </Button>
+              )}
+              <Select
+                value={kind}
+                onValueChange={(v) => void applyMutation({ kind: v })}
+                disabled={glassyError !== null}
+              >
+                <SelectTrigger className="w-32" aria-label="炫彩">
+                  <SelectValue placeholder="炫彩" />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value={NO_GLASSY}>无炫彩</SelectItem>
+                  {/* 常驻那款(黑白)缀个「隐藏」—— 光写「黑白」会被当成一组配色名
+                      (常规那 39 组就叫「亮X暗 - 浅蓝蓝」这种)。赛季款自带专名,不用缀 */}
+                  {glassy.hidden
+                    .filter((h) => !h.season)
+                    .map((h) => (
+                      <SelectItem key={h.name} value={h.name}>
+                        {h.name}隐藏
+                      </SelectItem>
+                    ))}
+                  <SelectItem value={COMMON_GLASSY}>常规炫彩</SelectItem>
+                  {glassy.hidden
+                    .filter((h) => h.season)
+                    .map((h) => (
+                      <SelectItem key={h.name} value={h.name}>
+                        {h.name}
+                      </SelectItem>
+                    ))}
+                </SelectContent>
+              </Select>
+              {/* 配色与粒子只有常规炫彩才挑;隐藏/赛季款是配好的一整套 */}
+              {kind === COMMON_GLASSY && (
+                <>
+                  <Select
+                    value={String(color)}
+                    onValueChange={(v) => void applyMutation({ color: Number(v) })}
+                  >
+                    <SelectTrigger className="w-52" aria-label="配色">
+                      <SelectValue placeholder="配色" />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {glassy.colors.map((c) => (
+                        <SelectItem key={c.id} value={String(c.id)}>
+                          <span className="flex items-center gap-2">
+                            <span className="flex gap-0.5">
+                              {[c.color1, c.color2].map((rgb, i) => (
+                                <span
+                                  key={i}
+                                  className="size-3 rounded-[2px]"
+                                  style={{ backgroundColor: swatch(rgb) }}
+                                />
+                              ))}
+                            </span>
+                            {c.name}
+                          </span>
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                  <Select
+                    value={String(particle)}
+                    onValueChange={(v) => void applyMutation({ particle: Number(v) })}
+                  >
+                    <SelectTrigger className="w-28" aria-label="粒子">
+                      <SelectValue placeholder="粒子" />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {glassy.particles.map((p) => (
+                        <SelectItem key={p.id} value={String(p.id)}>
+                          {p.name}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                </>
+              )}
+              {glassyError && (
+                <span className="text-xs text-[var(--warning)]">
+                  这个站点没上传炫彩素材,炫彩用不了
+                </span>
+              )}
+            </div>
+          )}
 
           {clips.length > 0 && (
             <div className="mt-3 flex flex-wrap gap-1.5">

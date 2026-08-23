@@ -7,6 +7,7 @@
  */
 
 import { RemoteZip, type ZipEntry } from "@/lib/rkpet.ts";
+import { glassyUrl } from "@/lib/api.ts";
 
 /** 这台机器有没有 WebGPU。骨骼矩阵走只读 storage buffer,WebGL2 顶不上。 */
 export function canPreview(): boolean {
@@ -16,6 +17,34 @@ export function canPreview(): boolean {
 export interface FormEntry {
   asset: string;
   name: string;
+  /** 这个形态导了异色材质吗。多数没有 —— 游戏里也是,得美术另做一套。 */
+  shiny: boolean;
+}
+
+/** 一款隐藏/赛季炫彩。 */
+export interface HiddenGlassEntry {
+  name: string;
+  season: boolean;
+}
+
+/** 常规炫彩的一组配色。两个 `color*` 是 0xRRGGBB,给人看的那两块。 */
+export interface GlassyColorEntry {
+  id: number;
+  name: string;
+  color1: number;
+  color2: number;
+}
+
+export interface GlassyParticleEntry {
+  id: number;
+  name: string;
+}
+
+/** 炫彩的全部选项。整份从 wasm 拿 —— 和桌面版读的是同一张配置表。 */
+export interface GlassyCatalog {
+  hidden: HiddenGlassEntry[];
+  colors: GlassyColorEntry[];
+  particles: GlassyParticleEntry[];
 }
 
 export interface ClipEntry {
@@ -27,16 +56,22 @@ interface Wasm {
   default: (init?: unknown) => Promise<unknown>;
   Preview: new () => WasmPreview;
   expressions: () => string[];
+  glassy_hidden: () => HiddenGlassEntry[];
+  glassy_colors: () => GlassyColorEntry[];
+  glassy_particles: () => GlassyParticleEntry[];
+  glassy_missing: (mutation: string) => string[];
 }
 
 interface WasmPreview {
   attach(canvas: HTMLCanvasElement): Promise<void>;
   put(path: string, bytes: Uint8Array): void;
   reset(): void;
-  load_pack(): { asset: string; name: string }[];
+  load_pack(): { asset: string; name: string; shiny: boolean }[];
   load_form(asset: string): { name: string; label: string }[];
   play(name: string): boolean;
   set_face(name: string): void;
+  put_glassy(name: string, bytes: Uint8Array): void;
+  set_mutation(text: string): void;
   drag(dx: number, dy: number): void;
   pan(dx: number, dy: number): void;
   zoom_by(factor: number): void;
@@ -85,11 +120,21 @@ export class PreviewSession {
   /** 已经喂进 wasm 的形态,别重复下载。 */
   private loaded = new Set<string>();
 
+  /** 已经喂进 wasm 的共享贴图,别重复下载。 */
+  private glassy = new Set<string>();
+  /** 取不到共享贴图(部署时没传 `glassy/`)—— 记下来,让界面把炫彩禁掉并说清楚。 */
+  private glassyError: string | null = null;
+
   static async open(
     url: string,
     canvas: HTMLCanvasElement,
     onProgress: (p: Progress) => void,
-  ): Promise<{ session: PreviewSession; forms: FormEntry[]; faces: string[] }> {
+  ): Promise<{
+    session: PreviewSession;
+    forms: FormEntry[];
+    faces: string[];
+    glassy: GlassyCatalog;
+  }> {
     const session = new PreviewSession();
     const { signal } = session.abort;
 
@@ -117,8 +162,21 @@ export class PreviewSession {
     const manifest = zip.entries.get("manifest.toml");
     if (!manifest) throw new Error("包里没有 manifest.toml");
     pv.put("manifest.toml", await zip.read(manifest, signal));
-    const forms = pv.load_pack().map((f) => ({ asset: f.asset, name: f.name }));
-    return { session, forms, faces: wasm.expressions() };
+    const forms = pv.load_pack().map((f) => ({ asset: f.asset, name: f.name, shiny: f.shiny }));
+    return {
+      session,
+      forms,
+      faces: wasm.expressions(),
+      // **当场摊成普通对象**:wasm-bindgen 回的是带指针的类实例,留着它们等于
+      // 让一份 39 条的表跨整个会话活着(和上面 `load_pack` 同一个处理)
+      glassy: {
+        hidden: wasm.glassy_hidden().map((h) => ({ name: h.name, season: h.season })),
+        colors: wasm
+          .glassy_colors()
+          .map((c) => ({ id: c.id, name: c.name, color1: c.color1, color2: c.color2 })),
+        particles: wasm.glassy_particles().map((p) => ({ id: p.id, name: p.name })),
+      },
+    };
   }
 
   /** 切到某个形态。第一次会把它那一份资产下下来。 */
@@ -148,6 +206,38 @@ export class PreviewSession {
 
   setFace(name: string) {
     this.pv?.set_face(name);
+  }
+
+  /**
+   * 换外观。`text` 的写法和 `roster.toml` 的 `mutation` 一样:`异色` /
+   * `炫彩:3/33` / `炫彩:黑白`,两个轴可以用 `+` 同时带;空串 = 原样。
+   *
+   * **炫彩的共享贴图是现取的**:那 13 张(3.6MB)不进 wasm 也不进包,由 wasm 说出
+   * 这一身还缺哪几张,取回来喂进去再切 —— 挑一次常规炫彩只多下两张(约 250KB)。
+   * 视角、缩放、正在播的那段动作都由 wasm 那边留着。
+   */
+  async setMutation(text: string): Promise<void> {
+    const pv = this.pv;
+    if (!pv) return;
+    const wasm = await loadWasm();
+    for (const name of wasm.glassy_missing(text)) {
+      if (this.glassy.has(name)) continue;
+      const res = await fetch(await glassyUrl(name), { signal: this.abort.signal });
+      // 取不到多半是部署时没上传 `glassy/`。**记下来往上抛**,别让人对着一个
+      // 点了没反应的下拉猜 —— 和桌面版「这个二进制没烘炫彩素材」是同一句话
+      if (!res.ok) {
+        this.glassyError = `取不到炫彩素材 ${name}(${res.status})`;
+        throw new Error(this.glassyError);
+      }
+      pv.put_glassy(name, new Uint8Array(await res.arrayBuffer()));
+      this.glassy.add(name);
+    }
+    pv.set_mutation(text);
+  }
+
+  /** 炫彩取不到素材时的那句话;能用就是 null。 */
+  get glassyProblem(): string | null {
+    return this.glassyError;
   }
 
   /**

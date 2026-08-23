@@ -114,6 +114,7 @@ Range 请求的,没这一步就全被拦下:
 |---|---|---|---|
 | app 构建 | `starts_with(http.request.uri.path, "/app/")` | 1 year | 1 year |
 | 宠物包 | `starts_with(http.request.uri.path, "/packs/")` | 1 month | **1 day** |
+| 炫彩贴图 | `starts_with(http.request.uri.path, "/glassy/")` | 1 year | 1 year |
 
 都要把 Cache eligibility 设成 **Eligible for cache**;匹配式再与上 `http.host eq "你的-r2-域名"`。
 
@@ -182,6 +183,10 @@ npm run catalog -- --packs ~/Downloads/rocom/packs-all \
 #    还会留下一堆同名目录 —— catalog 只 glob *.rkpet 所以不受影响,但 rclone 会照单全收。
 rclone copy ~/Downloads/rocom/packs-all r2:rocom-pets/packs/ --include "*.rkpet" --progress
 rclone copy ~/Downloads/rocom/dist-bin  r2:rocom-pets/app/0.1.0/ --progress
+
+# 3b. 炫彩共享贴图(13 张 3.6MB,导出器写在 <out>/glassy)。**不传也能跑**,
+#     只是预览里「炫彩」那个下拉会在第一次点的时候报「这个站点没上传炫彩素材」。
+rclone copy ~/Downloads/rocom/packs-all/glassy r2:rocom-pets/glassy/ --include "*.png" --progress
 
 # 4. 上线
 npm run deploy
