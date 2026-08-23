@@ -119,6 +119,32 @@ pub fn scrollbar(ui: &mut egui::Ui) {
     visuals.widgets.active.bg_fill = egui::Color32::from_rgb(61, 130, 165);
 }
 
+/// 一页的竖向滚动区。窗口拉小时装不下就得能滚 —— 不是把底下几行**裁掉**
+/// (原来就是裁掉的:整个 `CentralPanel` 里一个滚动区都没有,「活跃宠物」那页
+/// 光表单就有十来行,底下的「动作 / 位置」两行直接看不见也够不着)。
+///
+/// **每一页自己管滚动**,不在 `CentralPanel` 外面统一套一层:宠物包那页是虚拟化的
+/// (两百多个包只画看得见的十几行),外面再套一层会把它的可用高度变成无穷,那套算法当场失效。
+///
+/// **滚动条那套取色只能给滚动条**:`scrollbar()` 改的 `bg_fill` / `extreme_bg_color`
+/// 同时是复选框、滑杆轨道、数值框的填充色,内容照着画会跟着一起染蓝
+/// (宠物页里这三样都有)—— 所以进了内容那层先把 `Visuals` 还回去。
+/// 滚动条本身由外面那层的样式画,还回去不影响它。
+pub fn scroll_page<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    let restore = ui.visuals().clone();
+    scrollbar(ui);
+    egui::ScrollArea::vertical()
+        // 显式给个 id:自动 id 是按父 `Ui` 里的控件序号排的,而顶上那条「改动」栏
+        // 有没有按钮会让序号跟着变 —— 滚动位置会莫名其妙地被重置
+        .id_salt("page")
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            *ui.visuals_mut() = restore;
+            add(ui)
+        })
+        .inner
+}
+
 /// 次要说明文字(灰的一行小字)。
 pub fn hint(ui: &mut egui::Ui, text: impl Into<String>) {
     let color = ui.visuals().weak_text_color();

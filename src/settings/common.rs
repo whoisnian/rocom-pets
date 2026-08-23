@@ -13,6 +13,10 @@ const SIZE_RANGE: std::ops::RangeInclusive<f32> = 0.5..=3.0;
 
 impl SettingsApp {
     pub(super) fn common_page(&mut self, ui: &mut egui::Ui) {
+        theme::scroll_page(ui, |ui| self.common_page_inner(ui));
+    }
+
+    fn common_page_inner(&mut self, ui: &mut egui::Ui) {
         ui.heading("常用配置");
         ui.add_space(4.0);
         ui.separator();

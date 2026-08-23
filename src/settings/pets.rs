@@ -13,7 +13,12 @@ use crate::persona;
 use crate::platform::{PetOptions, SCALE_RANGE, VOICE_RANGE};
 
 impl SettingsApp {
+    /// 这一页装不下就滚(见 `theme::scroll_page`):表单本身十来行,窗口还能拉到 480 高。
     pub(super) fn pet_page(&mut self, ui: &mut egui::Ui, slot: usize) {
+        theme::scroll_page(ui, |ui| self.pet_page_inner(ui, slot));
+    }
+
+    fn pet_page_inner(&mut self, ui: &mut egui::Ui, slot: usize) {
         if slot >= self.roster.len() {
             self.page = Page::Packs;
             return;
@@ -321,7 +326,7 @@ impl SettingsApp {
     }
 }
 
-/// 外观那几行:异色一个开关,炫彩一排单选;选了常规炫彩再多一行挑配色与粒子。
+/// 外观那几行:异色一个开关,炫彩一排单选;选了常规炫彩再多两行挑配色与粒子。
 ///
 /// **异色与炫彩是两件独立的事** —— 游戏里是两个位标志(`MDT_SHINING` / `MDT_GLASS`),
 /// 既有异色炫彩,也有原色炫彩。所以这里是「一个开关 + 一排单选」,不是三选一。
@@ -338,12 +343,13 @@ fn appearance_rows(
 
     // 异色要包里真有那套材质,**多数宠物没有**(游戏里也是,得美术另做一套)。
     // 没有就整行不出 —— 摆一个永远点不动的开关只是占地方。
+    //
+    // 光一个方框,不写字:左边那格已经写着「异色」,开关再写一遍「换成异色」是同一个词
+    // 在一行里出现两次;那句「美术另做的一套材质」讲的是它**为什么时有时无**,
+    // 而这一行只在有的时候才出现 —— 看得见它的人不需要这句话。
     if form.has_shiny() {
         label(ui, "异色:");
-        ui.horizontal(|ui| {
-            ui.checkbox(&mut options.mutation.shiny, "换成异色");
-            theme::hint(ui, "美术另做的一套材质");
-        });
+        ui.checkbox(&mut options.mutation.shiny, "");
         ui.end_row();
     }
 
@@ -386,49 +392,72 @@ fn appearance_rows(
     let Some(Glassy::Common { color, particle }) = options.mutation.glassy else {
         return;
     };
+    let mut picked_color = color;
+    let mut picked_particle = particle;
+
     label(ui, "配色:");
+    ui.add_enabled_ui(glassy_ready, |ui| {
+        ui.vertical(|ui| {
+            // 39 组一次全铺开,不做下拉 —— 和上面那排炫彩档位同一个道理:一列 39 行
+            // 装不下要滚,滚起来就横不成排,而挑配色恰恰要横着比。
+            //
+            // **格子里画色块、不写名字**:名字(「亮X暗 - 浅蓝红」)说的就是那两个色块,
+            // 写出来等于把颜色翻译成字、再让人翻译回颜色。名字挂 tooltip,选中那组
+            // 写在底下一行 —— 色块认得出颜色,认不出「这是第几组」。
+            //
+            // 间距比默认的窄:这 39 格是**一片**要横着比的东西,拉开了就变成一个一个
+            // 孤立的按钮了。**最小格也必须显式给**:`Grid` 默认拿
+            // `spacing.interact_size`(40 × 28)当下限,比色块格子(28 × 22)还宽,
+            // 不给的话每列白撑到 40、15 列就是 642px,最右那列直接被窗口切掉。
+            egui::Grid::new(("glass-color", slot))
+                .num_columns(COLOR_COLUMNS)
+                .spacing([3.0, 3.0])
+                .min_col_width(CHIP.x)
+                .min_row_height(CHIP.y)
+                .show(ui, |ui| {
+                    for (index, c) in glassy::colors().iter().enumerate() {
+                        if swatch_chip(ui, c, picked_color == c.id).clicked() {
+                            picked_color = c.id;
+                        }
+                        if index % COLOR_COLUMNS == COLOR_COLUMNS - 1 {
+                            ui.end_row();
+                        }
+                    }
+                });
+            theme::hint(ui, glassy::color(picked_color).map_or("?", |c| c.name));
+        });
+    });
+    ui.end_row();
+
+    // 粒子四选一,同样铺开。**顺带给它一行标签**:先前两个下拉挤在「配色」一行里,
+    // 右边那个连个名字都没有,得点开才知道它管的是什么。
+    label(ui, "粒子:");
     ui.horizontal(|ui| {
         ui.add_enabled_ui(glassy_ready, |ui| {
-            let mut picked_color = color;
-            egui::ComboBox::from_id_salt(("glass-color", slot))
-                .width(210.0)
-                // 39 条,默认 200px 只够七八条 —— 和形态/性格那两个下拉一样让它一次铺开,
-                // 挑配色本来就要横着比,滚起来比不成。
-                .height(f32::INFINITY)
-                .selected_text(glassy::color(color).map_or("?".into(), swatch_text))
-                .show_ui(ui, |ui| {
-                    for c in glassy::colors() {
-                        ui.horizontal(|ui| {
-                            swatches(ui, c);
-                            if ui.selectable_label(picked_color == c.id, c.name).clicked() {
-                                picked_color = c.id;
-                            }
-                        });
-                    }
-                });
-            let mut picked_particle = particle;
-            egui::ComboBox::from_id_salt(("glass-particle", slot))
-                .width(120.0)
-                .selected_text(glassy::particle(particle).map_or("?", |p| p.name))
-                .show_ui(ui, |ui| {
-                    for p in glassy::particles() {
-                        ui.selectable_value(&mut picked_particle, p.id, p.name);
-                    }
-                });
-            if picked_color != color || picked_particle != particle {
-                options.mutation.glassy = Some(Glassy::Common {
-                    color: picked_color,
-                    particle: picked_particle,
-                });
-            }
-            // 两个色块就是这一组的两个颜色,与游戏图鉴里的显示同一套值(`ui_color_1/2`)。
-            if let Some(c) = glassy::color(picked_color) {
-                swatches(ui, c);
+            for p in glassy::particles() {
+                if ui
+                    .selectable_label(picked_particle == p.id, p.name)
+                    .clicked()
+                {
+                    picked_particle = p.id;
+                }
             }
         });
     });
     ui.end_row();
+
+    if picked_color != color || picked_particle != particle {
+        options.mutation.glassy = Some(Glassy::Common {
+            color: picked_color,
+            particle: picked_particle,
+        });
+    }
 }
+
+/// 配色一行铺几格。**15 不是凑的**:前 15 组是「亮X亮」(六个颜色两两组合,
+/// C(6,2) = 15),正好占满第一行,余下 24 组「亮X暗」自己占两行 ——
+/// 族的边界落在行的边界上,不用画分隔线也看得出是两拨。
+const COLOR_COLUMNS: usize = 15;
 
 /// 隐藏款那几个按钮。常驻那一款(黑白)后面缀个「隐藏」—— 光写「黑白」会被当成一组配色名
 /// (常规炫彩那 39 组就叫「亮X暗 - 浅蓝蓝」这种),缀上才看得出它是另一档。
@@ -454,20 +483,41 @@ fn hidden_button(
     }
 }
 
-/// 下拉框里选中那一行的文字。色块画不进 `selected_text`(它只收字符串),
-/// 所以框里写名字、框旁边另画两个色块。
-fn swatch_text(c: &crate::pet::glassy::GlassyColor) -> String {
-    c.name.to_string()
-}
-
-/// 一组配色的两个色块。**画 `ui_color_*` 而不是 `red_channel`/`green_channel`** ——
-/// 后者是线性空间里的 HDR 系数(取到 1.6),直接当颜色画会一片过曝。
-fn swatches(ui: &mut egui::Ui, c: &crate::pet::glassy::GlassyColor) {
-    let size = egui::vec2(12.0, 12.0);
-    for rgb in [c.ui_color_1, c.ui_color_2] {
-        let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
-        ui.painter().rect_filled(
+/// 一组配色的格子:两个小方块就是这一组的两个颜色,选中/指着的那格垫个底。
+///
+/// **画 `ui_color_*` 而不是 `red_channel`/`green_channel`** —— 后者是线性空间里的
+/// HDR 系数(取到 1.6),直接当颜色画会一片过曝;`ui_color_*` 是游戏图鉴上那两块。
+///
+/// 只在选中/指着的时候垫底,与 `selectable_label` 一致 —— 39 个格子要是各带一个底板,
+/// 满屏都是框,反倒盖过了格子里那点颜色。
+fn swatch_chip(
+    ui: &mut egui::Ui,
+    c: &crate::pet::glassy::GlassyColor,
+    selected: bool,
+) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(CHIP, egui::Sense::click());
+    response.widget_info(|| {
+        egui::WidgetInfo::selected(
+            egui::WidgetType::RadioButton,
+            ui.is_enabled(),
+            selected,
+            c.name,
+        )
+    });
+    if selected || response.hovered() || response.has_focus() {
+        let visuals = ui.style().interact_selectable(&response, selected);
+        ui.painter().rect(
             rect,
+            4.0,
+            visuals.weak_bg_fill,
+            visuals.bg_stroke,
+            egui::StrokeKind::Inside,
+        );
+    }
+    let mut at = rect.center() - egui::vec2(SWATCH.x + 1.0, SWATCH.y * 0.5);
+    for rgb in [c.ui_color_1, c.ui_color_2] {
+        ui.painter().rect_filled(
+            egui::Rect::from_min_size(at, SWATCH),
             2.0,
             egui::Color32::from_rgb(
                 (rgb >> 16) as u8,
@@ -475,8 +525,15 @@ fn swatches(ui: &mut egui::Ui, c: &crate::pet::glassy::GlassyColor) {
                 (rgb & 0xff) as u8,
             ),
         );
+        at.x += SWATCH.x + 2.0;
     }
+    response.on_hover_text(c.name)
 }
+
+/// 一格配色的大小,以及格子里那两个色块的大小。
+/// 15 格一行:`15 × 28 + 14 × 3 = 462`,窗口按 900 宽算,标签列之后放得下。
+const CHIP: egui::Vec2 = egui::vec2(28.0, 22.0);
+const SWATCH: egui::Vec2 = egui::vec2(10.0, 12.0);
 
 fn label(ui: &mut egui::Ui, text: &str) {
     // 表单标签右对齐 —— 设计稿 KDE 栏的规格
@@ -647,6 +704,137 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 这一页装不下就得**能滚**,而不是把底下几行裁掉。
+    ///
+    /// 曾经就是裁掉的:`CentralPanel` 里一个滚动区都没有(宠物包那页自带一个,
+    /// 另外两页没有),窗口按默认的 620 高开着、这一只又带炫彩配色,
+    /// 底下的「动作 / 位置」两行就够不着了 —— **看不见也点不着**,还没有滚动条提示。
+    #[test]
+    fn the_pet_page_scrolls_when_it_does_not_fit() {
+        use super::super::SettingsApp;
+        use egui_kittest::Harness;
+        use egui_kittest::kittest::Queryable;
+
+        let dir = std::env::temp_dir().join(format!("rocom-scroll-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let packs = dir.join("packs");
+        write_pack(&packs, "喵喵", 3001, 2);
+        std::fs::write(
+            dir.join("roster.toml"),
+            "[[pet]]\npack = \"喵喵\"\nmutation = \"炫彩:1/1\"\n",
+        )
+        .expect("该能写阵容");
+
+        let app = std::rc::Rc::new(std::cell::RefCell::new(SettingsApp::new(
+            Some(dir.join("config.toml")),
+            Some(packs),
+            crate::control::SettingsPage::Pets,
+        )));
+        let driven = app.clone();
+        let page = egui::vec2(theme::WINDOW[0] - theme::SIDEBAR_W, theme::WINDOW[1]);
+        let mut harness = Harness::builder().with_size(page).build_ui(move |ui| {
+            theme::install(ui.ctx());
+            driven.borrow_mut().pet_page(ui, 0);
+        });
+        harness.run();
+
+        // 「位置」是表单最后一行。前置条件:它本来就在页面下边界之外
+        let before = harness.get_by_label("记住上次落脚点").rect();
+        assert!(
+            before.max.y > page.y,
+            "前置条件:这一页按 {} 高本来就装不下(最后一行在 {})",
+            page.y,
+            before.max.y
+        );
+
+        // 把指针放进页面里再滚 —— 滚轮只作用在指着的那个滚动区上
+        harness.event(egui::Event::PointerMoved(egui::pos2(
+            page.x * 0.5,
+            page.y * 0.5,
+        )));
+        harness.event(egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Point,
+            delta: egui::vec2(0.0, -600.0),
+            phase: egui::TouchPhase::Move,
+            modifiers: egui::Modifiers::NONE,
+        });
+        harness.run();
+
+        let after = harness.get_by_label("记住上次落脚点").rect();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            after.max.y <= page.y,
+            "滚到底之后最后一行要在页面里:它在 {},页面下边界在 {}",
+            after.max.y,
+            page.y
+        );
+    }
+
+    /// 39 组配色要**一行 15 格、三行铺完,且不越过这一页的右边**。
+    ///
+    /// 曾经越界:`egui::Grid` 的最小格子是 `spacing.interact_size`(40 × 28),比色块
+    /// 格子(28 × 22)还宽 —— 不显式给 `min_col_width`,每列白撑到 40,15 列就要 642px,
+    /// 最右那列直接被窗口切掉,而**被切掉的格子照样有 rect**(裁的是绘制不是布局),
+    /// 所以得拿它和页面右边比,不能光看它自己。
+    #[test]
+    fn the_colour_swatches_fit_one_page_wide() {
+        use super::super::SettingsApp;
+        use crate::pet::glassy;
+        use egui_kittest::Harness;
+        use egui::accesskit::Role;
+        use egui_kittest::kittest::Queryable;
+
+        let dir = std::env::temp_dir().join(format!("rocom-swatch-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let packs = dir.join("packs");
+        write_pack(&packs, "喵喵", 3001, 1);
+        // 常规炫彩才有「配色」这一行;隐藏/赛季款是配好的一整套,没得挑
+        std::fs::write(
+            dir.join("roster.toml"),
+            "[[pet]]\npack = \"喵喵\"\nmutation = \"炫彩:1/1\"\n",
+        )
+        .expect("该能写阵容");
+
+        let app = std::rc::Rc::new(std::cell::RefCell::new(SettingsApp::new(
+            Some(dir.join("config.toml")),
+            Some(packs),
+            crate::control::SettingsPage::Pets,
+        )));
+        let driven = app.clone();
+        // 详情页占的是**窗口减去侧栏**那一块,量宽度就得按这个来;
+        // 字号与间距也要真主题,默认样式量出来的格子小一圈,这个测试就白做了
+        let page = egui::vec2(theme::WINDOW[0] - theme::SIDEBAR_W, theme::WINDOW[1]);
+        let mut harness = Harness::builder().with_size(page).build_ui(move |ui| {
+            theme::install(ui.ctx());
+            driven.borrow_mut().pet_page(ui, 0);
+        });
+        harness.run();
+
+        // **要按 role 找**:选中那组的名字还写在格子底下一行,光按名字会撞上那句
+        let rects: Vec<egui::Rect> = glassy::colors()
+            .iter()
+            .map(|c| {
+                harness
+                    .get_by_role_and_label(Role::RadioButton, c.name)
+                    .rect()
+            })
+            .collect();
+        // 详情页就画在这块屏幕上,左边从 0 起,所以页面右边就是它的宽
+        let right = page.x;
+        let over = rects.iter().map(|r| r.max.x).fold(f32::MIN, f32::max);
+        let rows = rects.iter().filter(|r| r.min.y == rects[0].min.y).count();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            over <= right,
+            "39 组配色要在这一页里排得下:最右一格到 {over},页面右边在 {right},超了 {:.1}px",
+            over - right
+        );
+        assert_eq!(
+            rows, COLOR_COLUMNS,
+            "第一行要正好铺满 15 格 ——「亮X亮」那一族(六色两两组合)占满它"
+        );
     }
 
     /// 当前那个下拉 popup 的高度:前景层里最高的那个 `Area`。
