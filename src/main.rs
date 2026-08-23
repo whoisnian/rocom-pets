@@ -65,7 +65,6 @@ stage 模式(不给参数时读配置文件,首次运行会生成模板;
   --no-fade          不额外渲「淡化中点」那一格
   --bench <帧数>     跑这么多帧测平均出帧耗时
   --mutation <写法>  外观变异:`异色`、`炫彩:<粒子id>/<配色id>`、`炫彩:<隐藏款名>`
-  --glassy-dir <目录> 炫彩共享贴图目录(默认按包目录旁边的 glassy/ 找)
   -o, --out <文件>   输出 PNG(默认 pet-render.png)
   -h, --help         本帮助
 ";
@@ -187,6 +186,15 @@ fn run() -> anyhow::Result<()> {
         }
     }
     env_logger::Builder::new().parse_filters(&filter).init();
+    // 炫彩素材是**构建期**烘进来的(见 build.rs)。没烘上时说一句 —— 否则「炫彩那一档是灰的」
+    // 在运行时没有任何线索可查。
+    match rocom_pets::pet::glassy::embedded_count() {
+        0 => log::info!(
+            "这个二进制没带炫彩素材,外观里的「炫彩」不可用 —— \
+             先导一次包(素材会写到 <out>/glassy),再重新编译"
+        ),
+        n => log::debug!("炫彩素材 {n} 张(构建期烘进来的)"),
+    }
 
     let mut args = args.into_iter();
     let mut request: Option<offscreen::Request> = None;
@@ -229,7 +237,6 @@ fn run() -> anyhow::Result<()> {
                     fade_probe: true,
                     bench: 0,
                     mutation: None,
-                    glassy_dir: None,
                 });
             }
             // --pack 可以是路径也可以是包名,到下面统一解析
@@ -281,9 +288,6 @@ fn run() -> anyhow::Result<()> {
                     "--no-fade" => request.fade_probe = false,
                     "--bench" => request.bench = next("--bench", &mut args)?.parse()?,
                     "--mutation" => request.mutation = Some(next("--mutation", &mut args)?),
-                    "--glassy-dir" => {
-                        request.glassy_dir = Some(PathBuf::from(next("--glassy-dir", &mut args)?));
-                    }
                     "-o" | "--out" => request.out = PathBuf::from(next("--out", &mut args)?),
                     unknown => anyhow::bail!("未知参数 {unknown}\n{USAGE}"),
                 }

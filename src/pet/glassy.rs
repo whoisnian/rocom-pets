@@ -355,42 +355,42 @@ impl Mutation {
     }
 }
 
-/// 炫彩素材目录:包目录**旁边**的 `glassy/`(`…/rocom-pets/glassy`)。
+/// 构建期烘进来的炫彩贴图(`build.rs` 生成)—— **运行时唯一的素材来源**。
 ///
-/// 为什么不放进宠物包:这几张图是**全库共用**的(常规炫彩的 `MainTex` 就一张
-/// `Tex_PetGlassy_007_D`,粒子图四张),塞进 201 个包里要多背 120MB;而做成一份共享目录,
-/// 已经导好的包不用重导也能用上炫彩。由 `rocom-pets-export --glassy` 导出。
+/// 炫彩要覆盖的两张贴图是全库共用的,既不进宠物包(塞进 201 个包要多背 120MB),
+/// 也不在运行时找目录:找目录意味着「装好了还得再摆一份素材」,而这一层的东西只有 3.5MB,
+/// 烘进来就没这一步了。导出器在正常导包时把它们写到 `<out>/glassy`,`build.rs` 构建时读那儿。
 ///
-/// 也不打进二进制:隐藏款那几张噪声图加起来 3MB 出头,会把 18MB 的产物顶到 21MB,
-/// 而且**素材不该进代码仓库**(本仓库只有代码与导出器)。
-#[cfg(not(target_arch = "wasm32"))]
-pub fn assets_dir(packs_dir: &std::path::Path) -> std::path::PathBuf {
-    packs_dir
-        .parent()
-        .map_or_else(|| std::path::PathBuf::from("glassy"), |p| p.join("glassy"))
+/// 素材不在仓库里 —— 烘的是**构建那台机器上自己导出来的那一份**,没有就是空表
+/// (那时炫彩那几档在界面上是灰的)。见 build.rs 的模块头。
+mod embed {
+    include!(concat!(env!("OUT_DIR"), "/glassy_embed.rs"));
 }
 
-/// 炫彩素材目录,`packs_dir` 没给时退回默认包目录旁边。
-///
-/// 两处都拿不到(比如 Windows 上连 `%LOCALAPPDATA%` 都没有)就返回 `None` ——
-/// 那时炫彩画不出来,`Model::apply_glassy` 会在日志里说清楚。
-#[cfg(not(target_arch = "wasm32"))]
-pub fn default_assets_dir(packs_dir: Option<&std::path::Path>) -> Option<std::path::PathBuf> {
-    match packs_dir {
-        Some(dir) => Some(assets_dir(dir)),
-        None => crate::pack::Pack::default_dir().map(|d| assets_dir(&d)),
-    }
+/// 烘进来了几张。0 = 这个二进制没带素材,只能读目录。
+pub fn embedded_count() -> usize {
+    embed::EMBEDDED.len()
 }
 
-/// 素材齐不齐。缺了就该把炫彩那几档在界面上禁掉并说清楚要跑什么命令 ——
-/// 让用户看着一个点不出效果的选项,比直接说「素材没导」更糟。
-#[cfg(not(target_arch = "wasm32"))]
-pub fn assets_ready(dir: &std::path::Path) -> bool {
-    let mut needed: Vec<&str> = vec![DEFAULT_MAIN_TEX];
-    needed.extend(PARTICLES.iter().map(|p| p.tex));
-    needed
+/// 按名字取一张烘进来的贴图(不带目录与扩展名,如 `Tex_PetGlassyStar_003`)。
+pub fn embedded(name: &str) -> Option<&'static [u8]> {
+    embed::EMBEDDED
         .iter()
-        .all(|name| dir.join(format!("{name}.png")).exists())
+        .find(|(key, _)| *key == name)
+        .map(|(_, bytes)| *bytes)
+}
+
+/// 常规炫彩要用到的贴图名(花纹 + 四种粒子)。隐藏款各带一对,单独查。
+fn common_assets() -> impl Iterator<Item = &'static str> {
+    std::iter::once(DEFAULT_MAIN_TEX).chain(PARTICLES.iter().map(|p| p.tex))
+}
+
+/// 素材齐不齐。**只看烘进来的那份** —— 运行时不再找任何目录,见 `embed` 的说明。
+///
+/// 不齐就该把炫彩那几档在界面上禁掉并说清楚为什么:让用户看着一个点不出效果的选项,
+/// 比直接说「这个二进制没带炫彩素材」更糟。
+pub fn assets_ready() -> bool {
+    common_assets().all(|name| embedded(name).is_some())
 }
 
 impl Clone for GlassyParams {

@@ -39,9 +39,11 @@ const string usage = """
                         只打印动画的调查信息:骨架的平移重定向模式、各段动画里整只跑偏的
                         骨骼;给 ALL 则全库普查「剥掉类别前缀之后哪些逻辑名撞了」
       --index           只列出归并后的包名与形态构成(不碰 pak,不导东西)
-      --glassy          只导炫彩要用的**共享**贴图到 <--out>/glassy(不导宠物)。
+      --glassy          **只**导炫彩要用的共享贴图到 <--out>/glassy(不导宠物)。
                         炫彩不换材质,它覆盖的 MainTex/StarStickTex 是全库共用的,
-                        所以单独一份、放在包目录旁边;导一次就够,加了新赛季款再跑
+                        所以单独一份、放在包目录旁边。正常导包时**默认也会写**这一份,
+                        这个开关是「只要它、不要宠物」时用的
+      --no-glassy       正常导包时不顺带写炫彩共享贴图
       --limit <n>       配合 --all:只导前 n 条链(试跑用)
       --skip-existing   跳过已经有 manifest.toml 的包(增量重跑)
       -j <n>            并行度(默认 CPU 核数;每个并行任务会同时持有一个形态的数据,
@@ -97,6 +99,7 @@ var probeAsset = (string?)null;
 var probeAnimAsset = (string?)null;
 var indexOnly = false;
 var glassyOnly = false;
+var noGlassy = false;
 
 for (var i = 0; i < args.Length; i++)
 {
@@ -123,6 +126,7 @@ for (var i = 0; i < args.Length; i++)
         case "--probe-anim": probeAnimAsset = Next(ref i); break;
         case "--index": indexOnly = true; break;
         case "--glassy": glassyOnly = true; break;
+        case "--no-glassy": noGlassy = true; break;
         case "-h" or "--help": Console.WriteLine(usage); return 0;
         default:
             Console.Error.WriteLine($"未知参数: {args[i]}\n{usage}");
@@ -335,6 +339,26 @@ report.AppendLine($"# 汇总:{targets.Count - failed - chainSkipped} 条链成�
                   $"{formSkipped} 个形态跳过;glb 合计 {totalBytes / 1024 / 1024}MB," +
                   $"用时 {stopwatch.Elapsed.TotalMinutes:F1} 分钟");
 Directory.CreateDirectory(outDir);
+
+// 炫彩共享贴图跟着一起写。**默认就写**,不用记着单独跑一条命令:
+// 它只有 13 张、约 3.5MB、零点几秒,而少了它炫彩就是画不出来。
+// 已经烘进二进制的构建也照写不误 —— 运行时目录优先,新赛季款换图不必重编译。
+if (!noGlassy)
+{
+    try
+    {
+        var glassyDir = Path.Combine(outDir, "glassy");
+        var glassyCount = Glassy.Export(provider, parsedPath, glassyDir);
+        report.AppendLine($"# 炫彩共享贴图:{glassyCount} 张 → {glassyDir}");
+        Console.WriteLine($"炫彩共享贴图:{glassyCount} 张 → {glassyDir}");
+    }
+    catch (Exception e)
+    {
+        // 导不出来不该让整批宠物包白导 —— 少的只是炫彩那一层。
+        Console.Error.WriteLine($"炫彩共享贴图导出失败(宠物包不受影响): {e.Message}");
+    }
+}
+
 var reportPath = Path.Combine(outDir, "report.txt");
 File.WriteAllText(reportPath, report.ToString());
 Console.WriteLine($"\n{targets.Count - failed - chainSkipped} 条链成功、{skipped} 已存在跳过、" +

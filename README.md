@@ -36,6 +36,7 @@ cargo build --release          # → target/release/rocom-pets(18.0MB)
 ```
 
 `[profile.release]` 开了 fat LTO + `codegen-units = 1` + `strip`:产物 31.7MB → **18.0MB**,
+(带炫彩素材是 **21.7MB**,差值就是那 13 张图的 3.5MB;`ROCOM_GLASSY_DIR=` 可以不烘)
 代价是编译从 1m09s 涨到 2m46s。**去掉符号后崩溃回溯只剩地址** —— 要排查就用不带
 `--release` 的 debug 档,那一档不受影响。
 
@@ -86,8 +87,10 @@ debug 版(`cargo build` 不带 `--release`)保持控制台子系统。
   `RedChannel×R + GreenChannel×G` → 按固有色亮度调制 → 星点层 → 整层替换)。
   配置窗口里逐只挑:**原样 / 异色 / 炫彩**,炫彩再分**常规 / 隐藏 / 赛季**三档,
   常规那档自己选配色(39 组 × 4 种粒子 = 156 种,编号与游戏一致)。
-  炫彩的贴图是全库共用的,单独导一份放在包目录旁边(`--glassy`,3.6MB),
-  **已经导好的包不用重导**。机制、逆向过程与「哪些数是读出来的、哪些还没定名」
+  炫彩的贴图是全库共用的(13 张 3.5MB),**构建时烘进二进制** —— 装好就能用,
+  不必再摆一份素材目录;导出器正常导包时会把它们写到 `<out>/glassy`,`build.rs` 就读那儿
+  (`ROCOM_GLASSY_DIR` 可指定,设成空则不烘)。**炫彩不用重导包,异色要**。
+  机制、逆向过程与「哪些数是读出来的、哪些还没定名」
   见 [docs/design.md](docs/design.md)「异色与炫彩:两件不同的事」。
 - 导出器(`exporter/`)：C# + CUE4Parse，从自己的游戏 pak 生成宠物包;
   **一个图鉴号一个包**(`076-海盔虫.rkpet`,glb 含全部动作 + 贴图 + 叫声 + manifest.toml),
@@ -259,7 +262,7 @@ cargo run --release -- --render packs/喵喵 --bench 600      # 离屏渲宠物 
 git -C "$CUE4PARSE_DIR" apply exporter/patches/*.patch      # 导出前必做:修上游法线与顶点色导出 bug
 dotnet run --project exporter -- --species 3001 --out packs # 导一条进化链
 dotnet run --project exporter -- --all --zip-only --skip-existing --out packs  # 全量导(可分批续跑)
-dotnet run --project exporter -- --glassy --out packs       # 炫彩共享贴图(导一次,放包目录旁边)
+dotnet run --project exporter -- --glassy --out packs       # 只导炫彩共享贴图(正常导包时本来就会写)
 python tools/verify_glb.py packs/喵喵 --clips Idle,Walk     # 渲图验证
 uv run --with numpy --with pillow python tools/sweep.py    # 回归闸门:全库三个数不许变差
 uv run --with lz4 python scripts/glsldump.py <安卓 shader 库> --index   # shader 逆向(见 docs/shader.md)

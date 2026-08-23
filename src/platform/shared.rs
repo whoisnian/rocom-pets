@@ -144,8 +144,6 @@ pub struct Assets {
     models: HashMap<ModelKey, Arc<Model>>,
     pet_gpus: HashMap<ModelKey, Arc<PetGpu>>,
     voices: HashMap<PathBuf, Arc<VoiceBank>>,
-    /// 炫彩共享贴图所在目录(包目录旁边的 `glassy/`)。由平台层在建任何角色之前填。
-    glassy_dir: Option<PathBuf>,
     /// 画布边长的上限 = GPU 的最大 2D 纹理边长。GPU 起来之后由平台层填(见 `set_max_canvas`)。
     max_canvas: Option<u32>,
     /// 最近用过的形态(glb 路径),最近的排最前。`prune` 靠它决定留哪几份,见那里的说明。
@@ -204,12 +202,6 @@ impl Assets {
         self.max_canvas = Some(limit);
     }
 
-    /// 告诉它去哪儿找炫彩共享贴图。**建任何角色之前调**;不调就等于没有炫彩素材,
-    /// 选了炫彩的宠物会按原样画并在日志里说清楚缺什么。
-    pub fn set_glassy_dir(&mut self, dir: PathBuf) {
-        self.glassy_dir = Some(dir);
-    }
-
     /// 取这个形态的模型:缓存里有就直接共享,没有才读盘。
     pub fn model(&mut self, form: &Form, mutation: Option<Mutation>) -> Result<Arc<Model>> {
         self.touch(&form.model);
@@ -225,10 +217,7 @@ impl Assets {
         model.mutation = mutation;
         // 异色不在这里 —— 它是换整套材质,包里就已经是换好的那一份。
         if let Some(mutation) = mutation.filter(|m| *m != Mutation::Shiny) {
-            match &self.glassy_dir {
-                Some(dir) => model.apply_glassy(mutation, dir),
-                None => log::warn!("没有炫彩素材目录,{} 按原样画", form.name),
-            }
+            model.apply_glassy(mutation);
         }
         let model = Arc::new(model);
         self.models.insert(key, Arc::clone(&model));

@@ -847,10 +847,16 @@ fn load_texture(path: &Path, _mask_alpha: bool) -> Option<Image> {
             return None;
         }
     };
-    let img = match image::load_from_memory(&bytes) {
+    decode_texture(&bytes, &path.display().to_string())
+}
+
+/// 解一张内存里的图。**独立出来是给炫彩用的** —— 它那两张贴图可能来自烘进二进制的字节,
+/// 根本没有对应的文件路径。`what` 只用于出错时说清楚是哪一张。
+fn decode_texture(bytes: &[u8], what: &str) -> Option<Image> {
+    let img = match image::load_from_memory(bytes) {
         Ok(img) => img,
         Err(e) => {
-            log::warn!("贴图 {path:?} 解不开: {e}");
+            log::warn!("贴图 {what} 解不开: {e}");
             return None;
         }
     };
@@ -865,16 +871,17 @@ fn load_texture(path: &Path, _mask_alpha: bool) -> Option<Image> {
 }
 
 impl Model {
-    /// 给这份模型套上一个炫彩外观。两张共享贴图从 `assets_dir` 里按名字取
-    /// (见 `glassy::assets_dir`);任一张缺了就整个不套 —— 只套一半会得到一只
+    /// 给这份模型套上一个炫彩外观。两张共享贴图取自**烘进二进制**的那份
+    /// (见 `glassy` 模块里的 `embed`);任一张缺了就整个不套 —— 只套一半会得到一只
     /// 花纹全白或者没有闪片的宠物,比原样更难看出哪里不对。
     ///
     /// 异色不走这里:那是换整套材质,包里就已经换好了。
-    #[cfg(not(target_arch = "wasm32"))]
-    pub fn apply_glassy(&mut self, mutation: super::glassy::Mutation, assets_dir: &Path) {
+    pub fn apply_glassy(&mut self, mutation: super::glassy::Mutation) {
         self.mutation = Some(mutation);
         self.glassy = mutation.render().and_then(|render| {
-            let load = |name: &str| load_texture(&assets_dir.join(format!("{name}.png")), true);
+            let load = |name: &str| {
+                super::glassy::embedded(name).and_then(|bytes| decode_texture(bytes, name))
+            };
             match (load(render.main_tex), load(render.star_tex)) {
                 (Some(main_tex), Some(star_tex)) => Some(GlassySkin {
                     render,
@@ -883,8 +890,8 @@ impl Model {
                 }),
                 _ => {
                     log::warn!(
-                        "炫彩素材不全({} / {}),这只按原样画 —— 跑一次 \
-                         `rocom-pets-export --glassy` 导出到 {assets_dir:?}",
+                        "这个二进制没带炫彩素材({} / {}),这只按原样画 —— \
+                         先导一次包(炫彩素材会顺带写到 <out>/glassy),再重新编译",
                         render.main_tex,
                         render.star_tex
                     );
