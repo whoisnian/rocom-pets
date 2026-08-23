@@ -460,6 +460,28 @@ impl PetGpu {
                     },
                     count: None,
                 },
+                // 金属区的光泽 matcap。**没有就绑 1×1 白图 = 乘 1 = 平涂**,不需要额外开关。
+                wgpu::BindGroupLayoutEntry {
+                    binding: 15,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                // `SeasonMutation` 那族的区域遮罩(`MixMask`)。没有就绑 1×1 白图。
+                wgpu::BindGroupLayoutEntry {
+                    binding: 14,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
                 // 炫彩的**区域门**(那张 `_M` 的 alpha)。没有就绑 1×1 白图 = 整片都刷。
                 wgpu::BindGroupLayoutEntry {
                     binding: 13,
@@ -623,12 +645,31 @@ impl PetGpu {
             );
             // 炫彩的两张共享贴图。**只给真会刷炫彩的槽上传** —— 眼睛那两个槽拿到也用不上,
             // 白图不占什么显存。
+            // `SeasonMutation` 那族:花纹图顶替共享 `MainTex` 那个槽,颜色也来自材质自己。
+            let season = material
+                .season_mutation
+                .as_ref()
+                .filter(|_| model.season_layer);
             let glassy_skin = model.glassy.as_ref().filter(|_| material.glassy_target);
             let glassy_main_view = upload_texture(
                 device,
                 queue,
                 &material.name,
-                glassy_skin.map_or(&white, |s| &s.main_tex),
+                season
+                    .and_then(|s| s.flow_noise.as_ref())
+                    .unwrap_or_else(|| glassy_skin.map_or(&white, |s| &s.main_tex)),
+            );
+            let season_mask_view = upload_texture(
+                device,
+                queue,
+                &material.name,
+                season.and_then(|s| s.mix_mask.as_ref()).unwrap_or(&white),
+            );
+            let season_matcap_view = upload_texture(
+                device,
+                queue,
+                &material.name,
+                season.and_then(|s| s.matcap.as_ref()).unwrap_or(&white),
             );
             let glassy_star_view = upload_texture(
                 device,
@@ -642,10 +683,12 @@ impl PetGpu {
                 device,
                 queue,
                 &material.name,
+                // **赛季那一族也要这道门**:它的 `glassy` 是 None(不走通用玻璃层),
+                // 只按 `glassy_skin` 过滤会把门贴图换成白图 ⇒ 门全开 ⇒ 整只被刷满。
                 material
                     .glassy_id_mask
                     .as_ref()
-                    .filter(|_| glassy_skin.is_some())
+                    .filter(|_| glassy_skin.is_some() || season.is_some())
                     .unwrap_or(&white),
             );
             let has = |v: bool| if v { 1.0 } else { 0.0 };
@@ -779,7 +822,21 @@ impl PetGpu {
             // 「包围盒对角线 × 0.004」更接近实机(魔力猫 1.79 厘米 vs 0.39 厘米)。
             let outline_width = material.outline_width.unwrap_or(DEFAULT_OUTLINE_WIDTH);
             // 炫彩只刷在 `by*` 那几个槽上 —— 判据与游戏一致,见 `pack::Material::glassy_target`。
-            let glassy = glassy_uniform(model.glassy.as_ref(), material.glassy_target);
+            let glassy = match season {
+                // 复用玻璃层那几个槽:骨架本来就是同一条,只是输入换成材质自己的。
+                // `glassy_red.w = 2` 是 shader 里的「走赛季那一族」。
+                Some(s) => [
+                    [s.red[0], s.red[1], s.red[2], 2.0],
+                    [s.green[0], s.green[1], s.green[2], 1.62],
+                    [1.0 / s.red[3].max(1e-6), s.green[3], s.flow[2], s.flow[3]],
+                    [s.flow[0], s.flow[1], 4.0, 0.35],
+                    s.blue,
+                    s.metal,
+                    s.metal2,
+                    [0.0; 4],
+                ],
+                None => glassy_uniform(model.glassy.as_ref(), material.glassy_target),
+            };
             let uniform = match &material.effect {
                 Some(effect) => MaterialUniform {
                     tint: effect.tint,
@@ -1040,6 +1097,14 @@ impl PetGpu {
                     wgpu::BindGroupEntry {
                         binding: 13,
                         resource: wgpu::BindingResource::TextureView(&glassy_id_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 14,
+                        resource: wgpu::BindingResource::TextureView(&season_mask_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 15,
+                        resource: wgpu::BindingResource::TextureView(&season_matcap_view),
                     },
                 ],
             }));

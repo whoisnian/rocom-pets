@@ -10,6 +10,25 @@ namespace RocomPets.Export;
 
 /// `M_Gra_Yutu_Ear_Lighting` 的目标 Low 材质输入。颜色/标量均保留游戏参数原值；
 /// 三张贴图分别对应 PS 6037 的 t2/t3/t4。
+/// `MI_P_Object_SeasonMutation*` 那族的赛季外观。见 `MaterialInfo.IsSeasonMutation`。
+/// 三个 float4 各自把一个颜色和一个标量打包在一起(`.w` 是标量),省几行 manifest。
+public record SeasonMutationMaterial(
+    string? FlowNoise,
+    string? MixMask,
+    string? MatCap,
+    /// [RedChannel.rgb, GlobalRefraction]
+    float[] Red,
+    /// [GreenChannel.rgb, GlobalDepth]
+    float[] Green,
+    /// [BlueChannel.rgb, FlowMaskInt]
+    float[] Blue,
+    /// [MetalColor.rgb, FlowMaskPow]
+    float[] Metal,
+    /// [MetalColor02.rgb, 0]
+    float[] Metal02,
+    /// [MainTexFlowSpeedX, MainTexFlowSpeedY, MainTexTiling, NormalEffectAmount]
+    float[] Flow);
+
 public record YutuEarMaterial(
     string? BubbleTexture,
     string? DistortTexture,
@@ -179,6 +198,8 @@ public record MaterialEntry(
     string? GlassyIdTexture = null,
     /// 赛季传说精灵的专属基色贴图。见 `MaterialInfo.SeasonBaseTexture`。
     string? SeasonBaseTexture = null,
+    /// `MI_P_Object_SeasonMutation*` 那一族的赛季外观。见 `MaterialInfo.IsSeasonMutation`。
+    SeasonMutationMaterial? SeasonMutation = null,
     /// 配套 `_Ol` 描边材质算出来的描边宽度(米);0 = 不画。见 `Materials.OutlineWidthOf`。
     float OutlineWidth = 0f,
     /// 按画家序画(不写深度),见 `MaterialInfo.IsPaintOrder`。
@@ -307,6 +328,18 @@ public static class Manifest
                 parts.Add($"glassy_id_tex = {Quote(mat.GlassyIdTexture)}");
             if (mat.SeasonBaseTexture is not null)
                 parts.Add($"season_base_color = {Quote(mat.SeasonBaseTexture)}");
+            if (mat.SeasonMutation is { } sm)
+            {
+                if (sm.FlowNoise is not null) parts.Add($"season_flow_noise = {Quote(sm.FlowNoise)}");
+                if (sm.MixMask is not null) parts.Add($"season_mix_mask = {Quote(sm.MixMask)}");
+                if (sm.MatCap is not null) parts.Add($"season_matcap = {Quote(sm.MatCap)}");
+                parts.Add($"season_red = [{string.Join(", ", sm.Red.Select(Num))}]");
+                parts.Add($"season_green = [{string.Join(", ", sm.Green.Select(Num))}]");
+                parts.Add($"season_blue = [{string.Join(", ", sm.Blue.Select(Num))}]");
+                parts.Add($"season_metal = [{string.Join(", ", sm.Metal.Select(Num))}]");
+                parts.Add($"season_metal2 = [{string.Join(", ", sm.Metal02.Select(Num))}]");
+                parts.Add($"season_flow = [{string.Join(", ", sm.Flow.Select(Num))}]");
+            }
             if (mat.FlowTexture is not null)
             {
                 parts.Add($"flow_tex = {Quote(mat.FlowTexture)}");

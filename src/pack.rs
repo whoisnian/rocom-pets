@@ -202,6 +202,24 @@ struct RawMaterial {
     #[serde(default)]
     season_base_color: Option<String>,
     #[serde(default)]
+    season_flow_noise: Option<String>,
+    #[serde(default)]
+    season_mix_mask: Option<String>,
+    #[serde(default)]
+    season_matcap: Option<String>,
+    #[serde(default)]
+    season_red: Option<[f32; 4]>,
+    #[serde(default)]
+    season_green: Option<[f32; 4]>,
+    #[serde(default)]
+    season_blue: Option<[f32; 4]>,
+    #[serde(default)]
+    season_metal: Option<[f32; 4]>,
+    #[serde(default)]
+    season_metal2: Option<[f32; 4]>,
+    #[serde(default)]
+    season_flow: Option<[f32; 4]>,
+    #[serde(default)]
     flicker: Option<[f32; 2]>,
     #[serde(default)]
     interior_tex: Option<String>,
@@ -508,6 +526,10 @@ pub struct Material {
     /// `BaseTex` 换成 `BaseTexSketch`**(两者 `index` 相同)—— 整套「赛季特殊效果」
     /// 就是换一张图。**它不开 `GlassySwitch`**,所以这几只上自家赛季炫彩时没有玻璃层。
     pub season_base_color: Option<PathBuf>,
+    /// **`MI_P_Object_SeasonMutation*` 那族的赛季外观。** 和「换基色贴图」那条是两种做法:
+    /// 铅字幻梦(加灵一家)换图,暗夜拾光的龙息帕尔与狂欢怪谈的机幕方舟走这一族。
+    /// 骨架就是玻璃层,只是换了输入 —— 见 `pet::glassy::SeasonMutation`。
+    pub season_mutation: Option<SeasonMutation>,
     /// **玻璃内部那颗星**:四角星场贴图(`StarTex` = `T_EMeng003`),沿折射光线在物体空间
     /// march、三向投影采样、按时间卷动。读 shader 汇编得来,见 docs/design.md §1。
     pub interior: Option<PathBuf>,
@@ -710,6 +732,34 @@ pub struct VoiceClip {
 }
 
 /// manifest 里那一节音频表 → 包内绝对路径。两层各调一次。
+/// `MI_P_Object_SeasonMutation*` 那族的赛季外观。三个 float4 各把一个颜色与一个标量
+/// 打包在一起(`.w` 是标量),与 manifest 里的写法一致。
+#[derive(Clone, Debug)]
+pub struct SeasonMutation {
+    /// 花纹图(每宠物一张),顶替玻璃层里那张全库共享的 `MainTex`。
+    /// **可以没有** —— 机幕方舟的 `_By1` 就没写,那时用共享的那张。
+    pub flow_noise: Option<PathBuf>,
+    /// **区域遮罩**(每宠物一张):`.b` 走幂曲线混向 `blue`,`.a ≥ 0.79` 的地方换成 `metal`。
+    /// 「只在翅膀」「只在身体与肩顶」就是它划的。
+    pub mix_mask: Option<PathBuf>,
+    /// 金属区那层金属光泽的 matcap。**只有 `MetalSpecInt > 0` 的材质导得到** ——
+    /// 机幕方舟有(实机是带高光的银),龙息帕尔没有(实机是平白)。见导出器那条说明。
+    pub matcap: Option<PathBuf>,
+    /// [RedChannel.rgb, GlobalRefraction]
+    pub red: [f32; 4],
+    /// [GreenChannel.rgb, GlobalDepth]
+    pub green: [f32; 4],
+    /// [BlueChannel.rgb, FlowMaskInt]
+    pub blue: [f32; 4],
+    /// [MetalColor.rgb, FlowMaskPow]
+    pub metal: [f32; 4],
+    /// [MetalColor02.rgb, 0]
+    pub metal2: [f32; 4],
+    /// [FlowSpeedX, FlowSpeedY, MainTexTiling, NormalEffectAmount]。
+    /// **两个流速轴都要**:机幕方舟给 Y、龙息帕尔给 X,只取一个会让另一只静止。
+    pub flow: [f32; 4],
+}
+
 /// `[forms.materials]` / `[forms.shiny_materials]` → 运行时的材质表。
 ///
 /// **两节共用一套字段**:异色是换整套材质,不是另一种着色,所以每一条的形状与默认那套
@@ -777,6 +827,19 @@ fn material_table(root: &Path, raw: HashMap<String, RawMaterial>) -> HashMap<Str
                     mask_id_range: mat.mask_id_range.unwrap_or([0.0, 1.0]),
                     glassy_id_mask: mat.glassy_id_tex.map(|rel| root.join(rel)),
                     season_base_color: mat.season_base_color.map(|rel| root.join(rel)),
+                    // 判据用 `MixMask`:花纹图可以缺(`_By1` 就缺),遮罩不能缺 ——
+                    // 缺了就没有「哪儿变」这回事。
+                    season_mutation: mat.season_mix_mask.map(|mask| SeasonMutation {
+                        flow_noise: mat.season_flow_noise.map(|rel| root.join(rel)),
+                        mix_mask: Some(root.join(mask)),
+                        matcap: mat.season_matcap.map(|rel| root.join(rel)),
+                        red: mat.season_red.unwrap_or([1.0, 1.0, 1.0, 2.0]),
+                        green: mat.season_green.unwrap_or([1.0, 1.0, 1.0, 30.0]),
+                        blue: mat.season_blue.unwrap_or([1.0, 1.0, 1.0, 1.0]),
+                        metal: mat.season_metal.unwrap_or([1.0, 1.0, 1.0, 1.0]),
+                        metal2: mat.season_metal2.unwrap_or([1.0, 1.0, 1.0, 0.0]),
+                        flow: mat.season_flow.unwrap_or([0.0, 0.0, 1.5, 0.1]),
+                    }),
                     interior: mat.interior_tex.map(|rel| root.join(rel)),
                     interior_color: mat.interior_color.unwrap_or([1.0; 3]),
                     refraction: mat.refraction,

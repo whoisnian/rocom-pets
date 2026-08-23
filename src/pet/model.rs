@@ -120,6 +120,9 @@ pub struct Material {
     pub glassy_id_mask: Option<Image>,
     /// 赛季传说精灵的专属基色贴图。见 `pack::Material::season_base_color`。
     pub season_base_color: Option<Image>,
+    /// `SeasonMutation` 那族的赛季外观:花纹图 + 区域遮罩 + 三组颜色。
+    /// 见 `pack::Material::season_mutation`。
+    pub season_mutation: Option<SeasonSkin>,
     /// 玻璃内部那颗星:四角星场贴图 + 着色 + 折射率 + march 深度。
     pub interior: Option<Image>,
     pub interior_color: [f32; 3],
@@ -344,6 +347,9 @@ pub struct Model {
     /// 这份模型套的是哪一种外观。**当缓存键用** —— `source` 只认到 (包, 形态),
     /// 同一个形态的原样版与几种炫彩版是不同的 GPU 资源,不能共用一份。
     pub mutation: super::glassy::Mutation,
+    /// 这只走了 `SeasonMutation` 那族的赛季外观(每材质自带花纹图 + 区域遮罩)。
+    /// 和 `season_art` 互斥:那条是换基色贴图,这条是刷一层。
+    pub season_layer: bool,
     /// 这只走了**赛季传说精灵专属贴图**那条路(换基色、不叠玻璃层)。
     /// 名单里但包里没那张图、或者属于还没复刻的 `SeasonMutation` 那族时是 `false`,
     /// 那时会退回通用玻璃层。
@@ -359,6 +365,22 @@ pub struct GlassySkin {
     pub render: GlassyRender,
     pub main_tex: Image,
     pub star_tex: Image,
+}
+
+/// `SeasonMutation` 那族的赛季外观(贴图已解码)。见 `pack::SeasonMutation`。
+#[derive(Clone)]
+pub struct SeasonSkin {
+    /// 缺省时用烘进来的那张共享 `MainTex`。
+    pub flow_noise: Option<Image>,
+    pub mix_mask: Option<Image>,
+    /// 金属光泽的 matcap;没有就不上光泽(见 `pack::SeasonMutation::matcap`)。
+    pub matcap: Option<Image>,
+    pub red: [f32; 4],
+    pub green: [f32; 4],
+    pub blue: [f32; 4],
+    pub metal: [f32; 4],
+    pub metal2: [f32; 4],
+    pub flow: [f32; 4],
 }
 
 impl Model {
@@ -616,6 +638,31 @@ impl Model {
                         .season_base_color
                         .as_deref()
                         .and_then(|p| load_texture(p, spec.mask_alpha)),
+                    season_mutation: spec.season_mutation.as_ref().map(|sm| {
+                        SeasonSkin {
+                            flow_noise: sm
+                                .flow_noise
+                                .as_deref()
+                                .and_then(|p| load_texture(p, false))
+                                .or_else(|| {
+                                    // `_By1` 那种没写花纹图的,用共享的那张(烘在二进制里)。
+                                    let name = super::glassy::DEFAULT_MAIN_TEX;
+                                    super::glassy::embedded(name)
+                                        .and_then(|b| decode_texture(b, name))
+                                }),
+                            mix_mask: sm
+                                .mix_mask
+                                .as_deref()
+                                .and_then(|p| load_texture(p, true)),
+                            matcap: sm.matcap.as_deref().and_then(|p| load_texture(p, false)),
+                            red: sm.red,
+                            green: sm.green,
+                            blue: sm.blue,
+                            metal: sm.metal,
+                            metal2: sm.metal2,
+                            flow: sm.flow,
+                        }
+                    }),
                     interior: spec.interior.as_deref().and_then(|p| load_texture(p, true)),
                     interior_color: spec.interior_color,
                     refraction: spec.refraction,
@@ -812,6 +859,7 @@ impl Model {
             glassy: None,
             mutation: super::glassy::Mutation::default(),
             season_art: false,
+            season_layer: false,
         })
     }
 
@@ -913,6 +961,18 @@ impl Model {
                 .materials
                 .iter()
                 .any(|m| m.season_base_color.is_some());
+        // 另一族(`MI_P_Object_SeasonMutation*`):不换基色,刷一层自带花纹的玻璃层。
+        // 判据同样是「名单里 + 材质真的带这套数据」,两条路互斥。
+        self.season_layer = !season_art
+            && mutation
+                .glassy
+                .is_some_and(|g| g.uses_season_art(petbase_id))
+            && self.materials.iter().any(|m| m.season_mutation.is_some());
+        if self.season_layer {
+            // 这条路的颜色、花纹图、区域遮罩全在材质里,不看玩家选的那一款。
+            self.glassy = None;
+            return;
+        }
         self.season_art = season_art;
         if season_art {
             for material in &mut self.materials {
@@ -1406,6 +1466,7 @@ impl Model {
             glassy: None,
             mutation: super::glassy::Mutation::default(),
             season_art: false,
+            season_layer: false,
         }
     }
 }

@@ -63,7 +63,10 @@ pub fn render(request: &Request) -> Result<()> {
     // **赛季传说精灵那条路不叠玻璃层**(只换基色贴图),别拿「没有玻璃层」当缺素材。
     // 只有它**真正生效**时才免检(见 `Model::season_art`):没生效会退回通用玻璃层。
     anyhow::ensure!(
-        mutation.glassy.is_none() || model.season_art || model.glassy.is_some(),
+        mutation.glassy.is_none()
+            || model.season_art
+            || model.season_layer
+            || model.glassy.is_some(),
         "这个二进制没烘炫彩素材:先导一次包(素材会写到 <out>/glassy),再重新编译"
     );
     let model = model;

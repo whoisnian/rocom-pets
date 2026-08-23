@@ -593,6 +593,14 @@ static List<MaterialEntry> BuildMaterials(
             yutuEar, fakeFluid, matcapMasked, fairyBall,
             ExportEffectTexture(info.GlassyIdTexture),
             ExportEffectTexture(info.SeasonBaseTexture),
+            info.IsSeasonMutation
+                ? new SeasonMutationMaterial(
+                    ExportEffectTexture(info.SeasonFlowNoise),
+                    ExportEffectTexture(info.SeasonMixMask),
+                    ExportEffectTexture(info.SeasonMatCap),
+                    info.SeasonRed, info.SeasonGreen,
+                    info.SeasonBlue, info.SeasonMetal, info.SeasonMetal02, info.SeasonFlow)
+                : null,
             info.OutlineWidth ?? 0f, info.IsPaintOrder));
 
         if (info.StarTexture is not null && ExportEffectTexture(info.StarTexture) is { } starTex

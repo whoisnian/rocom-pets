@@ -115,7 +115,9 @@ struct MaterialParams {
     glassy_p0: vec4<f32>,
     // [MainTexFlowSpeedX, MainTexFlowSpeedY, StarStickTiling, BaseColorDetail]
     glassy_p1: vec4<f32>,
-    // 星贴层四段渐变的四个色标(`StickRandomColor01..04`)
+    // 通用炫彩:星贴层四段渐变的四个色标(`StickRandomColor01..04`)。
+    // 赛季那一族(`glassy_red.w = 2`)复用前三个:BlueChannel / MetalColor / MetalColor02,
+    // 各自的 `.w` 依次是 FlowMaskInt / FlowMaskPow / MainTexFlowSpeedY。
     glassy_stick0: vec4<f32>,
     glassy_stick1: vec4<f32>,
     glassy_stick2: vec4<f32>,
@@ -150,6 +152,13 @@ struct MaterialParams {
 // 炫彩的**区域门**:那张 `_M` 的 alpha 是离散 ID 台阶,只有 `>= GLASSY_MIN_ID` 的地方刷玻璃。
 // 没导这张(旧包)时绑 1×1 白图 = 门恒开。
 @group(1) @binding(13) var glassy_id_tex: texture_2d<f32>;
+// `SeasonMutation` 那族的区域遮罩(`MixMask`):`.b` 走幂曲线混向 `glassy_stick0`,
+// `.a >= 0.79` 的地方整片换成 `glassy_stick1`(那片金属色)。没有就是 1×1 白图。
+@group(1) @binding(14) var season_mask_tex: texture_2d<f32>;
+// 金属区那层**金属光泽**的 matcap(`Mutation_MatCap`)。**这一条是近似,不是从汇编读的**
+// —— 那份排列里金属区就是平涂。只有 `MetalSpecInt > 0` 的材质导得到它,导不到就是白图
+// (乘 1 = 平涂):机幕方舟有(实机是带高光的银),龙息帕尔没有(实机是平白)。
+@group(1) @binding(15) var season_matcap_tex: texture_2d<f32>;
 // 第一遍不透明材质留下的场景深度；半透明材质按原 shader 的
 // `OpacityDepthDistance` 计算与后方实体/背景的距离。
 @group(2) @binding(0) var scene_depth: texture_depth_2d;
@@ -1158,10 +1167,15 @@ fn glassy_layer(in: VsOut, base: vec3<f32>, shaded: vec3<f32>) -> vec3<f32> {
     if material.glassy_red.w < 0.5 {
         return shaded;
     }
+    let season = material.glassy_red.w > 1.5;
     // ⓪ **区域门**。整段玻璃层在原 PS 里包在 `if (MaskTex.a >= MinID)` 里,门外走 `else`
     //    直接输出原着色。这是实机「只给部位上色」的来源:鸭吉吉的喙与脚、白金独角兽的
     //    身体,alpha 都是 0,于是一点玻璃色都不沾。没导那张遮罩的旧包绑的是白图 ⇒ 门恒开。
-    if textureSample(glassy_id_tex, base_sampler, in.uv).a < GLASSY_MIN_ID {
+    //
+    //    **赛季那一族的金属环画在门外面**(汇编里门做完之后才做),所以这里不能直接返回:
+    //    门只挡玻璃色那一半。挡错了整圈银色扑克花纹会被切碎、胳膊与肩膀上那圈直接没有。
+    let gated = textureSample(glassy_id_tex, base_sampler, in.uv).a >= GLASSY_MIN_ID;
+    if !gated && !season {
         return shaded;
     }
     let n = normalize(in.normal);
@@ -1197,6 +1211,23 @@ fn glassy_layer(in: VsOut, base: vec3<f32>, shaded: vec3<f32>) -> vec3<f32> {
     var glass = material.glassy_red.rgb * pattern.r + material.glassy_green.rgb * pattern.g;
     glass *= material.glassy_green.w;
 
+    // ④′ **赛季传说精灵那一族**(`MI_P_Object_SeasonMutation*`)在这里多两块区域。
+    //     骨架与上面完全相同 —— 同一条折射屏幕 UV、同一个 1.62 增益、同一道
+    //     `MaskTex.a` 区域门、同一条亮度门;换掉的只是输入(花纹图是材质自带的
+    //     `FlowNoise`,两个 Channel 色也是材质自己的)。多出来的就是这两块:
+    //     `MixMask.b` 按 `pow(x × FlowMaskInt, FlowMaskPow)` 混向 `BlueChannel`;
+    //     `MixMask.a ≥ 0.79` 的地方整片换成 `MetalColor` —— 机幕方舟那圈**银色**
+    //     扑克花纹就是它(它的 `MetalColor` = (1.5,1.5,1.5)),而「只在翅膀」
+    //     「只在身体与肩顶」是 `MixMask` 这张**每宠物一张**的图划的。
+    var season_metal_zone = 0.0;
+    if season {
+        let mask = textureSample(season_mask_tex, base_sampler, in.uv);
+        let curve = mask.b * material.glassy_stick0.w;
+        let m = select(min(pow(max(curve, 0.0), material.glassy_stick1.w), 1.0), 0.0, curve <= 0.0);
+        glass = mix(glass, material.glassy_stick0.rgb, m);
+        season_metal_zone = select(0.0, 1.0, mask.a >= 0.79);
+    }
+
     // ⑤ 按固有色亮度调制。`mean ≤ 0` 时整片归零(汇编那条 `ge` + `movc`),
     //    否则 `min(pow(mean, BaseColorDetail), 1)`。炫彩之所以还看得出原宠物的
     //    明暗结构,全靠这一步。
@@ -1207,7 +1238,13 @@ fn glassy_layer(in: VsOut, base: vec3<f32>, shaded: vec3<f32>) -> vec3<f32> {
     // ⑥ 星点层。相位公式与既有的 `stick_layer` 逐字相同(`1.1 × lerp(|sin θ|,|cos θ|, g)`,
     //    θ = `frac(time × 0.25) × 2π`)—— 两条排列共用同一段材质图。
     //    这里的 RGB **不是颜色**:g 给相位、r 给阈值、b 给幅度,颜色全来自参数。
-    let star = textureSample(glassy_star_tex, base_sampler, in.uv * material.glassy_p1.z);
+    // 赛季那一族没有星贴层(它的 `StarStickTex` 不参与这条分支),绑的是白图,
+    // 直接跳过免得在身上糊一层白方块。
+    let star = select(
+        textureSample(glassy_star_tex, base_sampler, in.uv * material.glassy_p1.z),
+        vec4<f32>(0.0),
+        season,
+    );
     let theta = fract(camera.time * STAR_PHASE_SPEED) * 6.2831855;
     let k = 1.1 * mix(abs(sin(theta)), abs(cos(theta)), star.g);
     let t = saturate((star.b * (k - star.r) - 0.01) * 25.0);
@@ -1244,7 +1281,36 @@ fn glassy_layer(in: VsOut, base: vec3<f32>, shaded: vec3<f32>) -> vec3<f32> {
     //    所以把游戏那边的显示值搬进来要先除以 `EXPOSURE`,否则玻璃层会比同一帧里
     //    别的东西暗一整档(实测鸭吉吉腹部 (124,113,134),实机是 #bac8fb / #f3c05a)。
     //    这和 `STICK_GAIN` 那条「旧² / EXPOSURE」的换算是同一个道理,不是新标定。
-    return mix(shaded, glass / EXPOSURE, GLASSY_BLEND_WEIGHT);
+    // 门外保持原着色;门内才换成玻璃色。
+    // 赛季那一族的颜色是**显示尺度**的(`BlueChannel` 就是 1.0、`MetalColor` 1.5),
+    // 不像玩家选的那 39 组是 HDR 系数(到 1.6)。再除一次 `EXPOSURE`(×2.08)会把它们
+    // 顶到纯白 —— 实机机幕方舟头顶那道竖条是亮红与暗红交替,不是红白交替。
+    let gain = select(1.0 / EXPOSURE, 1.0, season);
+    var out = select(shaded, mix(shaded, glass * gain, GLASSY_BLEND_WEIGHT), gated);
+
+    // ⑨ **赛季那一族的金属区画在门外面**(汇编 231~238 行:门做完之后才做),
+    //    所以整圈银色扑克花纹是连续的,胳膊与肩膀上那圈也在。
+    //    先整片换成 `MetalColor`,再按同一块区域里那条噪声混向 `MetalColor02`。
+    //    **平涂,不乘 matcap**:汇编那句就是 `mix(r0, MetalColor, zone)`。曾经为了解释
+    //    机幕方舟那圈「银」的明暗自作主张乘了 `Mutation_MatCap`,结果把龙息帕尔翅膀上
+    //    本该是白的星月染成了紫(它的 `MetalColor` 是 (1,1,1),matcap 才是紫的)。
+    //    实机那点明暗来自后面统一乘的那个阴影项,不是 matcap。
+    //    **要把光照乘回去。** 实机里这一族的输出后面还要走一整段 toon 光照(ramp/rim),
+    //    `MetalColor` 是被点亮的**固有色**;而我们这条链上 `glassy_layer` 在最后,替换掉的
+    //    是**已经点亮的** `shaded` —— 平铺就成了一片死白,机幕方舟那圈「银」的明暗全没了。
+    //    `shaded` 与 `base` 的亮度比就是当地那一档光照,乘回去金属才立体。
+    let lum_base = max(dot(base, vec3<f32>(0.3, 0.59, 0.11)), 1e-3);
+    let lum_lit = dot(shaded, vec3<f32>(0.3, 0.59, 0.11));
+    let relight = clamp(lum_lit / lum_base, 0.0, 4.0);
+    //    金属光泽:乘材质自己的 `Mutation_MatCap`(按视空间法线查表)。没导到就是白图,
+    //    乘 1 等于平涂 —— 这一层的开关是材质的 `MetalSpecInt`,在导出器那边判。
+    let metal_gloss = textureSample(season_matcap_tex, base_sampler, matcap_uv(n)).rgb;
+    out = mix(
+        out,
+        material.glassy_stick1.rgb * metal_gloss * gain * relight,
+        season_metal_zone,
+    );
+    return out;
 }
 
 fn shade_main(in: VsOut, depth_coverage: f32) -> vec4<f32> {

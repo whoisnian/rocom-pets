@@ -32,6 +32,14 @@ public record MaterialInfo(
     Dictionary<string, string> Textures,
     /// 参数名 → 线性色(RGBA)。特效层的颜色就在这儿:火焰的 Color、光晕的 EmissColor 之类。
     Dictionary<string, float[]> Vectors,
+    /// **只有这个材质自己写的**那批向量参数(不含父链继承)。
+    ///
+    /// 为什么要和 `Vectors` 分开:UE 的参数按**关联**(Global / Layer)分别解析,而
+    /// 赛季那一族的 Red/Green/Blue/Metal 都是 `LayerParameter`。机幕方舟**没写**
+    /// `BlueChannel`,可祖先上有一个同名的 `GlobalParameter` 白色 —— 合并视图里它是
+    /// (1,1,1),而那条排列实际用的是图默认 **(0,0,0)**。拿合并值去喂,头顶那道竖条
+    /// 就从「普通红 + 炫彩红」变成「红 + 惨白」。
+    Dictionary<string, float[]> OwnVectors,
     /// 参数名 → 标量。强度/流速/菲涅尔次数一类。
     Dictionary<string, float> Scalars,
     /// 参数名 → 该参数的 `ExpressionGUID`。**这是通往根材质默认值的桥**:根材质
@@ -229,6 +237,78 @@ public record MaterialInfo(
     /// 加尔/黑化加尔整张图都是铅绘 ⇒ 全身;龙息帕尔只有翅膀那块不一样 ⇒ 只翅膀变;
     /// 机幕方舟多画了银色扑克花纹 ⇒ 身体与肩顶多出花纹。
     public string? SeasonBaseTexture => FirstTexture("BaseTexSketch");
+
+    /// **赛季传说精灵的另一族做法**(`MI_P_Object_SeasonMutation*`)。
+    ///
+    /// 铅字幻梦那家(加灵)只是换基色贴图;暗夜拾光的龙息帕尔与狂欢怪谈的机幕方舟走的是
+    /// 这一族 —— 客户端同样只开 `MutationSwitch`,但效果整套烘在材质里,配置表那边
+    /// **没有** `season_pet_tex`。
+    ///
+    /// `MutationSwitch=true` 那份排列(`DynamicSwitchId = 2`)读下来,**骨架就是玻璃层**:
+    /// 同一条折射 + 相对包围盒中心的屏幕 UV、同一个 `1.62` 增益(汇编里是折进去的常量,
+    /// 正好印证 `(BaseColorDetail+1) × FlowColorIntensity`)、同一道 `MaskTex.a` 区域门、
+    /// 同一条 `pow(mean(基色), 0.35)` 亮度门。换掉的只有输入:
+    ///
+    /// - 花纹图用材质自己的 `FlowNoise`,不是全库共享的 `MainTex`;
+    /// - 两个 Channel 色用材质自己的(玩家选不了);
+    /// - 多两个区域:`MixMask.b` 按 `pow(x × FlowMaskInt, FlowMaskPow)` 混向 `BlueChannel`,
+    ///   `MixMask.a ≥ 0.79` 的地方直接换成 `MetalColor`。
+    ///
+    /// 机幕方舟的 `MetalColor = (1.5, 1.5, 1.5)` —— 「身体与肩顶那圈**银色**扑克花纹」就是它;
+    /// 而 `MixMask` 是**每宠物一张**,「只在翅膀」「只在身体与肩顶」全由它划定。
+    public bool IsSeasonMutation =>
+        ParentChain.Any(p => p.StartsWith("MI_P_Object_SeasonMutation", StringComparison.OrdinalIgnoreCase));
+
+    /// 花纹图。**可以没有** —— 机幕方舟的 `_By1`(胳膊/肩膀/小尖塔)就没写,
+    /// 那时用全库共享的 `MainTex`(运行时取烘进来的那张)。
+    /// 按 `FlowNoise` 存不存在来判定这一族会把 `_By1` 整块丢掉,判据要用 `MixMask`。
+    public string? SeasonFlowNoise => IsSeasonMutation ? FirstTexture("FlowNoise") : null;
+    public string? SeasonMixMask => IsSeasonMutation ? FirstTexture("MixMask") : null;
+
+
+    /// `[RedChannel.rgb, GlobalRefraction]` —— 这一族的两个 Channel 色是**材质自己的**,
+    /// 玩家选不了(客户端在这条分支上一个颜色都不设)。
+    public float[] SeasonRed =>
+        [.. OwnColor("RedChannel", [0f, 0.932292f, 0.829095f]), Scalar("GlobalRefraction", 2f)];
+
+    /// `[GreenChannel.rgb, GlobalDepth]`。
+    public float[] SeasonGreen =>
+        [.. OwnColor("GreenChannel", [0.05486f, 0.420539f, 1f]), Scalar("GlobalDepth", 30f)];
+
+    /// `[BlueChannel.rgb, FlowMaskInt]` —— `MixMask.b` 那条幂曲线混向的颜色 + 曲线强度。
+    public float[] SeasonBlue => [.. OwnColor("BlueChannel", [0f, 0f, 0f]), Scalar("FlowMaskInt", 1f)];
+
+    /// `[MetalColor.rgb, FlowMaskPow]` —— 高遮罩区那片金属色 + 幂曲线指数。
+    public float[] SeasonMetal =>
+        [.. OwnColor("MetalColor", [0.99132f, 0.669075f, 0.184151f]), Scalar("FlowMaskPow", 1f)];
+
+    /// `[MetalColor02.rgb, 0]`。
+    /// 金属区那层**金属光泽**的 matcap(`Mutation_MatCap`)。
+    ///
+    /// **这一条是近似,不是从这条排列读出来的** —— `MutationSwitch=true` 那份汇编里
+    /// 金属区就是平涂的 `mix(r0, MetalColor, zone)`,没有 matcap;实机那点明暗有一部分
+    /// 来自后面统一走的 toon 光照(我们用 `shaded/base` 的亮度比近似回去了),
+    /// 但光靠它出不来「银」的那种金属高光。
+    ///
+    /// 判据用材质自己的 **`MetalSpecInt`**:机幕方舟是 **1**(实机就是带高光的银),
+    /// 龙息帕尔是 **0**(实机翅膀上那圈花纹是平白的)。两只正好各归其位 ——
+    /// 曾经不分青红皂白一律乘 matcap,把龙息帕尔的白星月染成了紫(`Matcap29` 是紫的)。
+    public string? SeasonMatCap =>
+        IsSeasonMutation && Scalar("MetalSpecInt", 0f) > 0f ? FirstTexture("Mutation_MatCap") : null;
+
+    public float[] SeasonMetal02 =>
+        [.. OwnColor("MetalColor02", [0.99132f, 0.669075f, 0.184151f]), 0f];
+
+    /// `[MainTexFlowSpeedX, MainTexFlowSpeedY, MainTexTiling, NormalEffectAmount]`。
+    ///
+    /// **两个轴都要导**:机幕方舟给的是 Y(0.4)、龙息帕尔给的是 **X**(0.1)。
+    /// 只导 Y 的话龙息帕尔那层花纹是静止的 —— 而实机里它在动(翅膀上淡金那块
+    /// 时隐时现就是这个)。
+    public float[] SeasonFlow =>
+    [
+        Scalar("MainTexFlowSpeedX", 0f), Scalar("MainTexFlowSpeedY", 0f),
+        Scalar("MainTexTiling", 1.5f), Scalar("NormalEffectAmount", 0.1f),
+    ];
 
     /// 遮罩是不是 MatCap。**这决定采样方式**:matcap 要按视空间法线采(球面反射查找表),
     /// 拿网格 UV 采会变成一块块的斑,水灵的水膜就是这么糊掉的。
@@ -941,6 +1021,15 @@ public record MaterialInfo(
     private float Scalar(string name, float fallback = 0f) =>
         Scalars.TryGetValue(name, out var v) ? v : fallback;
 
+    /// 取一个向量参数的 rgb;没有就用给的兜底(**不跳过纯白**,这里纯白是有意义的值)。
+    private float[] Color(string name, float[] fallback) =>
+        Vectors.TryGetValue(name, out var v) ? [v[0], v[1], v[2]] : fallback;
+
+    /// 同上,但**只看材质自己写的**(见 `OwnVectors` 的说明);没写就用兜底,
+    /// 而兜底要填**那条编译排列的默认值**,不是随手写个白。
+    private float[] OwnColor(string name, float[] fallback) =>
+        OwnVectors.TryGetValue(name, out var v) ? [v[0], v[1], v[2]] : fallback;
+
     private float[]? FirstVector(params string[] names) =>
         names.Select(n => Vectors.TryGetValue(n, out var v) ? v : null).FirstOrDefault(v => v is not null);
 
@@ -1007,7 +1096,7 @@ public static class Materials
                     // 如小浣蛋的 `MI_Dem_XiaoHuanDan1_001_By`)。仍然登记一条空的,
                     // 让导出器能按名字去凑基色贴图,免得整只宠物画不出来。
                     warnings.Add($"材质 {slot.Name} 在 pak 里没有资产(悬空引用),退回按贴图名接基色");
-                    result[slot.Name] = new MaterialInfo(slot.Name, [], [], [], [], [],
+                    result[slot.Name] = new MaterialInfo(slot.Name, [], [], [], [], [], [],
                         EBlendMode.BLEND_Opaque, DefaultMaskClip, [], Resolved: false);
                     continue;
                 }
@@ -1101,6 +1190,7 @@ public static class Materials
     /// 顺父链合并参数。**从最远的祖先开始写**,近的覆盖远的,于是子实例的覆盖最终生效。
     private static MaterialInfo Resolve(string name, UMaterialInstance material)
     {
+        var ownVectors = new Dictionary<string, float[]>(StringComparer.OrdinalIgnoreCase);
         var chain = new List<UMaterialInstance>();
         var parents = new List<string>();
         var current = material;
@@ -1136,7 +1226,10 @@ public static class Materials
             {
                 var c = param.ParameterValue;
                 if (!string.IsNullOrEmpty(param.Name) && c is not null)
+                {
                     vectors[param.Name] = [c.Value.R, c.Value.G, c.Value.B, c.Value.A];
+                    if (i == 0) ownVectors[param.Name] = vectors[param.Name];
+                }
                 Remember(guids, param.Name, param.ExpressionGUID);
             }
             foreach (var param in mi.GetOrDefault<FScalarParameterValue[]>("ScalarParameterValues", []))
@@ -1166,6 +1259,7 @@ public static class Materials
                 if (overrides.OpacityMaskClipValue > 0) maskClip = overrides.OpacityMaskClipValue;
             }
         }
-        return new MaterialInfo(name, textures, vectors, scalars, guids, switches, blend, maskClip, parents);
+        return new MaterialInfo(
+            name, textures, vectors, ownVectors, scalars, guids, switches, blend, maskClip, parents);
     }
 }
