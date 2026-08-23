@@ -1,6 +1,9 @@
 [package]
 name = "rocom-pets"
-version = "0.0.0"
+# 跟着 git tag 走(0.1.0 那会儿这里还是 0.0.0)。`publish = false`,所以这个数
+# 只是给人看的一处记录;下载站上显示的版本另由 `gen_catalog.py --version` 决定,
+# 发布时两处要对齐。
+version = "0.2.0"
 edition = "2024"
 publish = false
 description = "桌面宠物运行时:KDE Wayland 与 Windows 10+ 双后端"

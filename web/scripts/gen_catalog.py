@@ -26,7 +26,7 @@
 
 用法:
   scripts/gen_catalog.py --packs ~/Downloads/rocom/packs-all \
-                         --apps dist-bin --version 0.1.0
+                         --apps dist-bin --version 0.2.0
   scripts/gen_catalog.py --index ../docs/petindex.md          # 无包时的演示目录
 
 要 Pillow:`uv run --with pillow python scripts/gen_catalog.py …`(npm run catalog 已经带上)。
