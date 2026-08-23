@@ -592,6 +592,7 @@ static List<MaterialEntry> BuildMaterials(
             info.XiaoYouNoiseFlow, info.XiaoYouShape, info.XiaoYouStarUv,
             yutuEar, fakeFluid, matcapMasked, fairyBall,
             ExportEffectTexture(info.GlassyIdTexture),
+            ExportEffectTexture(info.SeasonBaseTexture),
             info.OutlineWidth ?? 0f, info.IsPaintOrder));
 
         if (info.StarTexture is not null && ExportEffectTexture(info.StarTexture) is { } starTex

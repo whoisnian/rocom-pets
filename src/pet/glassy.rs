@@ -372,6 +372,19 @@ impl Glassy {
             })
     }
 
+    /// 这只宠物穿这一款炫彩时,该不该换成**赛季专属贴图**。
+    ///
+    /// 只有赛季款、而且这只在它的 `season_pet` 名单里才算数 —— 名单外的宠物走的是
+    /// 与常驻款相同的通用覆盖(客户端那个 `bSeasonButNotCustomPet` 分支)。
+    pub fn uses_season_art(&self, petbase_id: i64) -> bool {
+        let Glassy::Hidden { id } = self else {
+            return false;
+        };
+        hidden_by_id(*id).is_some_and(|h| {
+            h.season && h.season_pets.iter().any(|p| i64::from(*p) == petbase_id)
+        })
+    }
+
     /// 解析成 shader 输入。
     pub fn render(&self) -> Option<GlassyRender> {
         match self {
@@ -677,6 +690,22 @@ mod tests {
         assert!(qz.refraction_eta() > 1000.0, "{}", qz.refraction_eta());
         // 它的 BaseColorDetail 是 0.3,增益跟着走。
         assert!((qz.glass_gain() - 1.3 * FLOW_COLOR_INTENSITY).abs() < 1e-6);
+    }
+
+    /// 赛季传说精灵认人:只有赛季款、而且这只在名单里才换专属贴图。
+    #[test]
+    fn season_art_only_for_the_listed_pets() {
+        let qz = Glassy::Hidden { id: 3 }; // 铅字幻梦,名单 3230..3233
+        assert!(qz.uses_season_art(3232), "加尔在名单里");
+        assert!(!qz.uses_season_art(3438), "梦游不在名单里,走通用覆盖");
+        // 常驻款(黑白)没有赛季专属这回事。
+        assert!(!Glassy::Hidden { id: 1000 }.uses_season_art(3232));
+        // 常规炫彩更不会。
+        assert!(!Glassy::Common {
+            color: 1,
+            particle: 1
+        }
+        .uses_season_art(3232));
     }
 
     /// 星点色是**四段渐变**,不是四选一 —— 每颗粒子按自己的 `k` 取色,所以一边涨缩

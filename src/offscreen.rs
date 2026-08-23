@@ -57,9 +57,13 @@ pub fn render(request: &Request) -> Result<()> {
     let spec = load_materials(&request.pack, &glb, mutation.shiny)
         .with_context(|| format!("{:?} 里找不到这个形态的材质表,重导一次包", request.pack))?;
     let mut model = Model::load(&glb, &spec)?;
-    model.apply_mutation(mutation);
+    // 赛季专属贴图要按 petbase_id 认人,裸 glb 认不出来(没有 manifest),按 0 处理。
+    let petbase = petbase_id(&request.pack, &glb).unwrap_or(0);
+    model.apply_mutation(mutation, petbase);
+    // **赛季传说精灵那条路不叠玻璃层**(只换基色贴图),别拿「没有玻璃层」当缺素材。
+    // 只有它**真正生效**时才免检(见 `Model::season_art`):没生效会退回通用玻璃层。
     anyhow::ensure!(
-        mutation.glassy.is_none() || model.glassy.is_some(),
+        mutation.glassy.is_none() || model.season_art || model.glassy.is_some(),
         "这个二进制没烘炫彩素材:先导一次包(素材会写到 <out>/glassy),再重新编译"
     );
     let model = model;
@@ -579,6 +583,18 @@ fn write_sheet(out: &Path, size: u32, tiles: &[(String, Vec<u8>)]) -> Result<()>
         .save(out)
         .with_context(|| format!("写 {out:?} 失败"))?;
     Ok(())
+}
+
+/// 这个形态的 `petbase_id`(赛季传说精灵那份专属贴图要按它认人)。裸 glb 给不出来。
+fn petbase_id(pack: &Path, glb: &Path) -> Option<i64> {
+    let dir = if pack.extension().is_some_and(|e| e == "glb") {
+        pack.parent()?.parent()?.parent()?
+    } else {
+        pack
+    };
+    let loaded = crate::pack::Pack::load(dir).ok()?;
+    let asset = glb.parent()?.file_name()?.to_str()?;
+    loaded.forms.iter().find(|f| f.asset == asset).map(|f| f.id)
 }
 
 /// 从包目录里定位形态的 glb(也接受直接给 .glb)。

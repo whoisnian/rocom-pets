@@ -198,6 +198,9 @@ struct RawMaterial {
     /// 炫彩的**区域门**。见 `Material::glassy_id_mask`。
     #[serde(default)]
     glassy_id_tex: Option<String>,
+    /// 赛季传说精灵的专属基色贴图。见 `Material::season_base_color`。
+    #[serde(default)]
+    season_base_color: Option<String>,
     #[serde(default)]
     flicker: Option<[f32; 2]>,
     #[serde(default)]
@@ -498,6 +501,13 @@ pub struct Material {
     /// 白金独角兽鬃毛/尾/腿毛 0.5、**身体 0**。不接这道门,整只连喙带脚都会被刷上玻璃色。
     /// 只有 `glassy_target` 的槽导得到;旧包没有这个字段 ⇒ `None` ⇒ 整片都刷(老行为)。
     pub glassy_id_mask: Option<PathBuf>,
+    /// **赛季传说精灵的专属基色贴图**(材质里的 `BaseTexSketch`)。
+    ///
+    /// 游戏对 `HIDDEN_GLASS_CONF.season_pet` 里那几只走一条单独的路:开动态开关
+    /// `MutationSwitch`,而那个开关在编译产物里做的就是**把基色贴图这个绑定槽从
+    /// `BaseTex` 换成 `BaseTexSketch`**(两者 `index` 相同)—— 整套「赛季特殊效果」
+    /// 就是换一张图。**它不开 `GlassySwitch`**,所以这几只上自家赛季炫彩时没有玻璃层。
+    pub season_base_color: Option<PathBuf>,
     /// **玻璃内部那颗星**:四角星场贴图(`StarTex` = `T_EMeng003`),沿折射光线在物体空间
     /// march、三向投影采样、按时间卷动。读 shader 汇编得来,见 docs/design.md §1。
     pub interior: Option<PathBuf>,
@@ -766,6 +776,7 @@ fn material_table(root: &Path, raw: HashMap<String, RawMaterial>) -> HashMap<Str
                     mask_id: mat.mask_id_tex.map(|rel| root.join(rel)),
                     mask_id_range: mat.mask_id_range.unwrap_or([0.0, 1.0]),
                     glassy_id_mask: mat.glassy_id_tex.map(|rel| root.join(rel)),
+                    season_base_color: mat.season_base_color.map(|rel| root.join(rel)),
                     interior: mat.interior_tex.map(|rel| root.join(rel)),
                     interior_color: mat.interior_color.unwrap_or([1.0; 3]),
                     refraction: mat.refraction,

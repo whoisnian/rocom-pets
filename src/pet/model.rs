@@ -118,6 +118,8 @@ pub struct Material {
     pub mask_id_range: [f32; 2],
     /// 炫彩的**区域门**(同一张 `_M`,读 alpha)。见 `pack::Material::glassy_id_mask`。
     pub glassy_id_mask: Option<Image>,
+    /// 赛季传说精灵的专属基色贴图。见 `pack::Material::season_base_color`。
+    pub season_base_color: Option<Image>,
     /// 玻璃内部那颗星:四角星场贴图 + 着色 + 折射率 + march 深度。
     pub interior: Option<Image>,
     pub interior_color: [f32; 3],
@@ -342,6 +344,10 @@ pub struct Model {
     /// 这份模型套的是哪一种外观。**当缓存键用** —— `source` 只认到 (包, 形态),
     /// 同一个形态的原样版与几种炫彩版是不同的 GPU 资源,不能共用一份。
     pub mutation: super::glassy::Mutation,
+    /// 这只走了**赛季传说精灵专属贴图**那条路(换基色、不叠玻璃层)。
+    /// 名单里但包里没那张图、或者属于还没复刻的 `SeasonMutation` 那族时是 `false`,
+    /// 那时会退回通用玻璃层。
+    pub season_art: bool,
 }
 
 /// 一份炫彩外观:解析好的着色参数,加上它要用的两张**共享**贴图。
@@ -606,6 +612,10 @@ impl Model {
                         .glassy_id_mask
                         .as_deref()
                         .and_then(|p| load_texture(p, true)),
+                    season_base_color: spec
+                        .season_base_color
+                        .as_deref()
+                        .and_then(|p| load_texture(p, spec.mask_alpha)),
                     interior: spec.interior.as_deref().and_then(|p| load_texture(p, true)),
                     interior_color: spec.interior_color,
                     refraction: spec.refraction,
@@ -801,6 +811,7 @@ impl Model {
             face_cards,
             glassy: None,
             mutation: super::glassy::Mutation::default(),
+            season_art: false,
         })
     }
 
@@ -883,8 +894,36 @@ impl Model {
     ///
     /// **异色这一半在这里只是记下来**:它是换整套材质,而材质表是 `Model::load` 的入参,
     /// 调用方在加载时就已经挑好了哪一套(见 `Form::materials_for`)。
-    pub fn apply_mutation(&mut self, mutation: super::glassy::Mutation) {
+    pub fn apply_mutation(&mut self, mutation: super::glassy::Mutation, petbase_id: i64) {
         self.mutation = mutation;
+        // **赛季传说精灵的专属外观**:客户端对 `season_pet` 名单里那几只只开
+        // `MutationSwitch`,而那个开关做的就是把基色贴图换成 `BaseTexSketch`
+        // —— 换完就完了,**不开 `GlassySwitch`**,所以这几只没有玻璃层。
+        // 观感上的差别全在那张图里:加尔整张都是铅绘 ⇒ 全身;龙息帕尔只有翅膀那块不同
+        // ⇒ 只翅膀变;机幕方舟多画了银色扑克花纹 ⇒ 身体与肩顶多出花纹。
+        // **有没有那张图要先看过再决定走哪条路。** 名单里那几只并不都走「换基色贴图」:
+        // 只有铅字幻梦(加灵一家)的材质带 `BaseTexSketch`;暗夜拾光的龙息帕尔与
+        // 狂欢怪谈的机幕方舟是另一族(`MI_P_Object_SeasonMutation*`,靠 `MixMask` +
+        // `FlowNoise` + `Mutation_MatCap` 另画一层),那条分支还没复刻。
+        // 对这两只**退回通用玻璃层**,而不是把它们渲成原样 —— 原样等于什么都没发生。
+        let season_art = mutation
+            .glassy
+            .is_some_and(|g| g.uses_season_art(petbase_id))
+            && self
+                .materials
+                .iter()
+                .any(|m| m.season_base_color.is_some());
+        self.season_art = season_art;
+        if season_art {
+            for material in &mut self.materials {
+                if let Some(art) = material.season_base_color.take() {
+                    material.base_color = Some(art);
+                }
+            }
+            // 换了图就走完了:赛季专属那条路不叠玻璃层。
+            self.glassy = None;
+            return;
+        }
         // 旧包没导区域门那张遮罩(`glassy_id_tex`),玻璃层只能整片刷 —— 连喙带脚一起变色,
         // 和实机差很远。说一声比让人对着一只怪模怪样的宠物猜强。
         if mutation.glassy.is_some()
@@ -1366,6 +1405,7 @@ impl Model {
             face_cards: Vec::new(),
             glassy: None,
             mutation: super::glassy::Mutation::default(),
+            season_art: false,
         }
     }
 }

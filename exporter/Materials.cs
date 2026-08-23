@@ -217,6 +217,19 @@ public record MaterialInfo(
         }
     }
 
+    /// **赛季传说精灵的专属贴图**(「铅绘」那种)。
+    ///
+    /// 机制比看上去简单:`BaseTex` 与 `BaseTexSketch` 在编译产物里**共用同一个绑定槽**
+    /// (探针 `tex[0] BaseTex: index=3` / `tex[0] BaseTexSketch: index=3`),
+    /// 动态开关 `MutationSwitch` 一开就换成后面那张 —— **整套「特殊效果」就是换基色贴图**。
+    ///
+    /// 客户端只对 `HIDDEN_GLASS_CONF.season_pet` 里那几只走这条路
+    /// (`PetMutationUtils` 的赛季分支;注意它**不开** `GlassySwitch`,所以这几只
+    /// 上赛季炫彩时根本没有玻璃层,只是换了张图)。三种观感都由这张图自己决定:
+    /// 加尔/黑化加尔整张图都是铅绘 ⇒ 全身;龙息帕尔只有翅膀那块不一样 ⇒ 只翅膀变;
+    /// 机幕方舟多画了银色扑克花纹 ⇒ 身体与肩顶多出花纹。
+    public string? SeasonBaseTexture => FirstTexture("BaseTexSketch");
+
     /// 遮罩是不是 MatCap。**这决定采样方式**:matcap 要按视空间法线采(球面反射查找表),
     /// 拿网格 UV 采会变成一块块的斑,水灵的水膜就是这么糊掉的。
     public bool MaskIsMatcap =>

@@ -177,6 +177,8 @@ public record MaterialEntry(
     /// **炫彩的区域门**:`MaskTex`(那张 `_M`)的 alpha 是离散 ID 台阶,玻璃层只刷在
     /// `alpha >= 0.4` 的地方。见 `MaterialInfo.GlassyIdTexture`。
     string? GlassyIdTexture = null,
+    /// 赛季传说精灵的专属基色贴图。见 `MaterialInfo.SeasonBaseTexture`。
+    string? SeasonBaseTexture = null,
     /// 配套 `_Ol` 描边材质算出来的描边宽度(米);0 = 不画。见 `Materials.OutlineWidthOf`。
     float OutlineWidth = 0f,
     /// 按画家序画(不写深度),见 `MaterialInfo.IsPaintOrder`。
@@ -303,6 +305,8 @@ public static class Manifest
             }
             if (mat.GlassyIdTexture is not null)
                 parts.Add($"glassy_id_tex = {Quote(mat.GlassyIdTexture)}");
+            if (mat.SeasonBaseTexture is not null)
+                parts.Add($"season_base_color = {Quote(mat.SeasonBaseTexture)}");
             if (mat.FlowTexture is not null)
             {
                 parts.Add($"flow_tex = {Quote(mat.FlowTexture)}");
