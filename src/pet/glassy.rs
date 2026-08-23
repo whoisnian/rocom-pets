@@ -152,11 +152,8 @@ pub struct HiddenGlass {
     /// 覆盖 `MainTex`(共享贴图名)。常规炫彩不覆盖它,用材质自己的 `Tex_PetGlassy_007_D`。
     pub main_tex: &'static str,
     pub star_tex: &'static str,
-    /// `StickRandomColor01..04`。**只有隐藏款覆盖这四个**,常规炫彩一个都不动 ——
-    /// 但 `GlassySwitch=true` 那条排列**一个都消费不到**:汇编里星点色只有 `cb6[49]` 一个槽,
-    /// 喂它的是材质自己的 `BlueChannel`(见 `pack::Material::glassy_star_color`)。
-    /// 反证也有:暗夜拾光这四个里第一个是品红,而实机那对翅膀上的星点是白的。
-    /// 留在表里是忠实转录配置,渲染不读。
+    /// `StickRandomColor01..04` —— **星贴层四段渐变的四个色标**,不是四个离散色。
+    /// 配置里没列出来的退回根默认(见 [`ROOT_STICK_RAMP`]),不是白。
     pub stick_colors: [[f32; 4]; 4],
     pub params: GlassyParams,
     /// 有专属贴图的宠物 `petbase_id`。
@@ -186,6 +183,22 @@ pub const FLOW_COLOR_INTENSITY: f32 = 1.2;
 /// 星点层的强度(根材质的 `Stick_Intensity`,汇编 `cb6[61].w`)。
 /// 和既有 `stick_layer` 那条路读到的是同一个参数、同一个值。
 pub const STICK_INTENSITY: f32 = 1.5;
+
+/// 根材质 `M_P_Object` 的 `StickRandomColor01..04` —— 星贴层**四段渐变的色标**。
+///
+/// 和 pet.wgsl 里既有的 `STICK_RAMP_0..3` 是同一组数:那边是 `StarStickTex` 族的星贴层,
+/// 炫彩这条排列采的也是 `StarStickTex`,**同一族同一条公式**。
+///
+/// 常规炫彩没人覆盖它们,所以就是这四个。实机验证:鸭吉吉那张截图里量到的方块颜色
+/// 黄 (255,252,51) / 蓝 (116,148,240) / 紫 (201,155,255),对应 `ks` = 1.00 / 0.67 / **0.50**
+/// —— 那个紫正好落在品红与蓝**之间的过渡段上**,离散地四选一取不出这个颜色,
+/// 只有渐变取得出。这是「是渐变不是四选一」最硬的一条证据。
+pub const ROOT_STICK_RAMP: [[f32; 4]; 4] = [
+    [0.9462, 0.0636, 0.0214, 1.0],
+    [0.9601, 0.1603, 0.9074, 1.0],
+    [0.0489, 0.1545, 0.9774, 1.0],
+    [0.9253, 0.7416, 0.0273, 1.0],
+];
 
 /// `MutationRimColor`,lua 里写死的。
 pub const MUTATION_RIM_COLOR: [f32; 3] = [0.6, 0.6, 0.6];
@@ -229,6 +242,10 @@ pub struct GlassyRender {
     pub green_channel: [f32; 3],
     pub params: GlassyParams,
     pub star_stick_tiling: f32,
+    /// **星贴层四段渐变的四个色标**(`StickRandomColor01..04`),每段 ⅓ 宽,
+    /// 按每颗粒子自己的 `k` 取色 —— 所以粒子一边涨缩一边换色。
+    /// 常规炫彩用根材质默认那四个,隐藏款按配置覆盖(没覆盖的仍退回根默认)。
+    pub stick_ramp: [[f32; 4]; 4],
     /// 共享贴图名,运行时按名字到炫彩素材目录里取。
     pub main_tex: &'static str,
     pub star_tex: &'static str,
@@ -368,6 +385,7 @@ impl Glassy {
                         star_intensity: c.shine_strength,
                         ..ROOT_PARAMS
                     },
+                    stick_ramp: ROOT_STICK_RAMP,
                     star_stick_tiling: p.star_stick_tiling,
                     main_tex: DEFAULT_MAIN_TEX,
                     star_tex: p.tex,
@@ -379,6 +397,7 @@ impl Glassy {
                     red_channel: [h.red_channel[0], h.red_channel[1], h.red_channel[2]],
                     green_channel: [h.green_channel[0], h.green_channel[1], h.green_channel[2]],
                     params: GlassyParams { ..h.params },
+                    stick_ramp: h.stick_colors,
                     // 隐藏款不给 `StarStickTiling`,沿用根默认 4.0。
                     star_stick_tiling: 4.0,
                     main_tex: h.main_tex,
@@ -658,6 +677,29 @@ mod tests {
         assert!(qz.refraction_eta() > 1000.0, "{}", qz.refraction_eta());
         // 它的 BaseColorDetail 是 0.3,增益跟着走。
         assert!((qz.glass_gain() - 1.3 * FLOW_COLOR_INTENSITY).abs() < 1e-6);
+    }
+
+    /// 星点色是**四段渐变**,不是四选一 —— 每颗粒子按自己的 `k` 取色,所以一边涨缩
+    /// 一边换色。这条钉住「常规炫彩用根默认那四个色标、隐藏款用自己的」。
+    #[test]
+    fn stick_ramp_is_a_four_stop_gradient() {
+        let common = Glassy::Common {
+            color: 21,
+            particle: 3,
+        }
+        .render()
+        .expect("21 号配色 3 号粒子都在表里");
+        assert_eq!(common.stick_ramp, ROOT_STICK_RAMP);
+
+        // 铅字幻梦覆盖 02/03/04,**01 没列出来 ⇒ 退回根默认**(不是白)。
+        let qz = Glassy::Hidden { id: 3 }.render().expect("铅字幻梦");
+        assert_eq!(qz.stick_ramp[0], ROOT_STICK_RAMP[0]);
+        assert_eq!(qz.stick_ramp[1], [0.67, 1.0, 0.49, 1.0]);
+        assert_ne!(qz.stick_ramp[2], ROOT_STICK_RAMP[2]);
+
+        // 暗夜拾光四个全覆盖,一个都不该落回根默认。
+        let ay = Glassy::Hidden { id: 1 }.render().expect("暗夜拾光");
+        assert_eq!(ay.stick_ramp[0], [1.0, 0.0, 0.7, 1.0]);
     }
 
     /// 异色与炫彩互不影响:异色自己不产生玻璃层,而且两个都开时玻璃层照样出。

@@ -42,6 +42,15 @@ SCALARS = [
 
 # 根材质 `M_P_Object` 的默认值(`exporter/RootDefaults.cs` 那条路读出来的,幽星光
 # `MI_..._By` 的冻结块逐条复核过)。隐藏款没写的标量落到这里。
+# 根材质 `M_P_Object` 的 `StickRandomColor01..04` —— 星贴层四段渐变的色标。
+# 与 pet.wgsl 的 `STICK_RAMP_0..3` 是同一组数(那边是既有星贴层用的,同一族同一条公式)。
+ROOT_STICK_COLORS = [
+    [0.9462, 0.0636, 0.0214, 1.0],
+    [0.9601, 0.1603, 0.9074, 1.0],
+    [0.0489, 0.1545, 0.9774, 1.0],
+    [0.9253, 0.7416, 0.0273, 1.0],
+]
+
 ROOT_DEFAULTS = {
     "star_intensity": 1.0,
     "global_refraction": 2.0,
@@ -165,8 +174,11 @@ def build(parsed: Path) -> str:
                for c in h.get("color_param", [])}
         num = {n["num_param_name"]: n.get("num_param_value", 0.0)
                for n in h.get("num_param", [])}
-        # 粒子颜色 1..4:没给的沿用「不着色」的白,与材质根默认一致。
-        sticks = [col.get(f"StickRandomColor{i:02d}", [1.0, 1.0, 1.0, 1.0]) for i in range(1, 5)]
+        # 粒子颜色 1..4 是**四段渐变的四个色标**(不是四个离散色),按每颗粒子自己的
+        # `k` 取值 —— 所以粒子一边涨缩一边换色。没列出来的退回**根材质默认**
+        # (`ROOT_STICK_COLORS`),不是白:白会把那一段渐变冲淡成灰。
+        sticks = [col.get(f"StickRandomColor{i:02d}", ROOT_STICK_COLORS[i - 1])
+                  for i in range(1, 5)]
         w("    HiddenGlass {")
         w(f"        id: {h['id']},")
         w(f"        name: \"{strip_rich(h['name'])}\",")

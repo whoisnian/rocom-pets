@@ -144,19 +144,18 @@ struct MaterialUniform {
     glassy_green: [f32; 4],
     glassy_p0: [f32; 4],
     glassy_p1: [f32; 4],
-    /// 星点色 = 材质的 `BlueChannel`(汇编 `cb6[49]`)。
-    glassy_star: [f32; 4],
+    /// 星贴层四段渐变的色标 `StickRandomColor01..04`。
+    glassy_stick0: [f32; 4],
+    glassy_stick1: [f32; 4],
+    glassy_stick2: [f32; 4],
+    glassy_stick3: [f32; 4],
 }
 
-/// 把选中的炫彩摊成 uniform 的那 5 个 vec4。`None`(或这个槽不刷炫彩)时全零 ——
+/// 把选中的炫彩摊成 uniform 的那 8 个 vec4。`None`(或这个槽不刷炫彩)时全零 ——
 /// `glassy_red.w = 0` 就是 shader 里的「不画」。
-fn glassy_uniform(
-    skin: Option<&GlassySkin>,
-    target: bool,
-    star_color: [f32; 3],
-) -> [[f32; 4]; 5] {
+fn glassy_uniform(skin: Option<&GlassySkin>, target: bool) -> [[f32; 4]; 8] {
     let Some(skin) = skin.filter(|_| target) else {
-        return [[0.0; 4]; 5];
+        return [[0.0; 4]; 8];
     };
     let r = &skin.render;
     let p = &r.params;
@@ -183,8 +182,11 @@ fn glassy_uniform(
             r.star_stick_tiling,
             p.base_color_detail,
         ],
-        // 星点色来自**材质**(`BlueChannel`),不来自选中的那一款炫彩。
-        [star_color[0], star_color[1], star_color[2], 0.0],
+        // 星贴层四段渐变的四个色标,按每颗粒子自己的 `k` 取色。
+        r.stick_ramp[0],
+        r.stick_ramp[1],
+        r.stick_ramp[2],
+        r.stick_ramp[3],
     ]
 }
 
@@ -777,11 +779,7 @@ impl PetGpu {
             // 「包围盒对角线 × 0.004」更接近实机(魔力猫 1.79 厘米 vs 0.39 厘米)。
             let outline_width = material.outline_width.unwrap_or(DEFAULT_OUTLINE_WIDTH);
             // 炫彩只刷在 `by*` 那几个槽上 —— 判据与游戏一致,见 `pack::Material::glassy_target`。
-            let glassy = glassy_uniform(
-                model.glassy.as_ref(),
-                material.glassy_target,
-                material.glassy_star_color,
-            );
+            let glassy = glassy_uniform(model.glassy.as_ref(), material.glassy_target);
             let uniform = match &material.effect {
                 Some(effect) => MaterialUniform {
                     tint: effect.tint,
@@ -860,7 +858,10 @@ impl PetGpu {
                     glassy_green: glassy[1],
                     glassy_p0: glassy[2],
                     glassy_p1: glassy[3],
-                    glassy_star: glassy[4],
+                    glassy_stick0: glassy[4],
+                    glassy_stick1: glassy[5],
+                    glassy_stick2: glassy[6],
+                    glassy_stick3: glassy[7],
                 },
                 // 有基色的材质:params.x/.z 说明 alpha 怎么解释
                 // (x=1 镂空遮罩、z=1 不透明度,都为 0 则是线条遮罩)
@@ -969,7 +970,10 @@ impl PetGpu {
                     glassy_green: glassy[1],
                     glassy_p0: glassy[2],
                     glassy_p1: glassy[3],
-                    glassy_star: glassy[4],
+                    glassy_stick0: glassy[4],
+                    glassy_stick1: glassy[5],
+                    glassy_stick2: glassy[6],
+                    glassy_stick3: glassy[7],
                 },
             };
             let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {

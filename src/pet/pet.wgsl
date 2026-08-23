@@ -115,8 +115,11 @@ struct MaterialParams {
     glassy_p0: vec4<f32>,
     // [MainTexFlowSpeedX, MainTexFlowSpeedY, StarStickTiling, BaseColorDetail]
     glassy_p1: vec4<f32>,
-    // 星点色 = 材质自己的 `BlueChannel`(汇编 `cb6[49]`),不是隐藏款那四个 StickRandomColor
-    glassy_star: vec4<f32>,
+    // 星贴层四段渐变的四个色标(`StickRandomColor01..04`)
+    glassy_stick0: vec4<f32>,
+    glassy_stick1: vec4<f32>,
+    glassy_stick2: vec4<f32>,
+    glassy_stick3: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> camera: Camera;
@@ -1209,16 +1212,24 @@ fn glassy_layer(in: VsOut, base: vec3<f32>, shaded: vec3<f32>) -> vec3<f32> {
     let k = 1.1 * mix(abs(sin(theta)), abs(cos(theta)), star.g);
     let t = saturate((star.b * (k - star.r) - 0.01) * 25.0);
     let cover = t * t * (3.0 - 2.0 * t);
-    // 星点色是汇编里的 `cb6[49]` = 材质自己的 `BlueChannel`(lua 那三个 Channel 只覆盖
-    // Red/Green 两个),导出器按材质导。**不是隐藏款那四个 `StickRandomColor`** ——
-    // 那四个这条排列消费不到,见 glassy.rs。
+    // **星点色是一条四段渐变,按每颗粒子自己的 `k` 取** —— 和既有 `stick_layer` 同一条
+    // 公式、同一族(`StarStickTex`),色标就是 `StickRandomColor01..04`。所以粒子**一边
+    // 涨缩一边换色**:`k` 既是覆盖率的阈值,也是取色的位置。
     //
+    // 实机验证:鸭吉吉截图里量到的方块 黄 (255,252,51) / 蓝 (116,148,240) / 紫 (201,155,255),
+    // 对应 `ks` = 1.00 / 0.67 / **0.50** —— 那个紫落在品红与蓝**之间的过渡段**上,
+    // 四选一取不出这个颜色,只有渐变取得出。
+    let ks = saturate(k);
+    var star_color = mix(material.glassy_stick0.rgb, material.glassy_stick1.rgb, min(ks * 3.0, 1.0));
+    star_color = mix(star_color, material.glassy_stick2.rgb, saturate(ks * 3.0 - 1.0));
+    star_color = mix(star_color, material.glassy_stick3.rgb, max(ks * 3.0 - 2.0, 0.0));
+
     // **`cover` 在原式里乘了两次**:目标色是 `Stick_Intensity × cover × 星色`,混合系数
     // 又是 `saturate(cover + GlassyMainColorOpacity)`(汇编 306~309 行)。少乘一次的话
     // 星点会从玻璃色直接跳到纯白,而不是像实机那样淡淡地浮出来。
     glass = mix(
         glass,
-        GLASSY_STICK_INTENSITY * cover * material.glassy_star.rgb,
+        GLASSY_STICK_INTENSITY * cover * star_color,
         saturate(cover + GLASSY_STICK_BIAS),
     );
 

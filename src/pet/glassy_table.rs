@@ -427,7 +427,7 @@ pub static HIDDEN: [HiddenGlass; 4] = [
         main_tex: "T_PetGlassyNoiseS2_003",
         star_tex: "Tex_PetGlassyStarS2_002",
         stick_colors: [
-            [1.0, 1.0, 1.0, 1.0],
+            [0.9462, 0.0636, 0.0214, 1.0],
             [0.3, 0.2, 0.2, 1.0],
             [0.24, 0.27, 0.3, 1.0],
             [0.5, 0.6, 0.8, 1.0],
@@ -453,7 +453,7 @@ pub static HIDDEN: [HiddenGlass; 4] = [
         main_tex: "T_PetGlassyNoiseS3_001",
         star_tex: "T_PetGlassyStarS3_001",
         stick_colors: [
-            [1.0, 1.0, 1.0, 1.0],
+            [0.9462, 0.0636, 0.0214, 1.0],
             [0.67, 1.0, 0.49, 1.0],
             [1.0, 0.45, 0.91, 1.0],
             [0.55, 1.0, 0.19, 1.0],
@@ -479,7 +479,7 @@ pub static HIDDEN: [HiddenGlass; 4] = [
         main_tex: "T_PetGlassyNoiseHB_003",
         star_tex: "Tex_PetGlassyStar_005",
         stick_colors: [
-            [1.0, 1.0, 1.0, 1.0],
+            [0.9462, 0.0636, 0.0214, 1.0],
             [1.0, 1.0, 1.0, 1.0],
             [0.5, 0.5, 0.5, 1.0],
             [0.01, 0.01, 0.01, 1.0],

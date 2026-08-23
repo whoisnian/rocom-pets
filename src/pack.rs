@@ -198,9 +198,6 @@ struct RawMaterial {
     /// 炫彩的**区域门**。见 `Material::glassy_id_mask`。
     #[serde(default)]
     glassy_id_tex: Option<String>,
-    /// 炫彩星点的颜色(材质的 `BlueChannel`)。见 `Material::glassy_star_color`。
-    #[serde(default)]
-    glassy_star_color: Option<[f32; 3]>,
     #[serde(default)]
     flicker: Option<[f32; 2]>,
     #[serde(default)]
@@ -501,13 +498,6 @@ pub struct Material {
     /// 白金独角兽鬃毛/尾/腿毛 0.5、**身体 0**。不接这道门,整只连喙带脚都会被刷上玻璃色。
     /// 只有 `glassy_target` 的槽导得到;旧包没有这个字段 ⇒ `None` ⇒ 整片都刷(老行为)。
     pub glassy_id_mask: Option<PathBuf>,
-    /// **炫彩星点的颜色**:汇编里星点色只有一个槽(`cb6[49]`),喂它的是材质自己的
-    /// `BlueChannel` —— lua 只覆盖 Red/Green 两个 Channel,Blue 保持材质原值。
-    /// 实测常见值是纯白,所以旧包缺这个字段时就退回白。
-    ///
-    /// **不是隐藏款的 `StickRandomColor01..04`**:那四个配置里有、这条排列消费不到 ——
-    /// 暗夜拾光第一个是品红,而实机翅膀上的星点是白的。
-    pub glassy_star_color: [f32; 3],
     /// **玻璃内部那颗星**:四角星场贴图(`StarTex` = `T_EMeng003`),沿折射光线在物体空间
     /// march、三向投影采样、按时间卷动。读 shader 汇编得来,见 docs/design.md §1。
     pub interior: Option<PathBuf>,
@@ -776,7 +766,6 @@ fn material_table(root: &Path, raw: HashMap<String, RawMaterial>) -> HashMap<Str
                     mask_id: mat.mask_id_tex.map(|rel| root.join(rel)),
                     mask_id_range: mat.mask_id_range.unwrap_or([0.0, 1.0]),
                     glassy_id_mask: mat.glassy_id_tex.map(|rel| root.join(rel)),
-                    glassy_star_color: mat.glassy_star_color.unwrap_or([1.0; 3]),
                     interior: mat.interior_tex.map(|rel| root.join(rel)),
                     interior_color: mat.interior_color.unwrap_or([1.0; 3]),
                     refraction: mat.refraction,

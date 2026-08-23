@@ -118,8 +118,6 @@ pub struct Material {
     pub mask_id_range: [f32; 2],
     /// 炫彩的**区域门**(同一张 `_M`,读 alpha)。见 `pack::Material::glassy_id_mask`。
     pub glassy_id_mask: Option<Image>,
-    /// 炫彩星点的颜色(材质的 `BlueChannel`)。见 `pack::Material::glassy_star_color`。
-    pub glassy_star_color: [f32; 3],
     /// 玻璃内部那颗星:四角星场贴图 + 着色 + 折射率 + march 深度。
     pub interior: Option<Image>,
     pub interior_color: [f32; 3],
@@ -608,7 +606,6 @@ impl Model {
                         .glassy_id_mask
                         .as_deref()
                         .and_then(|p| load_texture(p, true)),
-                    glassy_star_color: spec.glassy_star_color,
                     interior: spec.interior.as_deref().and_then(|p| load_texture(p, true)),
                     interior_color: spec.interior_color,
                     refraction: spec.refraction,

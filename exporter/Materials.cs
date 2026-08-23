@@ -198,16 +198,6 @@ public record MaterialInfo(
     /// 只给炫彩会刷到的槽导(判据与 `pack.rs` 的 `is_glassy_target` 必须一致)。
     public string? GlassyIdTexture => IsGlassyTarget ? FirstTexture("MaskTex", "Mask") : null;
 
-    /// **炫彩星点的颜色**:汇编里星点色只有一个槽 `cb6[49]`,它的 preshader 就是
-    /// 材质自己的 `BlueChannel` —— lua 那三个 Channel 只覆盖 Red/Green 两个,Blue 保持
-    /// 材质的值。实测鸭吉吉与幽星光的实例都把它压成纯白(根默认是 (1, 0.56, 0.04))。
-    ///
-    /// **不是 `StickRandomColor01..04`**:那四个隐藏款配置里给了,但这条排列消费不到 ——
-    /// 暗夜拾光的第一个是品红,而实机那对翅膀上的星点是白的。
-    public float[]? GlassyStarColor => !IsGlassyTarget ? null
-        : Vectors.TryGetValue("BlueChannel", out var c) ? [c[0], c[1], c[2]]
-        : RootDefaults.Vectors.TryGetValue("BlueChannel", out var d) ? [d[0], d[1], d[2]]
-        : null;
 
     /// 炫彩刷在哪些材质槽上。**判据照抄客户端** `PetMutationUtils.SetGlassyDiffMutation`:
     /// 只取后缀 `by` / `by0..by9` 的材质,再加一道父链闸(`M_P_Object` 一族才带
