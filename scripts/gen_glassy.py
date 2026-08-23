@@ -155,8 +155,16 @@ def build(parsed: Path) -> str:
     for k in sorted(hidden, key=lambda x: int(x)):
         h = hidden[k]
         tex = {t["tex_param_name"]: asset_name(t["tex_param_path"]) for t in h.get("tex_param", [])}
-        col = {c["color_param_name"]: c["color_param_value"] for c in h.get("color_param", [])}
-        num = {n["num_param_name"]: n.get("num_param_value") for n in h.get("num_param", [])}
+        # **列在表里 = 覆盖了;而值那一栏缺席 = 值是 0。** RocoBinData 序列化时把零值字段
+        # 整个丢掉,所以「有 `num_param_name` 却没有 `num_param_value`」不是「没设」,
+        # 是「设成了 0」。原来这里读成 None 再退回根默认,于是铅字幻梦(把
+        # `MainTexFlowSpeedY` 与 `NormalEffectAmount` 都设成 0)在我们这儿照样在流动,
+        # 而实机是完全静止的。狂欢怪谈两个流速也都是 0,同样受影响。
+        # 参数**根本没列**才是「没设」,那时才落到根默认。
+        col = {c["color_param_name"]: c.get("color_param_value", [0.0, 0.0, 0.0, 0.0])
+               for c in h.get("color_param", [])}
+        num = {n["num_param_name"]: n.get("num_param_value", 0.0)
+               for n in h.get("num_param", [])}
         # 粒子颜色 1..4:没给的沿用「不着色」的白,与材质根默认一致。
         sticks = [col.get(f"StickRandomColor{i:02d}", [1.0, 1.0, 1.0, 1.0]) for i in range(1, 5)]
         w("    HiddenGlass {")
