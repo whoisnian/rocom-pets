@@ -9,6 +9,6 @@ pub mod model;
 pub mod target;
 
 pub use anim::Player;
-pub use glassy::Mutation;
+pub use glassy::{Glassy, Mutation};
 pub use gpu::{FrameParams, PetGpu, framing_radius, orbit_rotation, orbit_view, orthographic_view};
 pub use model::Model;

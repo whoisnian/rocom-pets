@@ -186,6 +186,47 @@ public record MaterialInfo(
         (IsYutuEar ? YutuBubbleTexture : null)
         ?? FirstTexture("FuildMask", "Mask", "MaskTex", "BaseMap", "Base Color", "MatCap", "MatCapTex");
 
+    /// **炫彩的区域门**:`MaskTex` 的 alpha 是离散 ID 台阶,`GlassySwitch=true` 那条排列
+    /// 整段玻璃层包在 `if (MaskTex.a >= MinID)` 里(反汇编 `ge r3.x, r3.w, l(0.4)` +
+    /// `else { 输出原着色 }`),`MinID` 根默认 0.4。
+    ///
+    /// 这就是「游戏里只给部位上色」的机制:鸭吉吉那张 By_M 的 alpha 身体 1.0、**喙与脚 0**,
+    /// 白金独角兽是鬃毛/尾/腿毛 0.5、**身体 0** —— 和实机截图里哪块变色一一对上。
+    /// 不接这道门,整只(连喙带脚)都会被刷上玻璃色。
+    ///
+    /// 和 `MaskIdTexture`(色带那道门)是**同一张图、两道不同的门**,各带各的阈值。
+    /// 只给炫彩会刷到的槽导(判据与 `pack.rs` 的 `is_glassy_target` 必须一致)。
+    public string? GlassyIdTexture => IsGlassyTarget ? FirstTexture("MaskTex", "Mask") : null;
+
+    /// **炫彩星点的颜色**:汇编里星点色只有一个槽 `cb6[49]`,它的 preshader 就是
+    /// 材质自己的 `BlueChannel` —— lua 那三个 Channel 只覆盖 Red/Green 两个,Blue 保持
+    /// 材质的值。实测鸭吉吉与幽星光的实例都把它压成纯白(根默认是 (1, 0.56, 0.04))。
+    ///
+    /// **不是 `StickRandomColor01..04`**:那四个隐藏款配置里给了,但这条排列消费不到 ——
+    /// 暗夜拾光的第一个是品红,而实机那对翅膀上的星点是白的。
+    public float[]? GlassyStarColor => !IsGlassyTarget ? null
+        : Vectors.TryGetValue("BlueChannel", out var c) ? [c[0], c[1], c[2]]
+        : RootDefaults.Vectors.TryGetValue("BlueChannel", out var d) ? [d[0], d[1], d[2]]
+        : null;
+
+    /// 炫彩刷在哪些材质槽上。**判据照抄客户端** `PetMutationUtils.SetGlassyDiffMutation`:
+    /// 只取后缀 `by` / `by0..by9` 的材质,再加一道父链闸(`M_P_Object` 一族才带
+    /// `GlassySwitch`)。**与 `src/pack.rs` 的 `is_glassy_target` 是同一条判据,改一处要改两处。**
+    public bool IsGlassyTarget
+    {
+        get
+        {
+            // 大小写不能较真:同一只宠物的材质名在资产文件名与对象名之间会漂
+            // (`MiaoMiao`/`Miaomiao`)。
+            var lower = Name.ToLowerInvariant();
+            var suffixOk = lower.EndsWith("_by", StringComparison.Ordinal)
+                || (lower.Length >= 4 && char.IsAsciiDigit(lower[^1])
+                    && lower.AsSpan(lower.Length - 4, 3).SequenceEqual("_by"));
+            return suffixOk
+                && ParentChain.Any(p => p.Contains("M_P_Object", StringComparison.OrdinalIgnoreCase));
+        }
+    }
+
     /// 遮罩是不是 MatCap。**这决定采样方式**:matcap 要按视空间法线采(球面反射查找表),
     /// 拿网格 UV 采会变成一块块的斑,水灵的水膜就是这么糊掉的。
     public bool MaskIsMatcap =>

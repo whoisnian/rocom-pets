@@ -116,6 +116,10 @@ pub struct Material {
     /// 色带的 ID 遮罩与取值区间(见 `pack::Material::mask_id`)。
     pub mask_id: Option<Image>,
     pub mask_id_range: [f32; 2],
+    /// 炫彩的**区域门**(同一张 `_M`,读 alpha)。见 `pack::Material::glassy_id_mask`。
+    pub glassy_id_mask: Option<Image>,
+    /// 炫彩星点的颜色(材质的 `BlueChannel`)。见 `pack::Material::glassy_star_color`。
+    pub glassy_star_color: [f32; 3],
     /// 玻璃内部那颗星:四角星场贴图 + 着色 + 折射率 + march 深度。
     pub interior: Option<Image>,
     pub interior_color: [f32; 3],
@@ -339,13 +343,13 @@ pub struct Model {
     pub glassy: Option<GlassySkin>,
     /// 这份模型套的是哪一种外观。**当缓存键用** —— `source` 只认到 (包, 形态),
     /// 同一个形态的原样版与几种炫彩版是不同的 GPU 资源,不能共用一份。
-    pub mutation: Option<super::glassy::Mutation>,
+    pub mutation: super::glassy::Mutation,
 }
 
 /// 一份炫彩外观:解析好的着色参数,加上它要用的两张**共享**贴图。
 ///
 /// 贴图不在宠物包里 —— `MainTex`(常规炫彩用 `Tex_PetGlassy_007_D`)与各粒子图是全库共用的,
-/// 由导出器的 `--glassy` 单独导一份放在包目录旁边,见 `assets::glassy_dir`。
+/// 由导出器写到 `<out>/glassy`,再由 `build.rs` 烘进二进制,见 `glassy` 模块里的 `embed`。
 #[derive(Clone)]
 pub struct GlassySkin {
     pub render: GlassyRender,
@@ -600,6 +604,11 @@ impl Model {
                     flow_power: spec.flow_power,
                     mask_id: spec.mask_id.as_deref().and_then(|p| load_texture(p, true)),
                     mask_id_range: spec.mask_id_range,
+                    glassy_id_mask: spec
+                        .glassy_id_mask
+                        .as_deref()
+                        .and_then(|p| load_texture(p, true)),
+                    glassy_star_color: spec.glassy_star_color,
                     interior: spec.interior.as_deref().and_then(|p| load_texture(p, true)),
                     interior_color: spec.interior_color,
                     refraction: spec.refraction,
@@ -794,7 +803,7 @@ impl Model {
             motion_bounds,
             face_cards,
             glassy: None,
-            mutation: None,
+            mutation: super::glassy::Mutation::default(),
         })
     }
 
@@ -871,14 +880,28 @@ fn decode_texture(bytes: &[u8], what: &str) -> Option<Image> {
 }
 
 impl Model {
-    /// 给这份模型套上一个炫彩外观。两张共享贴图取自**烘进二进制**的那份
+    /// 记下这份模型的外观,并把炫彩那一层套上去。两张共享贴图取自**烘进二进制**的那份
     /// (见 `glassy` 模块里的 `embed`);任一张缺了就整个不套 —— 只套一半会得到一只
     /// 花纹全白或者没有闪片的宠物,比原样更难看出哪里不对。
     ///
-    /// 异色不走这里:那是换整套材质,包里就已经换好了。
-    pub fn apply_glassy(&mut self, mutation: super::glassy::Mutation) {
-        self.mutation = Some(mutation);
-        self.glassy = mutation.render().and_then(|render| {
+    /// **异色这一半在这里只是记下来**:它是换整套材质,而材质表是 `Model::load` 的入参,
+    /// 调用方在加载时就已经挑好了哪一套(见 `Form::materials_for`)。
+    pub fn apply_mutation(&mut self, mutation: super::glassy::Mutation) {
+        self.mutation = mutation;
+        // 旧包没导区域门那张遮罩(`glassy_id_tex`),玻璃层只能整片刷 —— 连喙带脚一起变色,
+        // 和实机差很远。说一声比让人对着一只怪模怪样的宠物猜强。
+        if mutation.glassy.is_some()
+            && self
+                .materials
+                .iter()
+                .any(|m| m.glassy_target && m.glassy_id_mask.is_none())
+        {
+            log::info!(
+                "{:?}:这个包没带炫彩的区域门贴图,玻璃层会整片刷(实机只刷部分部位)—— 重导一次包就好",
+                self.source.file_name().unwrap_or_default()
+            );
+        }
+        self.glassy = mutation.glassy.and_then(|g| g.render()).and_then(|render| {
             let load = |name: &str| {
                 super::glassy::embedded(name).and_then(|bytes| decode_texture(bytes, name))
             };
@@ -1345,7 +1368,7 @@ impl Model {
             // 也没有网格脸
             face_cards: Vec::new(),
             glassy: None,
-            mutation: None,
+            mutation: super::glassy::Mutation::default(),
         }
     }
 }

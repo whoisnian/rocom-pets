@@ -179,7 +179,7 @@ impl SettingsApp {
                 });
                 ui.end_row();
 
-                appearance_rows(ui, slot,&mut options, form, self.glassy_ready);
+                appearance_rows(ui, slot, &mut options, form, self.glassy_ready);
 
                 label(ui, "叫声:");
                 ui.horizontal(|ui| {
@@ -321,13 +321,11 @@ impl SettingsApp {
     }
 }
 
-/// 外观那两行:「外观」挑大类,选了炫彩再挑具体是哪一种。
+/// 外观那几行:异色一个开关,炫彩一排单选;选了常规炫彩再多一行挑配色与粒子。
 ///
-/// **游戏里这两件事是两个位标志**(`MDT_SHINING` 异色 / `MDT_GLASS` 炫彩),理论上能同时带;
-/// 但异色是换整套材质、炫彩是往材质上刷一层,叠起来等于「给异色那套刷炫彩」——
-/// 我们的包里异色那套材质是导好的,刷炫彩要的 `by*` 判据一样成立,所以**技术上叠得起来**。
-/// 这里仍然做成单选:桌宠上一次只看得见一种外观,给三档单选比两个勾选框好懂,
-/// 而且和游戏 UI 里「选一个炫彩外观」的呈现一致。
+/// **异色与炫彩是两件独立的事** —— 游戏里是两个位标志(`MDT_SHINING` / `MDT_GLASS`),
+/// 既有异色炫彩,也有原色炫彩。所以这里是「一个开关 + 一排单选」,不是三选一。
+/// 底下两条路也是分开的:异色换整套材质(挑另一张材质表),炫彩往挑中的那套上刷一层。
 fn appearance_rows(
     ui: &mut egui::Ui,
     slot: usize,
@@ -336,149 +334,124 @@ fn appearance_rows(
     glassy_ready: bool,
 ) {
     use crate::pet::glassy;
-    use crate::pet::Mutation;
+    use crate::pet::Glassy;
 
-    label(ui, "外观:");
-    ui.horizontal(|ui| {
-        let is_glassy = matches!(
-            options.mutation,
-            Some(Mutation::Common { .. } | Mutation::Hidden { .. })
-        );
-        if ui.selectable_label(options.mutation.is_none(), "原样").clicked() {
-            options.mutation = None;
-        }
-        // 异色要包里真有那套材质。**多数宠物没有** —— 游戏里也是,得美术另做一套。
-        ui.add_enabled_ui(form.has_shiny(), |ui| {
-            if ui
-                .selectable_label(options.mutation == Some(Mutation::Shiny), "异色")
-                .clicked()
-            {
-                options.mutation = Some(Mutation::Shiny);
-            }
+    // 异色要包里真有那套材质,**多数宠物没有**(游戏里也是,得美术另做一套)。
+    // 没有就整行不出 —— 摆一个永远点不动的开关只是占地方。
+    if form.has_shiny() {
+        label(ui, "异色:");
+        ui.horizontal(|ui| {
+            ui.checkbox(&mut options.mutation.shiny, "换成异色");
+            theme::hint(ui, "美术另做的一套材质");
         });
-        ui.add_enabled_ui(glassy_ready, |ui| {
-            if ui.selectable_label(is_glassy, "炫彩").clicked() && !is_glassy {
-                // 头一次点进来给个确定的起点(1 号配色 · 1 号粒子),而不是随机 ——
-                // 随机的话「我刚才选的是哪个」就说不清了。
-                options.mutation = Some(Mutation::Common {
-                    color: 1,
-                    particle: 1,
-                });
-            }
-        });
-        if !form.has_shiny() {
-            theme::hint(ui, "这只没有异色美术");
-        } else if !glassy_ready {
-            theme::hint(ui, "缺炫彩素材:跑一次 rocom-pets-export --glassy");
-        }
-    });
-    ui.end_row();
-
-    let Some(mutation) = options.mutation else {
-        return;
-    };
-    if mutation == Mutation::Shiny {
-        return;
+        ui.end_row();
     }
 
     label(ui, "炫彩:");
     ui.horizontal(|ui| {
-        // 三档:常规(39 组配色 × 4 种粒子)、常驻隐藏款、赛季款。
-        // 分档就是游戏自己的分法(`HIDDEN_GLASS_CONF.type`:1 常驻 / 2 赛季)。
-        let mut tier = match mutation {
-            Mutation::Hidden { id } => glassy::hidden_by_id(id).map_or(0, |h| if h.season { 2 } else { 1 }),
-            _ => 0,
-        };
-        let before = tier;
-        egui::ComboBox::from_id_salt(("glass-tier", slot))
-            .width(120.0)
-            .selected_text(["常规炫彩", "隐藏炫彩", "赛季炫彩"][tier])
-            .show_ui(ui, |ui| {
-                ui.selectable_value(&mut tier, 0, "常规炫彩");
-                ui.selectable_value(&mut tier, 1, "隐藏炫彩");
-                ui.selectable_value(&mut tier, 2, "赛季炫彩");
-            });
-        if tier != before {
-            options.mutation = Some(match tier {
-                0 => Mutation::Common {
+        // 六档一排铺开,不做下拉:总共就这些,挑的时候要横着比,而下拉一滚就比不成了。
+        // 顺序照游戏自己的分法(`HIDDEN_GLASS_CONF.type`):常驻隐藏款、常规、三个赛季款。
+        if ui
+            .selectable_label(options.mutation.glassy.is_none(), "无炫彩")
+            .clicked()
+        {
+            options.mutation.glassy = None;
+        }
+        ui.add_enabled_ui(glassy_ready, |ui| {
+            for h in glassy::hidden().iter().filter(|h| !h.season) {
+                hidden_button(ui, &mut options.mutation.glassy, h);
+            }
+            let is_common = matches!(options.mutation.glassy, Some(Glassy::Common { .. }));
+            if ui.selectable_label(is_common, "常规炫彩").clicked() && !is_common {
+                // 头一次点进来给个确定的起点(1 号配色 · 1 号粒子),而不是随机 ——
+                // 随机的话「我刚才选的是哪个」就说不清了。
+                options.mutation.glassy = Some(Glassy::Common {
                     color: 1,
                     particle: 1,
-                },
-                want => glassy::hidden()
-                    .iter()
-                    .find(|h| h.season == (want == 2))
-                    .map_or(mutation, |h| Mutation::Hidden { id: h.id }),
-            });
-        }
-        // 隐藏/赛季款各自是一整套配好的外观(贴图 + 两个颜色 + 一串标量),只挑款名。
-        if tier > 0
-            && let Mutation::Hidden { id } = options.mutation.unwrap_or(mutation)
-        {
-            let mut picked = id;
-            let season = tier == 2;
-            egui::ComboBox::from_id_salt(("glass-hidden", slot))
-                .width(140.0)
-                .selected_text(glassy::hidden_by_id(id).map_or("?", |h| h.name))
-                .show_ui(ui, |ui| {
-                    for h in glassy::hidden().iter().filter(|h| h.season == season) {
-                        ui.selectable_value(&mut picked, h.id, h.name);
-                    }
                 });
-            if picked != id {
-                options.mutation = Some(Mutation::Hidden { id: picked });
             }
-            if season {
-                // 窗口宽度固定 900,这一行右边只剩一小截 —— 提示要短到不被裁掉。
-                theme::hint(ui, "专属贴图只给游戏指定的那几只");
+            for h in glassy::hidden().iter().filter(|h| h.season) {
+                hidden_button(ui, &mut options.mutation.glassy, h);
             }
+        });
+        // 窗口宽度固定 900,六个按钮排完右边只剩一小截 —— 只有这一句短的放得下,
+        // 赛季款那句解释挂在按钮的 tooltip 上(见 `hidden_button`),不跟它抢位置。
+        if !glassy_ready {
+            theme::hint(ui, "这个二进制没烘炫彩素材");
         }
     });
     ui.end_row();
 
-    // 常规炫彩才要自己挑配色与粒子。
-    let Some(Mutation::Common { color, particle }) = options.mutation else {
+    // 常规炫彩才要自己挑配色与粒子;隐藏/赛季款是配好的一整套,没得挑。
+    let Some(Glassy::Common { color, particle }) = options.mutation.glassy else {
         return;
     };
     label(ui, "配色:");
     ui.horizontal(|ui| {
-        let mut picked_color = color;
-        egui::ComboBox::from_id_salt(("glass-color", slot))
-            .width(210.0)
-            // 39 条,默认 200px 只够七八条 —— 和形态/性格那两个下拉一样让它一次铺开,
-            // 挑配色本来就要横着比,滚起来比不成。
-            .height(f32::INFINITY)
-            .selected_text(glassy::color(color).map_or("?".into(), swatch_text))
-            .show_ui(ui, |ui| {
-                for c in glassy::colors() {
-                    ui.horizontal(|ui| {
-                        swatches(ui, c);
-                        if ui.selectable_label(picked_color == c.id, c.name).clicked() {
-                            picked_color = c.id;
-                        }
-                    });
-                }
-            });
-        let mut picked_particle = particle;
-        egui::ComboBox::from_id_salt(("glass-particle", slot))
-            .width(120.0)
-            .selected_text(glassy::particle(particle).map_or("?", |p| p.name))
-            .show_ui(ui, |ui| {
-                for p in glassy::particles() {
-                    ui.selectable_value(&mut picked_particle, p.id, p.name);
-                }
-            });
-        if picked_color != color || picked_particle != particle {
-            options.mutation = Some(Mutation::Common {
-                color: picked_color,
-                particle: picked_particle,
-            });
-        }
-        // 两个色块就是这一组的两个颜色,与游戏图鉴里的显示同一套值(`ui_color_1/2`)。
-        if let Some(c) = glassy::color(picked_color) {
-            swatches(ui, c);
-        }
+        ui.add_enabled_ui(glassy_ready, |ui| {
+            let mut picked_color = color;
+            egui::ComboBox::from_id_salt(("glass-color", slot))
+                .width(210.0)
+                // 39 条,默认 200px 只够七八条 —— 和形态/性格那两个下拉一样让它一次铺开,
+                // 挑配色本来就要横着比,滚起来比不成。
+                .height(f32::INFINITY)
+                .selected_text(glassy::color(color).map_or("?".into(), swatch_text))
+                .show_ui(ui, |ui| {
+                    for c in glassy::colors() {
+                        ui.horizontal(|ui| {
+                            swatches(ui, c);
+                            if ui.selectable_label(picked_color == c.id, c.name).clicked() {
+                                picked_color = c.id;
+                            }
+                        });
+                    }
+                });
+            let mut picked_particle = particle;
+            egui::ComboBox::from_id_salt(("glass-particle", slot))
+                .width(120.0)
+                .selected_text(glassy::particle(particle).map_or("?", |p| p.name))
+                .show_ui(ui, |ui| {
+                    for p in glassy::particles() {
+                        ui.selectable_value(&mut picked_particle, p.id, p.name);
+                    }
+                });
+            if picked_color != color || picked_particle != particle {
+                options.mutation.glassy = Some(Glassy::Common {
+                    color: picked_color,
+                    particle: picked_particle,
+                });
+            }
+            // 两个色块就是这一组的两个颜色,与游戏图鉴里的显示同一套值(`ui_color_1/2`)。
+            if let Some(c) = glassy::color(picked_color) {
+                swatches(ui, c);
+            }
+        });
     });
     ui.end_row();
+}
+
+/// 隐藏款那几个按钮。常驻那一款(黑白)后面缀个「隐藏」—— 光写「黑白」会被当成一组配色名
+/// (常规炫彩那 39 组就叫「亮X暗 - 浅蓝蓝」这种),缀上才看得出它是另一档。
+/// 赛季款自带专名(暗夜拾光/狂欢怪谈/铅字幻梦),不用缀。
+fn hidden_button(
+    ui: &mut egui::Ui,
+    glassy: &mut Option<crate::pet::Glassy>,
+    h: &crate::pet::glassy::HiddenGlass,
+) {
+    let want = crate::pet::Glassy::Hidden { id: h.id };
+    let text = if h.season {
+        h.name.to_string()
+    } else {
+        format!("{}隐藏", h.name)
+    };
+    let mut button = ui.selectable_label(*glassy == Some(want), text);
+    if h.season {
+        // 赛季款只有 `season_pet` 里那几只有专属贴图,别的宠物走与常驻款相同的通用覆盖。
+        button = button.on_hover_text("赛季款:专属贴图只给游戏指定的那几只,别的宠物走通用外观");
+    }
+    if button.clicked() {
+        *glassy = Some(want);
+    }
 }
 
 /// 下拉框里选中那一行的文字。色块画不进 `selected_text`(它只收字符串),
@@ -566,10 +539,14 @@ mod tests {
             voice_value: Some(-37.0),
             remember: true,
             home_x: Some(0.62),
-            mutation: Some(crate::pet::Mutation::Common {
-                color: 33,
-                particle: 3,
-            }),
+            // 两个轴一起带:异色炫彩要能原样存回来,不能在存档里退成其中一个
+            mutation: crate::pet::Mutation {
+                shiny: true,
+                glassy: Some(crate::pet::Glassy::Common {
+                    color: 33,
+                    particle: 3,
+                }),
+            },
         };
         options.write_into(&mut slot);
         assert_eq!(PetOptions::from_slot(&slot), options);

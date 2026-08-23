@@ -139,36 +139,40 @@ struct MaterialUniform {
     /// `pack::MaterialSpec::outline_width`。
     outline: [f32; 4],
     /// 炫彩。字段顺序与 pet.wgsl 的 `MaterialParams` 尾部逐个对齐;含义见 `pet::glassy`。
-    /// `glassy_red.w` 是模式:0 不画 / 1 常规 / 2 隐藏。
+    /// `glassy_red.w`:0 = 这个槽不刷炫彩,1 = 刷。
     glassy_red: [f32; 4],
     glassy_green: [f32; 4],
     glassy_p0: [f32; 4],
     glassy_p1: [f32; 4],
-    glassy_stick0: [f32; 4],
-    glassy_stick1: [f32; 4],
-    glassy_stick2: [f32; 4],
-    glassy_stick3: [f32; 4],
+    /// 星点色 = 材质的 `BlueChannel`(汇编 `cb6[49]`)。
+    glassy_star: [f32; 4],
 }
 
-/// 把选中的炫彩摊成 uniform 的那 8 个 vec4。`None`(或这个槽不刷炫彩)时全零 ——
+/// 把选中的炫彩摊成 uniform 的那 5 个 vec4。`None`(或这个槽不刷炫彩)时全零 ——
 /// `glassy_red.w = 0` 就是 shader 里的「不画」。
-fn glassy_uniform(skin: Option<&GlassySkin>, target: bool) -> [[f32; 4]; 8] {
+fn glassy_uniform(
+    skin: Option<&GlassySkin>,
+    target: bool,
+    star_color: [f32; 3],
+) -> [[f32; 4]; 5] {
     let Some(skin) = skin.filter(|_| target) else {
-        return [[0.0; 4]; 8];
+        return [[0.0; 4]; 5];
     };
     let r = &skin.render;
     let p = &r.params;
-    let mode = if r.use_stick_colors { 2.0 } else { 1.0 };
     [
-        [r.red_channel[0], r.red_channel[1], r.red_channel[2], mode],
+        [r.red_channel[0], r.red_channel[1], r.red_channel[2], 1.0],
+        // .w 是玻璃色的总增益 `cb6[61].x`,**不是 `StarIntensity`** —— 后者在这条排列里
+        // 压根不存在,接上去会把整只推到过曝白。见 `glassy::FLOW_COLOR_INTENSITY`。
         [
             r.green_channel[0],
             r.green_channel[1],
             r.green_channel[2],
-            p.star_intensity,
+            r.glass_gain(),
         ],
+        // .x 是 refract 的 eta(= `1 / GlobalRefraction`),原 preshader 就带这个倒数。
         [
-            p.global_refraction,
+            r.refraction_eta(),
             p.global_depth,
             p.main_tex_tiling,
             p.normal_effect_amount,
@@ -179,10 +183,8 @@ fn glassy_uniform(skin: Option<&GlassySkin>, target: bool) -> [[f32; 4]; 8] {
             r.star_stick_tiling,
             p.base_color_detail,
         ],
-        r.stick_colors[0],
-        r.stick_colors[1],
-        r.stick_colors[2],
-        r.stick_colors[3],
+        // 星点色来自**材质**(`BlueChannel`),不来自选中的那一款炫彩。
+        [star_color[0], star_color[1], star_color[2], 0.0],
     ]
 }
 
@@ -456,6 +458,17 @@ impl PetGpu {
                     },
                     count: None,
                 },
+                // 炫彩的**区域门**(那张 `_M` 的 alpha)。没有就绑 1×1 白图 = 整片都刷。
+                wgpu::BindGroupLayoutEntry {
+                    binding: 13,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
             ],
         });
         // 半透明通道读取第一遍不透明几何留下的场景深度。原
@@ -621,6 +634,18 @@ impl PetGpu {
                 &material.name,
                 glassy_skin.map_or(&white, |s| &s.star_tex),
             );
+            // 区域门:同一张 `_M`,读的是 alpha。**白图 = 门恒开**,也就是旧包(没导这张)
+            // 的老行为 —— 整片都刷。
+            let glassy_id_view = upload_texture(
+                device,
+                queue,
+                &material.name,
+                material
+                    .glassy_id_mask
+                    .as_ref()
+                    .filter(|_| glassy_skin.is_some())
+                    .unwrap_or(&white),
+            );
             let has = |v: bool| if v { 1.0 } else { 0.0 };
             let rgb = |c: [f32; 3]| [c[0], c[1], c[2], 0.0];
             let mask_id = |m: &super::model::Material| {
@@ -752,7 +777,11 @@ impl PetGpu {
             // 「包围盒对角线 × 0.004」更接近实机(魔力猫 1.79 厘米 vs 0.39 厘米)。
             let outline_width = material.outline_width.unwrap_or(DEFAULT_OUTLINE_WIDTH);
             // 炫彩只刷在 `by*` 那几个槽上 —— 判据与游戏一致,见 `pack::Material::glassy_target`。
-            let glassy = glassy_uniform(model.glassy.as_ref(), material.glassy_target);
+            let glassy = glassy_uniform(
+                model.glassy.as_ref(),
+                material.glassy_target,
+                material.glassy_star_color,
+            );
             let uniform = match &material.effect {
                 Some(effect) => MaterialUniform {
                     tint: effect.tint,
@@ -831,10 +860,7 @@ impl PetGpu {
                     glassy_green: glassy[1],
                     glassy_p0: glassy[2],
                     glassy_p1: glassy[3],
-                    glassy_stick0: glassy[4],
-                    glassy_stick1: glassy[5],
-                    glassy_stick2: glassy[6],
-                    glassy_stick3: glassy[7],
+                    glassy_star: glassy[4],
                 },
                 // 有基色的材质:params.x/.z 说明 alpha 怎么解释
                 // (x=1 镂空遮罩、z=1 不透明度,都为 0 则是线条遮罩)
@@ -943,10 +969,7 @@ impl PetGpu {
                     glassy_green: glassy[1],
                     glassy_p0: glassy[2],
                     glassy_p1: glassy[3],
-                    glassy_stick0: glassy[4],
-                    glassy_stick1: glassy[5],
-                    glassy_stick2: glassy[6],
-                    glassy_stick3: glassy[7],
+                    glassy_star: glassy[4],
                 },
             };
             let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -1009,6 +1032,10 @@ impl PetGpu {
                     wgpu::BindGroupEntry {
                         binding: 12,
                         resource: wgpu::BindingResource::TextureView(&glassy_star_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 13,
+                        resource: wgpu::BindingResource::TextureView(&glassy_id_view),
                     },
                 ],
             }));

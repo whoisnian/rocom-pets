@@ -9,9 +9,12 @@
 //! | 1 | `MDT_SHINING` | **异色** | `PetMutationUtils.SetColorDiffMutation` |
 //! | 8 | `MDT_GLASS` | **炫彩** | `PetMutationUtils.SetGlassyDiffMutation` |
 //!
-//! **异色不在这个模块里** —— 它不是着色,是**整套材质替换**:美术为那只宠物另做了一份材质
-//! (资产目录下的 `Yise/Mat/MI_…_101_*`),客户端把网格每个槽位的材质换成那一份。所以异色走
-//! 的是导出器 + `Model` 那条既有路,包里多一套材质而已,见 `PackForm::shiny`。
+//! **这两位是独立的**,不是三选一:游戏里既有异色炫彩,也有原色炫彩。所以 `Mutation`
+//! 是一个带两个字段的结构体,而不是枚举。
+//!
+//! **异色的渲染不在这个模块里** —— 它不是着色,是**整套材质替换**:美术为那只宠物另做了
+//! 一份材质(资产目录下的 `Yise/Mat/MI_…_101_*`),客户端把网格每个槽位的材质换成那一份。
+//! 所以异色走的是导出器 + `Model` 那条既有路,包里多一套材质而已,见 `Form::has_shiny`。
 //!
 //! 炫彩才是这里的事:它**不换材质**,而是在原材质上打开一个动态开关 `GlassySwitch`,
 //! 再覆盖几个参数。开关一开,shader 走另一条分支 —— 那条分支就是下面复刻的东西。
@@ -115,8 +118,17 @@ pub struct GlassyParticle {
 
 /// 隐藏款要覆盖的标量。字段顺序与 `scripts/gen_glassy.py` 的 `SCALARS` 一致。
 pub struct GlassyParams {
+    /// **这条在实机上是空转的**,留着只为忠实转录配置表。
+    ///
+    /// lua 的 `SetScalarParameterValue("StarIntensity", shine_strength)` 设的参数,
+    /// 在 `GlassySwitch=true` 那条编译好的排列里**根本不存在** —— 探针列出的
+    /// uniform 标量里没有 `StarIntensity`(鸭吉吉与幽星光两个材质各查过一遍),
+    /// 玻璃层用的是 [`FLOW_COLOR_INTENSITY`],星点层用的是 [`STICK_INTENSITY`]。
+    /// 全表 39 组配色都写 10、4 个隐藏款一个都没覆盖,所以这条也确实没人在乎。
     pub star_intensity: f32,
-    /// `refract()` 的 eta。根默认 2.0;铅字幻梦压到 0.0001 ≈ 不折射。
+    /// `GlobalRefraction`。**注意不是 eta 本身** —— 汇编里 `cb6[58].z` 的 preshader 是
+    /// `1 / GlobalRefraction`(`const 1.0, param, Div`),见 [`GlassyRender::refraction_eta`]。
+    /// 根默认 2.0 ⇒ eta 0.5;铅字幻梦 0.0001 ⇒ eta 10000 ⇒ 判别式恒负 ⇒ 整支折射被置零。
     pub global_refraction: f32,
     /// 沿折射线推进多远(厘米,游戏单位)。根默认 30,隐藏款一律 100。
     pub global_depth: f32,
@@ -140,7 +152,11 @@ pub struct HiddenGlass {
     /// 覆盖 `MainTex`(共享贴图名)。常规炫彩不覆盖它,用材质自己的 `Tex_PetGlassy_007_D`。
     pub main_tex: &'static str,
     pub star_tex: &'static str,
-    /// `StickRandomColor01..04`。**只有隐藏款覆盖这四个**,常规炫彩一个都不动。
+    /// `StickRandomColor01..04`。**只有隐藏款覆盖这四个**,常规炫彩一个都不动 ——
+    /// 但 `GlassySwitch=true` 那条排列**一个都消费不到**:汇编里星点色只有 `cb6[49]` 一个槽,
+    /// 喂它的是材质自己的 `BlueChannel`(见 `pack::Material::glassy_star_color`)。
+    /// 反证也有:暗夜拾光这四个里第一个是品红,而实机那对翅膀上的星点是白的。
+    /// 留在表里是忠实转录配置,渲染不读。
     pub stick_colors: [[f32; 4]; 4],
     pub params: GlassyParams,
     /// 有专属贴图的宠物 `petbase_id`。
@@ -149,6 +165,27 @@ pub struct HiddenGlass {
 
 /// 材质自带的 `MainTex` —— 全库共享的红/绿双通道斑点图。常规炫彩就靠它出花纹。
 pub const DEFAULT_MAIN_TEX: &str = "Tex_PetGlassy_007_D";
+
+/// **区域门的阈值**(根材质的 `MinID`)。玻璃层整段包在 `if (MaskTex.a >= 0.4)` 里,
+/// 门外原样输出原着色 —— 汇编 `ge r3.x, r3.w, l(4.0e-01)` / `if_nz` / `else mov r0.xyz, r7.xyzx`。
+///
+/// 这就是「游戏只给部位上色」的机制,见 `pack::Material::glassy_id_mask`。
+pub const MIN_ID: f32 = 0.4;
+
+/// 玻璃色的总增益里那个系数(根材质的 `FlowColorIntensity`)。
+///
+/// 汇编第 ④ 步乘的是 `cb6[61].x`,它的 preshader 是
+/// **`(BaseColorDetail + 1) × FlowColorIntensity`**(`03<BaseColorDetail> 02<1.0> Add
+/// 03<FlowColorIntensity> Mul`,在鸭吉吉与幽星光两份 resource 上逐字一致)。
+/// 常规炫彩下就是 `(0.35 + 1) × 1.2 = 1.62`。
+///
+/// **这里原来接的是 `StarIntensity`(=10)**,于是整只被推到过曝白 —— 实机是柔和的两色渐变。
+/// 见 [`GlassyRender::glass_gain`]。
+pub const FLOW_COLOR_INTENSITY: f32 = 1.2;
+
+/// 星点层的强度(根材质的 `Stick_Intensity`,汇编 `cb6[61].w`)。
+/// 和既有 `stick_layer` 那条路读到的是同一个参数、同一个值。
+pub const STICK_INTENSITY: f32 = 1.5;
 
 /// `MutationRimColor`,lua 里写死的。
 pub const MUTATION_RIM_COLOR: [f32; 3] = [0.6, 0.6, 0.6];
@@ -162,11 +199,23 @@ pub const STICK_COVER_BIAS: f32 = 0.0;
 /// 整层混合系数(汇编 `cb6[62].y`)。材质里叫 `BlendWeight`,值 1.0 = 不衰减。
 pub const GLASS_BLEND_WEIGHT: f32 = 1.0;
 
-/// 玩家在配置窗口里选的外观。`None` = 原样。
+/// 玩家在配置窗口里选的外观。**异色与炫彩是两件独立的事,不是三选一。**
+///
+/// 游戏里这两位本来就能同时立(`MDT_SHINING | MDT_GLASS`):有异色炫彩,也有原色炫彩。
+/// 两条路互不干涉 —— 异色换掉整套材质(包里已经导好了),炫彩往**当前这套**材质上刷一层。
+/// 叠起来就是「给异色那套刷炫彩」,而刷在哪几个槽上的判据(`_by*` 后缀 + `M_P_Object` 父链)
+/// 对两套材质同样成立,所以组合不必另写一条路。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct Mutation {
+    /// 异色:换整套 `Yise/Mat/` 材质。只有包里带异色材质的形态给得出,见 `Form::has_shiny`。
+    pub shiny: bool,
+    /// 炫彩。`None` = 不上炫彩。
+    pub glassy: Option<Glassy>,
+}
+
+/// 哪一种炫彩。常规款要自己挑配色与粒子,隐藏/赛季款是配好的一整套。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum Mutation {
-    /// 异色:换整套 `Yise/Mat/` 材质。只有包里带异色材质的形态给得出。
-    Shiny,
+pub enum Glassy {
     /// 常规炫彩:39 组配色 × 4 种粒子。存的是**配色 id 与粒子 id**,和游戏编号一致。
     Common { color: u32, particle: u32 },
     /// 隐藏/赛季炫彩:`HIDDEN_GLASS_CONF.id`。
@@ -178,14 +227,24 @@ pub enum Mutation {
 pub struct GlassyRender {
     pub red_channel: [f32; 3],
     pub green_channel: [f32; 3],
-    /// 四段渐变色。常规炫彩用不上(留白),隐藏款按 `StickRandomColor01..04` 填。
-    pub stick_colors: [[f32; 4]; 4],
-    pub use_stick_colors: bool,
     pub params: GlassyParams,
     pub star_stick_tiling: f32,
     /// 共享贴图名,运行时按名字到炫彩素材目录里取。
     pub main_tex: &'static str,
     pub star_tex: &'static str,
+}
+
+impl GlassyRender {
+    /// 玻璃色的总增益(汇编 `cb6[61].x`)。见 [`FLOW_COLOR_INTENSITY`]。
+    pub fn glass_gain(&self) -> f32 {
+        (self.params.base_color_detail + 1.0) * FLOW_COLOR_INTENSITY
+    }
+
+    /// `refract()` 的 eta(汇编 `cb6[58].z` 的 preshader = `1 / GlobalRefraction`)。
+    /// 分母是配置里的值,可能小到 1e-4,除之前先兜一下底。
+    pub fn refraction_eta(&self) -> f32 {
+        1.0 / self.params.global_refraction.max(1e-6)
+    }
 }
 
 /// 根材质 `M_P_Object` 的标量默认值。常规炫彩只覆盖 `StarIntensity`,其余全用这一份。
@@ -228,26 +287,24 @@ pub fn hidden_by_id(id: u32) -> Option<&'static HiddenGlass> {
     HIDDEN.iter().find(|h| h.id == id)
 }
 
-impl Mutation {
+impl Glassy {
     /// 游戏协议里的 `glass_value` 打包法:`(粒子id << 20) | 配色id`。
-    /// 只对常规炫彩有意义 —— 隐藏款的 `glass_value` 直接就是 `HIDDEN_GLASS_CONF.id`,
-    /// **两套编号不能混查**。
-    pub fn glass_value(&self) -> Option<u32> {
+    /// 隐藏款的 `glass_value` 直接就是 `HIDDEN_GLASS_CONF.id`,**两套编号不能混查**。
+    pub fn glass_value(&self) -> u32 {
         match self {
-            Mutation::Common { color, particle } => Some((particle << 20) | color),
-            Mutation::Hidden { id } => Some(*id),
-            Mutation::Shiny => None,
+            Glassy::Common { color, particle } => (particle << 20) | color,
+            Glassy::Hidden { id } => *id,
         }
     }
 
     /// 从游戏的 `(glass_type, glass_value)` 还原。`glass_type`:1 = 常规、2 = 隐藏。
     pub fn from_glass_info(glass_type: u32, glass_value: u32) -> Option<Self> {
         match glass_type {
-            1 => Some(Mutation::Common {
+            1 => Some(Glassy::Common {
                 color: glass_value & 0xf_ffff,
                 particle: glass_value >> 20,
             }),
-            2 => Some(Mutation::Hidden { id: glass_value }),
+            2 => Some(Glassy::Hidden { id: glass_value }),
             _ => None,
         }
     }
@@ -255,50 +312,32 @@ impl Mutation {
     /// 给人看的名字,如「四角星 · 亮X暗 - 浅紫橙」。
     pub fn label(&self) -> String {
         match self {
-            Mutation::Shiny => "异色".to_string(),
-            Mutation::Common { color, particle } => {
+            Glassy::Common { color, particle } => {
                 let c = self::color(*color).map_or("?", |c| c.name);
                 let p = self::particle(*particle).map_or("?", |p| p.name);
                 format!("{p} · {c}")
             }
-            Mutation::Hidden { id } => {
+            Glassy::Hidden { id } => {
                 hidden_by_id(*id).map_or_else(|| format!("隐藏炫彩 {id}"), |h| h.name.to_string())
             }
         }
     }
 
-    /// 存进 `roster.toml` 的写法。三种形态:
-    ///
-    /// ```toml
-    /// mutation = "异色"
-    /// mutation = "炫彩:3/33"   # 粒子 3(方块)· 配色 33(亮X暗 - 浅紫橙),编号与游戏一致
-    /// mutation = "炫彩:黑白"
-    /// ```
-    ///
-    /// 常规炫彩存**编号**而不是名字:名字是配置表里的展示文本,换版本可能改;
-    /// 编号是协议里的东西,而且和游戏 UI 上看到的一致,对得上账。
-    /// 隐藏款反过来存名字 —— 那四条的 id(1/2/3/**1000**)没有规律,写名字才看得懂。
-    pub fn to_config(&self) -> String {
+    /// `炫彩:` 后面那一段。常规炫彩写**编号**而不是名字:名字是配置表里的展示文本,
+    /// 换版本可能改;编号是协议里的东西,而且和游戏 UI 上看到的一致,对得上账。
+    /// 隐藏款反过来写名字 —— 那四条的 id(1/2/3/**1000**)没有规律,写名字才看得懂。
+    fn config_part(&self) -> String {
         match self {
-            Mutation::Shiny => "异色".to_string(),
-            Mutation::Common { color, particle } => format!("炫彩:{particle}/{color}"),
-            Mutation::Hidden { id } => format!(
-                "炫彩:{}",
+            Glassy::Common { color, particle } => format!("{particle}/{color}"),
+            Glassy::Hidden { id } => {
                 hidden_by_id(*id).map_or_else(|| id.to_string(), |h| h.name.to_string())
-            ),
+            }
         }
     }
 
-    /// `to_config` 的逆。认不出来返回 `None` —— 调用方该**报错**而不是默默按原样画:
-    /// 配置里拼错了要让人看见,这和 config.rs 对未知键的态度一致。
-    pub fn from_config(s: &str) -> Option<Self> {
-        let s = s.trim();
-        if s == "异色" {
-            return Some(Mutation::Shiny);
-        }
-        let rest = s.strip_prefix("炫彩:")?.trim();
+    fn parse_part(rest: &str) -> Option<Self> {
         if let Some((particle, color)) = rest.split_once('/') {
-            return Some(Mutation::Common {
+            return Some(Glassy::Common {
                 color: color.trim().parse().ok()?,
                 particle: particle.trim().parse().ok()?,
             });
@@ -307,27 +346,24 @@ impl Mutation {
         HIDDEN
             .iter()
             .find(|h| h.name == rest)
-            .map(|h| Mutation::Hidden { id: h.id })
+            .map(|h| Glassy::Hidden { id: h.id })
             .or_else(|| {
                 rest.parse()
                     .ok()
                     .filter(|id| hidden_by_id(*id).is_some())
-                    .map(|id| Mutation::Hidden { id })
+                    .map(|id| Glassy::Hidden { id })
             })
     }
 
-    /// 解析成 shader 输入。异色返回 `None`(它不走这条路)。
+    /// 解析成 shader 输入。
     pub fn render(&self) -> Option<GlassyRender> {
         match self {
-            Mutation::Shiny => None,
-            Mutation::Common { color, particle } => {
+            Glassy::Common { color, particle } => {
                 let c = self::color(*color)?;
                 let p = self::particle(*particle)?;
                 Some(GlassyRender {
                     red_channel: c.red_channel,
                     green_channel: c.green_channel,
-                    stick_colors: [[1.0; 4]; 4],
-                    use_stick_colors: false,
                     params: GlassyParams {
                         star_intensity: c.shine_strength,
                         ..ROOT_PARAMS
@@ -337,13 +373,11 @@ impl Mutation {
                     star_tex: p.tex,
                 })
             }
-            Mutation::Hidden { id } => {
+            Glassy::Hidden { id } => {
                 let h = hidden_by_id(*id)?;
                 Some(GlassyRender {
                     red_channel: [h.red_channel[0], h.red_channel[1], h.red_channel[2]],
                     green_channel: [h.green_channel[0], h.green_channel[1], h.green_channel[2]],
-                    stick_colors: h.stick_colors,
-                    use_stick_colors: true,
                     params: GlassyParams { ..h.params },
                     // 隐藏款不给 `StarStickTiling`,沿用根默认 4.0。
                     star_stick_tiling: 4.0,
@@ -352,6 +386,67 @@ impl Mutation {
                 })
             }
         }
+    }
+}
+
+impl Mutation {
+    /// 什么都没选 —— 按包里原样画。
+    pub fn is_plain(&self) -> bool {
+        !self.shiny && self.glassy.is_none()
+    }
+
+    /// 给人看的名字,如「异色 · 四角星 · 亮X暗 - 浅紫橙」。
+    pub fn label(&self) -> String {
+        match (self.shiny, self.glassy) {
+            (false, None) => "原样".to_string(),
+            (true, None) => "异色".to_string(),
+            (false, Some(g)) => g.label(),
+            (true, Some(g)) => format!("异色 · {}", g.label()),
+        }
+    }
+
+    /// 存进 `roster.toml` 的写法。两个轴各写一段,同时带就用 `+` 接起来:
+    ///
+    /// ```toml
+    /// mutation = "异色"
+    /// mutation = "炫彩:3/33"        # 粒子 3(方块)· 配色 33(亮X暗 - 浅紫橙)
+    /// mutation = "炫彩:黑白"
+    /// mutation = "异色+炫彩:黑白"   # 异色炫彩;不写异色就是原色炫彩
+    /// ```
+    ///
+    /// 原样返回 `None` —— 默认值一律不写进存档,见 `Slot` 的说明。
+    pub fn to_config(&self) -> Option<String> {
+        let mut parts = Vec::new();
+        if self.shiny {
+            parts.push("异色".to_string());
+        }
+        if let Some(g) = self.glassy {
+            parts.push(format!("炫彩:{}", g.config_part()));
+        }
+        (!parts.is_empty()).then(|| parts.join("+"))
+    }
+
+    /// `to_config` 的逆。认不出来返回 `None` —— 调用方该**报错或警告**而不是默默按原样画:
+    /// 配置里拼错了要让人看见。同一个轴写两遍也算认不出来:那多半是手抖,
+    /// 猜「以后面那个为准」不如直接说这行有问题。
+    pub fn from_config(s: &str) -> Option<Self> {
+        let mut out = Self::default();
+        for part in s.split('+') {
+            let part = part.trim();
+            if part == "异色" {
+                if out.shiny {
+                    return None;
+                }
+                out.shiny = true;
+            } else {
+                let rest = part.strip_prefix("炫彩:")?;
+                if out.glassy.is_some() {
+                    return None;
+                }
+                out.glassy = Some(Glassy::parse_part(rest.trim())?);
+            }
+        }
+        (!out.is_plain()).then_some(out)
     }
 }
 
@@ -442,18 +537,18 @@ mod tests {
     /// docs 里那个例子:1048609 = 四角星(1) · 亮X暗 - 浅紫橙(33)。
     #[test]
     fn glass_value_roundtrip() {
-        let m = Mutation::Common {
+        let g = Glassy::Common {
             color: 33,
             particle: 1,
         };
-        assert_eq!(m.glass_value(), Some(1_048_609));
-        assert_eq!(Mutation::from_glass_info(1, 1_048_609), Some(m));
-        assert_eq!(m.label(), "四角星 · 亮X暗 - 浅紫橙");
+        assert_eq!(g.glass_value(), 1_048_609);
+        assert_eq!(Glassy::from_glass_info(1, 1_048_609), Some(g));
+        assert_eq!(g.label(), "四角星 · 亮X暗 - 浅紫橙");
     }
 
     #[test]
     fn common_uses_shared_main_tex_and_no_stick_colors() {
-        let r = Mutation::Common {
+        let r = Glassy::Common {
             color: 1,
             particle: 3,
         }
@@ -462,8 +557,6 @@ mod tests {
         assert_eq!(r.main_tex, DEFAULT_MAIN_TEX);
         assert_eq!(r.star_tex, "Tex_PetGlassyStar_001");
         assert_eq!(r.star_stick_tiling, 2.2);
-        // 常规炫彩不覆盖四段渐变色 —— 覆盖了就等于把隐藏款的着色套到常规上。
-        assert!(!r.use_stick_colors);
         assert_eq!(r.params.star_intensity, 10.0);
         // 其余标量必须原样落在根默认上。
         assert_eq!(r.params.global_refraction, ROOT_PARAMS.global_refraction);
@@ -472,9 +565,8 @@ mod tests {
 
     #[test]
     fn hidden_overrides_its_own_textures_and_scalars() {
-        let r = Mutation::Hidden { id: 3 }.render().expect("铅字幻梦");
+        let r = Glassy::Hidden { id: 3 }.render().expect("铅字幻梦");
         assert_eq!(r.main_tex, "T_PetGlassyNoiseS3_001");
-        assert!(r.use_stick_colors);
         // 铅字幻梦把折射压到近乎为零、深度提到 100、贴图放大三倍。
         assert_eq!(r.params.global_refraction, 0.0001);
         assert_eq!(r.params.global_depth, 100.0);
@@ -483,36 +575,106 @@ mod tests {
 
     #[test]
     fn config_strings_round_trip() {
+        let common = Glassy::Common {
+            color: 33,
+            particle: 3,
+        };
         for m in [
-            Mutation::Shiny,
-            Mutation::Common {
-                color: 33,
-                particle: 3,
+            Mutation {
+                shiny: true,
+                glassy: None,
             },
-            Mutation::Hidden { id: 1000 },
-            Mutation::Hidden { id: 3 },
+            Mutation {
+                shiny: false,
+                glassy: Some(common),
+            },
+            Mutation {
+                shiny: true,
+                glassy: Some(common),
+            },
+            Mutation {
+                shiny: true,
+                glassy: Some(Glassy::Hidden { id: 1000 }),
+            },
+            Mutation {
+                shiny: false,
+                glassy: Some(Glassy::Hidden { id: 3 }),
+            },
         ] {
-            let text = m.to_config();
+            let text = m.to_config().expect("非原样一定写得出来");
             assert_eq!(Mutation::from_config(&text), Some(m), "{text}");
         }
-        // 写法要看得懂 —— 这两条是文档里给用户看的样子。
+        // 写法要看得懂 —— 这几条是文档里给用户看的样子。
         assert_eq!(
-            Mutation::Common {
-                color: 33,
-                particle: 3
+            Mutation {
+                shiny: false,
+                glassy: Some(common)
             }
-            .to_config(),
-            "炫彩:3/33"
+            .to_config()
+            .as_deref(),
+            Some("炫彩:3/33")
         );
-        assert_eq!(Mutation::Hidden { id: 1000 }.to_config(), "炫彩:黑白");
+        assert_eq!(
+            Mutation {
+                shiny: true,
+                glassy: Some(Glassy::Hidden { id: 1000 })
+            }
+            .to_config()
+            .as_deref(),
+            Some("异色+炫彩:黑白")
+        );
+        // 原样不落盘。
+        assert_eq!(Mutation::default().to_config(), None);
         // 认不出来的要说不认识,不能悄悄退成「没有变异」。
         assert_eq!(Mutation::from_config("炫彩:不存在的款"), None);
         assert_eq!(Mutation::from_config("闪光"), None);
+        assert_eq!(Mutation::from_config(""), None);
+        // 同一个轴写两遍 = 这行有问题,不猜哪个算数。
+        assert_eq!(Mutation::from_config("异色+异色"), None);
+        assert_eq!(Mutation::from_config("炫彩:黑白+炫彩:3/33"), None);
     }
 
+    /// 第 ④ 步的乘数与 refract 的 eta 都是 **preshader 算出来的派生量**,不是参数本身。
+    /// 这两条各自对应一次实测读错,数值锁在这里免得再滑回去:
+    /// `cb6[61].x = (BaseColorDetail + 1) × FlowColorIntensity`、`cb6[58].z = 1 / GlobalRefraction`。
     #[test]
-    fn shiny_is_not_a_glassy_layer() {
-        assert!(Mutation::Shiny.render().is_none());
-        assert!(Mutation::Shiny.glass_value().is_none());
+    fn derived_scalars_match_the_preshaders() {
+        let common = Glassy::Common {
+            color: 1,
+            particle: 1,
+        }
+        .render()
+        .expect("1 号配色 1 号粒子都在表里");
+        // 常规炫彩不覆盖这两个,走根默认 0.35 / 2.0。
+        assert_eq!(common.params.base_color_detail, 0.35);
+        assert!((common.glass_gain() - 1.62).abs() < 1e-6, "{}", common.glass_gain());
+        assert!((common.refraction_eta() - 0.5).abs() < 1e-6);
+        // **不是 StarIntensity**:那个在这条排列里根本不存在,接上去是 10 倍,整只过曝白。
+        assert_eq!(common.params.star_intensity, 10.0);
+        assert!(common.glass_gain() < common.params.star_intensity);
+
+        // 铅字幻梦把 GlobalRefraction 压到 1e-4 ⇒ eta 一万 ⇒ 判别式恒负 ⇒ 折射整支置零。
+        let qz = Glassy::Hidden { id: 3 }.render().expect("铅字幻梦");
+        assert!(qz.refraction_eta() > 1000.0, "{}", qz.refraction_eta());
+        // 它的 BaseColorDetail 是 0.3,增益跟着走。
+        assert!((qz.glass_gain() - 1.3 * FLOW_COLOR_INTENSITY).abs() < 1e-6);
+    }
+
+    /// 异色与炫彩互不影响:异色自己不产生玻璃层,而且两个都开时玻璃层照样出。
+    #[test]
+    fn shiny_and_glassy_are_independent() {
+        let shiny_only = Mutation {
+            shiny: true,
+            glassy: None,
+        };
+        assert!(shiny_only.glassy.is_none());
+        assert!(!shiny_only.is_plain());
+
+        let both = Mutation {
+            shiny: true,
+            glassy: Some(Glassy::Hidden { id: 3 }),
+        };
+        assert!(both.glassy.and_then(|g| g.render()).is_some());
+        assert_eq!(both.label(), "异色 · 铅字幻梦");
     }
 }

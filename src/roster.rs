@@ -24,7 +24,8 @@ const HEADER: &str = "\
 # voice       参与叫声,不写 = 参与
 # voice_value 嗓音 −100~100,不写 = 0(原调);配置窗口里可以重掷
 # remember    记住落脚点;home_x 是运行时写的「上次站在可走范围的百分之几」
-# mutation    外观变异:`异色`,或 `炫彩:<粒子id>/<配色id>`(如 `炫彩:3/33`)、
+# mutation    外观变异。两个轴互不影响,可用 `+` 同时带(如 `异色+炫彩:黑白`):
+#             `异色`;`炫彩:<粒子id>/<配色id>`(如 `炫彩:3/33`);
 #             `炫彩:<隐藏款名>`(黑白/暗夜拾光/狂欢怪谈/铅字幻梦)
 #
 # 除 pack 外都可以不写,不写就是默认。
@@ -60,8 +61,8 @@ pub struct Slot {
     /// 记住落脚点;不写 = 不记(每次上台重新摆)。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remember: Option<bool>,
-    /// 外观变异:`异色`,或 `炫彩:<粒子id>/<配色id>`、`炫彩:<隐藏款名>`。
-    /// 不写 = 原样。写法与取值见 `pet::glassy::Mutation::from_config`。
+    /// 外观变异:`异色`、`炫彩:<粒子id>/<配色id>`、`炫彩:<隐藏款名>`,
+    /// 两者可用 `+` 同时带。不写 = 原样。写法与取值见 `pet::glassy::Mutation::from_config`。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mutation: Option<String>,
     /// 上次站在可走范围的百分之几(0~1)。**运行时写的**,存比例而不是像素 ——

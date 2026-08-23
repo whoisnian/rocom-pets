@@ -39,8 +39,8 @@ pub struct Request {
     pub fade_probe: bool,
     /// >0 时跑这么多帧测平均耗时(含 CPU 采样 + 上传 + 绘制)。
     pub bench: u32,
-    /// 外观变异,写法同 `roster.toml` 的 `mutation`(`异色` / `炫彩:3/33` / `炫彩:黑白`)。
-    /// 炫彩要这个二进制烘进了共享素材(构建时由 build.rs 决定)。
+    /// 外观变异,写法同 `roster.toml` 的 `mutation`(`异色` / `炫彩:3/33` / `炫彩:黑白`,
+    /// 两者可用 `+` 同时带)。炫彩要这个二进制烘进了共享素材(构建时由 build.rs 决定)。
     pub mutation: Option<String>,
 }
 
@@ -48,23 +48,20 @@ pub fn render(request: &Request) -> Result<()> {
     let glb = locate_glb(&request.pack, request.form.as_deref())?;
     // 材质表是必需的(贴图与 alpha 语义都由它定)。调试渲图必须走和运行时同一条路径,
     // 否则「渲出来对不对」验的不是运行时的行为。
-    let want_shiny = request.mutation.as_deref() == Some("异色");
-    let spec = load_materials(&request.pack, &glb, want_shiny)
+    let mutation = match &request.mutation {
+        Some(text) => crate::pet::Mutation::from_config(text)
+            .with_context(|| format!("认不得的 --mutation「{text}」"))?,
+        None => crate::pet::Mutation::default(),
+    };
+    // 异色挑的是另一张材质表,炫彩是往挑中的那套上刷一层 —— 两个轴分头落地,和运行时同一条路。
+    let spec = load_materials(&request.pack, &glb, mutation.shiny)
         .with_context(|| format!("{:?} 里找不到这个形态的材质表,重导一次包", request.pack))?;
     let mut model = Model::load(&glb, &spec)?;
-    if let Some(text) = &request.mutation {
-        let mutation = crate::pet::Mutation::from_config(text)
-            .with_context(|| format!("认不得的 --mutation「{text}」"))?;
-        model.mutation = Some(mutation);
-        // 异色是换整套材质(包里就换好了),这里只有炫彩要现套。
-        if mutation != crate::pet::Mutation::Shiny {
-            model.apply_glassy(mutation);
-            anyhow::ensure!(
-                model.glassy.is_some(),
-                "这个二进制没烘炫彩素材:先导一次包(素材会写到 <out>/glassy),再重新编译"
-            );
-        }
-    }
+    model.apply_mutation(mutation);
+    anyhow::ensure!(
+        mutation.glassy.is_none() || model.glassy.is_some(),
+        "这个二进制没烘炫彩素材:先导一次包(素材会写到 <out>/glassy),再重新编译"
+    );
     let model = model;
     log::info!(
         "{}: {} 顶点 / {} 三角 / {} 关节 / {} 段动作",

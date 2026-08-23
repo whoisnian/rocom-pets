@@ -43,8 +43,8 @@ pub struct PetOptions {
     pub remember: bool,
     /// 上次站在可走范围的百分之几(0~1)。**运行时写的**,配置窗口只读不改。
     pub home_x: Option<f32>,
-    /// 外观变异:异色或某一种炫彩。`None` = 原样。见 `pet::glassy`。
-    pub mutation: Option<Mutation>,
+    /// 外观变异:异色开关 + 炫彩,两者互不影响。全默认 = 原样。见 `pet::glassy`。
+    pub mutation: Mutation,
 }
 
 /// 大小倍数的上下限。太小看不清,太大挡住半个屏幕 —— 两头都不是「桌宠」了。
@@ -63,7 +63,7 @@ impl Default for PetOptions {
             voice_value: None,
             remember: false,
             home_x: None,
-            mutation: None,
+            mutation: Mutation::default(),
         }
     }
 }
@@ -93,13 +93,16 @@ impl PetOptions {
             home_x: slot.home_x.filter(|v| v.is_finite()).map(|v| v.clamp(0.0, 1.0)),
             // 认不出来的写法只警告、按原样上台 —— 这一层的规矩是「存档坏了不拦住桌宠」
             // (见 roster.rs 的模块头),和 config.toml 那边「拼错要报错」是两套。
-            mutation: slot.mutation.as_deref().and_then(|text| {
-                let parsed = Mutation::from_config(text);
-                if parsed.is_none() {
-                    log::warn!("认不得的 mutation「{text}」,这只按原样画");
-                }
-                parsed
-            }),
+            mutation: slot
+                .mutation
+                .as_deref()
+                .map(|text| {
+                    Mutation::from_config(text).unwrap_or_else(|| {
+                        log::warn!("认不得的 mutation「{text}」,这只按原样画");
+                        Mutation::default()
+                    })
+                })
+                .unwrap_or_default(),
         }
     }
 
@@ -112,7 +115,7 @@ impl PetOptions {
         slot.remember = self.remember.then_some(true);
         // 不记落脚点就把记下的那个也清掉,免得下次勾上时跳回一个很旧的位置
         slot.home_x = self.remember.then_some(self.home_x).flatten();
-        slot.mutation = self.mutation.map(|m| m.to_config());
+        slot.mutation = self.mutation.to_config();
     }
 }
 
@@ -137,7 +140,7 @@ impl Member {
 /// 模型与 GPU 资源的缓存键。**同一个形态套上不同的外观就是不同的一份** ——
 /// 炫彩改的是材质 uniform 与两张贴图,都烘在 `PetGpu` 里,不能和原样那份共用。
 /// 声音不受外观影响,所以 `voices` 仍按 glb 路径单独存。
-type ModelKey = (PathBuf, Option<Mutation>);
+type ModelKey = (PathBuf, Mutation);
 
 #[derive(Default)]
 pub struct Assets {
@@ -203,22 +206,16 @@ impl Assets {
     }
 
     /// 取这个形态的模型:缓存里有就直接共享,没有才读盘。
-    pub fn model(&mut self, form: &Form, mutation: Option<Mutation>) -> Result<Arc<Model>> {
+    pub fn model(&mut self, form: &Form, mutation: Mutation) -> Result<Arc<Model>> {
         self.touch(&form.model);
         let key = (form.model.clone(), mutation);
         if let Some(model) = self.models.get(&key) {
             return Ok(Arc::clone(model));
         }
-        // 异色换的是整套材质,包里已经是换好的那一份 —— 换一张材质表就够了。
-        let mut model = Model::load(
-            &form.model,
-            form.materials_for(mutation == Some(Mutation::Shiny)),
-        )?;
-        model.mutation = mutation;
-        // 异色不在这里 —— 它是换整套材质,包里就已经是换好的那一份。
-        if let Some(mutation) = mutation.filter(|m| *m != Mutation::Shiny) {
-            model.apply_glassy(mutation);
-        }
+        // 两个轴在这里分头落地:**异色**换的是整套材质,包里已经是换好的那一份,挑一张表就够了;
+        // **炫彩**是往挑中的那套上刷一层。所以异色炫彩不必另写一条路 —— 挑异色那张表,再刷。
+        let mut model = Model::load(&form.model, form.materials_for(mutation.shiny))?;
+        model.apply_mutation(mutation);
         let model = Arc::new(model);
         self.models.insert(key, Arc::clone(&model));
         Ok(model)

@@ -102,6 +102,14 @@ def main() -> None:
     todo = [(pack, name, asset)
             for pack in sorted(PACKS.iterdir()) if (pack / "manifest.toml").exists()
             for name, asset in forms(pack / "manifest.toml")]
+    if not todo:
+        # **一个包都没扫到时必须报错退出**,不能打印「失败 0、空白 0、过曝 0」——
+        # 那三个零看着像通过,实际上是闸门根本没跑。踩过一次:`packs-all/` 里放的是
+        # `.rkpet` 压缩包,而这里要的是**解开后的目录**(带 manifest.toml),于是静默零。
+        sys.exit(
+            f"{PACKS} 下没有带 manifest.toml 的包目录 —— 这里要的是解开后的目录,"
+            f"不是 .rkpet;`SWEEP_PACKS` 可以指到别处"
+        )
     if args.limit:
         todo = todo[: args.limit]
 
