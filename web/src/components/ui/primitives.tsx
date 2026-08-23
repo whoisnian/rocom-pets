@@ -152,6 +152,10 @@ export function SelectTrigger({
     <SelectPrimitive.Trigger
       className={cn(
         "flex h-10 items-center justify-between gap-2 rounded-lg border bg-card px-3 text-sm shadow-xs transition-[color,box-shadow] outline-none",
+        // **框里那行字不许折行**。定高 + 折行 = 两行字撑出框外(形态名长的那几只
+        // 「鸭吉吉(蓬松的样子)」、粒子里的「镂空五角星」都踩过)。放不下就省略号,
+        // 宽度由每处自己按最长的那条给。
+        "whitespace-nowrap [&>span]:min-w-0 [&>span]:overflow-hidden [&>span]:text-ellipsis",
         "focus-visible:border-ring focus-visible:ring-[3px] focus-visible:ring-ring/35 data-[placeholder]:text-muted-foreground",
         className,
       )}

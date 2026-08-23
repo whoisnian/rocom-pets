@@ -27,6 +27,10 @@ import { cn, formatBytes } from "@/lib/utils.ts";
 
 interface Props {
   pack: Pack | null;
+  /** 分享链接带来的现场:形态、表情、外观。都可省。 */
+  initial?: { form?: string; face?: string; look?: string } | null;
+  /** 现场变了就说一声,由外面写进地址栏。 */
+  onState?: (state: { form?: string; face?: string; look?: string }) => void;
   onOpenChange: (open: boolean) => void;
 }
 
@@ -52,6 +56,38 @@ function mutationText(shiny: boolean, kind: string, particle: number, color: num
   if (kind === COMMON_GLASSY) parts.push(`炫彩:${particle}/${color}`);
   else if (kind !== NO_GLASSY) parts.push(`炫彩:${kind}`);
   return parts.join("+");
+}
+
+/**
+ * `mutationText` 的逆:把分享链接里那段字还原成四个选项。
+ *
+ * 认不得的部分**默默忽略**(不整条丢掉):链接是手打的、或者跨版本了,能还原多少算多少,
+ * 比整只退回原样强。真正的把关在 wasm 那边 —— `set_mutation` 认不得会抛,
+ * 底下那句红字会说出来。
+ */
+function parseLook(text: string): { shiny: boolean; kind: string; color: number; particle: number } {
+  let shiny = false;
+  let kind = NO_GLASSY;
+  let color = 1;
+  let particle = 1;
+  for (const raw of text.split("+")) {
+    const part = raw.trim();
+    if (part === "异色") {
+      shiny = true;
+      continue;
+    }
+    if (!part.startsWith("炫彩:")) continue;
+    const rest = part.slice("炫彩:".length);
+    const slash = rest.indexOf("/");
+    if (slash < 0) {
+      kind = rest; // 隐藏/赛季款写的是名字
+      continue;
+    }
+    kind = COMMON_GLASSY;
+    particle = Number(rest.slice(0, slash)) || 1;
+    color = Number(rest.slice(slash + 1)) || 1;
+  }
+  return { shiny, kind, color, particle };
 }
 
 /** 0xRRGGBB → CSS。配色下拉里那两个小方块。 */
@@ -80,7 +116,7 @@ function midOf(pointers: Map<number, { x: number; y: number }>): { x: number; y:
  * 画的是桌宠那份渲染器编成的 wasm(src/web.rs),不是另做的一套预览:
  * 动作清单、降级规则、表情图集都来自同一份代码。
  */
-export function PreviewDialog({ pack, onOpenChange }: Props) {
+export function PreviewDialog({ pack, initial, onState, onOpenChange }: Props) {
   // **画布用回调 ref 存进 state,不是 useRef**:Radix 的 Portal 是在 layout effect 里
   // 才挂上的,首次提交时弹窗内容还是 null。用 useRef 的话下面这个 effect 第一次跑就看见
   // `current === null` 直接返回,而依赖没变也不会再跑一次 —— 表现是弹窗开着、画布停在
@@ -126,10 +162,32 @@ export function PreviewDialog({ pack, onOpenChange }: Props) {
         setForms(forms);
         setFaces(faces);
         setGlassy(glassy);
-        setFace(faces[0] ?? "");
-        const first = forms[0]?.asset ?? "";
+
+        // 分享链接带来的现场。**认不出来的就用默认**:形态可能已经改名、
+        // 表情可能是手打的 —— 那种情况下打开一只默认样子的宠物,好过报错不给看
+        const wanted = forms.find((f) => f.asset === initial?.form)?.asset;
+        const first = wanted ?? forms[0]?.asset ?? "";
+        const wantFace = faces.includes(initial?.face ?? "") ? initial!.face! : (faces[0] ?? "");
+        setFace(wantFace);
         setAsset(first);
         setClips(await session.showForm(first, setProgress));
+        if (wantFace) session.setFace(wantFace);
+
+        // 外观放在**装完形态之后**:`setMutation` 改的是「当前这只」,没有当前这只就没处改。
+        // 炫彩共享贴图要现取,所以这一步也可能有一小段进度
+        if (initial?.look) {
+          const want = parseLook(initial.look);
+          setShiny(want.shiny);
+          setKind(want.kind);
+          setColor(want.color);
+          setParticle(want.particle);
+          try {
+            setProgress({ done: 0, total: 1, label: "下载炫彩素材" });
+            await session.setMutation(initial.look);
+          } catch (e) {
+            setGlassyError(e instanceof Error ? e.message : String(e));
+          }
+        }
         setProgress(null);
       } catch (e) {
         if (!dead) {
@@ -144,6 +202,8 @@ export function PreviewDialog({ pack, onOpenChange }: Props) {
       sessionRef.current?.close();
       sessionRef.current = null;
     };
+    // `initial` 是**开场那一份**,故意不进依赖:它由地址栏来,而地址栏是我们自己写的
+    // —— 进了依赖就成了「改一下选项 → 重开一次会话」的死循环
   }, [pack, supported, canvas]);
 
   const switchForm = useCallback(
@@ -203,6 +263,22 @@ export function PreviewDialog({ pack, onOpenChange }: Props) {
     },
     [shiny, kind, color, particle],
   );
+
+  // 现场变了就往上报一次,由外面写进地址栏(见 lib/share.ts)。
+  //
+  // **默认值一律不写**:链首形态、默认表情、原样外观都省掉,于是随手点开一只得到的是
+  // 干净的 `?pet=011-鸭吉吉`,而不是一串等于没说的参数。和 `roster.toml` 那条
+  // 「默认值不落盘」是同一条规矩。
+  const look = mutationText(shiny, kind, particle, color);
+  useEffect(() => {
+    if (!asset || !onState) return;
+    onState({
+      form: asset === forms[0]?.asset ? undefined : asset,
+      face: face === faces[0] ? undefined : face,
+      look: look || undefined,
+    });
+    // `onState` 故意不进依赖:它每次渲染都是新的箭头函数,进去就是每帧写一次地址栏
+  }, [asset, face, look, forms, faces]);
 
   // 和常见的模型查看器(three.js 的 OrbitControls、<model-viewer>、Sketchfab)对齐:
   // 左键拖 = 转视角,右键 / 中键 / Shift+左键 拖 = 平移中心,滚轮 = 缩放;
@@ -335,7 +411,8 @@ export function PreviewDialog({ pack, onOpenChange }: Props) {
           <div className="mt-3 flex flex-wrap items-center gap-2">
             {forms.length > 1 && (
               <Select value={asset} onValueChange={switchForm}>
-                <SelectTrigger className="w-40" aria-label="形态">
+                {/* 按最长的形态名给宽度:「晶石蜗(西瓜碧玺的样子)」十一个汉字,再窄就要省略号 */}
+                <SelectTrigger className="w-56" aria-label="形态">
                   <SelectValue placeholder="形态" />
                 </SelectTrigger>
                 <SelectContent>
@@ -452,7 +529,7 @@ export function PreviewDialog({ pack, onOpenChange }: Props) {
                     value={String(color)}
                     onValueChange={(v) => void applyMutation({ color: Number(v) })}
                   >
-                    <SelectTrigger className="w-52" aria-label="配色">
+                    <SelectTrigger className="w-56" aria-label="配色">
                       <SelectValue placeholder="配色" />
                     </SelectTrigger>
                     <SelectContent>
@@ -478,7 +555,7 @@ export function PreviewDialog({ pack, onOpenChange }: Props) {
                     value={String(particle)}
                     onValueChange={(v) => void applyMutation({ particle: Number(v) })}
                   >
-                    <SelectTrigger className="w-28" aria-label="粒子">
+                    <SelectTrigger className="w-32" aria-label="粒子">
                       <SelectValue placeholder="粒子" />
                     </SelectTrigger>
                     <SelectContent>
@@ -514,10 +591,6 @@ export function PreviewDialog({ pack, onOpenChange }: Props) {
             </div>
           )}
 
-          <p className="mt-4 text-xs leading-relaxed text-muted-foreground">
-            表情是人挑的那张,不过<strong>做动作时跟着动作走</strong> —— 和桌面上一样:
-            生气时是生气眼,睡着时是困倦眼。预览只下当前这个形态的模型与贴图,不是整包。
-          </p>
         </div>
       </DialogContent>
     </Dialog>

@@ -4,6 +4,7 @@ import { Toaster, toast } from "sonner";
 import type { AppBuild, Catalog, Pack, StatsResponse } from "../shared/types.ts";
 import { fetchCatalog, fetchConfig, fetchStats, startDownload } from "@/lib/api.ts";
 import { SORTS, type SortKey, searchPacks, sortHits } from "@/lib/search.ts";
+import { type PreviewLink, readLink, writeLink } from "@/lib/share.ts";
 import { AppSection } from "@/components/AppSection.tsx";
 import { PackCard } from "@/components/PackCard.tsx";
 import { PackDialog } from "@/components/PackDialog.tsx";
@@ -25,6 +26,11 @@ import { cn, formatBytes } from "@/lib/utils.ts";
 export default function App() {
   const [catalog, setCatalog] = useState<Catalog | null>(null);
   const [stats, setStats] = useState<StatsResponse>({});
+  // **排序按的是这一份,不是上面那份。** 点了下载之后卡片上的数字要立刻 +1(那是点击反馈),
+  // 可列表**不能跟着重排** —— 刚点的那张卡会从手指底下溜走,页面还会跳。
+  // 于是把两件事分开:`stats` 管显示、跟着乐观 +1 走;`orderStats` 是服务端那一份快照,
+  // 只在拉到 `/api/stats` 时换,于是新排序**下次打开页面才看得到**。
+  const [orderStats, setOrderStats] = useState<StatsResponse>({});
   const [sitekey, setSitekey] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
@@ -37,15 +43,32 @@ export default function App() {
   const deferredQuery = useDeferredValue(query);
   const [detail, setDetail] = useState<Pack | null>(null);
   const [preview, setPreview] = useState<Pack | null>(null);
+  // 地址栏里带着的那条分享链接。**只在开场读一次** —— 之后是我们往里写,再读回来
+  // 会和用户正在改的选项打架
+  const [link, setLink] = useState<PreviewLink | null>(readLink);
   const [reportTarget, setReportTarget] = useState<{ id: string; label: string } | null>(null);
   const [dark, setDark] = useState(() => document.documentElement.classList.contains("dark"));
 
   useEffect(() => {
     fetchCatalog().then(setCatalog).catch((e: Error) => setError(e.message));
     // 统计挂了不该拖垮整页 —— 计数当 0 显示,下载照常。
-    fetchStats().then(setStats).catch(() => {});
+    fetchStats()
+      .then((s) => {
+        setStats(s);
+        setOrderStats(s);
+      })
+      .catch(() => {});
     fetchConfig().then((c) => setSitekey(c.turnstileSitekey)).catch(() => {});
   }, []);
+
+  // 带 `?pet=…` 进来的:目录一到手就把那只翻出来、直接开预览。
+  // 找不到就当没带(包被删了、链接是手打的),照常显示列表 —— 不值得为此弹一句错。
+  useEffect(() => {
+    if (!catalog || !link) return;
+    const pack = catalog.packs.find((p) => p.id === link.pet);
+    if (pack) setPreview(pack);
+    else writeLink(null);
+  }, [catalog, link]);
 
   useEffect(() => {
     document.documentElement.classList.toggle("dark", dark);
@@ -94,7 +117,7 @@ export default function App() {
     () => (catalog ? searchPacks(catalog.packs, deferredQuery) : []),
     [catalog, deferredQuery],
   );
-  const hits = useMemo(() => sortHits(found, sort, stats), [found, sort, stats]);
+  const hits = useMemo(() => sortHits(found, sort, orderStats), [found, sort, orderStats]);
   // 列表落后于操作的那一小段(换排序的 transition,或搜索还停在推迟的值上)
   const listBusy = reordering || query !== deferredQuery;
 
@@ -298,7 +321,25 @@ export default function App() {
         onReport={(p) => setReportTarget({ id: p.id, label: p.name })}
       />
 
-      <PreviewDialog pack={preview} onOpenChange={(open) => !open && setPreview(null)} />
+      <PreviewDialog
+        // **按包 id 重挂**:形态、表情、异色、炫彩这几样都是「这一只的」,
+        // 换一只必须从头来。曾经不重挂,于是关掉弹窗再开另一只时下拉里还写着上一只的炫彩,
+        // 画出来的却是原样 —— 界面和 wasm 记的不是同一身。
+        key={preview?.id ?? "none"}
+        pack={preview}
+        initial={preview && link?.pet === preview.id ? link : undefined}
+        onState={(s) => {
+          if (preview) writeLink({ pet: preview.id, ...s });
+        }}
+        onOpenChange={(open) => {
+          if (open) return;
+          setPreview(null);
+          writeLink(null);
+          // 分享链接**只管开场那一次**。关掉再点开同一只,该是这只的默认样子,
+          // 而不是又把链接里那一身穿回来 —— 那正是「选项和画出来的对不上」那类毛病
+          setLink(null);
+        }}
+      />
 
       <ReportDialog
         target={reportTarget}
