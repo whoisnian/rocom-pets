@@ -259,14 +259,16 @@ Windows 找雅黑/黑体),不打进二进制:一份中文字体比整个运行�
 被忽略 —— 拼错了要让人看见;删掉 config.toml 就会重新生成一份带注释的。
 
 ```sh
-cargo run --release -- --pack packs/喵喵                    # 把宠物放到桌面上
+cargo run --profile fast -- --pack packs/喵喵                # 把宠物放到桌面上(迭代用这档)
 rocom-pets --settings --page pets                          # 打开配置窗口(pets / packs / common)
 rocom-pets --list                                          # 列出 ~/.local/share/rocom-pets/packs 里的包
 rocom-pets --pack 喵喵                                      # 按包名启动(目录、.rkpet 路径也行)
 rocom-pets --toggle-passthrough                            # 通知已在跑的实例(可绑快捷键)
 rocom-pets --reload                                        # 手改完 config/roster 后让它重读
 cargo run                                                  # 同上但用调试精灵(平台层验收模式)
-cargo run --release -- --render packs/喵喵 --bench 600      # 离屏渲宠物 + 测出帧耗时
+# `--profile fast` = release 的优化 + 能并行的 LTO:改一行重编 23 秒 vs release 的 1 分 38 秒
+# (代价是二进制大 3.4MB)。**出包仍然用 `--release`**,体积那一档在发布里要算。
+cargo run --profile fast -- --render packs/喵喵 --bench 600  # 离屏渲宠物 + 测出帧耗时
 git -C "$CUE4PARSE_DIR" apply exporter/patches/*.patch      # 导出前必做:修上游法线与顶点色导出 bug
 dotnet run --project exporter -- --species 3001 --out packs # 导一条进化链
 dotnet run --project exporter -- --all --zip-only --skip-existing --out packs  # 全量导(可分批续跑)

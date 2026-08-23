@@ -14,6 +14,16 @@ codegen-units = 1  # 不切分,换更充分的优化(编译只能单线程,慢�
 panic = "abort"    # 桌宠没有捕获 panic 再续跑的地方,展开表纯属白带
 strip = "symbols"
 
+# **迭代用的快档**:和 release 同样的优化级别,但换掉那两条「慢在这儿」的设置 ——
+# thin LTO 能并行、codegen-units 放开也能并行。发布仍然用 release,别拿这个出包。
+#
+#     cargo run --profile fast -- …
+[profile.fast]
+inherits = "release"
+lto = "thin"
+codegen-units = 16
+strip = "none"     # 留符号,崩了有栈回溯
+
 # **依赖按优化档编,自己的代码仍是 debug。**
 #
 # 日常是 `cargo run` 跑的,而这个程序的重活几乎全在依赖里:读 glb(gltf + 贴图解码)、
