@@ -5,6 +5,12 @@ export interface PetForm {
   name: string;
   /** 资产目录名,如 Gra_MiaoMiao3_001;同名多外观时取第一个 */
   asset: string;
+  /**
+   * 这个形态在游戏配置里的编号(`PETBASE_CONF` 的行 id,3007 = 魔力猫)。
+   * 拿游戏侧编号换预览链接的唯一钥匙,见 `GET /api/link`(worker/index.ts)。
+   * 演示模式(--index)与老目录里可能没有,故可空。
+   */
+  conf?: number | null;
   /** 进化阶段,王者形态记 99 */
   stage: number;
   /** 外观数;>1 时页面显示 xN */

@@ -325,10 +325,36 @@ curl -s -X DELETE -H 'Content-Type: application/json' \
 | `GET /api/stats` | `{ id: { downloads, reports } }`,边缘缓存 60 秒 |
 | `GET /api/config` | 前端要的 Turnstile sitekey 与「是否直连」 |
 | `GET /api/dl/:id` | 计数后 302 到 R2(或代理字节);id 就是 `002-喵喵` / `app-windows-x64` |
+| `GET /api/link` | **开放接口**:拿游戏侧编号换一条预览链接,见下 |
 | `POST /api/report` | `{ id, reason, note?, token? }`,记异常标记 |
 
 `/api/dl/:id` **不接受客户端传对象键** —— Worker 自己读 `catalog.json` 把 id 解析成 R2 key
 并缓存 5 分钟。让客户端传键等于把整个桶开放给任意路径。
+
+### `GET /api/link` —— 给外部工具的入口
+
+    /api/link?petbase=3071&shiny=1&glass=2:1
+
+| 参数 | 是什么 |
+| --- | --- |
+| `petbase` | **必填**,形态编号:游戏 `PETBASE_CONF` 的行 id,也就是 `PetData.base_conf_id` |
+| `shiny` | 异色,`1`/`true` 为是(即 `mutation_type & 1`) |
+| `glass` | 炫彩,`<glass_type>:<glass_value>`,把 `GlassInfo` 原样送过来 |
+| `face` | 表情名,原样透传 |
+| `format` | `json` 则回 JSON,默认回 302 |
+
+默认**回 302**,所以可以直接当 `<a href>` 用:不要 JS、也不吃 CORS。
+`format=json` 回 `{ url, pet, form, look }` 并放开 CORS,给要自己拼页面的工具用。
+
+**存在的理由**是别让调用方抄两样本仓库的实现细节:「形态编号 → 包名 + 资产名」这层映射
+(`catalog.json` 的 `forms[].conf`)和 `look` 那串写法(`异色+炫彩:暗夜拾光`,见
+`src/pet/glassy.rs`)。两样都会随版本变,抄过去就是两处要同步。送**游戏自己的编号**进来,
+换算留在这边。目前的调用方是抓包统计
+[rocom-capture](https://github.com/whoisnian/rocom-capture) —— 宠物详情页那张炫彩色卡就链到这儿。
+
+`glass` 认不得(新赛季款、跨版本)时**不报错**,只是不带 `look`:链接照发,人还是能看到这只。
+**查不到那个形态**(还没出包)时,302 那条跳首页并在 query 里留个 `missing=<petbase>`
+(前端只读 `pet/form/face/look`,多的参数不碍事),好过甩人一张 404;`format=json` 则回 404。
 
 ## 计数是怎么防刷的
 

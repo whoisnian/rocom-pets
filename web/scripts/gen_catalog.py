@@ -238,6 +238,10 @@ def read_pack(path: Path) -> dict:
             "asset": raw.get("asset", ""),
             "stage": stage_of(raw),
             "skins": 1,
+            # conf 与 sprite 都是这个形态的 PETBASE_CONF 行 id,但用途不同:sprite 稍后
+            # 会被换成精灵图格子号(见 resolve_icons),conf 原样留着 —— /api/link 靠它
+            # 把游戏侧编号换成 pet/form,别在下面那步里跟着一起换掉。
+            "conf": raw.get("id"),
             "sprite": raw.get("id"),
         }
     forms = sorted(grouped.values(), key=lambda f: (f["stage"], f["name"]))
@@ -299,6 +303,7 @@ def scan_index(index_md: Path, by_name: dict[str, int]) -> list[dict]:
                 "asset": "",
                 "stage": i + 1,
                 "skins": int(n) if n.isdigit() else 1,
+                "conf": by_name.get(fname),
                 "sprite": by_name.get(fname),
             })
         packs.append({

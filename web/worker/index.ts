@@ -311,6 +311,109 @@ function spanOf(range: R2Range, size: number): { offset: number; length: number 
     : null;
 }
 
+// ---------------------------------------------------------------- 外部链接
+
+/**
+ * 隐藏/赛季炫彩 `HIDDEN_GLASS_CONF.id` → 款名。分享链接里的 `look` 写的是**名字**
+ * (`炫彩:黑白`):wasm 那边虽然也认 id,但前端 `parseLook` 只按名字回填下拉,
+ * 拿 id 进去选框会是空的。名字与 id 同 `src/pet/glassy_table.rs` 的 `HIDDEN`。
+ */
+const HIDDEN_GLASS: Record<number, string> = {
+  1: "暗夜拾光",
+  2: "狂欢怪谈",
+  3: "铅字幻梦",
+  1000: "黑白",
+};
+
+/** 常规炫彩色号的打包位宽:`glass_value = (粒子id << 20) | 配色id`(同游戏客户端)。 */
+const GLASS_PARTICLE_SHIFT = 20;
+
+/**
+ * 把 `glass_type:glass_value`(游戏 `GlassInfo` 原样)译成 `look` 里的炫彩那一段。
+ * 认不得就回 null —— 调用方当作「没有炫彩」,链接照发,人还是能看到这只。
+ */
+function glassPart(spec: string | undefined): string | null {
+  if (!spec) return null;
+  const [t, v] = spec.split(":");
+  const type = Number(t);
+  const value = Number(v);
+  if (!Number.isInteger(type) || !Number.isInteger(value) || value <= 0) return null;
+  if (type === 2) {
+    const name = HIDDEN_GLASS[value];
+    return name ? `炫彩:${name}` : null;
+  }
+  if (type === 1) {
+    const particle = value >>> GLASS_PARTICLE_SHIFT;
+    const color = value & ((1 << GLASS_PARTICLE_SHIFT) - 1);
+    return particle && color ? `炫彩:${particle}/${color}` : null;
+  }
+  return null;
+}
+
+/**
+ * **开放接口**:拿游戏侧的编号换一条预览链接。给外部工具用(抓包统计
+ * [rocom-capture](https://github.com/whoisnian/rocom-capture) 的宠物详情页点色卡就走这里),
+ * 免得每个调用方都去抄一遍「形态编号 → 包名/资产名」和 `look` 的写法 —— 那两样都是
+ * 本仓库自己的实现细节,换个版本就可能变。
+ *
+ *     GET /api/link?petbase=3007&shiny=1&glass=2:1
+ *
+ * | 参数 | 是什么 |
+ * | --- | --- |
+ * | `petbase` | **必填**,形态编号(`PETBASE_CONF` 行 id,即 `PetData.base_conf_id`) |
+ * | `shiny`   | 异色,`1`/`true` 为是(即 `mutation_type & 1`) |
+ * | `glass`   | 炫彩,`<glass_type>:<glass_value>`,`GlassInfo` 原样送过来 |
+ * | `face`    | 表情名,原样透传 |
+ * | `format`  | `json` 则回 JSON,默认回 302 |
+ *
+ * 默认**回 302**,所以可以直接当 `<a href>` 用:不需要 JS、也不吃 CORS。
+ * `format=json` 回 `{ url, pet, form, look }`,并放开 CORS 供别的站点取用。
+ *
+ * **查不到那只形态**(还没出包)时:302 那条跳站点首页并在 query 里留个
+ * `missing=<petbase>`(前端只读 pet/form/face/look,多的参数不碍事),让人至少落在
+ * 下载站而不是一张 404;`format=json` 则老老实实回 404。
+ */
+app.get("/api/link", async (c) => {
+  const q = c.req.query();
+  const petbase = Number(q.petbase);
+  const wantJson = q.format === "json";
+
+  if (!Number.isInteger(petbase) || petbase <= 0) {
+    return c.json({ error: "petbase 必填,且要是形态编号(PETBASE_CONF 行 id)" }, 400);
+  }
+
+  const catalog = await getCatalog(c.env, c.req.url);
+  const pack = catalog.packs.find((p) => p.forms.some((f) => f.conf === petbase));
+  const form = pack?.forms.find((f) => f.conf === petbase);
+  if (!pack || !form) {
+    if (wantJson) return c.json({ error: "还没有这个形态的宠物包", petbase }, 404);
+    const home = new URL("/", c.req.url);
+    home.searchParams.set("missing", String(petbase));
+    return c.redirect(home.toString(), 302);
+  }
+
+  const parts: string[] = [];
+  if (q.shiny === "1" || q.shiny === "true") parts.push("异色");
+  const glass = glassPart(q.glass);
+  if (glass) parts.push(glass);
+  const look = parts.join("+");
+
+  const url = new URL("/", c.req.url);
+  url.searchParams.set("pet", pack.id);
+  if (form.asset) url.searchParams.set("form", form.asset);
+  if (q.face) url.searchParams.set("face", q.face);
+  if (look) url.searchParams.set("look", look);
+
+  if (wantJson) {
+    return c.json(
+      { url: url.toString(), pet: pack.id, form: form.asset, look: look || null },
+      200,
+      { "Access-Control-Allow-Origin": "*", "Cache-Control": "public, max-age=300" },
+    );
+  }
+  return c.redirect(url.toString(), 302);
+});
+
 app.post("/api/report", async (c) => {
   const body = await c.req.json<{
     id?: string; reason?: string; note?: string; token?: string;
