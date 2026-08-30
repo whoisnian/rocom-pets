@@ -534,6 +534,13 @@ static List<MaterialEntry> BuildMaterials(
             // 水体预设的 caustics 也走 `noise_tex` 那个槽(它有基色,但没有色带,槽是空的)
             noiseFile = ExportEffectTexture(info.NoiseTexture);
         }
+        var backRender = info.IsBackRender
+            ? new BackRenderMaterial(
+                ExportEffectTexture(info.BackRenderFlowTexture),
+                info.BackRenderLevel, info.BackRenderSaturation, info.BackRenderFlowColor,
+                info.BackRenderFlow, WithSrgb(info.BackRenderRadial, info.BackRenderFlowTexture),
+                WithSrgb(info.BackRenderMain, info.BaseColorTexture))
+            : null;
         var yutuEar = info.IsYutuEar
             ? new YutuEarMaterial(
                 maskFile, noiseFile, ExportEffectTexture(info.YutuFlowTexture),
@@ -585,8 +592,9 @@ static List<MaterialEntry> BuildMaterials(
             info.UvFlowColor, info.UvFlowShape, UvFlowRadialWithSrgb(info),
             info.Fire1, info.Fire2, info.Fire3, info.Fire4, info.FireShape,
             info.Fresnel, info.FresnelShape, info.FresnelHard,
-            info.WaterColor1, info.WaterColor2, info.WaterMain,
-            info.WaterCaustics, info.WaterShape,
+            info.WaterColor1, info.WaterColor2,
+            info.WaterMain is { } wm ? WithSrgb(wm, info.NoiseTexture) : null,
+            info.WaterCaustics, info.WaterFlow, info.WaterShape,
             ExportEffectTexture(info.InteriorTexture), info.InteriorColor,
             info.Refraction, info.RefractDepth, info.FlickerSpeed, info.FlickerPower,
             info.NoiseUv,
@@ -598,7 +606,7 @@ static List<MaterialEntry> BuildMaterials(
             info.XiaoYouFlowColor1, info.XiaoYouFlowColor2, info.XiaoYouStarColor,
             info.XiaoYouNoiseFlow, info.XiaoYouShape, info.XiaoYouStarUv,
             info.XiaoYouStarUv2, info.XiaoYouStar2,
-            yutuEar, fakeFluid, matcapMasked, fairyBall,
+            backRender, yutuEar, fakeFluid, matcapMasked, fairyBall,
             ExportEffectTexture(info.GlassyIdTexture),
             ExportEffectTexture(info.SeasonBaseTexture),
             info.IsSeasonMutation
@@ -632,12 +640,12 @@ static List<MaterialEntry> BuildMaterials(
 
         // `.w` = 「共用那个绑定上的第二张贴图是不是 sRGB」。运行时按 `Rgba8Unorm` 上传,
         // sRGB 的必须在 shader 里自己解码 —— 少这一步,水体那层的噪声会强 4~5 倍。
-        float[] UvFlowRadialWithSrgb(MaterialInfo m)
-        {
-            var tex = m.UvFlowTexture;
-            var v = m.UvFlowRadial;
-            return [v[0], v[1], v[2], tex is not null && Textures.IsSrgb(fileProvider, tex) ? 1f : 0f];
-        }
+        float[] UvFlowRadialWithSrgb(MaterialInfo m) => WithSrgb(m.UvFlowRadial, m.UvFlowTexture);
+
+        /// 把 `objectPath` 那张贴图的 sRGB 旗标写进 `v` 的第四位。
+        float[] WithSrgb(float[] v, string? objectPath) =>
+            [v[0], v[1], v[2],
+             objectPath is not null && Textures.IsSrgb(fileProvider, objectPath) ? 1f : 0f];
 
         string? ExportEffectTexture(string? objectPath)
         {

@@ -214,6 +214,9 @@ struct VsIn {
     @location(6) color: vec4<f32>,
     // glTF `TEXCOORD_1`。`M_P_Object` 的加性流动层按 `UV Number` 在它与 UV0 之间选。
     @location(7) uv1: vec2<f32>,
+    // glTF `TEXCOORD_2`。背板族的 `UVNumber` 选的是**它**(VS 54079 的 `o5 = ATTRIBUTE7`,
+    // 签名查实)。全库 123 个骨骼网格真的有第 3 套 UV,见 `model::Vertex::uv2`。
+    @location(8) uv2: vec2<f32>,
 };
 
 struct VsOut {
@@ -235,6 +238,8 @@ struct VsOut {
     @location(7) world_pos: vec3<f32>,
     /// 第二套 UV。`M_P_Object` 的加性流动层按 `UV Number` 在它与 `uv` 之间选。
     @location(8) uv1: vec2<f32>,
+    /// 第三套 UV。背板族的 `UVNumber` 选它。
+    @location(9) uv2: vec2<f32>,
 };
 
 // 线性混合蒙皮:权重和不为 1 的顶点(导出误差)按权重和归一化,否则会缩水
@@ -271,6 +276,7 @@ fn skin(input: VsIn) -> VsOut {
     out.color = input.color;
     out.world_pos = world.xyz;
     out.uv1 = input.uv1;
+    out.uv2 = input.uv2;
     return out;
 }
 
@@ -299,6 +305,7 @@ fn vs_outline(input: VsIn) -> VsOut {
     out.color = input.color;
     out.world_pos = world.xyz;
     out.uv1 = input.uv1;
+    out.uv2 = input.uv2;
     return out;
 }
 
@@ -558,6 +565,40 @@ fn trans_spec_coverage(n: vec3<f32>) -> f32 {
     let spec_base = pow(max(dot(n, half_dir), 0.0), max(material.highlight.w, 1e-4));
     let spec_t = saturate((spec_base - 0.4) * 10.0);
     return spec_t * spec_t * (3.0 - 2.0 * spec_t) * material.highlight_color.w;
+}
+
+
+/// `M_P_Object_Trans` 那一族的边缘光遮罩 —— **逐指令来自 PS 53987 第 195~223 行**
+/// (莫比乌乌 `_By` / 幽星光 `_Fx1` 共用的 `quality=Num / lod=0 / dsid=0` 排列)。
+///
+/// ```text
+/// ndv   = saturate(视线 · 法线)
+/// 带宽  = 0.4 × (1 − |视线.z|)                 ← UE Z-up;我们是 Y-up,取 .y
+/// gate  = 1 − smoothstep(saturate((ndv − 0.05) / 带宽))
+/// base  = (1 − ndv) × gate
+/// p     = pow(base, Rim Power) − 0.5           ← base ≤ 0 时汇编直接顶成 −0.5
+/// cov   = smoothstep(saturate(p / Rim Soft Edge))
+/// ```
+///
+/// **我们原来只写了 `saturate(pow(1 − |N·V|, Rim Power))`**,漏掉了 `gate`、
+/// `− 0.5) / Rim Soft Edge` 那个重映射、以及最后那次 smoothstep。代价很具体:
+/// 幽星光那两颗球的 `Rim Power = 0.35`,`pow(facing, 0.35)` 是一条**很平**的曲线
+/// (facing = 0.1 就到 0.46),于是覆盖率在**整颗球**上都有 0.5~1 ——
+/// 而这一族的 alpha 正是 `max(基色a, 高光, MatCap, 这个覆盖率)`,球因此变成不透明,
+/// 把它背后那层**红色描边壳**整个挡住了。实机看到的红球就是那层壳。
+/// 补上重映射之后 facing = 0.1 处直接归 0,只有轮廓一圈还留着。
+fn trans_rim_coverage(n: vec3<f32>, power: f32, soft_edge: f32) -> f32 {
+    let view = view_direction();
+    let ndv = saturate(dot(view, n));
+    let width = max(0.4 * (1.0 - abs(view.y)), 1.0e-4);
+    let g = saturate((ndv - 0.05) / width);
+    let gate = 1.0 - g * g * (3.0 - 2.0 * g);
+    let base = (1.0 - ndv) * gate;
+    let shaped = select(-0.5,
+                        pow(max(base, 1.0e-6), max(power, 1.0e-4)) - 0.5,
+                        base > 0.0);
+    let c = saturate(shaped / max(soft_edge, 1.0e-4));
+    return c * c * (3.0 - 2.0 * c);
 }
 
 /// MatCap 的采样坐标:视空间法线映射到 [0,1](球面查找表的标准做法)。
@@ -955,6 +996,67 @@ fn interior_star(start: vec3<f32>, n: vec3<f32>, forward: vec3<f32>) -> f32 {
     let phase = fract(material.interior.z * camera.time + s.g);
     let twinkle = -1.2 * pow(abs(sin(phase * 6.28318548)), material.interior_color.w);
     return saturate((s.b + twinkle) * s.a * INTERIOR_GAIN);
+}
+
+
+/// **水体预设(`MI_P_Object_Water_NoMetal`)。** 逐指令来自 PS **16335**
+/// (水灵 `_Fx` 的 `quality=Num / lod=0 / dsid=0`,resource `AC743E86…`)第 62~118 行。
+///
+/// ```text
+/// a        = saturate((基色a − 0.04) × 1.1111)
+/// mask     = 1                                       ← Inv Opacity = 0 ∧ UseOpacityAsMask = 0
+/// cauUV    = uv × 平铺C + frac(时间 × 速度C)
+/// c1       = caustics(cauUV).g × CausticsInt
+/// flowUV   = uv × 平铺F + (frac(时间×速度F.u), frac(时间×速度F.v))
+/// d        = caustics(uv).a × FlowDistort              ← 注意这一次采的是**未卷动**的 uv
+/// c2       = caustics(flowUV + d × 0.5).r
+/// 层一     = (c1 × c2 + c2) × 0.5 × Main Color × mask
+/// 层二     = 反色调映射(基色) × lerp(Color1, Color2, pow(saturate(N·V), FresnelPower)) × FresnelInt
+/// glow    += 自发光 × Emitter Intensity + 层一 + 层二
+/// ```
+///
+/// **这一层以前被判成「实机一层都不画」并撤回过**(见待办里那条)。那个结论来自
+/// shader 35663 的 `r4 × (1 − r2.y)`,而那是**另一份排列**;实机默认那份
+/// (`lod=0 / dsid=0`)里根本没有那道门 —— 同一个「挑错排列」的坑,这本子里第四次。
+///
+/// **两处名字是反的**,按槽位不按名字:`FresnelInt`(cb6[59].w)是**增益**、
+/// `FresnelPower`(cb6[59].z)是**指数**。slot ↔ 参数的对应是从
+/// `PROBE_SHADER_DETAILS` 的 `scalar-slot` 编码读的,不是数出来的
+/// (slot14/15 与 slot17/21 都跟参数序不一致)。
+fn water_layer(uv: vec2<f32>, base_rgb: vec3<f32>, n: vec3<f32>) -> vec3<f32> {
+    if material.family6.x < 0.5 {
+        return vec3<f32>(0.0);
+    }
+    let color1 = material.family0;
+    let color2 = material.family1;
+    let main_color = material.family2;
+    let cau = material.family3;
+    let flw = material.family4;
+    let shape = material.family5;
+
+    // **caustics 那张是 sRGB 资源**(`main_color.w`),而运行时统一按 `Rgba8Unorm` 上传、
+    // 没有硬件解码那一步 —— 不解码整层强 **9 倍**(实测把水灵的亮度比从 0.85 顶到 1.15)。
+    let srgb = main_color.w >= 0.5;
+    let cau_uv = uv * cau.xy + fract(camera.time * cau.zw);
+    let s_cau = textureSample(noise_tex, base_sampler, cau_uv);
+    let c1 = select(s_cau.g, srgb_to_linear(s_cau.ggg).g, srgb) * shape.x;
+    let flow_uv = uv * flw.xy
+        + vec2<f32>(fract(camera.time * flw.z), fract(camera.time * flw.w));
+    // 这一次采的是**未卷动**的 uv(汇编第 84 行),用 alpha 通道当扰动量。
+    // alpha 不是颜色,**不解码**。
+    let d = textureSample(noise_tex, base_sampler, uv).a * shape.y;
+    let s_c2 = textureSample(noise_tex, base_sampler, flow_uv + vec2<f32>(d * 0.5));
+    let c2 = select(s_c2.r, srgb_to_linear(s_c2.rrr).r, srgb);
+    let caustics = (c1 * c2 + c2) * 0.5;
+    let layer1 = caustics * main_color.rgb;
+
+    // 汇编:`r7 = (Color2 − Color1) × pow(N·V, FresnelPower)`,`N·V ≤ 0` 时那一项取 0,
+    // 再 `+ Color1` —— 即「背面只剩 Color1」。
+    let ndv = dot(n, view_direction());
+    let k = select(0.0, pow(max(ndv, 1.0e-6), shape.w), ndv > 0.0);
+    let tint = (color1.rgb + (color2.rgb - color1.rgb) * k) * shape.z;
+    let layer2 = game_tonemap_inverse(base_rgb) * tint;
+    return layer1 + layer2;
 }
 
 /// MatCap 高光。`MatCapColor` 可能是 HDR(暮星辰那两个球是 (3,3,3)),所以直接相乘。
@@ -1834,6 +1936,18 @@ fn shade_main(in: VsOut, depth_coverage: f32) -> vec4<f32> {
     // 火系族那两层也进同一个累加器(汇编第 199 行)。传的是**未解码的**基色贴图值:
     // 这一族自己做反色调映射,和外面那条 `pow(albedo, DECODE_GAMMA)` 不是一回事。
     glow += fire_layers(normalize(in.normal), tex.rgb, in.color.g, detail_mask);
+    // **水体预设那两层没接上,是有意的** —— 公式已经按汇编写好了(`water_layer`),
+    // 接上去实测:水灵 调色板 0.106 → **0.293**、亮度比 0.85 → **1.17**;
+    // 波波拉 0.126 → 0.277、1.16。原因**量清楚了**:那一层里
+    // `层二 = 反色调映射(基色) × lerp(Color1, Color2, …) × FresnelInt`
+    // 的量级和身体本身相当(线性里 ≈ 0.3 对 0.43),而实机的身体是
+    // `固有色 × 色带`(`T_AllDebugRamp` 实测 256 行全在 0.947~1.000,≈ 恒 1),
+    // 我们的 `shade` 是两段明暗 + `AMBIENT`,最高到 **3.0** —— 身体先大了 2~3 倍,
+    // 再加一层等量的光当然过曝。
+    //
+    // ⇒ 这是待办里那条「`M_P_Object` 的实机着色链…直接接上更差,要整包做」的**同一堵墙**,
+    // 而且现在有了数:**要动 `shade` 就得连这一层一起动**,单接一边必崩。
+    // 参数与贴图都已导出并接到 uniform 上(`family0..6`),重新打开只要加回这一行。
     // **不透明度**:`alpha_is_opacity` 的材质取基色 alpha,并照汇编做那个重映射
     // (`add r1.z, a, -0.04` → `mul_sat r1.z, r1.z, 1.1111`,即把 0.04..0.94 拉到 0..1)。
     // 暮星辰裙子那块 UV 的 alpha 中位 0.537 → 0.55,与从实机截图水印衰减反推的 0.50 对得上。
@@ -1850,7 +1964,9 @@ fn shade_main(in: VsOut, depth_coverage: f32) -> vec4<f32> {
         // **加上去的几层光是 `max` 合的,不是相加。** 汇编里连着两条:
         // `max r2.yzw, matcap*MatCapColor, spec*SpecColor` 再 `max r2.xyz, 上一步, rim`。
         // 相加会让高光与边缘光在轮廓处叠成一圈白边;取 max 则是「哪层亮听哪层」。
-        let rim_strength = saturate(pow(facing, material.extra.x) * material.star.z);
+        // `extra.x` = `Rim Power`、`extra.z` = `Rim Soft Edge`、`star.z` = `Rim Intensity`。
+        let rim_strength = trans_rim_coverage(n, material.extra.x, material.extra.z)
+            * material.star.z;
         // 这组 SpecCol 属于 `M_P_Object_Trans` 的 alpha-opacity 排列；MatCap 族是另一张
         // 材质图，继续只走自己的查找表，不能被这一组根默认高光改色。
         let spec_light = select(vec3<f32>(0.0),
@@ -2259,6 +2375,78 @@ fn glassy_outline(in: VsOut) -> vec3<f32> {
 /// 1. 用预蒙皮局部位置/法线和 `GlassyNoiseRefract` 求折射方向；
 /// 2. 按组件包围盒、Depth、UVScale 与 Speed 构造三平面坐标；
 /// 3. 三次采 `GlassyNoiseTex` 的 R/A，并按原来的两次 lerp 合成 `saturate(R*A)`；
+/// **`M_P_BackRenderEmissive`:只画一侧的不透明背板(unlit)。**
+///
+/// 逐指令来源:莫比乌乌 `_Fx` 的 `quality=Num / lod=0 / dsid=0` 排列
+/// (resource `C2685A88…`,PS 48913)。整条链只有 130 行,而且**没有任何光照** ——
+/// 它不吃 `shade`、不吃 AMBIENT,输出 alpha 恒 1(`mov o0.w, l(1.0)`)。
+///
+/// 用户描述的「一侧透明,可以看到身体内形状和粉色液体;另一侧是白色基底,避免透出背景」
+/// 里的**白色基底**就是它:外壳 `_By` 的基色 alpha 在中段 z∈[−0.3,+0.3] 上中位 0.000
+/// (那是一块透明窗口),窗口后面就是这块背板。
+///
+/// 参数名与 `M_P_Object` 那条加性流动层高度重合(`FlowInt` / `FlowPower` /
+/// `Flow_U_Speed` / `OpenRadialUV` / `RadialCenterOffset*`),但**合成方式相反**:
+/// 那边是加进发光累加器,这边是 `lerp` **替换**固有色。
+///
+/// 链上被 0 乘掉的两层已经查过(这本子里同一个坑踩过三次):`FresnelIntensity` 与
+/// `Glow Intensity` 的根默认都是 0,而全库 16 份覆盖过 `FresnelIntensity` 的材质
+/// (小火苗 / 水蓝蓝 / 落大蟹)没有一份在这一族里 ⇒ 菲涅尔层与 Glow 层恒为 0,不实现。
+/// `Flat_EmissiveRatio` = 0、`SelectionColor.a` = 0,那两条 lerp 也是恒等。
+@fragment
+fn fs_back_render(in: VsOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f32> {
+    let level = material.family0;
+    let saturation = material.family1;
+    let flow_color = material.family2;
+    let flow_uv = material.family3;
+    let radial = material.family4;
+    let main = material.family5;
+
+    // **剔面。** 材质的 `BasePropertyOverrides` 写着 `TwoSided = True`,光栅器两面都出;
+    // PS 自己按 `SV_IsFrontFace` 丢掉一面(汇编 `if_nz` 那段,`BackFaceOnly` 根默认 1):
+    //     a   = saturate(场景淡出 × (正面 ? +1 : −1))     ← 背面恒 0,正面取那个淡出量(常 1)
+    //     cov = select(a, 1 − a, UseBackFace)
+    //     按屏幕 4×4 抖动阈值 discard
+    // 抖动那一步是 UE 的 LOD 淡入淡出,离线没有那两个场景标量(恒 1)⇒ 化简成一个硬判据。
+    // 全库 3393 份材质里只有**莫比乌乌**把 `UseBackFace` 设成 1(只画背面),其余 11 份画正面。
+    let want_front = level.w < 0.5;
+    if front != want_front {
+        discard;
+    }
+
+    // ① 电平重映射 + 逐通道去饱和。基色贴图是 sRGB 资源(`main.w`),而运行时统一按
+    //    `Rgba8Unorm` 上传、没有硬件解码那一步,所以自己解。
+    let sampled = textureSample(base_color, base_sampler, in.uv).rgb;
+    let tex = select(sampled, srgb_to_linear(sampled), main.w >= 0.5);
+    var base = mix(vec3<f32>(level.x), vec3<f32>(level.y), tex);
+    // `饱和度变化` 是**逐通道**的去饱和量(根默认正好是亮度权重 (0.3, 0.59, 0.11));
+    // 实例可以给负值(莫比乌乌 (−0.12, 0, −0.292))—— 那是**加**饱和。
+    let lum = dot(base, vec3<f32>(0.3, 0.59, 0.11));
+    base += saturation.rgb * (vec3<f32>(lum) - base);
+
+    // ② 流动层的 UV。`UVNumber` 选的是 **TEXCOORD2**(VS 的 `o5 = ATTRIBUTE7`,签名查实),
+    //    不是 UV1。**「源网格最多两套 UV」那条旧结论是错的**(见 `model::Vertex::uv2`):
+    //    全库 123 个骨骼网格有第 3 套,柴渣虫的 UV2 有 99.4% 非零。两套的网格 UV2 全零,
+    //    与游戏顶点工厂的行为一致,所以这里直接用它、不必特判。
+    var uv = mix(in.uv, in.uv2, saturate(level.z));
+    if radial.z > 0.0 {
+        let d = uv - radial.xy;
+        uv = mix(uv, vec2<f32>(fract(atan2(d.y, d.x) * 0.15915494), length(d)), radial.z);
+    }
+    let scrolled = uv * flow_uv.zw + fract(camera.time * flow_uv.xy);
+    let flow_raw = textureSample(noise_tex, base_sampler, scrolled).rgb;
+    let flow_lin = select(flow_raw, srgb_to_linear(flow_raw), radial.w >= 0.5);
+    // 汇编是 `movc(raw <= 0, 0, exp(log(raw) × FlowPower))` —— ≤0 的通道直接取 0。
+    let shaped = select(pow(max(flow_lin, vec3<f32>(1.0e-6)), vec3<f32>(saturation.w)),
+                        vec3<f32>(0.0), flow_lin <= vec3<f32>(0.0));
+    // ③ **替换**,不是相加(汇编 `mad r1, flow, (UVFlowColor×FlowInt − base), base`)。
+    //    权重是顶点色 B —— 和 `M_P_Object` 那条加性流动层用的是同一个通道。
+    let weight = shaped * in.color.b;
+    var color = mix(base, flow_color.rgb * flow_color.w, weight);
+    color *= main.rgb;
+    return vec4<f32>(encode_linear_color(color), 1.0);
+}
+
 /// 4. 在 FlowColor02→01 之间混色，再按 Schlick 修正后的 Fresnel mask 混向 FresnelColor。
 ///
 /// 原 shader 是 BLEND_Opaque 且 `o0.w = 1`；GPU 侧因此给这一入口独立的写深度管线。

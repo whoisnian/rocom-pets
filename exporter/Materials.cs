@@ -106,7 +106,13 @@ public record MaterialInfo(
         // 认不出来就落进「纯特效层」那条路,拿它当形状遮罩、颜色走 `Tint`(这个材质没有)
         // ⇒ 渲成一团**没有颜色的白**,正是实机反馈里的「幽火缺少颜色」。
         // 排在 `BaseTex`/`EyeTex` 之后:两者都有时仍以通用名为准。
-        ?? Textures.Keys.FirstOrDefault(k => k.Equals("Base Color", StringComparison.OrdinalIgnoreCase));
+        ?? Textures.Keys.FirstOrDefault(k => k.Equals("Base Color", StringComparison.OrdinalIgnoreCase))
+        // **`BaseMap` 也是基色。** `M_P_BackRenderEmissive` 那一族用的是这个名字,
+        // 认不出来就整族落进「纯特效层」—— 而它们在原资产里是 `BLEND_Opaque`、
+        // 输出 alpha 恒 1 的**不透明背板**,当半透画会直接透出背景
+        // (莫比乌乌那条面条实机是白的,我们透出了红卡)。
+        // 全库普查:`BaseMap` 只出现在 **12 份**材质上,正好就是这一族,不会误伤别人。
+        ?? Textures.Keys.FirstOrDefault(k => k.Equals("BaseMap", StringComparison.OrdinalIgnoreCase));
 
     /// 基色贴图的对象路径;没有就是纯特效材质。
     public string? BaseColorTexture => BaseColorParam is { } p ? Textures[p] : null;
@@ -347,6 +353,111 @@ public record MaterialInfo(
     /// Fluid 去匹配；目标 Low PS 42877 直接以 COLOR_0.g 乘最终覆盖率。
     public bool IsFakeFluid =>
         ParentChain.Any(p => p.Contains("FakeFulid", StringComparison.OrdinalIgnoreCase));
+
+    /// **`M_P_BackRenderEmissive`:只画一侧的不透明背板。**
+    ///
+    /// 目标排列(莫比乌乌 `_Fx` 的 `quality=Num / lod=0 / dsid=0`,resource `C2685A88…`,
+    /// PS 48913)整条链很短,而且**没有任何光照**——它是 unlit 的:
+    ///
+    /// ```text
+    /// base  = lerp(RGB强度(Dark), RGB强度(Light), BaseMap)      ← 电平重映射
+    /// base += 饱和度变化 × (luminance(base) − base)              ← 逐通道去饱和
+    /// uv    = lerp(TEXCOORD0, TEXCOORD2, saturate(UVNumber))
+    /// uv    = lerp(uv, 极坐标(uv − RadialCenter), OpenRadialUV)
+    /// flow  = pow(FlowTexture(uv × FlowTiling + frac(时间 × FlowSpeed)), FlowPower) × 顶点色.b
+    /// color = lerp(base, UVFlowColor × FlowInt, flow)            ← **替换**,不是相加
+    /// color = color × MainColor × MainBright
+    /// out   = sqrt(color × 曝光),  alpha = 1
+    /// ```
+    ///
+    /// **链上被 0 乘掉的两层已经查过了**(这本子里同一个坑踩过三次,读出公式必查每个因子):
+    /// `FresnelIntensity` 与 `Glow Intensity` 的根默认都是 **0**,而全库 16 份覆盖过
+    /// `FresnelIntensity` 的材质(小火苗 / 水蓝蓝 / 落大蟹)**没有一份在这一族里** ⇒
+    /// 菲涅尔层与 Glow 层恒为 0,不实现。`Flat_EmissiveRatio` = 0、`SelectionColor.a` = 0,
+    /// 那两条 lerp 也是恒等。
+    ///
+    /// **哪一面**:材质的 `BasePropertyOverrides` 写着 `TwoSided = True`(光栅器两面都出),
+    /// 而 PS 自己按 `SV_IsFrontFace` 丢掉一面:
+    ///
+    /// ```text
+    /// a   = saturate(场景淡出 × (正面 ? +1 : −1))     ← 背面恒 0
+    /// b   = BackFaceOnly × (a − 1) + 1                 ← 根默认 1 ⇒ b = a
+    /// cov = saturate(UseBackFace × ((1 − a) − b) + b)  ← 0 ⇒ a(只留正面);1 ⇒ 1 − a(只留背面)
+    /// 按屏幕 4×4 抖动阈值 discard
+    /// ```
+    ///
+    /// 也就是「两面 + 着色器自己剔一面」= 直接剔另一面。全库只有**莫比乌乌**把
+    /// `UseBackFace` 设成 1(普查 3393 份,只此一份)⇒ 只有它画背面,其余 11 份画正面。
+    /// 画背面正是用户描述的那块「白色基底,避免透出背景」:壳中段是透明窗口
+    /// (`_By` 基色 alpha 在 z∈[−0.3,+0.3] 上中位 0.000),窗口后面就是这块背板。
+    ///
+    /// **没实现的一项**:`SwingIntensity`/`Swing Direction`/`SwingNum`/`SpeedR` 是顶点着色器里的
+    /// 摆动(WPO),我们没有 WPO 这一路。莫比乌乌的 `SwingIntensity` = (0,0,0) ⇒ 对它无影响;
+    /// 电环(0.5,0.5,2)与柴渣虫(4.5)那几只会缺这段摆动。
+    public bool IsBackRender =>
+        ParentChain.Any(p => p.Equals("M_P_BackRenderEmissive", StringComparison.OrdinalIgnoreCase));
+
+    /// `[RGB强度(Dark), RGB强度(Light), saturate(UVNumber), UseBackFace]`。
+    ///
+    /// `UVNumber` 在汇编里选的是 **TEXCOORD2**(VS 的 `o5 = ATTRIBUTE7`,签名查实),
+    /// 不是 UV1。源网格最多两套 UV(见 docs/design.md「缺逐顶点烘焙项」那条),
+    /// 所以那一支采到的是 `(0,0)` —— 运行时照这个做,别拿 UV1 顶替。
+    public float[] BackRenderLevel =>
+    [
+        RootScalar("RGB强度(Dark)", 0f),
+        RootScalar("RGB强度(Light)", 1f),
+        Math.Clamp(RootScalar("UVNumber", 0f), 0f, 1f),
+        RootScalar("UseBackFace", 0f),
+    ];
+
+    /// `[饱和度变化.rgb, FlowPower]`。这个参数名有点误导:它是**逐通道**的去饱和量,
+    /// 根默认 (0.3, 0.59, 0.11) 正好是亮度权重,而实例会给负值
+    /// (莫比乌乌 (−0.12, 0, −0.292) ⇒ 反而加饱和)。
+    public float[] BackRenderSaturation =>
+    [
+        ..(FirstVector("饱和度变化") ?? RootDefaults?.Vectors.GetValueOrDefault("饱和度变化")
+           ?? [0f, 0f, 0f, 0f])[..3],
+        RootScalar("FlowPower", 1f),
+    ];
+
+    /// `[UVFlowColor.rgb, FlowInt]` —— 流动层要**替换**成的颜色。
+    public float[] BackRenderFlowColor =>
+    [
+        ..(FirstVector("UVFlowColor") ?? RootDefaults?.Vectors.GetValueOrDefault("UVFlowColor")
+           ?? [1f, 1f, 1f, 0f])[..3],
+        RootScalar("FlowInt", 1f),
+    ];
+
+    /// `[Flow_U_Speed, Flow_V_Speed, Flow_U_Tiling, Flow_V_Tiling]`。
+    public float[] BackRenderFlow =>
+    [
+        RootScalar("Flow_U_Speed", 0f), RootScalar("Flow_V_Speed", 0f),
+        RootScalar("Flow_U_Tiling", 1f), RootScalar("Flow_V_Tiling", 1f),
+    ];
+
+    /// `[RadialCenterOffsetX, RadialCenterOffsetY, OpenRadialUV, -]`;
+    /// 第四位留给流动贴图的 sRGB 旗标(见 Program.cs 的 `BackRenderRadialWithSrgb`)。
+    public float[] BackRenderRadial =>
+    [
+        RootScalar("RadialCenterOffsetX", 0.5f), RootScalar("RadialCenterOffsetY", 0.5f),
+        RootScalar("OpenRadialUV", 0f), 0f,
+    ];
+
+    /// `[MainColor.rgb × MainBright, -]`;第四位留给**基色贴图**的 sRGB 旗标。
+    public float[] BackRenderMain
+    {
+        get
+        {
+            var c = FirstVector("MainColor") ?? RootDefaults?.Vectors.GetValueOrDefault("MainColor")
+                    ?? [1f, 1f, 1f, 1f];
+            var k = RootScalar("MainBright", 1f);
+            return [c[0] * k, c[1] * k, c[2] * k, 0f];
+        }
+    }
+
+    /// 这一族自己的流动贴图。根默认那张 `TestResBlack` 是纯黑(⇒ 流动层恒 0),
+    /// 所以只认实例链上显式设过的那份 —— 莫比乌乌没设,它只出基色。
+    public string? BackRenderFlowTexture => IsBackRender ? FirstTexture("FlowTexture") : null;
 
     /// 克莱因龙外壳使用的 MatCap 遮罩材质。目标 Low color PS 19654 先算
     /// `BaseColor * LightRamp + MatCap`，再接 Rim/FlatEmissive/Main/Selection，
@@ -898,22 +1009,40 @@ public record MaterialInfo(
     public float[]? WaterColor2 =>
         !IsWater ? null : Vectors.TryGetValue("Color2", out var c) ? [c[0], c[1], c[2], 0f] : null;
 
-    /// `Main Color` 原样带 a(a = 混合系数)。
+    /// `[Main Color.rgb, caustics 贴图是不是 sRGB]`。
+    ///
+    /// **第四位不是 `Main Color.a`**(汇编只用 `.xyz`,见 pet.wgsl 的 `water_layer`),
+    /// 让给 sRGB 旗标 —— 这一族的 caustics 贴图(`Noise` 槽)实测 **sRGB = 1**,
+    /// 而运行时统一按 `Rgba8Unorm` 上传、没有硬件解码那一步。不解码的代价是
+    /// **整层强 9 倍**(G 中位 0.224 → 线性 0.041),实测会把水灵的亮度比从 0.85 顶到 1.15。
+    /// 同一个坑这本子里踩过第二次(上一次是 `M_P_Object` 的流动贴图)。
     public float[]? WaterMain =>
-        !IsWater ? null : Vectors.TryGetValue("Main Color", out var c) ? c : null;
+        !IsWater ? null : Vectors.TryGetValue("Main Color", out var c) ? [c[0], c[1], c[2], 0f] : null;
 
     /// caustics 的 `[u 平铺, v 平铺, u 速度, v 速度]`。
     public float[] WaterCaustics =>
     [
-        Scalar("U_Tiling_Caustics", 1f), Scalar("V_Tiling_Caustics", 1f),
-        Scalar("U_Speed_Caustics", 0f), Scalar("V_Speed_Caustics", 0f),
+        RootScalar("U_Tiling_Caustics", 1f), RootScalar("V_Tiling_Caustics", 0.8f),
+        RootScalar("U_Speed_Caustics", 0.1f), RootScalar("V_Speed_Caustics", -0.5f),
+    ];
+
+    /// 流动扰动那一路的 `[u 平铺, v 平铺, u 速度, v 速度]`(与 caustics 那组**不是同一组**:
+    /// 汇编 PS 16335 第 72~79 行分别用 `cb6[57].xy/.zw`(caustics)与 `cb6[58].yz`+`cb6[58].w`/
+    /// `cb6[59].x`(flow))。
+    public float[] WaterFlow =>
+    [
+        // **兜底值取自 cooked shader map 自带的参数默认表**(`PROBE_SHADER_DETAILS`),
+        // 不是随手填的 0/1:这一族的参数来自材质**图层**,`RootDefaults`(读根 UMaterial 的
+        // `CachedExpressionData`)里根本没有它们,而实例又只覆盖了一部分。
+        RootScalar("U_Tiling_Flow", 1f), RootScalar("V_Tiling_Flow", 0.8f),
+        RootScalar("U_Speed_Flow", 0.1f), RootScalar("V_Speed_Flow", -0.5f),
     ];
 
     /// `[CausticsInt, FlowDistort, FresnelInt, FresnelPower]`。
     public float[] WaterShape =>
     [
-        Scalar("CausticsInt", 1f), Scalar("FlowDistort", 0f),
-        Scalar("FresnelInt", 1f), Scalar("FresnelPower", 1f),
+        RootScalar("CausticsInt", 1f), RootScalar("FlowDistort", 0.2f),
+        RootScalar("FresnelInt", 1f), RootScalar("FresnelPower", 1.771117f),
     ];
 
     /// **实例没写 `Emitter Color` 时要退到根默认(通常是白),不能当成「没有自发光」。**

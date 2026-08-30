@@ -29,6 +29,24 @@ public record SeasonMutationMaterial(
     /// [MainTexFlowSpeedX, MainTexFlowSpeedY, MainTexTiling, NormalEffectAmount]
     float[] Flow);
 
+/// `M_P_BackRenderEmissive`:只画一侧的不透明背板(unlit)。字段含义见
+/// `MaterialInfo.IsBackRender`。基色贴图走 `MaterialEntry.BaseColor`,
+/// 流动贴图单独一张(运行时和别的族共用 `noise_tex` 那个 binding)。
+public record BackRenderMaterial(
+    string? FlowTexture,
+    /// [RGB强度(Dark), RGB强度(Light), saturate(UVNumber), UseBackFace]
+    float[] Level,
+    /// [饱和度变化.rgb, FlowPower]
+    float[] Saturation,
+    /// [UVFlowColor.rgb, FlowInt]
+    float[] FlowColor,
+    /// [U_Speed, V_Speed, U_Tiling, V_Tiling]
+    float[] Flow,
+    /// [RadialCenterX, RadialCenterY, OpenRadialUV, 流动贴图是不是 sRGB]
+    float[] Radial,
+    /// [MainColor.rgb × MainBright, 基色贴图是不是 sRGB]
+    float[] Main);
+
 public record YutuEarMaterial(
     string? BubbleTexture,
     string? DistortTexture,
@@ -176,6 +194,7 @@ public record MaterialEntry(
     float[]? WaterColor2,
     float[]? WaterMain,
     float[] WaterCaustics,
+    float[] WaterFlow,
     float[] WaterShape,
     /// 玻璃内部那颗星:四角星场贴图 + 着色 + 折射率 + march 深度。
     string? InteriorTexture,
@@ -208,6 +227,7 @@ public record MaterialEntry(
     /// 第二层星点(`Star_BA_*`)的 UV 控制与 [阈值, 阈值, 强度, 速度]。见 `MaterialInfo.XiaoYouStarUv2`。
     float[] XiaoYouStarUv2,
     float[] XiaoYouStar2,
+    BackRenderMaterial? BackRender,
     YutuEarMaterial? YutuEar,
     FakeFluidMaterial? FakeFluid,
     MatcapMaskedMaterial? MatcapMasked,
@@ -392,6 +412,7 @@ public static class Manifest
                     parts.Add($"water_main = [{string.Join(", ", wm.Select(Num))}]");
                 parts.Add($"water_caustics = [{string.Join(", ", mat.WaterCaustics.Select(Num))}]");
                 parts.Add($"water_shape = [{string.Join(", ", mat.WaterShape.Select(Num))}]");
+                parts.Add($"water_flow = [{string.Join(", ", mat.WaterFlow.Select(Num))}]");
                 // caustics 走 `noise_tex` 那个槽(水体材质有基色,但没有色带,槽是空的)。
                 // **这一行必须在这儿,不能靠下面「BaseColor is null」那支** —— 水体有基色。
                 if (mat.NoiseTexture is not null)
@@ -497,6 +518,18 @@ public static class Manifest
                 parts.Add($"xiaoyou_star_uv = [{string.Join(", ", mat.XiaoYouStarUv.Select(Num))}]");
                 parts.Add($"xiaoyou_star_uv2 = [{string.Join(", ", mat.XiaoYouStarUv2.Select(Num))}]");
                 parts.Add($"xiaoyou_star2 = [{string.Join(", ", mat.XiaoYouStar2.Select(Num))}]");
+            }
+            if (mat.BackRender is { } back)
+            {
+                parts.Add("back_render = true");
+                if (back.FlowTexture is not null)
+                    parts.Add($"back_render_flow_tex = {Quote(back.FlowTexture)}");
+                parts.Add($"back_render_level = [{string.Join(", ", back.Level.Select(Num))}]");
+                parts.Add($"back_render_saturation = [{string.Join(", ", back.Saturation.Select(Num))}]");
+                parts.Add($"back_render_flow_color = [{string.Join(", ", back.FlowColor.Select(Num))}]");
+                parts.Add($"back_render_flow = [{string.Join(", ", back.Flow.Select(Num))}]");
+                parts.Add($"back_render_radial = [{string.Join(", ", back.Radial.Select(Num))}]");
+                parts.Add($"back_render_main = [{string.Join(", ", back.Main.Select(Num))}]");
             }
             if (mat.YutuEar is { } yutu)
             {

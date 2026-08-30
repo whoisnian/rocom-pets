@@ -317,6 +317,36 @@ struct RawMaterial {
     xiaoyou_star_uv2: Option<[f32; 4]>,
     #[serde(default)]
     xiaoyou_star2: Option<[f32; 4]>,
+    /// `MI_P_Object_Water_NoMetal` 的水体预设。见 `MaterialSpec::water`。
+    #[serde(default)]
+    water_color1: Option<[f32; 4]>,
+    #[serde(default)]
+    water_color2: Option<[f32; 4]>,
+    #[serde(default)]
+    water_main: Option<[f32; 4]>,
+    #[serde(default)]
+    water_caustics: Option<[f32; 4]>,
+    #[serde(default)]
+    water_flow: Option<[f32; 4]>,
+    #[serde(default)]
+    water_shape: Option<[f32; 4]>,
+    /// `M_P_BackRenderEmissive`:只画一侧的不透明背板(unlit)。见 `MaterialSpec::back_render`。
+    #[serde(default)]
+    back_render: bool,
+    #[serde(default)]
+    back_render_flow_tex: Option<String>,
+    #[serde(default)]
+    back_render_level: Option<[f32; 4]>,
+    #[serde(default)]
+    back_render_saturation: Option<[f32; 4]>,
+    #[serde(default)]
+    back_render_flow_color: Option<[f32; 4]>,
+    #[serde(default)]
+    back_render_flow: Option<[f32; 4]>,
+    #[serde(default)]
+    back_render_radial: Option<[f32; 4]>,
+    #[serde(default)]
+    back_render_main: Option<[f32; 4]>,
     /// `M_Gra_Yutu_Ear_Lighting` 的目标 Low 专用分支。
     #[serde(default)]
     yutu_ear: bool,
@@ -674,6 +704,13 @@ pub struct Material {
     pub glassy_inner: Option<GlassyInner>,
     /// `MI_P_Object_XiaoYou` 的不透明 MainTex/NoiseTex/StarTex 合成链。
     pub xiaoyou: Option<XiaoYou>,
+    /// `MI_P_Object_Water_NoMetal` 的水体预设(caustics + 两色菲涅尔),`None` = 这个材质没有。
+    /// 判据是导出器写没写 `water_color1`(那一项只有这一族有)。
+    pub water: Option<Water>,
+    /// `M_P_BackRenderEmissive` 的不透明背板。**只画一侧**,哪一侧看 `level[3]`
+    /// (`UseBackFace`:0 = 只画正面,1 = 只画背面)。判据与汇编见导出器的
+    /// `MaterialInfo.IsBackRender`。
+    pub back_render: Option<BackRender>,
     /// 莫比乌乌内层的原生不透明液体材质。
     pub yutu_ear: Option<YutuEar>,
     /// 克莱因龙的原生 FakeFulid 玻璃/液面材质。
@@ -713,6 +750,43 @@ pub struct XiaoYou {
     /// `star2` = [`Star_RG_DarkTime`, `Star_BA_DarkTime`, `Star_BA_Int`, `Star_BA_TwinkleSpeed`]。
     pub star_uv2: [f32; 4],
     pub star2: [f32; 4],
+}
+
+/// 水体预设的材质局部链。逐字段含义见 pet.wgsl 的 `water_layer`;
+/// 全部来自 PS 16335(水灵 `_Fx` 的 `Num/lod=0/dsid=0`,resource `AC743E86…`)第 62~118 行。
+#[derive(Clone, Copy)]
+pub struct Water {
+    /// [Color1.rgb, Emitter Intensity]
+    pub color1: [f32; 4],
+    /// [Color2.rgb, -]
+    pub color2: [f32; 4],
+    /// [Main Color.rgb, -]
+    pub main: [f32; 4],
+    /// caustics 那一路的 [u 平铺, v 平铺, u 速度, v 速度]
+    pub caustics: [f32; 4],
+    /// 流动扰动那一路的 [u 平铺, v 平铺, u 速度, v 速度]
+    pub flow: [f32; 4],
+    /// [CausticsInt, FlowDistort, FresnelInt, FresnelPower]
+    pub shape: [f32; 4],
+}
+
+/// `M_P_BackRenderEmissive` 的材质局部链。字段含义见导出器的 `MaterialInfo.IsBackRender`;
+/// 基色贴图沿用 `Material::base_color`,流动贴图在运行时和别的族共用 `noise_tex` 那个绑定。
+#[derive(Clone)]
+pub struct BackRender {
+    pub flow: Option<PathBuf>,
+    /// [RGB强度(Dark), RGB强度(Light), saturate(UVNumber), UseBackFace]
+    pub level: [f32; 4],
+    /// [饱和度变化.rgb, FlowPower]
+    pub saturation: [f32; 4],
+    /// [UVFlowColor.rgb, FlowInt]
+    pub flow_color: [f32; 4],
+    /// [U_Speed, V_Speed, U_Tiling, V_Tiling]
+    pub flow_uv: [f32; 4],
+    /// [RadialCenterX, RadialCenterY, OpenRadialUV, 流动贴图是不是 sRGB]
+    pub radial: [f32; 4],
+    /// [MainColor.rgb × MainBright, 基色贴图是不是 sRGB]
+    pub main: [f32; 4],
 }
 
 #[derive(Clone)]
@@ -1023,6 +1097,24 @@ fn material_table(root: &Path, raw: HashMap<String, RawMaterial>) -> HashMap<Str
                         // 旧包没这两格 ⇒ 强度 0 ⇒ 第二层不出场,退回原来的单层近似
                         star_uv2: mat.xiaoyou_star_uv2.unwrap_or([1.0, 0.0, 1.0, 0.0]),
                         star2: mat.xiaoyou_star2.unwrap_or([0.0; 4]),
+                    }),
+                    water: mat.water_color1.map(|c1| Water {
+                        color1: c1,
+                        color2: mat.water_color2.unwrap_or([0.0; 4]),
+                        main: mat.water_main.unwrap_or([0.0; 4]),
+                        caustics: mat.water_caustics.unwrap_or([1.0, 0.8, 0.1, -0.5]),
+                        flow: mat.water_flow.unwrap_or([1.0, 0.8, 0.1, -0.5]),
+                        shape: mat.water_shape.unwrap_or([1.0, 0.2, 1.0, 1.771117]),
+                    }),
+                    back_render: mat.back_render.then(|| BackRender {
+                        flow: mat.back_render_flow_tex.map(|rel| root.join(rel)),
+                        // 兜底 = 根材质默认值:`lerp(0, 1, tex)` 是恒等、不去饱和、不流动。
+                        level: mat.back_render_level.unwrap_or([0.0, 1.0, 0.0, 0.0]),
+                        saturation: mat.back_render_saturation.unwrap_or([0.0, 0.0, 0.0, 1.0]),
+                        flow_color: mat.back_render_flow_color.unwrap_or([1.0; 4]),
+                        flow_uv: mat.back_render_flow.unwrap_or([0.0, 0.0, 1.0, 1.0]),
+                        radial: mat.back_render_radial.unwrap_or([0.5, 0.5, 0.0, 0.0]),
+                        main: mat.back_render_main.unwrap_or([1.0, 1.0, 1.0, 1.0]),
                     }),
                     yutu_ear: mat.yutu_ear.then(|| YutuEar {
                         bubble: mat.yutu_bubble_tex.map(|rel| root.join(rel)),

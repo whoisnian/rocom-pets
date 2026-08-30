@@ -340,6 +340,8 @@ pub struct PetGpu {
     effect_pipeline: wgpu::RenderPipeline,
     glass_pipeline: wgpu::RenderPipeline,
     glassy_inner_pipeline: wgpu::RenderPipeline,
+    /// `M_P_BackRenderEmissive` 的不透明背板;两面都光栅化,剔面在片元里做。
+    back_render_pipeline: wgpu::RenderPipeline,
     /// (首索引, 数量, 材质序号)。`glassy_inner_draws` 是原材质本来就不透明、写深度的
     /// 流动内胆；其余批次的先后见 `Self::new` 的拆分说明。
     draws: Vec<(u32, u32, usize)>,
@@ -347,6 +349,8 @@ pub struct PetGpu {
     glass_draws: Vec<(u32, u32, usize)>,
     inner_draws: Vec<(u32, u32, usize)>,
     glassy_inner_draws: Vec<(u32, u32, usize)>,
+    /// 背板族的片,见 `back_render_pipeline`。
+    back_render_draws: Vec<(u32, u32, usize)>,
     /// 原材质为不透明、但不应套桌宠统一描边的专用内层（当前为 YutuEar）。
     special_opaque_draws: Vec<(u32, u32, usize)>,
     /// 要画描边的那些(逐材质按 `_Ol` 资产开关;半透里有 `_Ol` 的也在这儿)。
@@ -677,6 +681,16 @@ impl PetGpu {
             height: 1,
             rgba: vec![255, 255, 255, 255],
         };
+        // **背板族没设 `FlowTexture` 时要退回黑图,不是白图。** 游戏那边的根默认是
+        // `TestResBlack`(纯黑)⇒ `pow(0, FlowPower) = 0` ⇒ 流动层整层不出场;
+        // 退回白图会让 `lerp(base, UVFlowColor × FlowInt, 1)` **整片替换成流动色** ——
+        // 莫比乌乌那块背板因此被刷成纯白,而它的 UV 落在图集蓝色区(中位 (0.42,0.54,0.74)),
+        // 实机那条紧贴粉色的浅蓝带就是这么丢的。
+        let black = super::model::Image {
+            width: 1,
+            height: 1,
+            rgba: vec![0, 0, 0, 255],
+        };
         // 内部星层要把模型空间位置归一化到包围盒
         let bmin = [model.bounds.0.x, model.bounds.0.y, model.bounds.0.z, 0.0];
         let extent = model.bounds.1 - model.bounds.0;
@@ -724,9 +738,14 @@ impl PetGpu {
                 })
                 // `M_P_Object` 那条加性流动层的贴图。排在最后:这一层的材质都有基色,
                 // 走的是上面 `None => material.flow` 那支,而它们没有卷动色带。
-                .or(material.uv_flow.as_ref());
+                .or(material.uv_flow.as_ref())
+                // 背板那一族自己的流动贴图(`FlowTexture`)。它们有基色,同样走上面
+                // `None => material.flow` 那支,而这一族没有卷动色带,槽是空的。
+                .or_else(|| material.back_render.as_ref().and_then(|b| b.flow.as_ref()));
+            // 缺省贴图:背板族退黑(见上面 `black` 的说明),其余仍退白。
+            let fallback = if material.back_render.is_some() { &black } else { &white };
             let noise_view =
-                upload_texture(device, queue, &material.name, second.unwrap_or(&white));
+                upload_texture(device, queue, &material.name, second.unwrap_or(fallback));
             let star_view = upload_texture(
                 device,
                 queue,
@@ -957,6 +976,26 @@ impl PetGpu {
                 family[4] = m.selection_color;
                 family[5] = m.rim_shape;
                 family[6] = m.surface_shape;
+            } else if let Some(w) = &material.water {
+                // 水体预设**不是**一个独立分支:它是加在普通 `M_P_Object` 链路上的一层,
+                // 所以只借这几格参数,`family_flags` 一格都不占;`family[6].x` 当判据。
+                family[0] = w.color1;
+                family[1] = w.color2;
+                family[2] = w.main;
+                family[3] = w.caustics;
+                family[4] = w.flow;
+                family[5] = w.shape;
+                family[6] = [1.0, 0.0, 0.0, 0.0];
+            } else if let Some(b) = &material.back_render {
+                // **这一族不占 `family_flags`**:它有自己的片元入口与自己的通道
+                // (`back_render_pipeline`),`shade_main` 那条 dispatch 根本看不到它,
+                // 所以不需要判据位 —— 那一行只有四格,而 `family11.w` 已经给了 FairyBall。
+                family[0] = b.level;
+                family[1] = b.saturation;
+                family[2] = b.flow_color;
+                family[3] = b.flow_uv;
+                family[4] = b.radial;
+                family[5] = b.main;
             } else if let Some(f) = &material.fairy_ball {
                 family[0] = f.base_color;
                 family[1] = f.matcap_color;
@@ -1405,6 +1444,13 @@ impl PetGpu {
                     shader_location: 7,
                     format: wgpu::VertexFormat::Float32x2,
                 },
+                // glTF `TEXCOORD_2`;背板族的 `UVNumber` 选的是它(签名查实)。
+                // 全库 123 个骨骼网格有第 3 套 UV,见 `model::Vertex::uv2`。
+                wgpu::VertexAttribute {
+                    offset: 92,
+                    shader_location: 8,
+                    format: wgpu::VertexFormat::Float32x2,
+                },
             ],
         };
         // depth_write:主通道写深度,特效通道只测不写(半透层之间不该互相挡)
@@ -1507,6 +1553,18 @@ impl PetGpu {
             false,
         );
 
+        // **背板族(`M_P_BackRenderEmissive`)。** 原材质 `TwoSided = True`(光栅器两面都出),
+        // 由 PS 自己按 `SV_IsFrontFace` 丢掉一面 —— 所以这里 `cull_mode: None`,
+        // 剔面交给 `fs_back_render` 里那段(逐字照汇编)。写深度:它是不透明的。
+        let back_render_pipeline = make_pipeline(
+            "pet-back-render",
+            "vs_main",
+            "fs_back_render",
+            None,
+            true,
+            false,
+        );
+
         let glassy_inner_pipeline = make_pipeline(
             "pet-glassy-inner",
             "vs_main",
@@ -1524,6 +1582,10 @@ impl PetGpu {
         // 自动落进混合通道，与原材质的 BLEND_Opaque 相反。
         let (glassy_inner_draws, remaining): (Vec<_>, Vec<_>) =
             all_draws.partition(|&(_, _, m)| model.materials[m].glassy_inner.is_some());
+        // 背板族同理:原材质是 BLEND_Opaque、输出 alpha 恒 1,不能落进混合通道。
+        let (back_render_draws, remaining): (Vec<_>, Vec<_>) = remaining
+            .into_iter()
+            .partition(|&(_, _, m)| model.materials[m].back_render.is_some());
         let (special_opaque_draws, remaining): (Vec<_>, Vec<_>) = remaining
             .into_iter()
             .partition(|&(_, _, m)| model.materials[m].yutu_ear.is_some());
@@ -1603,11 +1665,13 @@ impl PetGpu {
             effect_pipeline,
             glass_pipeline,
             glassy_inner_pipeline,
+            back_render_pipeline,
             draws,
             effect_draws,
             glass_draws,
             inner_draws,
             glassy_inner_draws,
+            back_render_draws,
             special_opaque_draws,
             outline_draws,
             paint_order_draws,
@@ -1684,6 +1748,13 @@ impl PetGpu {
         if !self.glassy_inner_draws.is_empty() {
             pass.set_pipeline(&self.glassy_inner_pipeline);
             for &(first, count, material) in &self.glassy_inner_draws {
+                pass.set_bind_group(1, &self.material_binds[material], &[]);
+                pass.draw_indexed(first..first + count, 0, 0..1);
+            }
+        }
+        if !self.back_render_draws.is_empty() {
+            pass.set_pipeline(&self.back_render_pipeline);
+            for &(first, count, material) in &self.back_render_draws {
                 pass.set_bind_group(1, &self.material_binds[material], &[]);
                 pass.draw_indexed(first..first + count, 0, 0..1);
             }
@@ -1918,6 +1989,7 @@ mod tests {
             local_pos: pos,
             color: [1.0; 4],
             uv1: [0.0; 2],
+            uv2: [0.0; 2],
         }
     }
 

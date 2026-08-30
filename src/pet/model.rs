@@ -45,6 +45,18 @@ pub struct Vertex {
     /// (亮于 0.1 的顶点 0.1%),UV0 则有 12.1% —— 后者会在身上糊出一片实机没有的紫。
     /// 没有第二套 UV 的网格退回 UV0。
     pub uv1: [f32; 2],
+    /// 第三套 UV(glTF `TEXCOORD_2`)。**`UVNumber` 那个选择器选的是它,不是 UV1** ——
+    /// 签名查实:`M_P_BackRenderEmissive` 的 VS 54079 输出 `o5 = TEXCOORD2 = ATTRIBUTE7`,
+    /// 而 PS 48913 读的正是 `v5`。
+    ///
+    /// **「源网格最多两套 UV」那条旧结论是错的。** 它来自一次 12 形态的抽样,
+    /// 而那 12 只恰好都是两套的。全库 2681 个骨骼网格直接问资产(`--probe-material MESH:`):
+    /// **93 个有 3 套、30 个有 4 套**(其中宠物 76 个)—— 幽星光/曜星光、果冻、
+    /// 水蓝蓝一族、闪电环、柴渣虫都在里面。glb 里这些数据**一直都在**
+    /// (`VertexColorXTextureX` 写满 8 套),只是运行时从来只读了前两套。
+    /// 实测:幽星光 UV2 有 96.2% 非零、UV3 99.7% 非零(范围 ±1,是个方向向量);
+    /// 水灵 UV2 98.7%;柴渣虫 UV2 99.4%;而莫比乌乌(两套)的 UV2/UV3 确实全零。
+    pub uv2: [f32; 2],
 }
 
 /// 一段网格:对应一个材质槽(宠物一般 2–3 个:本体/眼/嘴)。
@@ -178,6 +190,10 @@ pub struct Material {
     pub glassy_inner: Option<GlassyInner>,
     /// `MI_P_Object_XiaoYou` 的不透明专用材质链。
     pub xiaoyou: Option<XiaoYou>,
+    /// `MI_P_Object_Water_NoMetal` 的水体预设(caustics + 两色菲涅尔)。见 `pack::Water`。
+    pub water: Option<crate::pack::Water>,
+    /// `M_P_BackRenderEmissive` 的不透明背板(unlit,只画一侧)。见 `pack::BackRender`。
+    pub back_render: Option<BackRender>,
     /// `M_Gra_Yutu_Ear_Lighting` 的不透明内层液体。
     pub yutu_ear: Option<YutuEar>,
     /// `M_P_FakeFulid` 的半透明玻璃/液面。
@@ -197,6 +213,12 @@ impl Material {
         // UE 的 BLEND_Translucent 无论材质参数里的 Opacity 是否恰好为 1，都不写深度。
         // 内层液体必须先画、外层玻璃随后混合；把 opacity=1 的玻璃改进不透明通道会直接
         // 挡掉莫比乌乌的 Fx1。这是混合模式语义，不是按宠物做排序特判。
+        // **背板这一族必须排在最前面。** 它在原资产里是 `BLEND_Opaque`、输出 alpha 恒 1,
+        // 但基色贴图的 alpha 不是 1(它和本体共用一张图集),`alpha_opacity` 那一支会把它
+        // 拖进混合通道 —— 那正是莫比乌乌那条面条透出红背景的成因。
+        if self.back_render.is_some() {
+            return false;
+        }
         self.effect.is_some() || self.translucent || self.alpha_opacity || self.fake_fluid.is_some()
     }
 }
@@ -238,6 +260,17 @@ pub struct XiaoYou {
     /// 第二层星点(`Star_BA_*`)。见 `pack::XiaoYou::star_uv2` / `star2`。
     pub star_uv2: [f32; 4],
     pub star2: [f32; 4],
+}
+
+/// `M_P_BackRenderEmissive` 的不透明背板。字段含义见 `pack::BackRender`。
+pub struct BackRender {
+    pub flow: Option<Image>,
+    pub level: [f32; 4],
+    pub saturation: [f32; 4],
+    pub flow_color: [f32; 4],
+    pub flow_uv: [f32; 4],
+    pub radial: [f32; 4],
+    pub main: [f32; 4],
 }
 
 pub struct YutuEar {
@@ -571,6 +604,36 @@ impl Model {
                 .read_tex_coords(1)
                 .map(|t| t.into_f32().collect())
                 .unwrap_or_else(|| uvs.clone());
+            // 第三套 UV。**缺就退回全零,不是退回 UV0** —— 游戏那边网格没有第三套时
+            // 顶点工厂喂的就是 0,而 `UVNumber` 选中它的材质拿到 0 是有意义的
+            // (采到贴图的一个固定点);退回 UV0 会凭空造出一层流动。
+            let uv2s: Vec<[f32; 2]> = reader
+                .read_tex_coords(2)
+                .map(|t| t.into_f32().collect())
+                .unwrap_or_else(|| vec![[0.0, 0.0]; uvs.len()]);
+            // **`UV Number` 选的「第二套」到底是哪一套,取决于网格有几套 UV。**
+            //
+            // 同一份 cooked resource(水灵 `_By` 的 `Num/lod=0/dsid=0`,`0F1003EB…`)里
+            // 有两条像素着色器,选择器那一行**不一样**:
+            //
+            // | shader | 签名 | 第 75~76 行 |
+            // | --- | --- | --- |
+            // | 49966 | v3=TEXCOORD0, v4=TEXCOORD1 | `lerp(v3, v4, saturate(UV Number))` |
+            // | 37774 | v3..v6=TEXCOORD0..3 | `lerp(v3, **v5**, saturate(UV Number))` |
+            //
+            // 这是 UE 按网格的 `NumTexCoords` 编出来的两个变体:材质图里那个 TexCoord 节点
+            // 写的是 **2**,编译时被 clamp 到 `NumTexCoords − 1`。两套的网格 ⇒ UV1,
+            // 三套及以上 ⇒ **UV2**。
+            //
+            // **对水灵是决定性的**:它的网格有 **4 套** UV,而 `UV Number` = 1
+            // ⇒ 实机取 UV2(98.7% 非零),我们原来取 UV1(**只有 0.6% 非零**,几乎全是 (0,0))
+            // —— 于是整层流动退化成「采贴图上同一个点、随时间滚过去」,
+            // 表现就是用户报的**整只亮度瞬间闪烁**(见 design.md 那节的方波实测)。
+            //
+            // glb 里 8 套 UV 都写着(缺的补零),所以「有没有第三套」只能按**非零**判。
+            // 实测这个判据很干净:有第三套的网格 UV2 非零率 96~99%,没有的是 0.0%。
+            let has_uv2 = uv2s.iter().any(|c| c[0] != 0.0 || c[1] != 0.0);
+            let alt_uv = if has_uv2 { &uv2s } else { &uv1s };
             let joint_ids: Vec<[u16; 4]> = reader
                 .read_joints(0)
                 .context("缺 JOINTS_0")?
@@ -592,7 +655,9 @@ impl Model {
                     weights: weights[i],
                     local_pos: positions[i],
                     color: colors[i],
-                    uv1: uv1s.get(i).copied().unwrap_or(uvs[i]),
+                    // 见上面 `alt_uv`:这一格装的是**选择器真正会取的那一套**,不一定是 UV1。
+                    uv1: alt_uv.get(i).copied().unwrap_or(uvs[i]),
+                    uv2: uv2s.get(i).copied().unwrap_or([0.0, 0.0]),
                 });
             }
             let first_index = indices.len() as u32;
@@ -780,6 +845,16 @@ impl Model {
                         star_uv: x.star_uv,
                         star_uv2: x.star_uv2,
                         star2: x.star2,
+                    }),
+                    water: spec.water,
+                    back_render: spec.back_render.as_ref().map(|b| BackRender {
+                        flow: b.flow.as_deref().and_then(|p| load_texture(p, true)),
+                        level: b.level,
+                        saturation: b.saturation,
+                        flow_color: b.flow_color,
+                        flow_uv: b.flow_uv,
+                        radial: b.radial,
+                        main: b.main,
                     }),
                     yutu_ear: spec.yutu_ear.as_ref().map(|y| YutuEar {
                         bubble: y.bubble.as_deref().and_then(|p| load_texture(p, true)),
