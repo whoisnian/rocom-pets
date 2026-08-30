@@ -703,7 +703,7 @@ public static class MaterialProbe
         // `MESH:<资产名>`:打印骨骼网格每个 LOD 有几套 UV。
         //
         // **为什么要它**:背板族那段摆动(WPO)的轴与相位烘在 **TEXCOORD2/TEXCOORD3** 里
-        // (见 docs/design.md「背板族的摆动也拿不到」),而 `M_P_Object` 那条 `UVNumber`
+        // (见 docs/findings.md「背板族的摆动也拿不到」),而 `M_P_Object` 那条 `UVNumber`
         // 选的也是 TEXCOORD2。我们的 glb 只写两套,到底是**源网格就只有两套**、
         // 还是**导出器丢了**,一直是靠一次 12 形态的抽样在猜 —— 这里直接问资产。
         if (asset.StartsWith("MESH:", StringComparison.OrdinalIgnoreCase))
@@ -1146,7 +1146,7 @@ public static class MaterialProbe
                         }
                         // **CUE4Parse 的 `GAME_RocoKingdomWorld` 特判会把这两个字段对调,
                         // 而对我们这份包来说那是反的 —— 这里换回来。** 核对过程见
-                        // docs/design.md §1.1「排列标签」那节:SHA 之前的 24 字节是 6 个 uint32,
+                        // docs/findings.md §1.1「排列标签」那节:SHA 之前的 24 字节是 6 个 uint32,
                         //     [第一个 int: 0 或 4 交替] [第二个 int: 恒 1] [1] [0xFFFFFFFF] [每两条 +1] [0]
                         // 而 SHA 之后紧跟 `08000000 29000000`(= MaxFieldAlignment 8 / Flags 0x29),
                         // 说明偏移本身没错。不对调 ⇒ quality ∈ {Low(0), Num(4)}、feature = 1 = ES3_1,

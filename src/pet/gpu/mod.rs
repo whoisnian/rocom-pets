@@ -3,11 +3,40 @@
 //! 蒙皮在顶点着色器里做(CPU 只算每关节一个矩阵),多实体时也只多上传一小块矩阵。
 //! 描边是第二遍绘制:法线外扩 + 只画背面,顺序是先描边后本体(靠深度测试盖住)。
 
+mod util;
+mod view;
+
+pub use view::*;
+use util::{posed_object_bounds, resolve_face_card, upload_texture};
+
 use anyhow::Result;
 use glam::{Mat4, Vec3};
 use wgpu::util::DeviceExt;
 
 use super::model::{GlassySkin, Model, Vertex};
+
+/// 着色器源码:`src/pet/shader/*.wgsl` 按文件名顺序拼成一个模块。
+///
+/// **为什么要拼**:整份 shader 早先是一个 2700 行的 `pet/shader/*.wgsl`,一次改动要在里面翻很久。
+/// WGSL 没有 `#include`,但**模块级条目与顺序无关**,所以直接把几份文本首尾相接就行 ——
+/// `concat!` 要求字面量,而 `include_str!` 正好展开成字面量。
+///
+/// **加新文件必须同时改这张清单**(不会自动扫目录:构建期扫目录得写 build.rs,
+/// 而那样就没法在编译期算出 `&'static str`,还得多一份 `rerun-if-changed` 要维护)。
+/// 文件名前缀的数字只是给人看的顺序,和依赖无关。
+const SHADER_SOURCE: &str = concat!(
+    include_str!("../shader/00-types.wgsl"),
+    include_str!("../shader/10-vertex.wgsl"),
+    include_str!("../shader/20-consts.wgsl"),
+    include_str!("../shader/30-common.wgsl"),
+    include_str!("../shader/40-layers.wgsl"),
+    include_str!("../shader/50-encode.wgsl"),
+    include_str!("../shader/60-families.wgsl"),
+    include_str!("../shader/70-glassy.wgsl"),
+    include_str!("../shader/80-main.wgsl"),
+    include_str!("../shader/90-outline.wgsl"),
+    include_str!("../shader/95-effect.wgsl"),
+);
 
 pub const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 
@@ -124,7 +153,7 @@ struct MaterialUniform {
     matcap_color: [f32; 4],
     /// 自发光:`Emitter Color`(rgb,线性)+ `Emitter Intensity`(a)。a = 0 时整层不画。
     emissive: [f32; 4],
-    // ⚠ 字段顺序必须和 pet.wgsl 的 `MaterialParams` 逐个对齐:uniform 是按偏移读的,
+    // ⚠ 字段顺序必须和 pet/shader/00-types.wgsl 的 `MaterialParams` 逐个对齐:uniform 是按偏移读的,
     // 顺序错了不会报错,只会静默取到旁边那个字段的值(rim/main 曾经就是这么对调的)。
     /// 边缘光颜色
     rim_color: [f32; 4],
@@ -167,7 +196,7 @@ struct MaterialUniform {
     xiaoyou_noise_flow: [f32; 4],
     xiaoyou_shape: [f32; 4],
     xiaoyou_star_uv: [f32; 4],
-    /// 第二层星点(`Star_BA_*`)。见 pet.wgsl 的 `shade_xiaoyou`。
+    /// 第二层星点(`Star_BA_*`)。见 pet/shader/60-families.wgsl 的 `shade_xiaoyou`。
     xiaoyou_star_uv2: [f32; 4],
     xiaoyou_star2: [f32; 4],
     /// 四套互斥的原生材质族共用参数区；解释由 family_flags.y/z/w 与 family11.w 决定。
@@ -190,7 +219,7 @@ struct MaterialUniform {
     /// `outline.y = 0` 时整份不看 —— 旧包没有这份数据,退回「固有色 × 0.80」。
     /// 推导见 `exporter/Materials.cs` 的 `OutlineOf`。
     outline_ramp: [[f32; 4]; 5],
-    /// 炫彩。字段顺序与 pet.wgsl 的 `MaterialParams` 尾部逐个对齐;含义见 `pet::glassy`。
+    /// 炫彩。字段顺序与 pet/shader/00-types.wgsl 的 `MaterialParams` 尾部逐个对齐;含义见 `pet::glassy`。
     /// `glassy_red.w`:0 = 这个槽不刷炫彩,1 = 刷。
     glassy_red: [f32; 4],
     glassy_green: [f32; 4],
@@ -201,31 +230,31 @@ struct MaterialUniform {
     glassy_stick1: [f32; 4],
     glassy_stick2: [f32; 4],
     glassy_stick3: [f32; 4],
-    /// 闪点层:[`StarTiling`, `StarDensity`, `StarIntensity`, -]。见 pet.wgsl 的 `glassy_sparkle`。
+    /// 闪点层:[`StarTiling`, `StarDensity`, `StarIntensity`, -]。见 pet/shader/70-glassy.wgsl 的 `glassy_sparkle`。
     glassy_sparkle: [f32; 4],
     /// 玻璃层那圈边缘光:[`RimColor`.rgb, `RimIntensity`]。**不是 lua 的 `MutationRimColor`**,
     /// 那个参数这条排列不读,见 `glassy::ROOT_RIM`。
     glassy_rim: [f32; 4],
-    /// 逐 `MatID` 的高光:`[SpecColor.rgb, 开着(0/1)]`。见 pet.wgsl 的 `matid_specular`。
+    /// 逐 `MatID` 的高光:`[SpecColor.rgb, 开着(0/1)]`。见 pet/shader/90-outline.wgsl 的 `matid_specular`。
     spec_color: [f32; 4],
     /// 同上的四档参数,挡位 2~5 各一格:`[SpecPow, SpecIntensity, SpecRadius, -]`。
     spec_slots: [[f32; 4]; 4],
     /// 法线图:`[有(0/1), 强度, -, -]`。贴图与上面共用 —— 就是 `MaskTex` 的 RG。
-    /// 见 pet.wgsl 的 `mapped_normal`。
+    /// 见 pet/shader/90-outline.wgsl 的 `mapped_normal`。
     normal_map: [f32; 4],
     /// `M_P_Object` 公共链上的加性流动层:`[FlowColor.rgb, FlowInt]`(`.w = 0` 就是不画)、
     /// `[FlowPower, InverVertexColor, Inv Or Not, OpenRadialUV]`、`[极坐标中心 x, y, -, -]`。
-    /// 卷动速度与平铺复用 `flow`。见 pet.wgsl 的 `uv_flow_layer`。
+    /// 卷动速度与平铺复用 `flow`。见 pet/shader/40-layers.wgsl 的 `uv_flow_layer`。
     uv_flow_color: [f32; 4],
     uv_flow_shape: [f32; 4],
     uv_flow_radial: [f32; 4],
     /// 同一条链上那圈菲涅尔发光:`[FresnelColor.rgb, FresnelIntensity]`(`.w = 0` 就是不画)、
     /// `[FresnelExponent, FresnelBoost, FresnelBaseMin, FresnelSoftTohard]`、
-    /// `[HardLineCol.rgb, HardLineColMul]`。见 pet.wgsl 的 `fresnel_layer`。
+    /// `[HardLineCol.rgb, HardLineColMul]`。见 pet/shader/40-layers.wgsl 的 `fresnel_layer`。
     fresnel: [f32; 4],
     fresnel_shape: [f32; 4],
     fresnel_hard: [f32; 4],
-    /// 火系族在同一个发光累加器上多的两层。见 pet.wgsl 的 `fire_layers`。
+    /// 火系族在同一个发光累加器上多的两层。见 pet/shader/40-layers.wgsl 的 `fire_layers`。
     fire1: [f32; 4],
     fire2: [f32; 4],
     fire3: [f32; 4],
@@ -298,7 +327,7 @@ fn glassy_uniform(
 /// ES3.1/Low/LOD0 的 `M_P_Object`(资源 `BF0167AE…`,PS 68952)里,`Glow Color × Glow
 /// Intensity × 遮罩`(第 145 行)与 `Emitter Color × Emitter Intensity × 遮罩`
 /// (第 62~65 行)**都进发光累加器 r1**,第 268 行才和已着色的颜色相加。现在按汇编放在
-/// `glow` 里(见 pet.wgsl)。值仍然是 0,所以这次搬家对渲图是零改动。
+/// `glow` 里(见 pet/shader/*.wgsl)。值仍然是 0,所以这次搬家对渲图是零改动。
 ///
 /// 把 51377(罗隐 body,cb6、`dcl cb6[148]`、V=112)配到 `MI_P_Object` 块 14
 /// (V=112 / S=142 ⇒ 总槽 149 ≥ 148),`cb6[7]` 解出来是 **`Glow Color × Glow Intensity`**,
@@ -339,7 +368,7 @@ pub struct PetGpu {
     paint_order_pipeline: wgpu::RenderPipeline,
     effect_pipeline: wgpu::RenderPipeline,
     glass_pipeline: wgpu::RenderPipeline,
-    /// 玻璃球的内胆(远半球实心,写深度)。见 pet.wgsl 的 `fs_glass_fill`。
+    /// 玻璃球的内胆(远半球实心,写深度)。见 pet/shader/80-main.wgsl 的 `fs_glass_fill`。
     glass_fill_pipeline: wgpu::RenderPipeline,
     glassy_inner_pipeline: wgpu::RenderPipeline,
     /// `M_P_BackRenderEmissive` 的不透明背板;两面都光栅化,剔面在片元里做。
@@ -370,6 +399,7 @@ impl PetGpu {
         model: &Model,
         target_format: wgpu::TextureFormat,
     ) -> Result<Self> {
+        // ─── ① 顶点 / 索引 / 骨骼矩阵 / 相机:每只宠物一份的缓冲 ───────────────
         let vertices = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("pet-vertices"),
             contents: bytemuck::cast_slice(&model.vertices),
@@ -407,6 +437,7 @@ impl PetGpu {
             mapped_at_creation: false,
         });
 
+        // ─── ② 绑定组布局:group0 = 每帧,group1 = 每材质,group2 = 场景深度 ─────
         let frame_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("pet-frame"),
             entries: &[
@@ -656,6 +687,7 @@ impl PetGpu {
             ],
         });
 
+        // ─── ③ 采样器与两张 1×1 兜底图(缺贴图的槽绑白/黑,别绑上一个材质的图)───
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("pet-sampler"),
             mag_filter: wgpu::FilterMode::Linear,
@@ -704,6 +736,12 @@ impl PetGpu {
             extent.z,
             extent.x.max(extent.y).max(extent.z),
         ];
+        // ─── ④ 逐材质:上传贴图 + 打包 `MaterialUniform` + 建绑定组 ─────────────
+        //
+        // **这一段是全项目改得最勤的地方。** 每加一族材质就在这儿多一支:
+        // 判据(`material.xxx.is_some()`)→ 填 `family0..11` → 着色器那边按 `family_flags`
+        // 或某一格当判据分流。字段顺序必须和 `src/pet/shader/00-types.wgsl` 的
+        // `MaterialParams` 逐个对齐 —— uniform 是按偏移读的,错一格全盘皆错。
         let mut material_binds = Vec::new();
         for material in &model.materials {
             // 主贴图:普通材质是基色;特效层是遮罩(形状来源),缺了就用白图 = 常量 1
@@ -1389,9 +1427,10 @@ impl PetGpu {
             }));
         }
 
+        // ─── ⑤ 管线:本体 / 描边 / 特效 / 玻璃 / 玻璃球内胆 / 背板 / 专用不透明件 ──
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("pet"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("pet.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(SHADER_SOURCE.into()),
         });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("pet"),
@@ -1551,7 +1590,7 @@ impl PetGpu {
             true,
         );
         // 玻璃球的「内胆」:剔正面、只画远半球,**写深度**,当不透明件先画一遍。
-        // 见 pet.wgsl 的 `fs_glass_fill`(那里有完整的合成推导与两条被否决的做法)。
+        // 见 pet/shader/80-main.wgsl 的 `fs_glass_fill`(那里有完整的合成推导与两条被否决的做法)。
         let glass_fill_pipeline = make_pipeline(
             "pet-glass-fill",
             "vs_main",
@@ -1617,6 +1656,7 @@ impl PetGpu {
         // 需要混合的最后画(叠在本体之上)。判据是 `blended()` 而不是 `translucent`:
         // 标着 BLEND_Translucent 但不透明度就是 1 的(幽星光那两个球)输出和不透明一样,
         // 放进混合通道只会因为不写深度而互相盖不住 —— 两颗球绕着转就闪。
+        // ─── ⑥ 拆绘制清单:不透明遍 / 混合遍 / 描边壳,顺序就是遮挡关系 ────────
         let (blended, draws): (Vec<_>, Vec<_>) = remaining
             .into_iter()
             .partition(|&(_, _, m)| model.materials[m].blended());
@@ -1839,315 +1879,3 @@ impl PetGpu {
     }
 }
 
-/// 用与顶点着色器完全相同的线性混合蒙皮计算本帧物体盒。FakeFulid 的 cooked PS
-/// 通过 PrimitiveSceneData 读取当前 `ObjectWorldPositionAndRadius/ObjectBounds`，液面
-/// 平面以那个中心为原点；这是材质输入，不是为某个模型拟合液位。
-fn posed_object_bounds(vertices: &[Vertex], matrices: &[Mat4]) -> Option<[f32; 4]> {
-    if vertices.is_empty() || matrices.is_empty() {
-        return None;
-    }
-    let mut min = Vec3::splat(f32::INFINITY);
-    let mut max = Vec3::splat(f32::NEG_INFINITY);
-    for vertex in vertices {
-        let total: f32 = vertex.weights.iter().sum();
-        let weights = if total > 0.0001 {
-            vertex.weights.map(|weight| weight / total)
-        } else {
-            vertex.weights
-        };
-        let mut skin = Mat4::ZERO;
-        for (slot, weight) in weights.into_iter().enumerate() {
-            if weight > 0.0 {
-                let joint = vertex.joints[slot] as usize;
-                if joint < matrices.len() {
-                    skin += matrices[joint] * weight;
-                }
-            }
-        }
-        let position = skin.transform_point3(Vec3::from_array(vertex.pos));
-        min = min.min(position);
-        max = max.max(position);
-    }
-    if !min.is_finite() || !max.is_finite() {
-        return None;
-    }
-    let center = (min + max) * 0.5;
-    Some([center.x, center.y, center.z, (max - min).max_element()])
-}
-
-/// 想画的那张表情卡这只有没有;没有就退档(`cards` 是这只真有的卡号,升序)。
-///
-/// 退档顺序:**先退回 2 号**(网格脸的默认脸,见 `Expression::card`),再退到最小的那张。
-/// 卡是按需做的,缺号不少见 —— 觅觅蝠一/三阶没有 1 号、蝴蝶陶陶三阶没有 5 号(困倦),
-/// 它睡着时若照着 5 号剔就整张脸都不画了。
-/// `cards` 为空(不是网格脸)时原样返回:着色器那条判据本来就不生效。
-fn resolve_face_card(cards: &[u32], want: u32) -> u32 {
-    if cards.is_empty() || cards.contains(&want) {
-        return want;
-    }
-    if cards.contains(&2) {
-        return 2;
-    }
-    cards[0]
-}
-
-fn upload_texture(
-    device: &wgpu::Device,
-    queue: &wgpu::Queue,
-    label: &str,
-    image: &super::model::Image,
-) -> wgpu::TextureView {
-    let texture = device.create_texture(&wgpu::TextureDescriptor {
-        label: Some(label),
-        size: wgpu::Extent3d {
-            width: image.width,
-            height: image.height,
-            depth_or_array_layers: 1,
-        },
-        mip_level_count: 1,
-        sample_count: 1,
-        dimension: wgpu::TextureDimension::D2,
-        format: wgpu::TextureFormat::Rgba8Unorm,
-        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-        view_formats: &[],
-    });
-    queue.write_texture(
-        wgpu::TexelCopyTextureInfo {
-            texture: &texture,
-            mip_level: 0,
-            origin: wgpu::Origin3d::ZERO,
-            aspect: wgpu::TextureAspect::All,
-        },
-        &image.rgba,
-        wgpu::TexelCopyBufferLayout {
-            offset: 0,
-            bytes_per_row: Some(image.width * 4),
-            rows_per_image: Some(image.height),
-        },
-        wgpu::Extent3d {
-            width: image.width,
-            height: image.height,
-            depth_or_array_layers: 1,
-        },
-    );
-    texture.create_view(&wgpu::TextureViewDescriptor::default())
-}
-
-/// 正交相机:桌宠是贴在桌面上的小人,透视没有意义,正交还免了远近缩放的麻烦。
-///
-/// `bounds` 是**绑定姿势**的包围盒,`yaw` 是绕 Y 轴的观察角(0 = 从 +Z 看;宠物朝 +Z,故 0 是正面)。
-/// `padding` 要留出余量:跳跃/伸展类动作会超出绑定姿势的包围盒(实测 Happy 会高出一截)。
-///
-/// 桌宠只绕 Y 转、画布也一定是正方的,所以这里没有俯仰与宽高比;
-/// 网页预览要拖着看,走 [`orbit_view`]。
-pub fn orthographic_view(bounds: (Vec3, Vec3), yaw: f32, padding: f32) -> Mat4 {
-    orbit_view(bounds, yaw, 0.0, padding, 1.0, Vec3::ZERO)
-}
-
-/// 取景半径:包围盒最长边的一半,乘上余量。
-///
-/// 取最长边而不是对角线:对角线会把瘦高的模型框得过松,宠物在画面里缩成一小团。
-/// 单独提出来是因为网页预览要拿它换算「拖一像素等于世界里多远」——**正交投影下
-/// 画面高度正好是 `2 * radius`**,两处各写一遍迟早对不上。
-pub fn framing_radius(bounds: (Vec3, Vec3), padding: f32) -> f32 {
-    let extent = bounds.1 - bounds.0;
-    extent.x.max(extent.y).max(extent.z) * 0.5 * padding
-}
-
-/// 观察角 → 相机朝向。`pitch` 在这里夹紧,调用方不必自己管。
-pub fn orbit_rotation(yaw: f32, pitch: f32) -> glam::Quat {
-    glam::Quat::from_rotation_y(yaw)
-        * glam::Quat::from_rotation_x(pitch.clamp(-MAX_PITCH, MAX_PITCH))
-}
-
-/// 同上,外加**俯仰**与**画布宽高比** —— 网页预览那块 canvas 可以拖、也不一定是正方的。
-///
-/// `pitch` 正值是从上往下看。**夹在 ±80° 内**:到极点时 `look_at` 的上方向会和视线共线,
-/// 矩阵直接退化成一片空白。宽高比只放宽横向,竖向那半径不动,于是不论画布多宽,
-/// 宠物在画面里的**高度**是一样的 —— 拖窗口大小时它不会跟着忽大忽小。
-///
-/// `target` 是**世界坐标里的**轨道中心偏移(网页预览的平移)。存世界坐标而不是屏幕偏移,
-/// 是因为平移完再转视角时,被推到一边的宠物应当待在原地,而不是跟着镜头甩。
-pub fn orbit_view(
-    bounds: (Vec3, Vec3),
-    yaw: f32,
-    pitch: f32,
-    padding: f32,
-    aspect: f32,
-    target: Vec3,
-) -> Mat4 {
-    let (min, max) = bounds;
-    let center = (min + max) * 0.5 + target;
-    let radius = framing_radius(bounds, padding);
-    let rotation = orbit_rotation(yaw, pitch);
-    let eye = center + rotation * Vec3::new(0.0, 0.0, radius * 2.0);
-    let view = glam::camera::rh::view::look_at_mat4(eye, center, Vec3::Y);
-    let half_w = radius * aspect.max(0.01);
-    // 深度范围用 wgpu 的 0..1(DirectX 约定),与管线的 Depth32Float + CompareFunction::Less 匹配
-    let proj = glam::camera::rh::proj::directx::orthographic(
-        -half_w,
-        half_w,
-        -radius,
-        radius,
-        0.01,
-        // 俯仰会把相机推到包围盒的角上,近/远平面要按对角线留够,不然会削掉一块
-        radius * 6.0,
-    );
-    proj * view
-}
-
-/// 俯仰的上限(弧度)。差 10° 到极点就停 —— 再上去 `look_at` 就退化了。
-pub const MAX_PITCH: f32 = std::f32::consts::FRAC_PI_2 * 8.0 / 9.0;
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// 缺卡要退档,而且不能退成「一张都不画」。
-    #[test]
-    fn a_missing_face_card_falls_back_instead_of_vanishing() {
-        let full: Vec<u32> = (1..=8).collect();
-        assert_eq!(resolve_face_card(&full, 5), 5, "有就用它");
-        // 蝴蝶陶陶三阶缺 5 号(困倦):退回默认那张
-        let no_sleepy = [1, 2, 3, 4, 6, 7, 8];
-        assert_eq!(resolve_face_card(&no_sleepy, 5), 2);
-        // 觅觅蝠一阶连 1 号都没有,但 2 号在,默认脸照样有
-        let no_first = [2, 3, 4, 5, 6, 7, 8];
-        assert_eq!(resolve_face_card(&no_first, 2), 2);
-        // 连 2 号都没有的极端情况:退到最小的一张,而不是什么都不画
-        assert_eq!(resolve_face_card(&[3, 6], 5), 3);
-        // 不是网格脸:原样返回(着色器不看这个值)
-        assert_eq!(resolve_face_card(&[], 2), 2);
-    }
-
-    fn skinned_vertex(pos: [f32; 3], joint: u16) -> Vertex {
-        Vertex {
-            pos,
-            normal: [0.0, 1.0, 0.0],
-            uv: [0.0; 2],
-            joints: [joint, 0, 0, 0],
-            weights: [1.0, 0.0, 0.0, 0.0],
-            local_pos: pos,
-            color: [1.0; 4],
-            uv1: [0.0; 2],
-            uv2: [0.0; 2],
-        }
-    }
-
-    /// 拖视角那两条约束:**俯仰要夹住**(到极点 `look_at` 会退化成一片空白),
-    /// 而**宽高比只放宽横向** —— 不论画布多宽,宠物在画面里的高度不变。
-    #[test]
-    fn orbit_clamps_pitch_and_only_widens_horizontally() {
-        let bounds = (Vec3::new(-1.0, -1.0, -1.0), Vec3::new(1.0, 1.0, 1.0));
-        // 竖直方向的投影比例不受宽高比影响
-        let square = orbit_view(bounds, 0.0, 0.0, 1.0, 1.0, Vec3::ZERO);
-        let wide = orbit_view(bounds, 0.0, 0.0, 1.0, 2.0, Vec3::ZERO);
-        assert!((square.y_axis.y - wide.y_axis.y).abs() < 1e-6, "高度该一样");
-        assert!(wide.x_axis.x.abs() < square.x_axis.x.abs(), "横向该放宽");
-
-        // 俯仰给到超过 90° 也不能让矩阵烂掉(NaN / 全零)
-        let over = orbit_view(bounds, 0.3, 3.0, 1.0, 1.5, Vec3::ZERO);
-        assert!(over.to_cols_array().iter().all(|v| v.is_finite()));
-        assert_eq!(
-            over,
-            orbit_view(bounds, 0.3, MAX_PITCH, 1.0, 1.5, Vec3::ZERO),
-            "该夹到上限"
-        );
-
-        // 不给俯仰与宽高比时,就是原来那个正方取景
-        assert_eq!(
-            orthographic_view(bounds, 0.7, 1.15),
-            orbit_view(bounds, 0.7, 0.0, 1.15, 1.0, Vec3::ZERO)
-        );
-    }
-
-    #[test]
-    fn posed_bounds_follow_skin_matrices() {
-        let vertices = [
-            skinned_vertex([-1.0, -2.0, -3.0], 0),
-            skinned_vertex([1.0, 2.0, 3.0], 1),
-        ];
-        let matrices = [
-            Mat4::from_translation(Vec3::new(2.0, 3.0, 4.0)),
-            Mat4::from_translation(Vec3::new(-2.0, -1.0, 0.0)),
-        ];
-
-        assert_eq!(
-            posed_object_bounds(&vertices, &matrices),
-            Some([0.0, 1.0, 2.0, 2.0])
-        );
-        assert_eq!(posed_object_bounds(&[], &matrices), None);
-    }
-
-    /// 网页预览的缩放没有动相机,而是把取景余量按比例收紧(`web.rs` 里传的是
-    /// `PADDING / zoom`)—— 投影是正交的,这么做和「拉近」等价。这条测试钉住那个比例:
-    /// 余量减半,同一个点在裁剪空间里就该走到大约两倍远。
-    #[test]
-    fn tightening_the_padding_makes_the_pet_fill_more_of_the_frame() {
-        let bounds = (Vec3::splat(-1.0), Vec3::splat(1.0));
-        let ndc_y = |padding: f32| {
-            let clip = orbit_view(bounds, 0.0, 0.0, padding, 1.0, Vec3::ZERO)
-                * Vec3::new(0.0, 1.0, 0.0).extend(1.0);
-            clip.y / clip.w
-        };
-
-        let wide = ndc_y(1.15);
-        let tight = ndc_y(1.15 / 2.0);
-        assert!(
-            (tight / wide - 2.0).abs() < 0.01,
-            "余量减半应当正好等于放大两倍,实得 {wide} → {tight}"
-        );
-    }
-
-    /// 平移要**精确跟手**:把轨道中心沿屏幕上方推「一个画面高」(正交下就是 `2 * radius`),
-    /// 原来在正中的那个点就该正好落到画面下边缘 —— NDC 里走 2.0。差一点都会表现成
-    /// 「拖得比手快 / 比手慢」,而这正是 web.rs 里 `pan` 那个换算的依据。
-    #[test]
-    fn panning_one_screen_height_moves_the_subject_exactly_one_screen() {
-        let bounds = (Vec3::splat(-1.0), Vec3::splat(1.0));
-        let padding = 1.15;
-        let radius = framing_radius(bounds, padding);
-        let ndc_y = |target: Vec3| {
-            let clip = orbit_view(bounds, 0.0, 0.0, padding, 1.0, target) * Vec3::ZERO.extend(1.0);
-            clip.y / clip.w
-        };
-
-        assert!(ndc_y(Vec3::ZERO).abs() < 1e-6, "没平移时中心就在画面正中");
-        let one_screen = ndc_y(Vec3::Y * 2.0 * radius);
-        assert!(
-            (one_screen + 2.0).abs() < 1e-5,
-            "中心上移一个画面高,画面里那个点就该反向走过整整一屏(NDC 满程 2.0),实得 {one_screen}"
-        );
-    }
-
-    /// **两只身高差 5 倍的宠物,桌面上的描边像素数该一样。**
-    ///
-    /// 导出器写的 `outline_width` 正比于身高(莫比乌乌 27.6cm → 0.0007 米、
-    /// 克莱因龙 138cm → 0.0035 米),而桌宠的窗口也正比于身高 ⇒ 不修正的话描边像素
-    /// 差 5 倍(用户实测「宠物体型越大描边越明显」)。乘上这个倍率之后两者应重合。
-    #[test]
-    fn desktop_outline_is_the_same_width_for_a_small_and_a_large_pet() {
-        let pet = |h: f32| (Vec3::new(-1.0, 0.0, -1.0), Vec3::new(1.0, h, 1.0));
-        // 导出器那一侧:宽度 = ratio × 身高(见 exporter/Materials.cs `OutlineOf`)
-        let exported = |h: f32| 0.0196 * 0.13 * h;
-        let on_screen = |h: f32| exported(h) * desktop_outline_scale(pet(h));
-
-        let small = on_screen(0.276); // 莫比乌乌
-        let large = on_screen(1.380); // 克莱因龙
-        assert!(
-            (small - large).abs() < 1e-9,
-            "修正后两只该等宽,实得 {small} vs {large}"
-        );
-        // 中位身高那只宽度不变 —— 离屏那批基线数字才不会跟着动
-        let median = 1.173;
-        assert!((desktop_outline_scale(pet(median)) - 1.0).abs() < 1e-3);
-    }
-
-    /// 包围盒退化(资产坏了)时不缩放,免得除出一个巨大的倍率。
-    #[test]
-    fn desktop_outline_scale_ignores_a_degenerate_bounding_box() {
-        let flat = (Vec3::ZERO, Vec3::new(1.0, 0.0, 1.0));
-        assert_eq!(desktop_outline_scale(flat), 1.0);
-    }
-
-}

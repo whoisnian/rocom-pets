@@ -21,7 +21,7 @@ cargo run --release -- --render packs/喵喵 --bench 600
   拓扑序 + 逆绑定矩阵)、动画通道、材质。贴图按材质名后缀从 `tex/` 找(`_By` → `T_*_By_D.png`)。
 - `pet/anim.rs`:采样 + 交叉淡化 + 蒙皮矩阵。**混合在 TRS 分量上做**(旋转 slerp),
   不在矩阵上插值——矩阵插值会把旋转插成剪切。淡化默认 0.18s。
-- `pet/gpu.rs` + `pet.wgsl`:蒙皮在顶点着色器里做(CPU 每帧只算每关节一个矩阵,经
+- `pet/gpu.rs` + `pet/shader/*.wgsl`:蒙皮在顶点着色器里做(CPU 每帧只算每关节一个矩阵,经
   storage buffer 上传);toon = 基色 + 两段明暗(`smoothstep` 过渡带避免锯齿)+ 边缘光;
   描边是第二遍绘制,法线外扩 + 只画背面,颜色取基色暗版而非纯黑。
 - 深度用 `Depth32Float`,投影用 glam 的 DirectX 约定(0..1 深度)配 `CompareFunction::Less`。

@@ -93,7 +93,7 @@ adb unroot                                          # 用完复原
 同三个 **Windows** cooked package 在安卓 archive 里是 **0 命中**,符合 platform-specific cook,
 也再次证明 `docs/android-glsl.md` §3 那个「交集 0」不是 bug。
 
-**为什么这条最重要**:本仓库栽得最狠的几次全在归属上 —— design.md 的「一次解析 bug 引发的
+**为什么这条最重要**:本仓库栽得最狠的几次全在归属上 —— findings.md 的「一次解析 bug 引发的
 连锁误读」、「**公式读对了不等于这条公式属于这个材质**」、`docs/shader.md` 里反复出现的
 「那个材质没有自己的内联 shader map,只能借父材质布局」。这些都是配对不确定的代价。
 
@@ -132,7 +132,7 @@ nrc.UtilityGroup=2
 安卓这条路不走名字:按 UE 4.26 `EvaluatePreshader` 把材质的 preshader opcode **求值**,
 直接得到 shader 真正消费的数值缓冲。喵喵身体 PS 的结果是 152 floats 的 numeric buffer,
 再按 header 的 `FUniformBufferCopyInfo` 复制出 `pc5_m` 的 14 个 float4(逐条校验 source/destination
-偏移、无重叠无空洞)。⇒ **design.md §1.1 的「B 类:替未解出名字的 cb 槽位站着的标定系数」
+偏移、无重叠无空洞)。⇒ **findings.md §1.1 的「B 类:替未解出名字的 cb 槽位站着的标定系数」
 整类都能变成查表。**
 
 一条必须记住的限制:求值出来的是**静态默认值**。运行时 lua 仍可能通过 material render proxy
@@ -196,7 +196,7 @@ uniform buffer 是 **`pc5_m[39]`**(1131~1146 行),而 `#3119` 是 **`pc6_m[69]`*
 `exporter/` 下零命中);§7 那条曲线当初就已整体回退,§8 两次落地也都失败回滚。所以这次更正
 只作废一批**笔记**,`cmp_shots` 基线 0.93 / 0.077 / 0.95 / 1.01 不受影响。
 
-**教训是老教训又中了一次**:design.md 记过「公式读对了不等于这条公式属于这个材质」。
+**教训是老教训又中了一次**:findings.md 记过「公式读对了不等于这条公式属于这个材质」。
 这次更狠一档 —— 指纹配到的是**同族的共享父材质**,它 feature 全开、双面、11 次采样,
 指纹的每一条判据都对得上,**恰恰因为它是那个超集**。⇒ **结构指纹天然偏向父材质,
 不能用来定位具体某只宠物。**
@@ -219,7 +219,7 @@ uniform buffer 是 **`pc5_m[39]`**(1131~1146 行),而 `#3119` 是 **`pc6_m[69]`*
 2. **参数是具名读出来的**(不经 cb 槽位):`Color1` (0.325, 0.539, 0.887) / `Color2` (0.338, 0.367, 0.627) /
    `Emitter Intensity` 0.4 / `CausticsInt` **7.0** / `FresnelInt` 0.85 / `FresnelPower` 4.0 /
    `FlowDistort` 0.38 / caustics 平铺 2,2 速度 0,0.171。静态开关 `开启黑魔法效果` = false
-   (与 design.md 记的"`OpenBlackMagicByIDMask` 全库零覆盖"对上)。
+   (与 findings.md 记的"`OpenBlackMagicByIDMask` 全库零覆盖"对上)。
 
 3. **`Main Color.w = 0`** —— 汇编尾部那个 `lerp(…, Main Color, Main Color.w)` **是关的**。
    上一次"整层替换成 Main Color"崩到 0.631,根因就在这:拿一个权重为 0 的层当主色。
@@ -414,8 +414,8 @@ v26 = texture(ps1, TEXCOORD0)                        // 基色贴图
 h27 = clamp((v26.w - 0.04) * 1.1111, 0, 1)           // 基色 alpha 的重映射
 ```
 
-和 `pet.wgsl` 里不透明度/线条遮罩用的 `saturate((tex.a − 0.04) × 1.1111)` **逐字相同** ——
-design.md 记的那条重映射在这里第三次独立出现。
+和 `pet/shader/*.wgsl` 里不透明度/线条遮罩用的 `saturate((tex.a − 0.04) × 1.1111)` **逐字相同** ——
+findings.md 记的那条重映射在这里第三次独立出现。
 
 **收获二:`v56` 不是菲涅尔项,是「反色调映射」本身 —— 而且这次是在宠物自己的材质上。**
 
@@ -460,7 +460,7 @@ v56 = ((-0.56·基色 + 0.047) - sqrt(-0.2072·基色² + 0.70896·基色 + 0.00
 2. **查 `OpenCustomDepth` 那条通道。** 眼下 `tools/cmp_shots.py` 基线里最差的波波拉与火神
    都开着这个静态开关(见 design.md 横向待办),而我们完全没有这条通道。安卓侧是可读源码 +
    确定 permutation,是最有希望的一只。
-3. **水体预设**:design.md 里那条「先把 35663 的 150~676 行读完」在 GLSL 侧是读表达式而不是
+3. **水体预设**:findings.md 里那条「先把 35663 的 150~676 行读完」在 GLSL 侧是读表达式而不是
    读寄存器流,成本低一个量级。
 
 ### 复现

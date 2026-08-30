@@ -159,7 +159,7 @@ if (!PackedNormalRoundTrips())
         CUE4Parse 的 FPackedNormal(FVector) 构造函数是坏的(上游 bug),法线会被写成切线。
         先给 CUE4Parse 克隆打补丁:
           git -C "$CUE4PARSE_DIR" apply <本仓库>/exporter/patches/0001-fix-FPackedNormal-quantize.patch
-        细节见 docs/design.md §1「法线」那几行。
+        细节见 docs/findings.md §1「法线」那几行。
         """);
     return 1;
 }
@@ -173,7 +173,7 @@ if (!MissingVertexColorIsWhite())
         CUE4Parse 在网格没有顶点色缓冲时把 COLOR_0 填成 0(该是白)。
         先给 CUE4Parse 克隆打补丁:
           git -C "$CUE4PARSE_DIR" apply <本仓库>/exporter/patches/0002-fix-FColor-missing-vertex-colors.patch
-        细节见 docs/design.md §1.1「六条实机反馈」那节。
+        细节见 docs/findings.md §1.1「六条实机反馈」那节。
         """);
     return 1;
 }
@@ -778,7 +778,7 @@ FormReport ExportForm(
         // 黑猫巫师(`Com_HeiMao2_001`)的网格挂的是 `Com_HeiMaoBo_001` 的骨架,
         // 而它按族名先撞上了小黑猫 —— 39 根骨骼对 92 根,尾巴/帽子/翅膀全没轨道(僵直),
         // 对得上的那半又把**小黑猫的骨骼长度**当平移写了进去(身体缩到三分之一)。
-        // 见 design.md「黑猫巫师身体偏短、尾巴笔直」。
+        // 见 findings.md「黑猫巫师身体偏短、尾巴笔直」。
         var skeletonOwner = SkeletonOwner(mesh, petsRoot);
         if (skeletonOwner is not null &&
             !skeletonOwner.Equals(form.Asset, StringComparison.OrdinalIgnoreCase))
@@ -858,7 +858,7 @@ FormReport ExportForm(
     var textures = Textures.Export(fileProvider, assetDir, texDir, warnings);
 
     // 材质:哪个槽画哪张贴图、alpha 该不该当遮罩剔。这一步取代原来的命名约定猜法
-    // (实测全量 2043 个槽里 258 个猜错或猜不到,详见 docs/design.md §1)。
+    // (实测全量 2043 个槽里 258 个猜错或猜不到,详见 docs/findings.md §1)。
     var resolved = Materials.Load(mesh, warnings);
     // **材质资产全部悬空 = 这只宠物没做完。** 实测 13 个形态如此,而且都是未实装的:
     // 4 个名字里直接带「占位」,全部 legal_petbase / completeness 皆空,id 集中在最新未上线段。

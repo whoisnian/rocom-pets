@@ -5,7 +5,7 @@
 宠物包放 `~/Downloads/rocom/packs-all/`(`exporter --all` 的产物)。
 
     uv run --with numpy --with pillow --with scipy python tools/edge_profile.py
-    EDGE_PACKS=~/Downloads/rocom/packs-F uv run … tools/edge_profile.py --profile 学院呱呱
+    EDGE_PACKS=~/Downloads/rocom/packs-all uv run … tools/edge_profile.py --profile 学院呱呱
 
 **为什么要单独一个工具:`cmp_shots.py` 的「描边比」判不了描边。** 那个比值是
 `(我们的描边环 ÷ 主体) ÷ (实机的同一个比)`,而两边的边缘锐度不同(我们硬、实机抗锯齿),

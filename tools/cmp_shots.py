@@ -165,7 +165,7 @@ def lit_scene(a, sel, drop=8.0, band=0.18, side=40):
     **为什么要分**:实机截图分两拨 —— 一拨有投影(绿底 + 地面),一拨是平铺卡片、
     没有任何投影，光照/背景条件显然不同，所以相关指标不能混算。这里只判断场景，
     不推断 shader permutation；后者必须按 cooked resource 的 FeatureLevel/Quality/LOD/
-    DynamicSwitchId 精确选择(见 docs/design.md §1.1 的果冻记录)。
+    DynamicSwitchId 精确选择(见 docs/findings.md §1.1 的果冻记录)。
 
     判据:宠物正下方一条带(高度按宠物高的 `band`)比同一行左右两侧暗 `drop` 以上。
     实测这条把 21 张分得很干净:有投影的一拨在 8.7~28.8,没投影的一拨 ≤ 0.7
@@ -288,7 +288,7 @@ def main() -> None:
             print(f"{tag}({len(sub):2d} 只)中位: 亮度 {med(1):.2f}  调色板 {med(2):.3f}  "
                   f"描边 {med(3):.2f}  对比 {med(4):.2f}")
         print("比值类目标都是 1.00,调色板距离目标 0.00。"
-              "亮度中位偏低是**实机的场景雾**,不要去追,见 docs/design.md §1.1")
+              "亮度中位偏低是**实机的场景雾**,不要去追,见 docs/findings.md §1.1")
 
 
 main()

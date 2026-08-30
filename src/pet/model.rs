@@ -2,7 +2,7 @@
 //!
 //! 包是导出器(exporter/)产出的:一个 glb 里装着「网格 + 蒙皮 + 全部逻辑动作」,
 //! 贴图独立成 PNG 放在 `tex/`,**哪个材质画哪张贴图由 manifest 的 `[forms.materials]` 指定**
-//! (导出器从游戏材质实例里解出来,见 docs/design.md §1、§4.3)。
+//! (导出器从游戏材质实例里解出来,见 docs/findings.md §1、§4.3)。
 //! 这里只做加载与整形,不碰 GPU。
 
 use std::collections::HashMap;
@@ -15,7 +15,7 @@ use super::anim::Pose;
 use super::glassy::GlassyRender;
 use crate::pack::Material as PackMaterial;
 
-/// 顶点布局:位置/法线/UV/关节索引/权重/顶点色。与 pet.wgsl 的 `@location` 一一对应。
+/// 顶点布局:位置/法线/UV/关节索引/权重/顶点色。与 pet/shader/*.wgsl 的 `@location` 一一对应。
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct Vertex {
@@ -471,7 +471,7 @@ pub struct SeasonSkin {
 impl Model {
     /// `materials_spec` 是 manifest 的 `[forms.materials]`:glb 材质名 → 该画什么
     /// (基色贴图、alpha 语义)。**这是唯一的贴图来源**,导出器从游戏材质实例里解出来,
-    /// 不再按贴图命名约定猜(猜法错 258 处,见 docs/design.md §1)。
+    /// 不再按贴图命名约定猜(猜法错 258 处,见 docs/findings.md §1)。
     pub fn load(glb_path: &Path, materials_spec: &HashMap<String, PackMaterial>) -> Result<Self> {
         if materials_spec.is_empty() {
             bail!("{glb_path:?} 所属的包没有 [forms.materials](旧版导出的包),重导一次");

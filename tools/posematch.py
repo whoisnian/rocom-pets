@@ -25,7 +25,7 @@ sys.path.insert(0, "tools")
 from gamemask import game_mask
 
 SHOTS = Path.home()/"Downloads/rocom/screenshot-pets"
-PACKS = Path(os.environ.get("CMP_PACKS", Path.home()/"Downloads/rocom/packs-back"))
+PACKS = Path(os.environ.get("CMP_PACKS", Path.home() / "Downloads/rocom/packs-all"))
 BIN = Path("target/release/rocom-pets").resolve()
 OUT = Path("/tmp/posematch"); OUT.mkdir(exist_ok=True)
 

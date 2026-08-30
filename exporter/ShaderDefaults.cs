@@ -87,7 +87,7 @@ public static class ShaderMapDefaults
         {
             if (resource.LoadedShaderMap is not { } map) continue;
             // **CUE4Parse 对 `GAME_RocoKingdomWorld` 会把这两个字段对调**,对我们这份包是反的
-            // (核对过程见 docs/design.md §1.1「排列标签」);这里换回来,与探针同一套。
+            // (核对过程见 docs/findings.md §1.1「排列标签」);这里换回来,与探针同一套。
             var quality = (EMaterialQualityLevel) (int) map.ShaderMapId.FeatureLevel;
             if (quality != EMaterialQualityLevel.Num) continue;
             if (PermutationKey(raw, map.ShaderMapId.CookedShaderMapIdHash?.ToString())

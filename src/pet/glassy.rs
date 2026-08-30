@@ -45,7 +45,7 @@
 //!
 //! `GlassySwitch` 是**动态开关**(本作自改引擎的 `DynamicSwitchParameters`),cook 时按
 //! `DynamicSwitchId` 另存一份 resource,所以「开着」的那份是**编译好在包里的**,不用猜。
-//! 定位办法见 docs/design.md「炫彩那条 shader 分支是怎么找到的」:
+//! 定位办法见 docs/findings.md「炫彩那条 shader 分支是怎么找到的」:
 //! `MI_Ill_XingGuang1_001_By` 有 6 个动态开关排列,3 个开关(`GlassySwitch` /
 //! `OpenPetFX` / `开启黑魔法效果`)按位组合,**id=1 就是只开炫彩那份**。
 //!
@@ -179,7 +179,7 @@ pub struct GlassyParams {
     /// 玻璃色总增益里的那个系数。增益 = `(base_color_detail + 1) × flow_color_intensity`,
     /// 见 [`GlassyParams::glass_gain`] 与 [`FLOW_COLOR_INTENSITY`]。
     pub flow_color_intensity: f32,
-    /// 闪点层的格子大小(`StarTiling`,根默认 0.4)。见 pet.wgsl 的 `glassy_sparkle`。
+    /// 闪点层的格子大小(`StarTiling`,根默认 0.4)。见 pet/shader/70-glassy.wgsl 的 `glassy_sparkle`。
     pub star_tiling: f32,
     /// 闪点层的密度(`StarDensity`,根默认 8)。格子边长 = `1 / (20 × StarTiling × StarDensity)`
     /// 的 UV 单位 —— 根默认下是 UV × 64,比星贴层(× 4)密得多,所以是「极小的亮点」。
@@ -252,7 +252,7 @@ pub struct GlassyOverrides {
     ///
     /// **这条曾被记成「实机空转」**:那是因为当时只读得到 quality=Low 那条排列,
     /// 里面确实没有 `StarIntensity`。高质量那条(鸭吉吉 `_By` 的 `[15]`,PS 5710)里它
-    /// 是那层 Voronoi 闪点的亮度,见 pet.wgsl 的 `glassy_sparkle`。
+    /// 是那层 Voronoi 闪点的亮度,见 pet/shader/70-glassy.wgsl 的 `glassy_sparkle`。
     /// 实机对照直接印证:常规炫彩(10)身上一片极小的白亮点,而狂欢怪谈/黑白(0)
     /// 一个都没有 —— 奔波鼠与卡波两张截图同放大倍数一比就看得出。
     pub star_intensity: Option<f32>,
@@ -330,7 +330,7 @@ pub const STICK_INTENSITY: f32 = 1.5;
 
 /// 根材质 `M_P_Object` 的 `StickRandomColor01..04` —— 星贴层**四段渐变的色标**。
 ///
-/// 和 pet.wgsl 里既有的 `STICK_RAMP_0..3` 是同一组数:那边是 `StarStickTex` 族的星贴层,
+/// 和 pet/shader/*.wgsl 里既有的 `STICK_RAMP_0..3` 是同一组数:那边是 `StarStickTex` 族的星贴层,
 /// 炫彩这条排列采的也是 `StarStickTex`,**同一族同一条公式**。
 ///
 /// 常规炫彩没人覆盖它们,所以就是这四个。实机验证:鸭吉吉那张截图里量到的方块颜色

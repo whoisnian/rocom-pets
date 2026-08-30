@@ -4,7 +4,7 @@
 材质观感,而 cooked 包里**材质图是被剥掉的**(那是 editor-only 数据):CUE4Parse 能给的只有
 参数值、静态开关、贴图引用,**公式没有**。于是「`Rim Intensity` 到底怎么参与」「星点强度是多少」
 这类问题只能靠对着截图猜 —— 而猜法在这个项目里连续翻车过好几次(见 rocom-pets 的
-docs/design.md §1)。
+docs/findings.md §1)。
 
 公式的唯一离线来源是**编译产物**:shader library 里的 DXBC 字节码。静态开关在编译期已经定死,
 所以那就是「这个材质实际跑的是什么」。整条链路已经打通,**不需要抓帧、不需要 Windows、
@@ -58,7 +58,7 @@ Engine/GlobalShaderCache-PCD3D_ES31.bin
 160/1207/2439/4673/1622/2265/5447/3908/692/3972/3193/3945,按 `CookedShaderMapIdHash` 一条都对不上。)
 
 **探针的 quality/feature 标签曾经是反的**,已修:CUE4Parse 对 `GAME_RocoKingdomWorld`
-会把这两个字段对调,而对我们这份包是反的 —— 详见 design.md §1.1「排列标签」那节,
+会把这两个字段对调,而对我们这份包是反的 —— 详见 findings.md §1.1「排列标签」那节,
 `PROBE_RAWMAP=1` 能随时回到原始字节复核。
 
 **cb 槽位 ↔ 参数名:直接从 cooked resource 拿,不用再捞冻结块(2026-08-06)**
@@ -213,7 +213,7 @@ TArray<uint32>                  ShaderIndices
 
 ## 已经读出来的(实例)
 
-以宠物「幽星光」一族为例,详细结论在 rocom-pets 的 docs/design.md §1:
+以宠物「幽星光」一族为例,详细结论在 rocom-pets 的 docs/findings.md §1:
 
 - **`MI_P_Object_Trans_MatCap`(幽星光/曜星光那两颗球)**:开头就是 `refract()` 的教科书实现
   (`k = 1 - eta²(1-cos²)`;eta 就是每个宠物材质都写着的 `GlobalRefraction` = 1.3),
@@ -656,7 +656,7 @@ r4    = r4 × (1 − r2.y)                            ← mad r4, r2.y, -r4, r4
   ② 材质里所有大于 1 的值(两段明暗的亮端 1.5、`MatCapColor` 的 (2,1.76,1.45)/(3,3,3)…)
   都是靠这两个曝光压回来的,**离线读不出它们的运行时值**。
   ③ 拿实机截图当参考时要记住**雾是加性的**:截图里那层淡白不属于宠物材质。
-  rocom-pets 已按①落地(基色平方进线性、末尾 `sqrt(色 × 曝光)`),见它的 docs/design.md §1.1。
+  rocom-pets 已按①落地(基色平方进线性、末尾 `sqrt(色 × 曝光)`),见它的 docs/findings.md §1.1。
 - **两段明暗那对是标量广播出来的灰度对**,不是颜色对:shader 20284 里
   `add r6.xyz, cb6[60].xyzx, -cb6[61].xyzx` / `mad r6.xyz, r0.w, r6, cb6[61]`,两个槽都是
   `Parameter(下标)` 且下标落在标量段(值 **1.5 / 0.5**)。它被 `r6 * r11 + r13` 消费,
