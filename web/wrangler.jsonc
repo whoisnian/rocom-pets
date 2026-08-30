@@ -5,6 +5,9 @@
   "compatibility_date": "2026-08-01",
   "compatibility_flags": ["nodejs_compat"],
 
+  // 走 Dashboard 里配的 Custom Domain,别让 wrangler deploy 顺手把 *.workers.dev 也开出来
+  "workers_dev": false,
+
   "assets": {
     "directory": "./dist/client",
     "binding": "ASSETS",
