@@ -152,6 +152,22 @@ public record MaterialEntry(
     /// 色带的 ID 遮罩:`MaskTex` + alpha 的取值区间。
     string? MaskIdTexture,
     float[] MaskIdRange,
+    /// **`M_P_Object` 公共链上的加性流动层**(不是暮星辰那条卷动色带)。
+    /// 公式与判据见 `MaterialInfo.UvFlowTexture`;`uv_flow`(= 速度/平铺)复用 `Flow`。
+    string? UvFlowTexture,
+    float[] UvFlowColor,
+    float[] UvFlowShape,
+    float[] UvFlowRadial,
+    /// 火系族在同一个发光累加器上多的两层。见 `MaterialInfo.IsFireFamily`。
+    float[] Fire1,
+    float[] Fire2,
+    float[] Fire3,
+    float[] Fire4,
+    float[] FireShape,
+    /// 同一条链上那圈菲涅尔发光。见 `MaterialInfo.Fresnel`。
+    float[]? Fresnel,
+    float[] FresnelShape,
+    float[] FresnelHard,
     /// 水体预设(`ML_P_StylizedWater`):`Color1`(a = 增益 `Emitter Intensity`)、
     /// `Color2`、`Main Color`(a = 末尾 lerp 的混合系数)、caustics 的平铺/速度、
     /// `[CausticsInt, FlowDistort, FresnelInt, FresnelPower]`。公式见
@@ -333,11 +349,14 @@ public static class Manifest
                 parts.Add($"emissive = [{Num(ec[0])}, {Num(ec[1])}, {Num(ec[2])}]");
                 parts.Add($"emissive_intensity = {Num(mat.EmissiveIntensity)}");
             }
+            // **颜色与覆盖率要分开。** 上面那条 `> 1` 的门是为了不画错颜色(曜星光那两颗球),
+            // 可**同一个 `Rim Intensity` 还喂着输出覆盖率**(`alpha = max(…, 边缘光)`,
+            // 见 `M_P_Object_Trans_MatCap` 的 PS 53987 第 259 行)。一刀切等于把覆盖率也砍了 ——
+            // 莫比乌乌的 `Rim Intensity` 是 0.2,于是它那条半透尾巴在我们这儿少了一路覆盖。
+            // 所以:**强度一律写**(给覆盖率),**颜色仍然只在 > 1 时写**(不画错色)。
+            parts.Add($"rim_intensity = {Num(mat.RimIntensity)}");
             if (mat.RimIntensity > 1 && mat.RimColor is { } rc)
-            {
                 parts.Add($"rim_color = [{Num(rc[0])}, {Num(rc[1])}, {Num(rc[2])}]");
-                parts.Add($"rim_intensity = {Num(mat.RimIntensity)}");
-            }
             // 半透族的输出覆盖率不是贴图 alpha 一项:实机的 ES3.1/Low shader
             // 还会与高光取 max，再按场景深度差补一层 depth-fade。距离是 UE 厘米。
             if (mat.Translucent)
@@ -404,6 +423,43 @@ public static class Manifest
                     parts.Add($"mask_id_tex = {Quote(mat.MaskIdTexture)}");
                     parts.Add($"mask_id_range = [{Num(mat.MaskIdRange[0])}, {Num(mat.MaskIdRange[1])}]");
                 }
+            }
+            if (mat.UvFlowTexture is not null)
+            {
+                // 单独一个键,但**运行时和噪声/色带共用同一个绑定**(采样器已经排到 16 张,
+                // 正好是 wgpu 默认上限,再开一个会超限)。不能直接写 `noise_tex`:
+                // 那个键只在「没有基色的纯特效层」那支才会被读进来,而这一层的材质都有基色。
+                parts.Add($"uv_flow_tex = {Quote(mat.UvFlowTexture)}");
+                parts.Add($"uv_flow_color = [{string.Join(", ", mat.UvFlowColor.Select(Num))}]");
+                parts.Add($"uv_flow_shape = [{string.Join(", ", mat.UvFlowShape.Select(Num))}]");
+                // **无条件写**:这一行除了极坐标中心,`.z` 还装着 UV 集选择器
+                // `saturate(UV Number)`。原来按 `OpenRadialUV` 门控,于是波波拉(没开极坐标)
+                // 整行不写、`.z` 退回默认 0 ⇒ 流动层照旧采 UV0,UV1 那条路等于没接上。
+                parts.Add($"uv_flow_radial = [{string.Join(", ", mat.UvFlowRadial.Select(Num))}]");
+                // 速度与平铺和色带那支同一组参数,共用 `flow` 这个键。
+                parts.Add($"flow = [{string.Join(", ", mat.Flow.Select(Num))}]");
+                // 这一层还有一道 ID 门:`MaskTex.a` 落在 [MaskID Min, MaskID Max] 之外时
+                // 这一层不画(汇编末尾那步 `lerp(带流动, 不带流动, 门)`)。全库 50 份材质
+                // 设过 `MaskID Min`,不接会让它们整只都盖上流动色。
+                if (mat.FlowTexture is null && mat.MaskIdTexture is not null)
+                {
+                    parts.Add($"mask_id_tex = {Quote(mat.MaskIdTexture)}");
+                    parts.Add($"mask_id_range = [{Num(mat.MaskIdRange[0])}, {Num(mat.MaskIdRange[1])}]");
+                }
+            }
+            if (mat.FireShape[3] > 0.5f)
+            {
+                parts.Add($"fire1 = [{string.Join(", ", mat.Fire1.Select(Num))}]");
+                parts.Add($"fire2 = [{string.Join(", ", mat.Fire2.Select(Num))}]");
+                parts.Add($"fire3 = [{string.Join(", ", mat.Fire3.Select(Num))}]");
+                parts.Add($"fire4 = [{string.Join(", ", mat.Fire4.Select(Num))}]");
+                parts.Add($"fire_shape = [{string.Join(", ", mat.FireShape.Select(Num))}]");
+            }
+            if (mat.Fresnel is { } fr)
+            {
+                parts.Add($"fresnel = [{string.Join(", ", fr.Select(Num))}]");
+                parts.Add($"fresnel_shape = [{string.Join(", ", mat.FresnelShape.Select(Num))}]");
+                parts.Add($"fresnel_hard = [{string.Join(", ", mat.FresnelHard.Select(Num))}]");
             }
             if (mat.InteriorTexture is not null)
             {

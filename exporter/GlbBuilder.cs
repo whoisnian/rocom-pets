@@ -80,7 +80,7 @@ public static class GlbBuilder
             exportMorphTargets: false);
 
         using var dto = new SkeletalMeshDto(mesh, quality);
-        var files = new GltfMeshFormat().BuildSkeletalMesh(mesh.Name, options, dto);
+        var files = new GltfMeshFormat().BuildSkeletalMesh(mesh.Name, mesh.GetPathName(), options, dto);
         if (files.Count == 0)
             throw new InvalidOperationException($"{mesh.Name}: glTF 导出没产出 LOD");
         var lod = lodIndex < files.Count ? files[lodIndex] : files[0];

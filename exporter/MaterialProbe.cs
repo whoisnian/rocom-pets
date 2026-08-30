@@ -512,6 +512,8 @@ public static class MaterialProbe
 
     /// 全库普查**某一个标量参数**的取值分布(`--probe-material PARAM:<名字>`)。
     ///
+    /// 标量 / 向量 / 贴图 / 静态开关**四类都查**,同一个名字问一次就够。
+    ///
     /// 用来回答「这条链上的某个开关/系数,全库到底有没有人设过」——
     /// 这套逆向里最常见的失误就是读出了公式却没查它实际吃到的数据(见 docs/design.md
     /// 里那串「代码在字节码里 ≠ 这一层可见」)。只看**实例链上覆盖过的**,没覆盖单列一档。
@@ -541,6 +543,14 @@ public static class MaterialProbe
             {
                 foreach (var p in chain[i].GetOrDefault<FScalarParameterValue[]>("ScalarParameterValues", []))
                     if (name.Equals(p.Name, StringComparison.OrdinalIgnoreCase)) val = $"{p.ParameterValue:0.####}";
+                // 向量与贴图也一起查:逆向里「这个槽位到底有没有人设过」的问题
+                // 对三类参数是同一个问题,分三个命令问纯属自找麻烦。
+                foreach (var p in chain[i].GetOrDefault<FVectorParameterValue[]>("VectorParameterValues", []))
+                    if (name.Equals(p.Name, StringComparison.OrdinalIgnoreCase) && p.ParameterValue is { } c)
+                        val = $"({c.R:0.####}, {c.G:0.####}, {c.B:0.####}, {c.A:0.####})";
+                foreach (var p in chain[i].GetOrDefault<FTextureParameterValue[]>("TextureParameterValues", []))
+                    if (name.Equals(p.Name, StringComparison.OrdinalIgnoreCase))
+                        val = p.ParameterValue?.Name ?? "(空贴图)";
                 // 静态开关的形状见 `Materials.Resolve` 那段注释:存的是合并后的有效值
                 var staticSet = chain[i].GetOrDefault<FStructFallback>("StaticParameters");
                 foreach (var e in staticSet?.GetOrDefault<FStructFallback[]>("StaticSwitchParameters", []) ?? [])
@@ -792,6 +802,21 @@ public static class MaterialProbe
                     if (provider.LoadPackageObject(trimmed) is not UMaterialInterface material)
                         continue;
                     Console.WriteLine($"  {material.Name}: {material.LoadedMaterialResources.Count} resources");
+                    // **排列的四元组里,CUE4Parse 只解得出前两个**(Quality/Feature);
+                    // 后两个 —— `LODUsed` 与 `DynamicSwitchId` —— 只存在于 uexp 的原始字节里,
+                    // 就在 `CookedShaderMapIdHash` 前面那 24 字节的第 4、5 个 int:
+                    //     [quality][feature=1][1][LODUsed][DynamicSwitchId][0]
+                    // **不打出来就只能靠猜,而猜错了两次都不会报错**:一次挑到 DSId=6
+                    // (幽星光,见 design.md),一次挑到 LODUsed=-1 且 DSId=6(莫比乌乌)——
+                    // 两次都拿到一份能反汇编、能读出公式、但不是实机跑的 shader。
+                    // 实机默认那份的判据是 **quality=Num ∧ LODUsed=0 ∧ DSId=0**。
+                    byte[]? rawUexp = null;
+                    try { rawUexp = provider.SaveAsset(trimmed + ".uexp"); }
+                    catch (Exception e)
+                    {
+                        // **不要静默**:少了这两列就只能靠猜排列,而猜错不会报错。
+                        Console.WriteLine($"    (读不到 {trimmed}.uexp,lod/dsid 这两列缺失: {e.Message})");
+                    }
                     for (var i = 0; i < material.LoadedMaterialResources.Count; i++)
                     {
                         var map = material.LoadedMaterialResources[i].LoadedShaderMap;
@@ -839,11 +864,19 @@ public static class MaterialProbe
                         var quality = (EMaterialQualityLevel) (int) map.ShaderMapId.FeatureLevel;
                         var feature = (ERHIFeatureLevel) (int) map.ShaderMapId.QualityLevel;
                         var layout = map.ShaderMapId.LayoutParams;
+                        var permKey = PermutationKey(rawUexp, map.ShaderMapId.CookedShaderMapIdHash?.ToString());
+                        var isDefault = quality == EMaterialQualityLevel.Num && permKey is { Lod: 0, Dsid: 0 };
                         Console.WriteLine(
                             $"    [{i}] quality={quality} feature={feature} " +
+                            // 查不到就打 `lod=? dsid=?` —— **不能什么都不打**:
+                            // 少两列和「这份没有这两列」长得一样,而它决定挑哪份 shader。
+                            (permKey is { } pk
+                                ? $"lod={(pk.Lod == uint.MaxValue ? "-1" : pk.Lod.ToString())} dsid={pk.Dsid} "
+                                : "lod=? dsid=? ") +
                             $"align=0x{layout?.MaxFieldAlignment:X} flags={layout?.Flags} " +
                             $"map={map.ShaderMapId.CookedShaderMapIdHash} " +
-                            $"resource={map.ResourceHash}");
+                            $"resource={map.ResourceHash}" +
+                            (isDefault ? "  ← 实机默认" : ""));
                         var detailIndexText = Environment.GetEnvironmentVariable("PROBE_SHADER_INDEX");
                         var wantsDetails = Environment.GetEnvironmentVariable("PROBE_SHADER_DETAILS") is not null
                                            && (detailIndexText is null
@@ -1073,4 +1106,24 @@ public static class MaterialProbe
             }
         }
     }
+
+    /// 排列四元组的后两项 `(LODUsed, DynamicSwitchId)` —— CUE4Parse 不解这两个字段,
+    /// 只能回到 uexp 的原始字节:它们是 `CookedShaderMapIdHash` 前面那 24 字节
+    /// (6 个 uint32)的第 4、5 项。`LODUsed` 为 0xFFFFFFFF 表示 `INDEX_NONE`。
+    private static (uint Lod, uint Dsid)? PermutationKey(byte[]? raw, string? sha)
+    {
+        if (raw is null || string.IsNullOrEmpty(sha)) return null;
+        byte[] needle;
+        try { needle = Convert.FromHexString(sha); }
+        catch { return null; }
+        for (var at = 24; at + needle.Length <= raw.Length; at++)
+        {
+            var hit = true;
+            for (var k = 0; k < needle.Length && hit; k++)
+                if (raw[at + k] != needle[k]) hit = false;
+            if (hit) return (BitConverter.ToUInt32(raw, at - 12), BitConverter.ToUInt32(raw, at - 8));
+        }
+        return null;
+    }
+
 }

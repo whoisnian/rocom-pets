@@ -40,6 +40,51 @@ struct CameraUniform {
     _pad: [f32; 3],
 }
 
+/// 桌宠这一侧的描边宽度倍率 —— 把「按宠物身高走」拉回「按屏幕走」。
+///
+/// ## 为什么要这一步
+///
+/// 描边 VS(`M_P_Outline`,见 exporter/Materials.cs `OutlineOf`)是在**裁剪空间**推顶点:
+///
+/// ```text
+/// clip.xy += 0.01 × OutlineWidthPC × 物体缩放 × clamp(clip.w, Min, Max) × (ViewProj·N).xy
+/// ```
+///
+/// 除以 `clip.w` 之后,`Min < w < Max` 那一档里 `clamp(w)/w = 1`,于是**NDC 偏移是个常数**:
+/// 与相机距离无关,也与网格多大无关。也就是说,实机同一块屏幕上,大宠物和小宠物的描边
+/// **是同样多的像素**。
+///
+/// 我们这边有两种取景,它们对这条律的诉求正好相反:
+///
+/// - **离屏渲染 / 图鉴式对照**(`offscreen.rs`):把宠物铺满画布 ⇒ 「NDC 常数」等价于
+///   「占宠物自身高度的固定比例」,正是导出器写进 `outline_width` 的形式(`ratio × height_cm`)。
+///   那一侧要 `outline_scale = 1.0`,别动。
+/// - **桌宠**:每只的窗口是按**真实身高**开的(`宠物屏幕高 = height_cm × px_per_cm`,
+///   见 config.rs)。这正是实机世界里「同一距离、身高不同」的情形 ⇒ 描边该是**同样的像素数**。
+///   而 `outline_width ∝ height_cm` 会让描边像素数也 ∝ 身高:克莱因龙(138cm)的描边
+///   是莫比乌乌(27.6cm)的 5 倍粗。实机用户报的就是这个 ——「宠物体型越大描边越明显,
+///   而实机中描边的存在感很低」。
+///
+/// 所以桌宠这一侧乘上 `参考身高 / 本形态身高`,把 `ratio × height_cm` 打回常数。
+///
+/// 参考身高取全库 617 个形态的**身高中位数 117.3 cm**,于是中位那只宽度不变、
+/// 四项离屏指标一位不动(它们都走 `outline_scale = 1.0` 那条路)。
+///
+/// **已知的小偏差**:全库 854 份 `_Ol` 里有 3 份(火源那一族)是
+/// `MinWidthScale = MaxWidthScale = 200`,走的是**世界空间常数**那一支,本来就不该按
+/// 身高缩放;manifest 里没有记录走了哪一支,所以这 3 份会被一起乘。呜呜 `_Fx` 那份
+/// (`MaxWidthScale = 0` ⇒ 宽度 0)不受影响。
+pub fn desktop_outline_scale(bind_bounds: (Vec3, Vec3)) -> f32 {
+    /// 全库 617 个形态 `height_cm` 的中位数(米)。
+    const REF_HEIGHT_M: f32 = 1.173;
+    let height = bind_bounds.1.y - bind_bounds.0.y;
+    // 退化的包围盒(资产坏了)不缩放,免得把描边放大成一块黑斑。
+    if !(height > 1e-3) {
+        return 1.0;
+    }
+    REF_HEIGHT_M / height
+}
+
 /// 画一帧要给的东西。**打包传**:拆成参数的话 `update` 要排到第八个,而它们
 /// 每帧一起变。
 pub struct FrameParams {
@@ -168,6 +213,24 @@ struct MaterialUniform {
     /// 法线图:`[有(0/1), 强度, -, -]`。贴图与上面共用 —— 就是 `MaskTex` 的 RG。
     /// 见 pet.wgsl 的 `mapped_normal`。
     normal_map: [f32; 4],
+    /// `M_P_Object` 公共链上的加性流动层:`[FlowColor.rgb, FlowInt]`(`.w = 0` 就是不画)、
+    /// `[FlowPower, InverVertexColor, Inv Or Not, OpenRadialUV]`、`[极坐标中心 x, y, -, -]`。
+    /// 卷动速度与平铺复用 `flow`。见 pet.wgsl 的 `uv_flow_layer`。
+    uv_flow_color: [f32; 4],
+    uv_flow_shape: [f32; 4],
+    uv_flow_radial: [f32; 4],
+    /// 同一条链上那圈菲涅尔发光:`[FresnelColor.rgb, FresnelIntensity]`(`.w = 0` 就是不画)、
+    /// `[FresnelExponent, FresnelBoost, FresnelBaseMin, FresnelSoftTohard]`、
+    /// `[HardLineCol.rgb, HardLineColMul]`。见 pet.wgsl 的 `fresnel_layer`。
+    fresnel: [f32; 4],
+    fresnel_shape: [f32; 4],
+    fresnel_hard: [f32; 4],
+    /// 火系族在同一个发光累加器上多的两层。见 pet.wgsl 的 `fire_layers`。
+    fire1: [f32; 4],
+    fire2: [f32; 4],
+    fire3: [f32; 4],
+    fire4: [f32; 4],
+    fire_shape: [f32; 4],
 }
 
 /// 把选中的炫彩摊成 uniform 的那 8 个 vec4。`None`(或这个槽不刷炫彩)时全零 ——
@@ -658,7 +721,10 @@ impl PetGpu {
                 .or(match &material.effect {
                     Some(effect) => effect.noise.as_ref(),
                     None => material.flow.as_ref(),
-                });
+                })
+                // `M_P_Object` 那条加性流动层的贴图。排在最后:这一层的材质都有基色,
+                // 走的是上面 `None => material.flow` 那支,而它们没有卷动色带。
+                .or(material.uv_flow.as_ref());
             let noise_view =
                 upload_texture(device, queue, &material.name, second.unwrap_or(&white));
             let star_view = upload_texture(
@@ -1043,6 +1109,17 @@ impl PetGpu {
                     spec_color,
                     spec_slots,
                     normal_map,
+                    uv_flow_color: material.uv_flow_color,
+                    uv_flow_shape: material.uv_flow_shape,
+                    uv_flow_radial: material.uv_flow_radial,
+                    fresnel: material.fresnel,
+                    fresnel_shape: material.fresnel_shape,
+                    fresnel_hard: material.fresnel_hard,
+                    fire1: material.fire1,
+                    fire2: material.fire2,
+                    fire3: material.fire3,
+                    fire4: material.fire4,
+                    fire_shape: material.fire_shape,
                 },
                 // 有基色的材质:params.x/.z 说明 alpha 怎么解释
                 // (x=1 镂空遮罩、z=1 不透明度,都为 0 则是线条遮罩)
@@ -1163,6 +1240,17 @@ impl PetGpu {
                     spec_color,
                     spec_slots,
                     normal_map,
+                    uv_flow_color: material.uv_flow_color,
+                    uv_flow_shape: material.uv_flow_shape,
+                    uv_flow_radial: material.uv_flow_radial,
+                    fresnel: material.fresnel,
+                    fresnel_shape: material.fresnel_shape,
+                    fresnel_hard: material.fresnel_hard,
+                    fire1: material.fire1,
+                    fire2: material.fire2,
+                    fire3: material.fire3,
+                    fire4: material.fire4,
+                    fire_shape: material.fire_shape,
                 },
             };
             let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -1310,6 +1398,12 @@ impl PetGpu {
                     offset: 68,
                     shader_location: 6,
                     format: wgpu::VertexFormat::Float32x4,
+                },
+                // glTF `TEXCOORD_1`;`M_P_Object` 的加性流动层按 `UV Number` 选它。
+                wgpu::VertexAttribute {
+                    offset: 84,
+                    shader_location: 7,
+                    format: wgpu::VertexFormat::Float32x2,
                 },
             ],
         };
@@ -1823,6 +1917,7 @@ mod tests {
             weights: [1.0, 0.0, 0.0, 0.0],
             local_pos: pos,
             color: [1.0; 4],
+            uv1: [0.0; 2],
         }
     }
 
@@ -1911,4 +2006,35 @@ mod tests {
             "中心上移一个画面高,画面里那个点就该反向走过整整一屏(NDC 满程 2.0),实得 {one_screen}"
         );
     }
+
+    /// **两只身高差 5 倍的宠物,桌面上的描边像素数该一样。**
+    ///
+    /// 导出器写的 `outline_width` 正比于身高(莫比乌乌 27.6cm → 0.0007 米、
+    /// 克莱因龙 138cm → 0.0035 米),而桌宠的窗口也正比于身高 ⇒ 不修正的话描边像素
+    /// 差 5 倍(用户实测「宠物体型越大描边越明显」)。乘上这个倍率之后两者应重合。
+    #[test]
+    fn desktop_outline_is_the_same_width_for_a_small_and_a_large_pet() {
+        let pet = |h: f32| (Vec3::new(-1.0, 0.0, -1.0), Vec3::new(1.0, h, 1.0));
+        // 导出器那一侧:宽度 = ratio × 身高(见 exporter/Materials.cs `OutlineOf`)
+        let exported = |h: f32| 0.0196 * 0.13 * h;
+        let on_screen = |h: f32| exported(h) * desktop_outline_scale(pet(h));
+
+        let small = on_screen(0.276); // 莫比乌乌
+        let large = on_screen(1.380); // 克莱因龙
+        assert!(
+            (small - large).abs() < 1e-9,
+            "修正后两只该等宽,实得 {small} vs {large}"
+        );
+        // 中位身高那只宽度不变 —— 离屏那批基线数字才不会跟着动
+        let median = 1.173;
+        assert!((desktop_outline_scale(pet(median)) - 1.0).abs() < 1e-3);
+    }
+
+    /// 包围盒退化(资产坏了)时不缩放,免得除出一个巨大的倍率。
+    #[test]
+    fn desktop_outline_scale_ignores_a_degenerate_bounding_box() {
+        let flat = (Vec3::ZERO, Vec3::new(1.0, 0.0, 1.0));
+        assert_eq!(desktop_outline_scale(flat), 1.0);
+    }
+
 }

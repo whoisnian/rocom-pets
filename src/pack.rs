@@ -217,6 +217,33 @@ struct RawMaterial {
     mask_id_tex: Option<String>,
     #[serde(default)]
     mask_id_range: Option<[f32; 2]>,
+    /// `M_P_Object` 公共链上的加性流动层。
+    #[serde(default)]
+    uv_flow_tex: Option<String>,
+    #[serde(default)]
+    uv_flow_color: Option<[f32; 4]>,
+    #[serde(default)]
+    uv_flow_shape: Option<[f32; 4]>,
+    #[serde(default)]
+    uv_flow_radial: Option<[f32; 4]>,
+    /// 火系族多的那两层。见 `Material::fire`。
+    #[serde(default)]
+    fire1: Option<[f32; 4]>,
+    #[serde(default)]
+    fire2: Option<[f32; 4]>,
+    #[serde(default)]
+    fire3: Option<[f32; 4]>,
+    #[serde(default)]
+    fire4: Option<[f32; 4]>,
+    #[serde(default)]
+    fire_shape: Option<[f32; 4]>,
+    /// 同一条链上那圈菲涅尔发光。
+    #[serde(default)]
+    fresnel: Option<[f32; 4]>,
+    #[serde(default)]
+    fresnel_shape: Option<[f32; 4]>,
+    #[serde(default)]
+    fresnel_hard: Option<[f32; 4]>,
     /// 炫彩的**区域门**。见 `Material::glassy_id_mask`。
     #[serde(default)]
     glassy_id_tex: Option<String>,
@@ -588,6 +615,31 @@ pub struct Material {
     /// 阈值 0.6~0.8 正好只选中环带。不门控的话黄装饰会跟着在黄绿之间来回变。
     pub mask_id: Option<PathBuf>,
     pub mask_id_range: [f32; 2],
+    /// **`M_P_Object` 公共链上的加性流动层**(读自波波拉 `_By` 的 quality=Num 排列 PS 49966
+    /// 第 110~123 行;火系 41058 第 160~177 行逐指令相同)。`[FlowColor.rgb, FlowInt]`,
+    /// `.w = 0` 表示这一层不画。贴图与 `flow` 共用 `noise` 那个槽。
+    /// 流动贴图。**运行时和噪声/色带共用同一个绑定**(见 `gpu.rs` 里挑 `second` 那段)。
+    pub uv_flow: Option<PathBuf>,
+    pub uv_flow_color: [f32; 4],
+    /// `[FlowPower, InverVertexColor, Inv Or Not, OpenRadialUV]`。
+    pub uv_flow_shape: [f32; 4],
+    /// `OpenRadialUV` 打开时的极坐标中心 `[x, y, -, -]`。
+    pub uv_flow_radial: [f32; 4],
+    /// **火系族**(`MI_P_Object_Fire*`)在同一个发光累加器上多的两层
+    /// (读自火神 `_By` 的 quality=Num 排列 PS 41058 第 68~122 行):
+    /// `[Color1.rgb, FresnelPower]` / `[Color2.rgb, FresnelInt]` / `[Color.rgb, Int]` /
+    /// `[Color02.rgb, UseVertexColorG]` / `[Range, Soft, Use Opacity as Mask, 这一族(0/1)]`。
+    pub fire1: [f32; 4],
+    pub fire2: [f32; 4],
+    pub fire3: [f32; 4],
+    pub fire4: [f32; 4],
+    pub fire_shape: [f32; 4],
+    /// 同一条链上那圈菲涅尔发光:`[FresnelColor.rgb, FresnelIntensity]`,`.w = 0` 表示不画。
+    pub fresnel: [f32; 4],
+    /// `[FresnelExponent, FresnelBoost, FresnelBaseMin, FresnelSoftTohard]`。
+    pub fresnel_shape: [f32; 4],
+    /// `[HardLineCol.rgb, HardLineColMul]`。
+    pub fresnel_hard: [f32; 4],
     /// **炫彩的区域门**:同一张 `_M` 贴图,但读的是另一道门 —— 玻璃层只刷在
     /// `alpha >= `[`GLASSY_MIN_ID`] 的地方,别处原样输出。
     ///
@@ -889,7 +941,11 @@ fn material_table(root: &Path, raw: HashMap<String, RawMaterial>) -> HashMap<Str
                     stick_intensity: mat.stick_intensity,
                     matcap: mat.matcap_tex.map(|rel| root.join(rel)),
                     matcap_color: mat.matcap_color.unwrap_or([1.0; 3]),
-                    rim_color: mat.rim_color.unwrap_or([1.0; 3]),
+                    // **默认黑,不是白。** `rim_intensity` 现在一律导(它还喂着覆盖率),
+                    // 而 `rim_color` 仍只在「强度 > 1」时导 —— 两者不再同进同出。
+                    // 默认白会让那 943 个「只有强度」的材质凭空多一圈白边;黑则是
+                    // 「只顶覆盖率、不加颜色」,正是这条门想要的。
+                    rim_color: mat.rim_color.unwrap_or([0.0; 3]),
                     rim_intensity: mat.rim_intensity,
                     emissive: mat.emissive.unwrap_or([0.0; 3]),
                     emissive_intensity: mat.emissive_intensity,
@@ -915,6 +971,18 @@ fn material_table(root: &Path, raw: HashMap<String, RawMaterial>) -> HashMap<Str
                     flow_power: mat.flow_power,
                     mask_id: mat.mask_id_tex.map(|rel| root.join(rel)),
                     mask_id_range: mat.mask_id_range.unwrap_or([0.0, 1.0]),
+                    uv_flow: mat.uv_flow_tex.map(|rel| root.join(rel)),
+                    uv_flow_color: mat.uv_flow_color.unwrap_or([0.0; 4]),
+                    uv_flow_shape: mat.uv_flow_shape.unwrap_or([1.0, 0.0, 0.0, 0.0]),
+                    uv_flow_radial: mat.uv_flow_radial.unwrap_or([0.5, 0.5, 0.0, 0.0]),
+                    fire1: mat.fire1.unwrap_or([1.0, 1.0, 1.0, 1.0]),
+                    fire2: mat.fire2.unwrap_or([1.0, 1.0, 1.0, 0.0]),
+                    fire3: mat.fire3.unwrap_or([1.0, 1.0, 1.0, 0.0]),
+                    fire4: mat.fire4.unwrap_or([1.0, 1.0, 1.0, 0.0]),
+                    fire_shape: mat.fire_shape.unwrap_or([0.0, 0.5, 0.0, 0.0]),
+                    fresnel: mat.fresnel.unwrap_or([0.0; 4]),
+                    fresnel_shape: mat.fresnel_shape.unwrap_or([8.0, 20.0, 0.4, 1.0]),
+                    fresnel_hard: mat.fresnel_hard.unwrap_or([1.0; 4]),
                     glassy_id_mask: mat.glassy_id_tex.map(|rel| root.join(rel)),
                     season_base_color: mat.season_base_color.map(|rel| root.join(rel)),
                     // 判据用 `MixMask`:花纹图可以缺(`_By1` 就缺),遮罩不能缺 ——

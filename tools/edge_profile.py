@@ -29,6 +29,20 @@
   粗略抠图用的;在这里砍会把脚剪掉 ⇒ 宠物高度算错 ⇒ 整条缩放跟着错(踩过:学院呱呱
   571 → 509px,我们的描边凭空细了 12%)。
 - **暗环太浅的不可比**:实机面积 < 0.30 时这个比值全是噪声,直接跳过。
+- **改完导出器要清渲图缓存**(`rm -rf /tmp/edge_profile`,或 `EDGE_OUT` 指到新目录)。
+  缓存的失效判据是「png 比**二进制**新」,只改导出器/包时二进制没动 ⇒ 缓存全命中,
+  于是「我们描边px」(从 manifest 读)变了而「面积/比值」(从渲图算)纹丝不动。
+  踩过一次,差点据此得出「改了等于没改」。
+
+## 参考图得是**原生截图**,不能是手机截屏
+
+同一只鸭吉吉、同一套剖面,两批参考图(亮度,负号 = 宠物内侧):
+
+              -6     -5     -4     -3     -2     -1    | 主体
+    手机     0.531  0.525  0.490  0.477  0.497  0.514  | 0.617   ← 谷底在 -3,摊开 5~6 px
+    Windows  0.593  0.593  0.596  0.592  0.589  0.475  | 0.630   ← 只有 -1 一格
+
+**手机截屏把 1px 的描边糊成 5px**,暗环面积虚高约 2 倍。`EDGE_SHOTS` 指到原生截图那批。
 
 ## 三条候选律
 
@@ -58,7 +72,9 @@ import numpy as np
 from PIL import Image
 from scipy import ndimage
 
-SHOTS = Path.home() / "Downloads/rocom/screenshot-pets"
+# `EDGE_SHOTS` 指到别处就能比**另一批参考图**(手机截屏 vs Windows 原生截图)。
+SHOTS = Path(os.environ.get("EDGE_SHOTS",
+                            Path.home() / "Downloads/rocom/screenshot-pets"))
 PACKS = Path(os.environ.get("EDGE_PACKS", Path.home() / "Downloads/rocom/packs-all"))
 BIN = Path(os.environ.get(
     "EDGE_BIN", Path(__file__).resolve().parent.parent / "target/release/rocom-pets"))

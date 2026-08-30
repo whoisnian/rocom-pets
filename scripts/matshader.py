@@ -37,16 +37,40 @@ from pathlib import Path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from shaderdump import ShaderArchive  # noqa: E402
 
-# 宠物在世界里实际跑的那组:移动端 base pass + 平行光,没有聚簇前向着色
-WORLD_BASE_PASS = (
-    "View",
-    "MobileBasePass",
+# 宠物在世界里实际跑的那组:移动端 base pass,**没有聚簇前向着色**
+# (`ClusteredForwardShading` 那一支是另一条,别挑到它)。
+#
+# **不能只认一个固定元组。** 材质带不带某个 uniform buffer 取决于它用不用得上:
+#
+# - **`MobileDirectionalLight`**:unlit 材质(`MSM_Unlit`)不吃平行光,整条就没有它。
+#   幽星光那两颗球的 `_Fx1` 就是,它的 base pass 组是 5 个 ub 而不是 7 个。
+# - **`MaterialCollection0/1`**:材质引用了几个集合就有几个。
+# - **`Primitive`**:不读逐图元数据(世界位置/包围盒/局部变换)的材质连它都没有。
+#   沙漏那层玻璃壳 `M_FairyBall_BallFront` 就是,它只有 4 个 ub。
+#
+# 按固定 7 元组过滤会把这些材质整个漏掉 —— 症状是「世界 base pass 那组是空的」,
+# 而实际上它有,只是短一点。**踩过一次**:据此以为幽星光的球没有 base pass,
+# 转去读了 `ClusteredForwardShading` 那支(PS 34529,材质 cb5),
+# 而实机跑的是 PS 51288(材质 **cb4**)—— 整张 cb 表因此错位一整级。
+WORLD_BASE_PASS_REQUIRED = ("View", "MobileBasePass", "Material")
+WORLD_BASE_PASS_OPTIONAL = (
     "MobileDirectionalLight",
     "Primitive",
     "MaterialCollection0",
     "MaterialCollection1",
-    "Material",
 )
+# 这一支必须**排除**:它是另一条渲染路径,不是宠物在世界里跑的那条。
+WORLD_BASE_PASS_FORBIDDEN = ("ClusteredForwardShading",)
+
+
+def is_world_base_pass(ubs) -> bool:
+    """这一组 uniform buffer 是不是宠物在世界里实际跑的 base pass。"""
+    got = set(ubs)
+    if not got.issuperset(WORLD_BASE_PASS_REQUIRED):
+        return False
+    if got & set(WORLD_BASE_PASS_FORBIDDEN):
+        return False
+    return not (got - set(WORLD_BASE_PASS_REQUIRED) - set(WORLD_BASE_PASS_OPTIONAL))
 
 
 def main() -> None:
@@ -85,6 +109,15 @@ def main() -> None:
     if args.resource is not None:
         want = args.resource.strip().lower()
         by_hash = {arc.map_hash(i).lower(): i for i in range(arc.n_maps)}
+        # **前缀也认**:探针那一栏是 40 个十六进制字符,手抄容易只抄前 8 位,
+        # 而原来要求全等 —— 抄短了得到的报错和「真的不在存档里」一模一样,
+        # 于是会把「我抄短了」误读成「这个排列不在存档里」(踩过一次)。
+        if want not in by_hash:
+            pref = [h for h in by_hash if h.startswith(want)]
+            if len(pref) == 1:
+                want = pref[0]
+            elif len(pref) > 1:
+                raise SystemExit(f"前缀 {args.resource} 在存档里有 {len(pref)} 个匹配,请补长")
         if want not in by_hash:
             raise SystemExit(
                 f"ResourceHash {args.resource} 不在这份存档里。"
@@ -114,11 +147,11 @@ def main() -> None:
     if args.groups:
         for ubs, n in Counter(r[2] for r in rows).most_common():
             sizes = sorted(r[1] for r in rows if r[2] == ubs)
-            mark = "  ← 世界 base pass" if ubs == WORLD_BASE_PASS else ""
+            mark = "  ← 世界 base pass" if is_world_base_pass(ubs) else ""
             print(f"  {n:4d} 条  {sizes[0] // 1024:3d}K~{sizes[-1] // 1024:3d}K  {ubs}{mark}")
         return
 
-    picked = rows if args.any_group else [r for r in rows if r[2] == WORLD_BASE_PASS]
+    picked = rows if args.any_group else [r for r in rows if is_world_base_pass(r[2])]
     if not picked:
         raise SystemExit("世界 base pass 那组是空的;用 --groups 看看有哪些组、或加 --any-group")
     picked.sort(key=lambda r: -r[1])

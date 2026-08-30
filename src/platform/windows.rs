@@ -594,7 +594,8 @@ impl App {
                 &crate::pet::FrameParams {
                     view_proj: view,
                     light_dir: Vec3::new(-0.4, 0.8, 0.6),
-                    outline_scale: 1.0,
+                    // 桌宠按真实身高开窗 ⇒ 描边要按屏幕走,不跟身高走。
+                    outline_scale: crate::pet::desktop_outline_scale(pet.model.bounds),
                     time: effect_time(),
                     // 复现目标实机的 MaterialQualityLevel=Low shader map。
                     high_material_quality: false,

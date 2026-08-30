@@ -581,6 +581,10 @@ static List<MaterialEntry> BuildMaterials(
             info.AlphaIsOpacity,
             ExportEffectTexture(info.FlowTexture), info.FlowPower,
             ExportEffectTexture(info.MaskIdTexture), info.MaskIdRange,
+            ExportEffectTexture(info.UvFlowTexture),
+            info.UvFlowColor, info.UvFlowShape, UvFlowRadialWithSrgb(info),
+            info.Fire1, info.Fire2, info.Fire3, info.Fire4, info.FireShape,
+            info.Fresnel, info.FresnelShape, info.FresnelHard,
             info.WaterColor1, info.WaterColor2, info.WaterMain,
             info.WaterCaustics, info.WaterShape,
             ExportEffectTexture(info.InteriorTexture), info.InteriorColor,
@@ -625,6 +629,15 @@ static List<MaterialEntry> BuildMaterials(
         // 只按贴图那一份挑会把 5.3 丢掉、退回根默认 4。
         if (info.Scalars.ContainsKey("StarStickTiling") || info.Vectors.ContainsKey("StarStickTiling"))
             explicitTiling ??= info.StarTiling;
+
+        // `.w` = 「共用那个绑定上的第二张贴图是不是 sRGB」。运行时按 `Rgba8Unorm` 上传,
+        // sRGB 的必须在 shader 里自己解码 —— 少这一步,水体那层的噪声会强 4~5 倍。
+        float[] UvFlowRadialWithSrgb(MaterialInfo m)
+        {
+            var tex = m.UvFlowTexture;
+            var v = m.UvFlowRadial;
+            return [v[0], v[1], v[2], tex is not null && Textures.IsSrgb(fileProvider, tex) ? 1f : 0f];
+        }
 
         string? ExportEffectTexture(string? objectPath)
         {

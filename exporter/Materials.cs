@@ -452,16 +452,15 @@ public record MaterialInfo(
     /// 边缘光的形状 + 覆盖率的底:`[RimArea, RimSmoothness, Opacity, 1]`。
     /// 最后一位是这一族的开关(运行时放在 `family11.w`,见 gpu.rs)。
     ///
-    /// **两个 Rim 标量的名字与 cooked 参数表对不上,这里按实机截图定。** 汇编第 45–53 行是
-    /// `smoothstep(0.5 + P1, 0.5 + P0, pow(1 - N·V, P1))` —— 指数与低边同一个参数、高边是
-    /// 另一个。按 cooked `UniformScalarParameters` 的名字配(槽 0 = RimSmoothness、
-    /// 槽 1 = RimArea),五个实例全都是 `RimArea > RimSmoothness`,低边恒大于高边、
-    /// smoothstep 整个反过来,结果在球面上恒 ≈ 1 —— 壳会是一坨不透明的白。
-    /// 而实机截图里等一等鸭那个沙漏的紫沙清清楚楚(只有轮廓一圈白边),所以取另一种配对:
-    /// **指数与低边是小的那个(`RimSmoothness`),高边是大的那个(`RimArea`)**。
-    /// 那张表的其余 7 个标量(`HardLineColMul`/`FresnelExponent`/`FresnelBoost`/
-    /// `FresnelIntensity`/`FresnelBaseMin`/`FresnelSoftTohard`/`MainBright`)逐个与汇编里的
-    /// 位置对得上,所以错位只在这两格。
+    /// `[RimArea, RimSmoothness, Opacity, -]`。汇编第 45–56 行是
+    /// **`smoothstep(0.5 − RimSmoothness, 0.5 + RimSmoothness, pow(1 − N·V, RimArea))`**,
+    /// 见 pet.wgsl 的 `shade_fairy_ball`。
+    ///
+    /// **这两格以前是配错的**,原注释写着「cooked 参数表的名字对不上,按实机截图定」——
+    /// 真因是 CUE4Parse 读 `UniformScalarParameters` 的步长差 4 字节,那张表**只有第 0 条
+    /// 名字是对的**(见 docs/design.md「标量参数名那条终于通了」)。补丁修掉之后
+    /// `cb3[19]` 四格逐个读出来是 `RimSmoothness` / `RimArea` / `0.5 + RimSmoothness` /
+    /// `0.5 − RimSmoothness` —— 一点都不用猜,两个名字也到这儿才讲得通。
     public float[] FairyBallShape =>
     [
         RootScalar("RimArea", 2f),
@@ -652,13 +651,186 @@ public record MaterialInfo(
     /// 色带的混入强度(暮星辰环带 0.8)—— 是**混色权重**,不是乘法强度。
     public float FlowPower => Scalar("FlowPower", 1f);
 
+    /// **`M_P_Object` 公共链上的加性流动层**(不是「色带」那一支,别和 `FlowTexture` 混)。
+    ///
+    /// 读自波波拉 `_By` 的 quality=**Num** 排列(resource `0F1003EB…`、LOD0、**DSId=1**,
+    /// PS 49966 第 110~123 行。DSId=0 那条(`16F07608…`)**根本没有世界 base pass 那组
+    /// shader**,`matshader.py` 直接报「那组是空的」—— 所以这里不能按「DSId=0」的老习惯挑);
+    /// 火系那条(PS 41058 第 160~177 行)是**逐指令相同**的一段,只是 cb 下标不同 ——
+    /// 所以这不是某一族的专属层,是根图 `M_P_Object` 的公共件:
+    ///
+    /// ```text
+    /// uv  = uv × (Flow_U_Tiling, Flow_V_Tiling) + frac(time × (Flow_U_Speed, Flow_V_Speed))
+    /// F   = pow(FlowTexture(uv).rgb, FlowPower) × FlowColor × FlowInt
+    /// vb  = 顶点色B + InverVertexColor × (1 − 2 × 顶点色B)
+    /// w   = m + Inv Or Not × (1 − 2m)          m = saturate((基色a − 0.04) × 1.1111)
+    /// 发光 += w × vb × F
+    /// ```
+    ///
+    /// **过去把这一层读成「法线扰动」是从 Low 排列读的**(见 pet.wgsl 的 `flow_band` 注释),
+    /// 实机跑 Num —— 同一个坑第 N 次。
+    ///
+    /// 判据:**实例链自己给了 `FlowTexture`**(根默认那张 `TestResMaskTex` 不算)、
+    /// 而且不是暮星辰那条「卷动色带」支(那一支已由 `FlowTexture`/`flow_band` 处理)。
+    public string? UvFlowTexture =>
+        IsObjectRoot && FlowTexture is null ? FirstTexture("FlowTexture") : null;
+
+    /// 这两层都长在根图 **`M_P_Object`** 上,不是某一族的。**必须按根名字挡**:
+    /// 水蓝蓝的 `_Fx`(`MI_ShuiLanLan_PP ← M_Wat_ShuiLanLan_PP`)也有个叫
+    /// `FresnelIntensity` 的参数,那是**另一张图里同名的另一个参数** —— 不挡就会把
+    /// 一层根本不存在的边缘光加到那片外壳上。同名不同图,这本子里已经栽过好几次。
+    private bool IsObjectRoot =>
+        ParentChain.Any(p => p.Equals("M_P_Object", StringComparison.OrdinalIgnoreCase));
+
+    /// `[FlowColor.rgb, FlowInt]`。**16 份材质自己覆盖了 `FlowColor`**(小火苗一族是橙、
+    /// 多多一族是暗紫、幻星一族是粉),其余用根默认(波波拉那条根链 (0.5, 0, 0.6))。
+    ///
+    /// 注:全库普查最初报的是「3393 份一个都没覆盖」—— 那是因为当时的 `PARAM:` 普查
+    /// **只查标量与静态开关**,向量参数一律落进「没设」那一档。普查器已经补上向量与贴图。
+    public float[] UvFlowColor =>
+    [
+        ..(FirstVector("FlowColor") ?? RootDefaults?.Vectors.GetValueOrDefault("FlowColor")
+           ?? [1f, 1f, 1f, 0f])[..3],
+        RootScalar("FlowInt", 1f),
+    ];
+
+    /// `[FlowPower, InverVertexColor, Inv Or Not, OpenRadialUV]`。
+    ///
+    /// **`EmissContrast` 不在这儿**:全库只有一份材质设过它、值还是 0
+    /// (`saturate(x × (2k+1) − k)` 在 k=0 时就是 `saturate(x)`),所以运行时按定值 0 做,
+    /// 只保留那一步 `saturate`。火系那条排列里连这步都没编进去。
+    public float[] UvFlowShape =>
+    [
+        RootScalar("FlowPower", 1f),
+        RootScalar("InverVertexColor", 0f),
+        RootScalar("Inv Or Not", 0f),
+        RootScalar("OpenRadialUV", 0f),
+    ];
+
+    /// 极坐标卷动的中心。`OpenRadialUV` 打开时,采样 UV 先换成
+    /// `(atan2(d.y, d.x) / 2π 的小数部分, |d|)`(`d = uv − 中心`),再按上面那组平铺/卷动走。
+    /// 全库 **10 份**材质开了这个开关(小火苗一族在内),波波拉没开。
+    public float[] UvFlowRadial =>
+    [
+        RootScalar("RadialCenterOffsetX", 0.5f), RootScalar("RadialCenterOffsetY", 0.5f),
+        // `.z` = UV 集选择器 `saturate(UV Number)`:0 取 UV0、1 取 UV1。
+        Math.Clamp(RootScalar("UV Number", 0f), 0f, 1f), 0f,
+    ];
+
+    /// **`M_P_Object` 公共链上那圈菲涅尔发光**(PS 49966 第 128~149 行,火系 41058 第 178~197 行):
+    ///
+    /// ```text
+    /// f    = pow(1 − saturate(N·V), FresnelExponent) × FresnelBoost   ← N 是**顶点法线**
+    /// c    = f × FresnelColor × FresnelIntensity
+    /// g    = FresnelIntensity × (FresnelBaseMin − 1) + 1
+    /// 硬边 = smoothstep(0.99, 1, c.r × g) × HardLineCol × HardLineColMul
+    /// 发光 += lerp(硬边, c × g, FresnelSoftTohard)
+    /// ```
+    ///
+    /// 全库只有 **16 份**材质设过 `FresnelIntensity`(其中 8 份设成 0),所以这一层
+    /// 用「强度 > 0」当门就够,不必再挑族。
+    public float[]? Fresnel =>
+        !IsObjectRoot || Scalar("FresnelIntensity") <= 0f ? null
+        : [..(FirstVector("FresnelColor")
+              ?? RootDefaults?.Vectors.GetValueOrDefault("FresnelColor") ?? [1f, 1f, 1f, 0f])[..3],
+           Scalar("FresnelIntensity")];
+
+    /// `[FresnelExponent, FresnelBoost, FresnelBaseMin, FresnelSoftTohard]`。
+    public float[] FresnelShape =>
+    [
+        RootScalar("FresnelExponent", 8f), RootScalar("FresnelBoost", 20f),
+        RootScalar("FresnelBaseMin", 0.4f), RootScalar("FresnelSoftTohard", 1f),
+    ];
+
+    /// `[HardLineCol.rgb, HardLineColMul]` —— 菲涅尔超过 0.99 之后接管的那一档硬边色。
+    public float[] FresnelHard =>
+    [
+        ..(FirstVector("HardLineCol")
+           ?? RootDefaults?.Vectors.GetValueOrDefault("HardLineCol") ?? [1f, 1f, 1f, 1f])[..3],
+        RootScalar("HardLineColMul", 1f),
+    ];
+
+    /// 火系族(`MI_P_Object_Fire*`)。它在**同一个发光累加器**上比通用链多两层,
+    /// 读自火神 `_By` 的 quality=Num 排列(resource `041D1E47…`,PS 41058 第 68~122 行,
+    /// `V=64 / S=75`,cb 槽位逐格读出)。
+    ///
+    /// ```text
+    /// base = toneInv(BaseTex.rgb)            ← 和通用链同一条反色调映射
+    /// 层1  = base × lerp(Color1, Color2, pow(max(N·V,0), FresnelPower)) × FresnelInt
+    /// 带   = smoothstep 形状,见 FireShape;色 = UseVertexColorG ? lerp(Color02, Color, 顶点色.g) : Color
+    /// 层2  = base × 色 × 带 × Int
+    /// 两层各自再 lerp(层, m × 层, `Use Opacity as Mask`)      m = saturate((基色a−0.04)×1.1111)
+    /// 发光 += 层1 + 层2 (+ 通用链那层 m × Emitter Color × Emitter Intensity)
+    /// ```
+    ///
+    /// **这两层是加性发光,不是固有色**(汇编第 199 行把它们并进 `r6` 那个累加器,
+    /// 而基色 `r5` 另走一路)。火神代进去:`FresnelInt = 0` ⇒ 层1 整个为零;
+    /// `Range = 0` ⇒ 那条带恒为 1 ⇒ 层2 = `toneInv(基色) × (1.2, 0.825, 0) × 0.4`,
+    /// 一层均匀的橙色自发光。这正是它 0.160 里缺的那块。
+    public bool IsFireFamily =>
+        ParentChain.Any(p => p.Contains("Object_Fire", StringComparison.OrdinalIgnoreCase));
+
+    /// **`Color1`/`Color2` 那条菲涅尔带火系与水体两族共用**,但水体那一族**没有落地**
+    /// —— 量下来更差,撤回了,见 docs/design.md「水体那层:公式这次是对的,量下来还是更差」。
+    /// `[Color1.rgb, FresnelPower]`。
+    public float[] Fire1 =>
+    [
+        ..(FirstVector("Color1") ?? RootDefaults?.Vectors.GetValueOrDefault("Color1")
+           ?? [1f, 1f, 1f, 1f])[..3],
+        RootScalar("FresnelPower", 1f),
+    ];
+
+    /// `[Color2.rgb, FresnelInt]` —— `.w = 0` 就是层1 不画。
+    public float[] Fire2 =>
+    [
+        ..(FirstVector("Color2") ?? RootDefaults?.Vectors.GetValueOrDefault("Color2")
+           ?? [1f, 1f, 1f, 1f])[..3],
+        RootScalar("FresnelInt", 1f),
+    ];
+
+    /// `[Color.rgb, Int]` —— `.w = 0` 就是层2 不画。
+    public float[] Fire3 =>
+    [
+        ..(FirstVector("Color") ?? RootDefaults?.Vectors.GetValueOrDefault("Color")
+           ?? [1f, 1f, 1f, 1f])[..3],
+        RootScalar("Int", 0f),
+    ];
+
+    /// `[Color02.rgb, UseVertexColorG]`。`UseVertexColorG >= 0.5` 时层2 的颜色是
+    /// `lerp(Color02, Color, 顶点色.g)`,否则就是 `Color`。
+    public float[] Fire4 =>
+    [
+        ..(FirstVector("Color02") ?? RootDefaults?.Vectors.GetValueOrDefault("Color02")
+           ?? [1f, 1f, 1f, 1f])[..3],
+        RootScalar("UseVertexColorG", 0f),
+    ];
+
+    /// `[Range, Soft, Use Opacity as Mask, 这一族(0/1)]`。带的形状(汇编第 100~113 行):
+    ///
+    /// ```text
+    /// t   = saturate((pow(max(1 − max(N·V,0), 1e-4), Range) × 0.96 − 0.46) / (Soft × 0.1))
+    /// 带  = t²(3 − 2t)
+    /// ```
+    ///
+    /// 那个 `Soft × 0.1` 来自 preshader:`cb6[66].y = 0.5 + Soft × 0.1`,汇编再减 0.5。
+    /// **`Use Opacity as Mask`(带空格)和 `UseOpacityAsMask`(不带)是两个参数**,
+    /// 火神分别是 0 与 1;这里要的是带空格那个。
+    public float[] FireShape =>
+    [
+        RootScalar("Range", 0f), RootScalar("Soft", 0.5f),
+        RootScalar("Use Opacity as Mask", 0f), IsFireFamily ? 1f : 0f,
+    ];
+
     /// **色带的 ID 遮罩**:只在 `MaskTex` 的 **alpha** 落在 [`MaskID Min`, `MaskID Max`] 的地方生效。
     ///
     /// 实测暮星辰(阈值 0.6~0.8):那张 By_M 的 alpha 是**离散 ID 台阶**(0.0 / 0.27 / 0.50 /
     /// 0.72 / 1.0),环带那片是 0.72(68.5% 落在区间内)、额头与身体中央的黄色装饰是 0.502
     /// (0% 落在区间内)。不按这个门控,色带会连黄装饰一起卷,装饰就在黄绿之间来回变 ——
     /// 而实机里那些装饰是固定黄色。
-    public string? MaskIdTexture => FlowTexture is null ? null : FirstTexture("MaskTex", "Mask");
+    /// 卷动色带那支与 `UvFlowTexture` 那支**共用这道门**(汇编里也是同一个
+    /// `MaskID Min/Max` 对 `MaskTex.a` 的区间判断)。
+    public string? MaskIdTexture =>
+        FlowTexture is null && UvFlowTexture is null ? null : FirstTexture("MaskTex", "Mask");
 
     public float[] MaskIdRange => [Scalar("MaskID Min", 0f), Scalar("MaskID Max", 1f)];
 

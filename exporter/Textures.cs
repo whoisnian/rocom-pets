@@ -56,6 +56,17 @@ public static class Textures
     /// 按资产对象路径导一张贴图(材质参数给的就是这种路径)。已经导过就直接返回文件名。
     /// 用于基色贴图不在本资产 `Tex/` 下的情况:共享图集,或槽名与贴图名对不上。
     /// 返回文件名(不含目录),失败返回 null。
+    /// **这张贴图是不是 sRGB。** 运行时统一按 `Rgba8Unorm` 上传(没有硬件解码那一步),
+    /// 所以凡是 sRGB 的槽,shader 里必须自己 `srgb_to_linear`。同一个参数槽在不同材质上
+    /// 冷暖不一:火系的 `FlowTexture`(`T_Fire_BJ_020`)是 sRGB,波波拉的
+    /// (`T_Wat_ShuiLanLanBo_001_Fx_M`)不是 —— 所以只能逐材质查,不能按槽位一刀切。
+    public static bool IsSrgb(AbstractVfsFileProvider provider, string objectPath)
+    {
+        var packagePath = objectPath.Contains('.') ? objectPath[..objectPath.LastIndexOf('.')] : objectPath;
+        try { return provider.LoadPackageObject<UTexture>(packagePath).SRGB; }
+        catch { return false; }
+    }
+
     public static string? ExportByObjectPath(
         AbstractVfsFileProvider provider,
         string objectPath,

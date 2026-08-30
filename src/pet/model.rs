@@ -39,6 +39,12 @@ pub struct Vertex {
     /// `R*G*(1-A)` 控制流光/星点覆盖；兔耳液体用 R、FakeFluid 用 G。
     /// 以前加载器完全丢弃它，三个独立材质族都会因此失去身体或液面。
     pub color: [f32; 4],
+    /// 第二套 UV(glTF `TEXCOORD_1`)。`M_P_Object` 那条加性流动层按 `UV Number` 在
+    /// UV0 / UV1 之间选(汇编 `lerp(v3.xy, v4.xy, saturate(UV Number))`),而这两套 UV
+    /// 差得很远:波波拉的 UV1 只铺在 −0.26~0.38 那一小片,采到的流动贴图几乎全黑
+    /// (亮于 0.1 的顶点 0.1%),UV0 则有 12.1% —— 后者会在身上糊出一片实机没有的紫。
+    /// 没有第二套 UV 的网格退回 UV0。
+    pub uv1: [f32; 2],
 }
 
 /// 一段网格:对应一个材质槽(宠物一般 2–3 个:本体/眼/嘴)。
@@ -136,8 +142,23 @@ pub struct Material {
     pub flow_uv: [f32; 4],
     pub flow_power: f32,
     /// 色带的 ID 遮罩与取值区间(见 `pack::Material::mask_id`)。
+    /// **卷动色带那支与加性流动层那支共用它**(汇编里也是同一道 `MaskID Min/Max` 门)。
     pub mask_id: Option<Image>,
     pub mask_id_range: [f32; 2],
+    /// `M_P_Object` 公共链上的加性流动层与那圈菲涅尔发光。见 `pack::Material` 里的同名字段。
+    pub uv_flow: Option<Image>,
+    pub uv_flow_color: [f32; 4],
+    pub uv_flow_shape: [f32; 4],
+    pub uv_flow_radial: [f32; 4],
+    /// 火系族多的那两层。见 `pack::Material` 里的同名字段。
+    pub fire1: [f32; 4],
+    pub fire2: [f32; 4],
+    pub fire3: [f32; 4],
+    pub fire4: [f32; 4],
+    pub fire_shape: [f32; 4],
+    pub fresnel: [f32; 4],
+    pub fresnel_shape: [f32; 4],
+    pub fresnel_hard: [f32; 4],
     /// 炫彩的**区域门**(同一张 `_M`,读 alpha)。见 `pack::Material::glassy_id_mask`。
     pub glassy_id_mask: Option<Image>,
     /// 赛季传说精灵的专属基色贴图。见 `pack::Material::season_base_color`。
@@ -545,6 +566,11 @@ impl Model {
                     }
                 }
             }
+            // 第二套 UV;缺就退回 UV0(UE 的顶点工厂也是这个行为)。
+            let uv1s: Vec<[f32; 2]> = reader
+                .read_tex_coords(1)
+                .map(|t| t.into_f32().collect())
+                .unwrap_or_else(|| uvs.clone());
             let joint_ids: Vec<[u16; 4]> = reader
                 .read_joints(0)
                 .context("缺 JOINTS_0")?
@@ -566,6 +592,7 @@ impl Model {
                     weights: weights[i],
                     local_pos: positions[i],
                     color: colors[i],
+                    uv1: uv1s.get(i).copied().unwrap_or(uvs[i]),
                 });
             }
             let first_index = indices.len() as u32;
@@ -680,6 +707,18 @@ impl Model {
                     flow_power: spec.flow_power,
                     mask_id: spec.mask_id.as_deref().and_then(|p| load_texture(p, true)),
                     mask_id_range: spec.mask_id_range,
+                    uv_flow: spec.uv_flow.as_deref().and_then(|p| load_texture(p, true)),
+                    uv_flow_color: spec.uv_flow_color,
+                    uv_flow_shape: spec.uv_flow_shape,
+                    uv_flow_radial: spec.uv_flow_radial,
+                    fire1: spec.fire1,
+                    fire2: spec.fire2,
+                    fire3: spec.fire3,
+                    fire4: spec.fire4,
+                    fire_shape: spec.fire_shape,
+                    fresnel: spec.fresnel,
+                    fresnel_shape: spec.fresnel_shape,
+                    fresnel_hard: spec.fresnel_hard,
                     glassy_id_mask: spec
                         .glassy_id_mask
                         .as_deref()

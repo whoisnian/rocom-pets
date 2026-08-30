@@ -139,6 +139,19 @@ struct MaterialParams {
     // 法线图:[有(0/1), 强度, -, -]。贴图就是 `glassy_id_tex` 那张 `MaskTex` 的 RG。
     // 见 `mapped_normal`。
     normal_map: vec4<f32>,
+    /// `M_P_Object` 公共链上的加性流动层与那圈菲涅尔发光。见 `uv_flow_layer` / `fresnel_layer`。
+    uv_flow_color: vec4<f32>,
+    uv_flow_shape: vec4<f32>,
+    uv_flow_radial: vec4<f32>,
+    fresnel: vec4<f32>,
+    fresnel_shape: vec4<f32>,
+    fresnel_hard: vec4<f32>,
+    /// 火系族在同一个发光累加器上多的两层。见 `fire_layers`。
+    fire1: vec4<f32>,
+    fire2: vec4<f32>,
+    fire3: vec4<f32>,
+    fire4: vec4<f32>,
+    fire_shape: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> camera: Camera;
@@ -199,6 +212,8 @@ struct VsIn {
     @location(5) local_pos: vec3<f32>,
     // glTF `COLOR_0`。XiaoYou / YutuEar / FakeFluid 的目标 Low PS 都直接读取。
     @location(6) color: vec4<f32>,
+    // glTF `TEXCOORD_1`。`M_P_Object` 的加性流动层按 `UV Number` 在它与 UV0 之间选。
+    @location(7) uv1: vec2<f32>,
 };
 
 struct VsOut {
@@ -218,6 +233,8 @@ struct VsOut {
     /// 蒙皮后世界位置。FakeFulid 的目标 PS 42877 从 v7 读取 AbsoluteWorldPosition；
     /// 未蒙皮 local_pos 只用于它自己的局部纹理坐标，不能拿来切液面。
     @location(7) world_pos: vec3<f32>,
+    /// 第二套 UV。`M_P_Object` 的加性流动层按 `UV Number` 在它与 `uv` 之间选。
+    @location(8) uv1: vec2<f32>,
 };
 
 // 线性混合蒙皮:权重和不为 1 的顶点(导出误差)按权重和归一化,否则会缩水
@@ -253,6 +270,7 @@ fn skin(input: VsIn) -> VsOut {
     out.local_view = normalize(vec3<f32>(camera.view_proj[0][2], camera.view_proj[1][2], camera.view_proj[2][2]));
     out.color = input.color;
     out.world_pos = world.xyz;
+    out.uv1 = input.uv1;
     return out;
 }
 
@@ -280,6 +298,7 @@ fn vs_outline(input: VsIn) -> VsOut {
     out.local_view = vec3<f32>(0.0, 0.0, 1.0);
     out.color = input.color;
     out.world_pos = world.xyz;
+    out.uv1 = input.uv1;
     return out;
 }
 
@@ -719,6 +738,140 @@ fn flow_band(uv: vec2<f32>, albedo: vec3<f32>) -> vec3<f32> {
     // **是混色不是相乘。** 色带图本身就是成品颜色(青↔粉竖条纹),而基色图里环带那条是纯粉;
     // 相乘等于「粉 × 青」→ 出来是蓝,实机是真青。`FlowPower`(暮星辰 0.8)就是混色权重。
     return mix(albedo, band, material.extra.y * step(0.05, band_lit));
+}
+
+/// **`M_P_Object` 公共链上的加性流动层** —— 和上面那条「卷动色带」是两回事。
+///
+/// 读自波波拉 `_By` 的 quality=**Num** 排列(resource `0F1003EB…`,PS 49966 第 110~123 行);
+/// 火系那条(PS 41058 第 160~177 行)是**逐指令相同**的一段,只是 cb 下标不同 ——
+/// 所以这一层长在根图 `M_P_Object` 上,不是哪一族的专属件。
+///
+/// ```text
+/// uv  = uv × (Flow_U_Tiling, Flow_V_Tiling) + frac(time × (Flow_U_Speed, Flow_V_Speed))
+/// F   = pow(FlowTexture(uv).rgb, FlowPower) × FlowColor × FlowInt      ← ≤0 的通道取 0
+/// vb  = 顶点色B + InverVertexColor × (1 − 2 × 顶点色B)
+/// w   = m + `Inv Or Not` × (1 − 2m)        m = saturate((基色a − 0.04) × 1.1111)
+/// 发光 += w × vb × F
+/// ```
+///
+/// 三处值得记的:
+///
+/// - **`OpenRadialUV`**:打开时 UV 先换成极坐标 `(atan2(d)/2π 的小数部分, |d|)`,
+///   `d = uv − 中心`。全库 10 份材质开着(小火苗一族在内)。汇编里那一大段多项式
+///   就是 `atan2` 展开,不是什么别的东西。
+/// - **`EmissContrast` 当 0 处理**:全库只有一份材质设过它、值还是 0,
+///   `saturate(x × (2k+1) − k)` 于是化简成 `saturate` —— 而火系那条排列里连这步都没编进去。
+/// - **过去把这一层读成「法线扰动」是从 Low 排列读的**(见 `flow_band` 的注释)。
+///   实机跑 quality=Num,Num 里它进的是**加性发光层**。
+fn uv_flow_layer(uv0: vec2<f32>, uv1: vec2<f32>, vertex_b: f32, m: f32) -> vec3<f32> {
+    // `.w` = `FlowInt`;为 0 就是这一层不画(全库 33 份材质给了流动贴图,其中几份 FlowInt=0)。
+    if material.uv_flow_color.w <= 0.0 {
+        return vec3<f32>(0.0);
+    }
+    // 汇编第 75~76 行是 `lerp(v3.xy, v4.xy, saturate(UV Number))` —— 一个 UV 集选择器。
+    // `saturate` 那个 opcode(0x18)是**按用途认出来的**:全库把所有排列的 preshader
+    // 都译一遍,它只出现在 `UV Number`(56 次)与 `UseUV4`(9 次)两个参数上 ——
+    // 两个都是 UV 集选择器,只有 `saturate` 讲得通(`UV Number = 2` ⇒ 取第二套)。
+    // 实测佐证:波波拉的 UV1 只铺在 −0.26~0.38 那一小片,采到的流动贴图几乎全黑
+    // (亮于 0.1 的顶点 0.1%),而 UV0 有 12.1% —— 用 UV0 会在身上糊出一片
+    // 实机根本没有的紫(渲出来对着实机截图看过)。
+    var src = mix(uv0, uv1, material.uv_flow_radial.z);
+    if material.uv_flow_shape.w > 0.5 {
+        let d = src - material.uv_flow_radial.xy;
+        src = vec2<f32>(fract(atan2(d.y, d.x) * 0.15915494), length(d));
+    }
+    let scrolled = src * material.flow.zw
+        + fract(camera.time * vec2<f32>(material.flow.x, material.flow.y));
+    // **这张贴图可能是 sRGB 资源**,而运行时统一按 `Rgba8Unorm` 上传、没有硬件解码那一步 ——
+    // 不自己解码,取到的值会大 4~5 倍,整层强度错一个量级。
+    // **旗标只能逐材质查,不能按槽位一刀切**:火系的 `T_Fire_BJ_020` 是 sRGB,
+    // 波波拉的 `T_Wat_ShuiLanLanBo_001_Fx_M` 不是(见导出器的 `Textures.IsSrgb`)。
+    // 全库 26 份带这一层的材质里 20 份是 sRGB。
+    let sampled = textureSample(noise_tex, base_sampler, scrolled).rgb;
+    let raw = select(sampled, srgb_to_linear(sampled), material.uv_flow_radial.w >= 0.5);
+    // 汇编是 `movc(raw <= 0, 0, exp(log(raw) × FlowPower))` —— 即「≤0 的通道直接取 0」。
+    // 直接 `pow(0, p)` 在部分后端是 NaN,所以先夹再按原判据选。
+    let shaped = select(pow(max(raw, vec3<f32>(1.0e-6)), vec3<f32>(material.uv_flow_shape.x)),
+                        vec3<f32>(0.0), raw <= vec3<f32>(0.0));
+    let vb = vertex_b + material.uv_flow_shape.y * (1.0 - 2.0 * vertex_b);
+    let w = m + material.uv_flow_shape.z * (1.0 - 2.0 * m);
+    return w * vb * shaped * material.uv_flow_color.rgb * material.uv_flow_color.w;
+}
+
+/// **同一条链上那圈菲涅尔发光**(PS 49966 第 128~149 行 / 火系 41058 第 178~197 行):
+///
+/// ```text
+/// f    = pow(1 − saturate(N·V), FresnelExponent) × FresnelBoost
+/// c    = f × FresnelColor × FresnelIntensity
+/// g    = FresnelIntensity × (FresnelBaseMin − 1) + 1
+/// 硬边 = smoothstep(0.99, 1, c.r × g) × HardLineCol × HardLineColMul
+/// 发光 += lerp(硬边, c × g, FresnelSoftTohard)
+/// ```
+///
+/// **`N` 是顶点法线,不是法线贴图扰动过的那个** —— 汇编第 130 行点的是 `v1.xyz`。
+/// 全库只有 16 份材质设过 `FresnelIntensity`(8 份还设成 0),所以「强度 > 0」当门就够。
+///
+/// 那道「硬边」是给强度大的材质用的:波波拉代进去 `c.r × g` 的上界只有约 0.16,
+/// 够不到 0.99,于是它那圈光化简成 `pow(1 − N·V, 8) × 0.94 × (0.087, 0.353, 1)`。
+fn fresnel_layer(vertex_normal: vec3<f32>, view_dir: vec3<f32>) -> vec3<f32> {
+    if material.fresnel.w <= 0.0 {
+        return vec3<f32>(0.0);
+    }
+    let f = pow(max(1.0 - saturate(dot(vertex_normal, view_dir)), 1.0e-4),
+                material.fresnel_shape.x) * material.fresnel_shape.y;
+    let c = f * material.fresnel.rgb * material.fresnel.w;
+    let g = material.fresnel.w * (material.fresnel_shape.z - 1.0) + 1.0;
+    let hard = smoothstep(0.99, 1.0, c.r * g) * material.fresnel_hard.rgb * material.fresnel_hard.w;
+    return mix(hard, c * g, material.fresnel_shape.w);
+}
+
+/// **火系族(`MI_P_Object_Fire*`)在同一个发光累加器上多的两层。**
+///
+/// 读自火神 `_By` 的 quality=**Num** 排列(resource `041D1E47…`,PS 41058 第 68~122 行,
+/// `V=64 / S=75`,cb 槽位逐格读出来的):
+///
+/// ```text
+/// base = toneInv(BaseTex.rgb)                       ← 与通用链同一条反色调映射
+/// 层1  = base × lerp(Color1, Color2, pow(max(N·V,0), FresnelPower)) × FresnelInt
+/// t    = saturate((pow(max(1 − max(N·V,0), 1e-4), Range) × 0.96 − 0.46) / (Soft × 0.1))
+/// 色2  = UseVertexColorG ? lerp(Color02, Color, 顶点色.g) : Color
+/// 层2  = base × 色2 × t²(3−2t) × Int
+/// 两层各自 lerp(层, m × 层, `Use Opacity as Mask`)
+/// ```
+///
+/// **这两层是加性发光,不是固有色** —— 汇编第 199 行把它们并进发光累加器 `r6`,
+/// 而基色 `r5` 另走一路。这一点很容易读错:链子开头就是 `toneInv(BaseTex) × 颜色`,
+/// 看着像在改固有色。
+///
+/// 火神代进去:`FresnelInt = 0` ⇒ **层1 整个为零**;`Range = 0` ⇒ `pow(x, 0) = 1`,
+/// 那条带化简成恒 1 ⇒ 层2 = `toneInv(基色) × (1.2, 0.825, 0) × 0.4`,一层均匀的橙色自发光。
+///
+/// `N` 取**顶点法线**(汇编第 86 行点的是 `v1.xyz`),和菲涅尔那层一样。
+/// 那个 `Soft × 0.1` 来自 preshader:`cb6[66].y = 0.5 + Soft × 0.1`,汇编再减 0.5。
+fn fire_layers(vertex_normal: vec3<f32>, base_tex: vec3<f32>, vertex_g: f32, m: f32) -> vec3<f32> {
+    if material.fire_shape.w < 0.5 {
+        return vec3<f32>(0.0);
+    }
+    let base = game_tonemap_inverse(srgb_to_linear(base_tex));
+    let ndv = dot(vertex_normal, view_direction());
+    // 第 87、93 行:`N·V <= 0` 时那一支直接顶成 0(不然 log(负数))。
+    let lit = max(ndv, 0.0);
+    let f1 = select(pow(max(ndv, 1.0e-6), material.fire1.w), 0.0, ndv <= 0.0);
+    var layer1 = base * mix(material.fire1.rgb, material.fire2.rgb, f1) * material.fire2.w;
+    // 第 100~113 行那条带。`Soft` 为 0 时分母是 0 → ±inf → saturate 出硬阶跃,
+    // 和沙漏那条一样用 `max(…, 1e-6)` 取同样的极窄过渡且不产生 NaN。
+    let inv = max(abs(1.0 - lit), 1.0e-4);
+    let raw = pow(inv, material.fire_shape.x) * 0.96 - 0.46;
+    let t = saturate(raw / max(material.fire_shape.y * 0.1, 1.0e-6));
+    let band = t * t * (3.0 - 2.0 * t) * material.fire3.w;
+    let tint2 = select(material.fire3.rgb,
+                       mix(material.fire4.rgb, material.fire3.rgb, vertex_g),
+                       material.fire4.w >= 0.5);
+    var layer2 = base * tint2 * band;
+    // 第 97~98、120~121 行:两层各自按 `Use Opacity as Mask` 决定要不要再乘一遍基色 alpha 的遮罩。
+    layer1 = mix(layer1, layer1 * m, material.fire_shape.z);
+    layer2 = mix(layer2, layer2 * m, material.fire_shape.z);
+    return layer1 + layer2;
 }
 
 /// glTF 导出把 UE `(X,Y,Z)` 换成运行时 `(X,Z,Y)`；材质里的三平面采样仍须按 UE 轴序。
@@ -1222,17 +1375,25 @@ fn shade_fairy_ball(in: VsOut) -> vec4<f32> {
     let n = normalize(in.normal);
     let ndv = max(dot(n, view_direction()), 0.0);
 
-    // 第 45–56 行:`smoothstep(0.5 + 小, 0.5 + 大, pow(1 - N·V, 小))`。指数与低边取的是
-    // **同一个** scalar 槽,高边是另一个;哪个是 `RimArea`、哪个是 `RimSmoothness` 见
-    // exporter/Materials.cs 的 `FairyBallShape`(cooked 参数表那两格的名字对不上,按实机截图定)。
-    // 汇编那句 `div 1, (高 - 低)` 在两者相等时是 ±inf → saturate 出一个硬阶跃(逗逗就是
-    // 这么写的,两个都填 0.5);这里用 `max(…, 1e-4)` 得到同样的极窄过渡,同时不产生 NaN。
-    // 求幂那步汇编是 `log → mul → exp`,再拿 `movc` 把「底 ≤ 0」那一格顶成 0(不然 log(0)
-    // 是 -inf);指数**不夹**:落陨星兔那份填的就是 0,而 `pow(x, 0) = 1` 正是原式的值。
-    let rim_lo = 0.5 + material.family11.y;
-    let rim_hi = 0.5 + material.family11.x;
+    // 第 45–56 行:**`smoothstep(0.5 − RimSmoothness, 0.5 + RimSmoothness,
+    // pow(1 − N·V, RimArea))`** —— 一条以 0.5 为中心、半宽 `RimSmoothness` 的过渡带,
+    // 指数是 `RimArea`。两个名字到这儿才讲得通:`Area` 管边缘光铺多宽,`Smoothness` 管它多软。
+    //
+    // **这两格以前是配错的**(写着「cooked 参数表的名字对不上,按实机截图定」):
+    // 那张表是被 CUE4Parse 的步长 bug 打乱的,只有第 0 条名字对。修掉之后
+    // `cb3[19]` 四格逐个读出来是 `RimSmoothness` / `RimArea` / `0.5 + RimSmoothness` /
+    // `0.5 − RimSmoothness`,一点都不用猜。旧配法把指数取成 `RimSmoothness`(等一等鸭
+    // = 0.2254),`pow(x, 0.2254) ≤ 1` 又永远够不到高边 `0.5 + RimArea`,于是边缘光
+    // 在整个球面上是一层最高只有 0.24 的淡雾,而不是「轮廓一圈、中间干净」。
+    //
+    // 汇编那句 `div 1, (高 − 低)` 在 `RimSmoothness = 0` 时是 ±inf → saturate 出一个
+    // 硬阶跃;这里用 `max(…, 1e-4)` 得到同样的极窄过渡,同时不产生 NaN。
+    // 求幂那步汇编是 `log → mul → exp`,再拿 `movc` 把「底 ≤ 0」那一格顶成 0(不然
+    // log(0) 是 -inf)。
+    let rim_lo = 0.5 - material.family11.y;
+    let rim_hi = 0.5 + material.family11.y;
     let rim_fresnel = 1.0 - ndv;
-    let rim_base = select(pow(max(rim_fresnel, 1e-6), material.family11.y),
+    let rim_base = select(pow(max(rim_fresnel, 1e-6), material.family11.x),
                           0.0, rim_fresnel <= 0.0);
     let rim_t = saturate((rim_base - rim_lo) / max(rim_hi - rim_lo, 1e-4));
     let rim = rim_t * rim_t * (3.0 - 2.0 * rim_t);
@@ -1645,9 +1806,34 @@ fn shade_main(in: VsOut, depth_coverage: f32) -> vec4<f32> {
     //
     // 原来这里拿 `facing` 当遮罩、把整层糊在所有像素上:水灵的条纹一根都看不见(遮罩没参与),
     // 火神那对黑翅膀反被橙色自发光染成褐黄 —— 实机报的「多了一层黄色遮罩」就是它。
-    if material.emissive.w > 0.0 {
-        glow += material.emissive.rgb * material.emissive.w * detail_mask;
-    }
+    let emissive_layer = select(vec3<f32>(0.0),
+                                material.emissive.rgb * material.emissive.w * detail_mask,
+                                material.emissive.w > 0.0);
+    // **流动层和自发光层进的是同一个累加器,而且末尾一起过一次 `saturate`**
+    // (汇编 `mad_sat r7, (E + 流动), 2·EmissContrast+1, -EmissContrast`;`EmissContrast`
+    // 全库实测恒 0,那一步就化简成 `saturate`)。分开加会让 `FlowInt` 大的材质
+    // (火系有 20 的)冲过 1 而不被夹住。
+    //
+    // 流动层还带一道 ID 门:`MaskTex.a` 落在 [`MaskID Min`, `MaskID Max`] 之外时,
+    // 汇编末尾那步 `lerp(带流动, 不带流动, 门)` 把它整个换掉 —— 全库 50 份材质设过
+    // 这个下界,不接就会整只盖上流动色。
+    //
+    // **采样提到分支外面**:WGSL 的均匀性规则要求 `textureSample` 在均匀控制流里
+    // (`flow_band` 那儿踩过一次,Dawn 直接判整份 shader 非法)。
+    let uv_flow = uv_flow_layer(in.uv, in.uv1, in.color.b, detail_mask);
+    let flow_id = textureSample(mask_id_tex, base_sampler, in.uv).a;
+    let flow_gated = material.mask_id.z > 0.5
+        && (flow_id < material.mask_id.x || flow_id > material.mask_id.y);
+    let flow_layer = select(uv_flow, vec3<f32>(0.0), flow_gated);
+    // 没有流动层的材质保持原样(不夹),免得给既有的那批凭空改行为。
+    glow += select(emissive_layer,
+                   saturate(emissive_layer + flow_layer),
+                   material.uv_flow_color.w > 0.0);
+    // 菲涅尔那层是在这一步**之后**才加进累加器的(汇编第 151 行),不参与上面那次 saturate。
+    glow += fresnel_layer(normalize(in.normal), view_direction());
+    // 火系族那两层也进同一个累加器(汇编第 199 行)。传的是**未解码的**基色贴图值:
+    // 这一族自己做反色调映射,和外面那条 `pow(albedo, DECODE_GAMMA)` 不是一回事。
+    glow += fire_layers(normalize(in.normal), tex.rgb, in.color.g, detail_mask);
     // **不透明度**:`alpha_is_opacity` 的材质取基色 alpha,并照汇编做那个重映射
     // (`add r1.z, a, -0.04` → `mul_sat r1.z, r1.z, 1.1111`,即把 0.04..0.94 拉到 0..1)。
     // 暮星辰裙子那块 UV 的 alpha 中位 0.537 → 0.55,与从实机截图水印衰减反推的 0.50 对得上。
