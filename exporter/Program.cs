@@ -491,6 +491,9 @@ static List<MaterialEntry> BuildMaterials(
     Dictionary<string, MaterialInfo> resolved,
     string assetName,
     string texDir,
+    // 描边宽度要用它:全库 851/854 的描边是**屏幕空间常数**,换算到我们的正交取景就是
+    // 「占宠物自身高度的固定比例」。见 `Materials.OutlineOf`。
+    float heightCm,
     List<TextureFile> textures,
     List<string> warnings)
 {
@@ -590,6 +593,7 @@ static List<MaterialEntry> BuildMaterials(
             info.XiaoYouBaseColor1, info.XiaoYouBaseColor2,
             info.XiaoYouFlowColor1, info.XiaoYouFlowColor2, info.XiaoYouStarColor,
             info.XiaoYouNoiseFlow, info.XiaoYouShape, info.XiaoYouStarUv,
+            info.XiaoYouStarUv2, info.XiaoYouStar2,
             yutuEar, fakeFluid, matcapMasked, fairyBall,
             ExportEffectTexture(info.GlassyIdTexture),
             ExportEffectTexture(info.SeasonBaseTexture),
@@ -601,7 +605,11 @@ static List<MaterialEntry> BuildMaterials(
                     info.SeasonRed, info.SeasonGreen,
                     info.SeasonBlue, info.SeasonMetal, info.SeasonMetal02, info.SeasonFlow)
                 : null,
-            info.OutlineWidth ?? 0f, info.IsPaintOrder, info.GlassyStarTiling, info.GlassyScalars, info.GlassyRim));
+            info.OutlineHeightRatio is { } r ? r * heightCm / 100f : info.OutlineWidth ?? 0f,
+            info.IsPaintOrder, info.GlassyStarTiling, info.GlassyScalars, info.GlassyRim,
+            info.OutlineColors, ExportEffectTexture(info.OutlineIdTexture),
+            info.SpecSlots is { Length: 4 } ? info.SpecSlots : null, info.SpecColor,
+            ExportEffectTexture(info.MatIdTexture)));
 
         if (info.StarTexture is not null && ExportEffectTexture(info.StarTexture) is { } starTex
             && (starLayer is null || (info.IsFakeTrans && !starFromFakeTrans)))
@@ -818,7 +826,9 @@ FormReport ExportForm(
         throw new InvalidOperationException(
             $"{form.Asset} 的材质资产在 pak 里全部缺失(疑似未实装的宠物)");
 
-    var materials = BuildMaterials(fileProvider, resolved, form.Asset, texDir, textures, warnings);
+    var heightCm = mesh.ImportedBounds.BoxExtent.Z * 2f;
+    var materials = BuildMaterials(
+        fileProvider, resolved, form.Asset, texDir, heightCm, textures, warnings);
 
     // 异色(`MDT_SHINING`):清单挂在宠物蓝图的 `DiffMaterials` 上,内容是
     // `<资产>/Yise/Mat/` 那一套。**多数宠物没有**,拿不到就是空表,不是错误。
@@ -829,7 +839,7 @@ FormReport ExportForm(
     {
         var shinyResolved = Shiny.Resolve(shinySources, warnings);
         shinyMaterials = BuildMaterials(
-            fileProvider, shinyResolved, form.Asset, texDir, textures, warnings);
+            fileProvider, shinyResolved, form.Asset, texDir, heightCm, textures, warnings);
     }
 
     // 音频:拿不到就是 null(39 个 bnk 查无此宠,还有形态压根没有 Pet_Vo_* 库),不算失败
@@ -837,8 +847,7 @@ FormReport ExportForm(
         ? null
         : Audio.Export(fileProvider, pinyin, formDir, $"forms/{form.Asset}", warnings);
 
-    var bounds = mesh.ImportedBounds;
-    return new FormReport(form, written, textures, materials, glb.Length, bounds.BoxExtent.Z * 2f,
+    return new FormReport(form, written, textures, materials, glb.Length, heightCm,
         warnings, audio, shinyMaterials);
 }
 

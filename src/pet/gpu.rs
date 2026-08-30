@@ -122,6 +122,9 @@ struct MaterialUniform {
     xiaoyou_noise_flow: [f32; 4],
     xiaoyou_shape: [f32; 4],
     xiaoyou_star_uv: [f32; 4],
+    /// 第二层星点(`Star_BA_*`)。见 pet.wgsl 的 `shade_xiaoyou`。
+    xiaoyou_star_uv2: [f32; 4],
+    xiaoyou_star2: [f32; 4],
     /// 四套互斥的原生材质族共用参数区；解释由 family_flags.y/z/w 与 family11.w 决定。
     family0: [f32; 4],
     family1: [f32; 4],
@@ -135,9 +138,13 @@ struct MaterialUniform {
     family9: [f32; 4],
     family10: [f32; 4],
     family11: [f32; 4],
-    /// 描边:[沿法线外扩多少米, -, -, -]。**逐材质**(游戏里也是),见
-    /// `pack::MaterialSpec::outline_width`。
+    /// 描边:[沿法线外扩多少米, **有五档颜色**(0/1), -, -]。**逐材质**(游戏里也是),
+    /// 见 `pack::MaterialSpec::outline_width`。
     outline: [f32; 4],
+    /// 描边的五档颜色(线性 RGB,已乘过 `Outline Intensity`),按 `outline_id_tex` 的 alpha 挑。
+    /// `outline.y = 0` 时整份不看 —— 旧包没有这份数据,退回「固有色 × 0.80」。
+    /// 推导见 `exporter/Materials.cs` 的 `OutlineOf`。
+    outline_ramp: [[f32; 4]; 5],
     /// 炫彩。字段顺序与 pet.wgsl 的 `MaterialParams` 尾部逐个对齐;含义见 `pet::glassy`。
     /// `glassy_red.w`:0 = 这个槽不刷炫彩,1 = 刷。
     glassy_red: [f32; 4],
@@ -154,6 +161,13 @@ struct MaterialUniform {
     /// 玻璃层那圈边缘光:[`RimColor`.rgb, `RimIntensity`]。**不是 lua 的 `MutationRimColor`**,
     /// 那个参数这条排列不读,见 `glassy::ROOT_RIM`。
     glassy_rim: [f32; 4],
+    /// 逐 `MatID` 的高光:`[SpecColor.rgb, 开着(0/1)]`。见 pet.wgsl 的 `matid_specular`。
+    spec_color: [f32; 4],
+    /// 同上的四档参数,挡位 2~5 各一格:`[SpecPow, SpecIntensity, SpecRadius, -]`。
+    spec_slots: [[f32; 4]; 4],
+    /// 法线图:`[有(0/1), 强度, -, -]`。贴图与上面共用 —— 就是 `MaskTex` 的 RG。
+    /// 见 pet.wgsl 的 `mapped_normal`。
+    normal_map: [f32; 4],
 }
 
 /// 把选中的炫彩摊成 uniform 的那 8 个 vec4。`None`(或这个槽不刷炫彩)时全零 ——
@@ -235,10 +249,10 @@ const LINE_BOOST: f32 = 0.0;
 
 /// 旧包(没有 `outline_width` 字段)的描边宽度,单位**米**。
 ///
-/// 取全库模态值:`0.01 × OutlineWidthPC(0.13) × MaxWidthScale(300)` 厘米 = 0.39 厘米。
-/// 854 份 `_Ol` 里 `OutlineWidthPC = 0.13` 的有 848 份、`MaxWidthScale = 300` 的有 847 份,
-/// 例外只有火源两份、呜呜 `_Fx` 一份和挂在别的根上的 3 份。
-/// 推导见 `exporter/Materials.cs` 的 `OutlineWidthOf`。
+/// 取当年那个全库模态值 `0.01 × OutlineWidthPC(0.13) × MaxWidthScale(300)` 厘米 = 0.39 厘米。
+/// **新包不走这条**:宽度现在随宠物大小走(占体高 0.255%),由导出器逐形态算好写进
+/// `outline_width` —— 这个常数只是旧包的兜底,对小宠物偏粗,推导与订正见
+/// `exporter/Materials.cs` 的 `OutlineOf`。
 const DEFAULT_OUTLINE_WIDTH: f32 = 0.0039;
 
 /// 一只宠物的 GPU 资源(网格与贴图按形态共享,实例状态另说)。
@@ -471,6 +485,21 @@ impl PetGpu {
                 },
                 wgpu::BindGroupLayoutEntry {
                     binding: 12,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                // 描边挑五档颜色用的 `MatID` 遮罩(读 alpha)。没这份数据就是白图,
+                // 而 `outline.y = 0` 时着色器压根不看它。
+                //
+                // **这是第 15 张贴图**,`wgpu::Limits::default()` 的
+                // `max_sampled_textures_per_shader_stage` 是 16 —— 只剩一格。
+                wgpu::BindGroupLayoutEntry {
+                    binding: 17,
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Texture {
                         sample_type: wgpu::TextureSampleType::Float { filterable: true },
@@ -727,7 +756,20 @@ impl PetGpu {
                     .glassy_id_mask
                     .as_ref()
                     .filter(|_| glassy_skin.is_some() || season.is_some())
+                    // **法线图与逐 `MatID` 的高光也读这一路**:它们要的就是同一张 `MaskTex`
+                    // (RG 法线 / A 是 MatID),而在不炫彩的材质上也要用。同槽不冲突;
+                    // 炫彩那份优先,免得改变已有行为。
+                    .or(material.mat_id_mask.as_ref())
                     .unwrap_or(&white),
+            );
+            // 描边挑档用的 `MatID`。**和上面那张区域门不是同一路** —— 854 份 `_Ol` 里
+            // 732 份指着同一张 `_M`(导出后会被去重成同一个文件),但 38 份指着别的、
+            // 81 份本体压根没有 `MaskTex`;而且区域门只给炫彩槽上传,描边每个材质都要。
+            let outline_id_view = upload_texture(
+                device,
+                queue,
+                &material.name,
+                material.outline_id_mask.as_ref().unwrap_or(&white),
             );
             let has = |v: bool| if v { 1.0 } else { 0.0 };
             let rgb = |c: [f32; 3]| [c[0], c[1], c[2], 0.0];
@@ -814,6 +856,8 @@ impl PetGpu {
             let xiaoyou_noise_flow = material.xiaoyou.as_ref().map_or([0.0; 4], |x| x.noise_flow);
             let xiaoyou_shape = material.xiaoyou.as_ref().map_or([0.0; 4], |x| x.shape);
             let xiaoyou_star_uv = material.xiaoyou.as_ref().map_or([0.0; 4], |x| x.star_uv);
+            let xiaoyou_star_uv2 = material.xiaoyou.as_ref().map_or([0.0; 4], |x| x.star_uv2);
+            let xiaoyou_star2 = material.xiaoyou.as_ref().map_or([0.0; 4], |x| x.star2);
             let mut family = [[0.0; 4]; 12];
             if let Some(y) = &material.yutu_ear {
                 family[0] = y.bubble_color;
@@ -856,9 +900,34 @@ impl PetGpu {
                 // 形状与开关同格:`shape.w` 恒为 1,着色器据此认这一族。
                 family[11] = f.shape;
             }
-            // 旧包没有 `outline_width` ⇒ 用全库模态值 0.13 × 300。这比旧包自己当年那条
-            // 「包围盒对角线 × 0.004」更接近实机(魔力猫 1.79 厘米 vs 0.39 厘米)。
+            // 旧包没有 `outline_width` ⇒ 用当年那个全库模态值(见 `DEFAULT_OUTLINE_WIDTH`)。
             let outline_width = material.outline_width.unwrap_or(DEFAULT_OUTLINE_WIDTH);
+            // 五档描边色。**遮罩缺了就整份不用** —— 没有 `MatID` 只能恒取一档,
+            // 那会把整圈刷成同一个近黑色,比「固有色 × 0.80」更错。
+            let outline_ramp_src = material
+                .outline_colors
+                .filter(|_| material.outline_id_mask.is_some());
+            let outline_has_ramp = has(outline_ramp_src.is_some());
+            let outline_ramp = outline_ramp_src
+                .unwrap_or([[0.0; 3]; 5])
+                .map(|c| [c[0], c[1], c[2], 0.0]);
+            // 逐 `MatID` 的高光。同样**遮罩缺了就整份不用**:没有 `MatID` 只能恒取一档,
+            // 那是把整片刷成同一块高光。
+            let spec_src = material
+                .spec_slots
+                .filter(|_| material.mat_id_mask.is_some());
+            let spec_color = [
+                material.spec_color[0],
+                material.spec_color[1],
+                material.spec_color[2],
+                has(spec_src.is_some()),
+            ];
+            let spec_slots = spec_src
+                .unwrap_or([[0.0; 3]; 4])
+                .map(|v| [v[0], v[1], v[2], 0.0]);
+            // 法线图。**强度取 1**:汇编那一步 `lerp(几何法线, 贴图法线, cb0[149].w)` 的系数
+            // 是 View 常量、读不到,而主光照那一路用的本来就是没 lerp 的贴图法线。
+            let normal_map = [has(material.mat_id_mask.is_some()), 1.0, 0.0, 0.0];
             // 炫彩只刷在 `by*` 那几个槽上 —— 判据与游戏一致,见 `pack::Material::glassy_target`。
             let glassy = match season {
                 // 复用玻璃层那几个槽:骨架本来就是同一条,只是输入换成材质自己的。
@@ -945,6 +1014,8 @@ impl PetGpu {
                     xiaoyou_noise_flow,
                     xiaoyou_shape,
                     xiaoyou_star_uv,
+                    xiaoyou_star_uv2,
+                    xiaoyou_star2,
                     family0: family[0],
                     family1: family[1],
                     family2: family[2],
@@ -957,7 +1028,8 @@ impl PetGpu {
                     family9: family[9],
                     family10: family[10],
                     family11: family[11],
-                    outline: [outline_width, 0.0, 0.0, 0.0],
+                    outline: [outline_width, outline_has_ramp, 0.0, 0.0],
+                    outline_ramp,
                     glassy_red: glassy[0],
                     glassy_green: glassy[1],
                     glassy_p0: glassy[2],
@@ -968,6 +1040,9 @@ impl PetGpu {
                     glassy_stick3: glassy[7],
                     glassy_sparkle: glassy[8],
                     glassy_rim: glassy[9],
+                    spec_color,
+                    spec_slots,
+                    normal_map,
                 },
                 // 有基色的材质:params.x/.z 说明 alpha 怎么解释
                 // (x=1 镂空遮罩、z=1 不透明度,都为 0 则是线条遮罩)
@@ -1059,6 +1134,8 @@ impl PetGpu {
                     xiaoyou_noise_flow,
                     xiaoyou_shape,
                     xiaoyou_star_uv,
+                    xiaoyou_star_uv2,
+                    xiaoyou_star2,
                     family0: family[0],
                     family1: family[1],
                     family2: family[2],
@@ -1071,7 +1148,8 @@ impl PetGpu {
                     family9: family[9],
                     family10: family[10],
                     family11: family[11],
-                    outline: [outline_width, 0.0, 0.0, 0.0],
+                    outline: [outline_width, outline_has_ramp, 0.0, 0.0],
+                    outline_ramp,
                     glassy_red: glassy[0],
                     glassy_green: glassy[1],
                     glassy_p0: glassy[2],
@@ -1082,6 +1160,9 @@ impl PetGpu {
                     glassy_stick3: glassy[7],
                     glassy_sparkle: glassy[8],
                     glassy_rim: glassy[9],
+                    spec_color,
+                    spec_slots,
+                    normal_map,
                 },
             };
             let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -1160,6 +1241,10 @@ impl PetGpu {
                     wgpu::BindGroupEntry {
                         binding: 16,
                         resource: wgpu::BindingResource::TextureView(&glassy_outline_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 17,
+                        resource: wgpu::BindingResource::TextureView(&outline_id_view),
                     },
                 ],
             }));
@@ -1388,12 +1473,22 @@ impl PetGpu {
         // 只能来自它背后的描边壳。而同样标着半透、也有 `_Ol` 的暮星辰裙子与春兔耳膜
         // **是画出来的不透明度图**(那块 UV 的基色 alpha 中位 0.537 / 0.378),实机里
         // 确实透得见背景 —— 给它们补一层不透明壳会把耳朵里那泡液体连同背景一起糊掉(试过)。
+        //
+        // **判据从「有没有 MatCap 贴图」换成了「不透明度是不是画出来的」**(见
+        // `model::painted_opacity`)。原来那个是代理判据,选错了人:全库「半透 + 有 `_Ol` +
+        // 有 MatCap」命中 **11 份**、不是文档里写的「三对球一个不多」,里面就有莫比乌乌 ——
+        // 它的尾巴那块 UV 基色 alpha 中位 **0.400**(画出来的),补上壳之后整条尾巴被
+        // 背面的近黑壳透着染暗:边界剖面「往里 1~6 像素」实机是 0.55/0.82/0.87/0.89/0.90/0.91、
+        // 主体 0.854,而我们带壳是 0.43/0.50/0.49/0.48/0.47/0.49、主体 0.713;
+        // **去掉壳就变成 0.70/0.82/0.81/0.81/0.81/0.80、主体 0.807** —— 和实机对上了。
         let outline_draws: Vec<_> = draws
             .iter()
             .copied()
             .filter(|&(_, _, m)| model.materials[m].outline.unwrap_or(true))
             .chain(glass_draws.iter().copied().filter(|&(_, _, m)| {
-                model.materials[m].outline == Some(true) && model.materials[m].matcap.is_some()
+                model.materials[m].outline == Some(true)
+                    && model.materials[m].matcap.is_some()
+                    && !model.materials[m].painted_opacity
             }))
             .collect();
         Ok(Self {

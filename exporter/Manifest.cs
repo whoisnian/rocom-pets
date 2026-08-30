@@ -189,6 +189,9 @@ public record MaterialEntry(
     float[] XiaoYouNoiseFlow,
     float[] XiaoYouShape,
     float[] XiaoYouStarUv,
+    /// 第二层星点(`Star_BA_*`)的 UV 控制与 [阈值, 阈值, 强度, 速度]。见 `MaterialInfo.XiaoYouStarUv2`。
+    float[] XiaoYouStarUv2,
+    float[] XiaoYouStar2,
     YutuEarMaterial? YutuEar,
     FakeFluidMaterial? FakeFluid,
     MatcapMaskedMaterial? MatcapMasked,
@@ -212,7 +215,19 @@ public record MaterialEntry(
     /// **炫彩玻璃层的逐材质标量**,顺序见 `Materials.GlassyScalars`;空 = 这个材质没有这一层。
     float[]? GlassyScalars = null,
     /// **炫彩那圈边缘光**:`[RimColor.rgb, RimIntensity]`,见 `Materials.GlassyRim`。
-    float[]? GlassyRim = null);
+    float[]? GlassyRim = null,
+    /// **描边的五档颜色**(线性 RGB × `Outline Intensity`),按 `MatID` 遮罩挑;
+    /// null = 读不出来,运行时退回「固有色压暗」。见 `Materials.OutlineOf`。
+    float[][]? OutlineColors = null,
+    /// 挑档用的 `MatID` 遮罩(读 alpha)。见 `MaterialInfo.OutlineIdTexture`。
+    string? OutlineIdTexture = null,
+    /// **逐 `MatID` 的高光**:四档 `(SpecPow, SpecIntensity, SpecRadius)`;
+    /// 空 = 这个材质四档强度全 0,这一层不出场。见 `MaterialInfo.SpecSlots`。
+    float[][]? SpecSlots = null,
+    /// 上面那层的染色 `SpecColor`(线性 RGB)。
+    float[]? SpecColor = null,
+    /// `MaskTex`:**RG 是切线空间法线、A 是 `MatID`**。见 `MaterialInfo.MatIdTexture`。
+    string? MatIdTexture = null);
 
 public record FormReport(
     Form Form,
@@ -257,6 +272,15 @@ public static class Manifest
             // (米),同一个来源算出来的两面 —— 前者留着是因为旧包只有它。
             parts.Add($"outline = {(mat.OutlineWidth > 0f ? "true" : "false")}");
             parts.Add($"outline_width = {Num(mat.OutlineWidth)}");
+            // 描边颜色:五档 + 挑档用的遮罩。两者缺一不可 —— 只有颜色没有遮罩就只能恒取
+            // 一档,那还不如老路。旧包两个字段都没有 ⇒ 运行时仍走「固有色 × 0.80」。
+            if (mat.OutlineColors is { Length: 5 } oc && mat.OutlineIdTexture is not null)
+            {
+                parts.Add("outline_colors = ["
+                          + string.Join(", ", oc.Select(c => $"[{Num(c[0])}, {Num(c[1])}, {Num(c[2])}]"))
+                          + "]");
+                parts.Add($"outline_id_tex = {Quote(mat.OutlineIdTexture)}");
+            }
             if (mat.PaintOrder) parts.Add("paint_order = true");
             // 炫彩那一层的平铺:**逐材质**、而且和星点层开没开无关(炫彩会把它打开)。
             if (mat.GlassyStarTiling > 0f)
@@ -267,6 +291,18 @@ public static class Manifest
                 parts.Add($"glassy_params = [{string.Join(", ", gs.Select(Num))}]");
             if (mat.GlassyRim is { Length: 4 } gr)
                 parts.Add($"glassy_rim = [{string.Join(", ", gr.Select(Num))}]");
+            // `MaskTex`:RG 是法线、A 是 `MatID`。**逐材质无条件写**(只要这个材质有基色),
+            // 法线那一路每个材质都要;逐 `MatID` 的高光也读同一张。
+            if (mat.MatIdTexture is not null) parts.Add($"mat_id_tex = {Quote(mat.MatIdTexture)}");
+            // 逐 `MatID` 的高光:四档参数 + 染色。没有上面那张图就只能恒取一档,不写。
+            if (mat.SpecSlots is { Length: 4 } sp && mat.MatIdTexture is not null)
+            {
+                parts.Add("spec_slots = ["
+                          + string.Join(", ", sp.Select(v => $"[{Num(v[0])}, {Num(v[1])}, {Num(v[2])}]"))
+                          + "]");
+                if (mat.SpecColor is { Length: 3 } sc)
+                    parts.Add($"spec_color = [{Num(sc[0])}, {Num(sc[1])}, {Num(sc[2])}]");
+            }
             // 星点/MatCap/边缘光对所有材质都可能有
             if (mat.StarTexture is not null)
             {
@@ -403,6 +439,8 @@ public static class Manifest
                 parts.Add($"xiaoyou_noise_flow = [{string.Join(", ", mat.XiaoYouNoiseFlow.Select(Num))}]");
                 parts.Add($"xiaoyou_shape = [{string.Join(", ", mat.XiaoYouShape.Select(Num))}]");
                 parts.Add($"xiaoyou_star_uv = [{string.Join(", ", mat.XiaoYouStarUv.Select(Num))}]");
+                parts.Add($"xiaoyou_star_uv2 = [{string.Join(", ", mat.XiaoYouStarUv2.Select(Num))}]");
+                parts.Add($"xiaoyou_star2 = [{string.Join(", ", mat.XiaoYouStar2.Select(Num))}]");
             }
             if (mat.YutuEar is { } yutu)
             {

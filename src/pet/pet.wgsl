@@ -91,6 +91,9 @@ struct MaterialParams {
     // [FlowNoseInt1,FlowNoiseInt2,Star_RG_Int,Star_RG_TwinkleSpeed]
     xiaoyou_shape: vec4<f32>,
     xiaoyou_star_uv: vec4<f32>,
+    // 第二层星点(`Star_BA_*`):UV 控制 + [RG阈值, BA阈值, BA强度, BA闪烁速度]。
+    xiaoyou_star_uv2: vec4<f32>,
+    xiaoyou_star2: vec4<f32>,
     // YutuEar / FakeFulid / MatCapMasked / FairyBall 互斥复用的原始参数区。
     family0: vec4<f32>,
     family1: vec4<f32>,
@@ -104,8 +107,11 @@ struct MaterialParams {
     family9: vec4<f32>,
     family10: vec4<f32>,
     family11: vec4<f32>,
-    // 描边:[沿法线外扩多少米, -, -, -]
+    // 描边:[沿法线外扩多少米, 有五档颜色(0/1), -, -]
     outline: vec4<f32>,
+    // 描边的五档颜色(线性 RGB × `Outline Intensity`),按 `outline_id_tex` 的 alpha 挑;
+    // `outline.y = 0`(旧包)时整份不看。见 `fs_outline`。
+    outline_ramp: array<vec4<f32>, 5>,
     // ── 炫彩(`GlassySwitch` 那条分支)。整套推导见 src/pet/glassy.rs。
     // `RedChannel`(rgb)+ 开关:0 = 这个槽不刷炫彩
     glassy_red: vec4<f32>,
@@ -126,6 +132,13 @@ struct MaterialParams {
     glassy_sparkle: vec4<f32>,
     // 玻璃层那圈边缘光:[RimColor.rgb, RimIntensity]。
     glassy_rim: vec4<f32>,
+    // 逐 `MatID` 的高光:[SpecColor.rgb, 开着(0/1)];四档 [SpecPow, SpecIntensity,
+    // SpecRadius, -](挡位 2~5)。见 `matid_specular`。
+    spec_color: vec4<f32>,
+    spec_slots: array<vec4<f32>, 4>,
+    // 法线图:[有(0/1), 强度, -, -]。贴图就是 `glassy_id_tex` 那张 `MaskTex` 的 RG。
+    // 见 `mapped_normal`。
+    normal_map: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> camera: Camera;
@@ -168,6 +181,10 @@ struct MaterialParams {
 // 所以隐藏款/赛季款在描边上用的**仍是共享的那张 `Tex_PetGlassy_007_D`**,
 // 不是本体那张。两张不能共用一个绑定,故单开一条;没选炫彩时是 1×1 白图。
 @group(1) @binding(16) var glassy_outline_tex: texture_2d<f32>;
+// **描边挑档用的 `MatID` 遮罩**(读 alpha)。和上面那张区域门 `glassy_id_tex` 不是一路:
+// 854 份 `_Ol` 里 732 份指着同一张 `_M`,但 38 份指着别的、81 份本体压根没有 `MaskTex`;
+// 而且区域门只给炫彩槽上传,描边每个材质都要。没这份数据时是 1×1 白图。
+@group(1) @binding(17) var outline_id_tex: texture_2d<f32>;
 // 第一遍不透明材质留下的场景深度；半透明材质按原 shader 的
 // `OpacityDepthDistance` 计算与后方实体/背景的距离。
 @group(2) @binding(0) var scene_depth: texture_depth_2d;
@@ -374,6 +391,13 @@ const GLASSY_SPARKLE_DRIFT: f32 = 0.0056;
 /// 而它只影响星芒的胖瘦,不影响位置与密度。
 const GLASSY_SPARKLE_DIST: f32 = 0.30;
 
+/// 法线图 G 通道的方向。**+1 = 贴图的 +Y 跟着 UV 的 +V 走**(导数法解出来的副切线就是 +V)。
+/// UE 的法线图是 OpenGL 约定(+Y 朝上),而纹理坐标的 V 轴向下 —— 两者差一个负号。
+/// **这个符号是对着实机截图定的**(见 docs/design.md),不是从汇编读的:汇编那侧的副切线
+/// 用的是 UE 自己的切线基,而我们的是从 glTF 的 UV 反解的,中间还隔着 CUE4Parse
+/// 那个 Y/Z 交换(一次反射)。
+const NORMAL_MAP_GREEN: f32 = -1.0;
+
 /// 描边材质 `MI_P_Outline` 的 `GlassyUV` = (平铺 u, 平铺 v, 流速 u, 流速 v)。
 /// **写死在共享的父材质上**(每份 `_Ol` 都继承它,鸭吉吉那份一个参数都没覆盖),
 /// 而 lua 往描边材质上只写两个 Channel 色 —— 所以这四个数对全库是同一份。
@@ -429,14 +453,31 @@ const SHOULDER_WHITE: f32 = 1.5;
 /// 引擎真实的解码方式,不是拟合出来的数;而变差的那两项**本来就补不回来** ——
 /// 抬曝光能把亮度拉到 0.98(曝光 0.70),但全库过曝会从 3 暴涨到 **98**:
 /// 游戏在 HDR 里有余量、削顶很少,我们的贴图是 LDR,抬曝光只会削顶。
-/// 明暗过渡的上下界。**读出来的**:汇编里这一步是
-/// `smoothstep(BlackMagicSoftMin, BlackMagicSoftMax, (N·L + 1) / 2)`
-/// (`MI_Ill_XingGuang1_001_Fx1` 块 10 的 `cb5[59].x` / `cb5[58].w`,值 0.50 / 0.52,
-/// 全库零覆盖),换算到 `N·L` 空间就是 `smoothstep(2×0.50 − 1, 2×0.52 − 1)` = **(0.00, 0.04)**。
+/// 明暗过渡的上下界(`N·L` 空间)。
 ///
-/// 原来写的是 `(-0.04, 0.04)` —— 宽一倍且偏低,是当初扫参数扫出来的。
+/// ~~汇编里这一步是 `smoothstep(BlackMagicSoftMin, BlackMagicSoftMax, (N·L + 1) / 2)`
+/// (`MI_Ill_XingGuang1_001_Fx1` 块 10),换算过来是 (0.00, 0.04)。~~
+/// **那是从错的 shader 读的** —— `BlackMagic` 是「黑魔法效果」那一族的参数,
+/// 而**本体材质**(`M_P_Object`)的明暗在 PS 8409 第 174~180 行,读的是 `cb6[15]`:
+///
+/// ```text
+/// hl = (0.5 × N·L + MaskTex.b + 0.5) × 0.5        ← 半兰伯特,MaskTex.b 全库恒 0.298
+/// t  = saturate((hl − cb6[15].x) / (cb6[15].y × 0.1))
+/// ```
+///
+/// `cb6[15]` 的 preshader 是 `(0.4, SoftEdge)`(`vector-slot[15]` 的字节码里
+/// 0.4 是图里硬写的常数,`SoftEdge` 全库根默认 **0.5**)。代进去:
+/// 阈值 `0.4` 对上 `hl` 的 `0.399` ⇒ 起点仍在 `N·L ≈ 0`,而**宽度**是
+/// `0.05 / 0.25 = 0.2` —— 比原来那个 0.04 **宽 5 倍**。
+///
+/// **为什么非改不可**:接上法线图之后,2.3° 宽的过渡带会把贴图的法线扰动变成一条
+/// **锯齿状的硬边**(鸭吉吉的肚子上肉眼可见),而实机那儿是一片平滑的渐变。
+/// 过渡带的宽度和法线图是**耦合**的,只上其中一件必然更差。
+///
+/// **还没接的那一半**:汇编在这之后还要拿这个值去查 `RampTex`(按 `(明暗, RampID)` 取色),
+/// 卡通分层其实烘在那张 LUT 里。那是「整条着色链」那件大的,见 docs/design.md。
 const SHADE_TERM_LO: f32 = 0.0;
-const SHADE_TERM_HI: f32 = 0.04;
+const SHADE_TERM_HI: f32 = 0.2;
 /// 特效层边缘系数的下限(`rim = mix(下限, 1, facing)`)。**当年在显示空间对着截图标的。**
 ///
 /// **把 `fs_effect` 搬进线性的尝试到此为止,记下别再走**:三种编码 × 四档下限全测过,
@@ -892,33 +933,73 @@ fn shade_xiaoyou(in: VsOut) -> vec4<f32> {
     // PNG 不携带 UE 的采样色彩空间，故在专用链里显式还原硬件视图转换。
     let main_linear = game_tonemap_inverse(main_sample.rgb);
 
-    let flow_uv = in.uv
-        + material.xiaoyou_noise_flow.xy * camera.time
-        + vec2<f32>(0.0, sin(fract(camera.time * 0.1) * 6.28318548) * 0.02);
-    // `sample ... r2.z, ..., t3.xzyw`：目标寄存器写 z，而资源 z 被 swizzle 到 y，
-    // 因而这里取的是 NoiseTex.g，不是视觉上最显眼的红通道。
-    let noise = srgb_to_linear(textureSample(noise_tex, base_sampler, flow_uv).rgb).g;
+    // **卷动层要采两次,不是一次。** 实机排列(quality=Num / LOD0 / DSId=0,resource
+    // `069E8956…`,PS 41540 第 70~90 行)拿同一张 `NoiseTex` 按**两组不同的速度**各采一次,
+    // 取**不同的通道**,再**相乘**当 lerp 系数:
+    //
+    //     wob = sin(frac(time × 0.1) × 2π) × 0.02          // 只加在 V 上,两次共用
+    //     a   = NoiseTex(uv + frac(time × 速度1) + wob).g   // 第 82 行 t3.yxzw → dest .x → g
+    //     b   = NoiseTex(uv + frac(time × 速度2) + wob).b   // 第 87 行 t3.xywz → dest .w → b
+    //     r8  = lerp(FlowNoiseColor1 × Int1, FlowNoiseColor2 × Int2, a × b)
+    //
+    // 原来只采一次(速度1 的 `.g`),`USpeedTex02`/`VSpeedTex02` 那一组导出器早就写进包了、
+    // 运行时压根没读。相乘的效果是**把两层慢速卷动打散成更细的斑**,而单层是一整片。
+    let wob = vec2<f32>(0.0, sin(fract(camera.time * 0.1) * 6.28318548) * 0.02);
+    let flow_uv1 = in.uv + fract(camera.time * material.xiaoyou_noise_flow.xy) + wob;
+    let flow_uv2 = in.uv + fract(camera.time * material.xiaoyou_noise_flow.zw) + wob;
+    let noise_a = srgb_to_linear(textureSample(noise_tex, base_sampler, flow_uv1).rgb).g;
+    let noise_b = srgb_to_linear(textureSample(noise_tex, base_sampler, flow_uv2).rgb).b;
     let flow1 = material.xiaoyou_flow1.rgb * material.xiaoyou_shape.x;
     let flow2 = material.xiaoyou_flow2.rgb * material.xiaoyou_shape.y;
-    let flow_color = mix(flow1, flow2, noise);
+    let flow_color = mix(flow1, flow2, noise_a * noise_b);
 
-    // preshader 把 UV_Control 的 Y/W 与 TwinkleSpeed 都除以 100 后再送入 cb。
-    let star_uv = in.uv * material.xiaoyou_star_uv.xz
-        + material.xiaoyou_star_uv.yw * (camera.time * 0.01);
-    let star = textureSample(star_tex, base_sampler, star_uv);
-    let phase = fract(camera.time * material.xiaoyou_shape.w * 0.01 + star.r) * 6.28318548;
-    let wave = sin(phase) * 0.5 + 0.5;
-    // cb6[52].x/y 分别是 `Star_RG_DarkTime` / `Star_RG_Int`。前者在
-    // ML_P_Flow_XiaoYou 的冻结默认值中为 0，且三只实例均未覆盖；不是由 Int 反推阈值。
-    let star_gain = max(material.xiaoyou_shape.z, 1.0);
-    let star_pulse = saturate(wave) * star_gain;
-    let star_amount = star.g * star_pulse;
+    // **星点是两层,不是一层**(PS 41540 第 91~117 行):`StarTex` 的 **R/G** 给一层、
+    // **B/A** 给另一层 —— 正是参数名里那两族 `Star_RG_*` / `Star_BA_*`:
+    //
+    // ```text
+    // uvN  = uv × UV_Control.xz + frac(time × UV_Control.yw / 100)   // 速度 preshader 除过 100
+    // 相位  = frac(time × TwinkleSpeed / 100) + StarTex.相位通道
+    // A    = saturate((sin(2π·相位) × 0.5 + 0.5) − DarkTime) × Int    // RG 那层
+    // B    = StarTex.a × saturate(|sin(2π·相位)| − DarkTime) × Int    // BA 那层,取**绝对值**
+    // 星点  = A × StarTex.g + B                                       // 第 117 行
+    // ```
+    //
+    // 槽位都是从 preshader 字节码定的:`scalar-slot[12]/[13]` = `UV_Control` 的 x/z(平铺)、
+    // `[15]/[17]` = 它的 y/w **除以 100**(速度)、`[19]`/`[18]` = RG 的 Int/DarkTime、
+    // `[29]`/`[28]` = BA 的 Int/DarkTime、`[11]`/`[27]` = 两个 `TwinkleSpeed` 除以 100。
+    //
+    // 两层的差别不只是参数:**RG 那层是 `sin×0.5+0.5`(单向脉冲),BA 那层是 `|sin|`
+    // (一个周期闪两次)**,而且 RG 那层的结果还要再乘一次 `StarTex.g`。
+    // 原来只实现了 RG 那一层,`Star_BA_*` 那几个参数导出器压根没导。
+    //
+    // `DarkTime`(参数名后面跟着「数值越大, 黑的时间越长」)全库没人覆盖,取根默认 0;
+    // 旧包没有 `xiaoyou_star2` ⇒ BA 那层的 Int 是 0 ⇒ 整层不出场,退回原来的单层。
+    let star_t = camera.time * 0.01;
+    let star_uv_a = in.uv * material.xiaoyou_star_uv.xz
+        + fract(star_t * material.xiaoyou_star_uv.yw);
+    let star_uv_b = in.uv * material.xiaoyou_star_uv2.xz
+        + fract(star_t * material.xiaoyou_star_uv2.yw);
+    let star_a = textureSample(star_tex, base_sampler, star_uv_a);
+    let star_b = textureSample(star_tex, base_sampler, star_uv_b);
+    let wave_a = sin(fract(star_t * material.xiaoyou_shape.w + star_a.r) * 6.28318548) * 0.5 + 0.5;
+    let layer_a = saturate(wave_a - material.xiaoyou_star2.x) * material.xiaoyou_shape.z;
+    let wave_b = sin(fract(star_t * material.xiaoyou_star2.w + star_b.b) * 6.28318548);
+    let layer_b = star_b.a
+        * saturate(abs(wave_b) - material.xiaoyou_star2.y)
+        * material.xiaoyou_star2.z;
+    let star_amount = layer_a * star_a.g + layer_b;
 
-    // 32511 第 92~97 行:噪声与星光都要算进覆盖遮罩,再乘顶点色 R·G·(1−A)。
+    // 覆盖遮罩(PS 41540 第 119~124 行):`saturate((a + b + 星光) × 顶点色 R·G·(1−A))`。
+    //
+    // **原来这儿多了一个 `1.0 +`**(从 Low 排列 32511 读的)。那一项让遮罩几乎恒等于
+    // `R·G·(1−A)` 的饱和值 ⇒ 卷动层整片盖住本体,实机报的「小灵面身体像一层薄雾」
+    // 就是它。Num 那条没有这个 1,遮罩跟着噪声走 —— 噪声暗的地方露出受光的固有色。
     let vertex_mask = saturate(
-        (1.0 + noise + star_amount) * in.color.r * in.color.g * (1.0 - in.color.a)
+        (noise_a + noise_b + star_amount) * in.color.r * in.color.g * (1.0 - in.color.a)
     );
-    // **固有色不读 MainTex,读的是材质自己的 BaseColor1/BaseColor2** —— 32511 第 140~143 行:
+    // **固有色不读 MainTex,读的是材质自己的 BaseColor1/BaseColor2** —— 这条**在 Num 排列里
+    // 一模一样**(PS 41540 第 167~170 行,`cb6[31]` = `BaseColor1`、`cb6[30]` = `BaseColor2`,
+    // 槽位由 preshader 字节码 `040B00…` / `040C00…` 定死),下面这段 32511 的记录照旧成立:
     //     r4 = lerp(cb6[28], cb6[27], 1 − 顶点色 G)
     //     r3 = lerp(MF_ToneMapInverse(BaseTex), r4, 1 − 顶点色 A)
     // 这一族三只的顶点色 A 恒为 0 ⇒ 基色贴图整支权重为 0,固有色**全部**来自那对颜色;
@@ -1464,7 +1545,9 @@ fn shade_main(in: VsOut, depth_coverage: f32) -> vec4<f32> {
     let exact_object_trans = material.depth_fade.z > 0.5;
     let line = select(select(tex.a, 0.0, alpha_is_opacity), 0.0, cutout);
 
-    let n = normalize(in.normal);
+    // **法线图接在这儿**:汇编里主光照那一路 `N·L` 用的就是贴图法线(PS 8409 第 157 行)。
+    // 没有这张图(纯特效层、专用族、旧包)时 `mapped_normal` 原样返回几何法线。
+    let n = mapped_normal(in, normalize(in.normal));
     let ndl = dot(n, normalize(camera.light_dir));
     // 两段明暗:亮部原色,暗部压到 0.72,过渡带 0.08 宽度避免锯齿。
     //
@@ -1673,7 +1756,10 @@ fn shade_main(in: VsOut, depth_coverage: f32) -> vec4<f32> {
     // **`else` 那支的位置本来就是对的**:`mov r0.xyz, r9.xyzx`(第 511 行)—— 不开这层时
     // `r0` 就是干净的固有色,同样在乘光照之前。
     let surface_albedo = select(mix(albedo, stick.color, stick.cover), albedo, fake_trans);
-    var body = surface_albedo * shade;
+    // **逐 `MatID` 的高光是乘在这一步上的**(汇编 PS 8409 第 220~221 行把
+    // `基色 × 光照` 与 `基色 × 光照 × 高光` 相加,提出来就是这个 1 + …),
+    // 不是加一层白光 —— 见 `matid_specular`。四档强度全 0 的材质返回 0,原样通过。
+    var body = surface_albedo * shade * (1.0 + matid_specular(in.uv, n));
     if exact_object_trans {
         body = object_trans_low_light(in.uv, n, surface_albedo);
     }
@@ -1805,14 +1891,146 @@ fn fs_outline(in: VsOut) -> @location(0) vec4<f32> {
                                          material.xiaoyou_base2.rgb,
                                          saturate(1.0 - in.color.g)));
     }
-    return vec4<f32>(mix(albedo * 0.80, glassy_outline(in), glassy_outline_zone(in)), 1.0);
+    // 有五档颜色就走实机那条(近黑),没有(旧包)才退回「固有色压暗」。
+    let id = outline_mat_id(in);
+    let base = select(albedo * 0.80, outline_ramp_color(id), material.outline.y > 0.5);
+    return vec4<f32>(mix(base, glassy_outline(in), glassy_outline_zone(id)), 1.0);
+}
+
+/// **逐 `MatID` 的高光**(`M_P_Object` 的 quality=Num 排列独有,PS 8409 第 192~221 行)。
+///
+/// 返回的是**乘性加亮量**:调用处写 `body *= 1 + matid_specular(...)`。汇编里这两项共用
+/// 同一个光照因子 —— `r13 = 基色 × 光照 + 基色 × 光照 × Int × SpecColor × v × edge`,
+/// 提出来就是 `基色 × 光照 × (1 + …)`。所以**不是加一层白光**,是把已着色的颜色整体推亮。
+///
+/// ```text
+/// 挡位 = floor(min((1 − MatID) × 5 + 1, 5))          // 和描边同一张图同一套刻度
+/// (Pow, Int, R) = 挡位 1 ? (0.35, 0.001, 0.5)        // 第 1 档是汇编里硬写的立即数
+///                        : (SpecPow_n, SpecIntensity_n, SpecRadius_n)
+/// α    = Pow²
+/// D    = min((α / ((N·H)²(α² − 1) + 1))², 2048)      // GGX,少了 1/π
+/// k    = 0.25 × Pow + 0.25
+/// v    = lerp(saturate(k·D), k·D, R²)
+/// edge = saturate((saturate((k·D + 0.5) × 0.5) − (0.49 − R)) / (2R))
+/// ```
+///
+/// `R = 0` 时 `edge` 退化成 `k·D > 0.48` 的**硬阶跃**(友爱星飞身上那种硬边高光块);
+/// `R = 1` 时是一片宽而柔的加亮(蛋煲蛋)。第 1 档那个 `0.001` 让「美术没设过的部位」
+/// 实际等于关闭(代进去加亮量 0.006)。
+///
+/// **全库 2539 份材质里只有 213 份真的开着**(四档 `SpecIntensity` 有一档非 0);
+/// 早先按 120 个资产的抽样得出的「只有 2 份」是样本太小,已更正。
+///
+/// `MatID` 走 `glassy_id_tex` 那一路 —— 它和炫彩区域门是**同一张图同一个通道**
+/// (`MaskTex` 的 alpha,那张图同时是法线图),见 gpu.rs 里那条上传规则。
+/// 采样无条件做:一致控制流。
+fn matid_specular(uv: vec2<f32>, n: vec3<f32>) -> vec3<f32> {
+    let id = textureSample(glassy_id_tex, base_sampler, uv).a;
+    let slot = i32(floor(min((1.0 - id) * 5.0 + 1.0, 5.0)));
+    // 第 1 档不在 uniform 里:汇编把它编成了立即数
+    let s = select(material.spec_slots[clamp(slot, 2, 5) - 2].xyz,
+                   vec3<f32>(0.35, 0.001, 0.5), slot <= 1);
+    let pow_ = s.x;
+    let intensity = s.y;
+    let radius = s.z;
+    let h = normalize(view_direction() + normalize(camera.light_dir));
+    let ndh = saturate(dot(n, h));
+    let a = pow_ * pow_;
+    let denom = ndh * ndh * (a * a - 1.0) + 1.0;
+    let d0 = a / max(denom, 1e-6);
+    let d = min(d0 * d0, 2048.0);
+    let k = 0.25 * pow_ + 0.25;
+    let kd = k * d;
+    let v = mix(saturate(kd), kd, radius * radius);
+    // `radius = 0` 时汇编那条 `div_sat` 就是 x/0 —— ±inf 被 saturate 夹成 1/0,
+    // 也就是在 0.49 处的**硬阶跃**。WGSL 的除零是实现定义的,所以把分母垫一个极小量:
+    // 结果一样是阶跃,但不依赖 inf 的行为。
+    let edge = saturate((saturate((kd + 0.5) * 0.5) - (0.49 - radius))
+                        / max(2.0 * radius, 1e-6));
+    return select(vec3<f32>(0.0),
+                  material.spec_color.rgb * intensity * v * edge,
+                  material.spec_color.w > 0.5);
+}
+
+/// **法线图**:`MaskTex` 的 RG 是切线空间法线的 xy,z 由 `sqrt(1 − x² − y²)` 补出。
+/// PS 8409 第 44~52 行读它、第 157 行拿它算主光照的 `N·L` —— 我们一直只用了这张图的 alpha。
+/// 抽 14 张 `_By_M` 量过,**14 张全都带真实扰动**(nx/ny 的 p2~p98 到 ±0.3~±0.7)。
+///
+/// **切线基从屏幕空间导数反解,不走顶点切线。** 两个理由:
+///
+/// 1. glb 里那份 `TANGENT` 的 **w(副切线符号)是坏的** —— CUE4Parse 每个网格只写一个值
+///    (抽 8 只:7 只全 +1、1 只全 −1),而拿网格自己的 位置+UV 重算出来的副切线方向,
+///    与 `cross(N, T) × w` 的**同向率只有 0.00~0.61**。也就是说镜像 UV 那半边会整片翻掉
+///    (角色左右对称,镜像 UV 很常见)。方向本身是对的(`dot(存的T, UV推的T)` 中位 +0.996),
+///    坏的只有符号。
+/// 2. 导数法(Mikkelsen 的 cotangent frame)对镜像 UV **自动正确**,而且不用改顶点格式、
+///    不用改导出器。代价是切线基逐三角常量 —— 但 `N` 仍是插值来的平滑法线,
+///    重正交之后接缝上看不出来。
+///
+/// 汇编里最后还有一步 `lerp(几何法线, 贴图法线, cb0[149].w)`,那是 View 常量、读不到;
+/// 而**主光照那一路用的是没 lerp 的贴图法线**(第 150~157 行),所以这里也不 lerp,
+/// `normal_map.y` 留作强度旋钮(默认 1)。
+fn mapped_normal(in: VsOut, n: vec3<f32>) -> vec3<f32> {
+    let t = textureSample(glassy_id_tex, base_sampler, in.uv).rg * 2.0 - 1.0;
+    let dp1 = dpdx(in.world_pos);
+    let dp2 = dpdy(in.world_pos);
+    let duv1 = dpdx(in.uv);
+    let duv2 = dpdy(in.uv);
+    let dp2perp = cross(dp2, n);
+    let dp1perp = cross(n, dp1);
+    let tan = dp2perp * duv1.x + dp1perp * duv2.x;
+    let bit = dp2perp * duv1.y + dp1perp * duv2.y;
+    let inv = inverseSqrt(max(max(dot(tan, tan), dot(bit, bit)), 1e-20));
+    let xy = t * material.normal_map.y;
+    let nz = sqrt(max(1.0 - dot(xy, xy), 0.0));
+    let mapped = tan * (xy.x * inv) + bit * (xy.y * inv * NORMAL_MAP_GREEN) + n * nz;
+    let ok = material.normal_map.x > 0.5 && dot(mapped, mapped) > 1e-12;
+    return select(n, normalize(mapped), ok);
+}
+
+/// 描边那一遍挑档用的 `MatID`。**优先用 `_Ol` 自己那张** —— 描边材质有自己的 `MatID` 槽,
+/// 854 份里 38 份指着与本体 `MaskTex` 不同的图、81 份本体压根没有这个槽。
+/// 旧包(`outline.y = 0`)没导这张,退回炫彩那道门用的 `_M`,保持老行为。
+///
+/// **两张都无条件采**:采样带隐式导数,只能在一致控制流里调(和 `glassy_layer` 里
+/// 踩过的那条同一个道理),所以是 `select` 而不是 `if`。
+fn outline_mat_id(in: VsOut) -> f32 {
+    let own = textureSample(outline_id_tex, base_sampler, in.uv).a;
+    let fallback = textureSample(glassy_id_tex, base_sampler, in.uv).a;
+    return select(fallback, own, material.outline.y > 0.5);
+}
+
+/// 描边的颜色。**实机是五档的**,按 `MatID` 遮罩挑,不是「固有色压暗」——
+/// 描边 PS 58499(鸭吉吉 `_By_Ol` 的 quality=Num / LOD0 / DSId=0 排列)第 32~41 行:
+///
+/// ```text
+/// 挡位 = floor(min((1 − MatID.a) × 5 + 1, 5))     // MatID=1 → 1 档,MatID=0 → 5 档
+/// out  = OutLineOtherColor[挡位] × Outline Intensity
+/// ```
+///
+/// 汇编里这之后还有三步,**全库都是恒等的**,所以导出器不传:
+/// 混 `Flat_EmissiveColor`(权重 `Flat_EmissiveRatio` = 0 × 851)、混 `SelectionColor`
+/// (引擎的编辑器选中色,打包后 alpha = 0)、以及乘 `saturate(2 × 灯色亮度)`
+/// (权重 `OutlineIgnoreEnvColor` = 1 × 850,名字的意思是「只吃环境光的**亮度**、
+/// 不吃它的颜色」;白光下那个 saturate 就是 1,我们没有等价量,取 1)。
+///
+/// 挡位与炫彩那道门是**同一张图同一套刻度**:`MinID` = 0.4 ⇒ 炫彩区正好是 1~3 档,
+/// 4/5 档是喙、脚这类非炫彩部位。所以第 5 档最常被美术改(全库 597 种不同的值),
+/// 而 1~4 档大多留着父材质那个近黑的紫(0.0144, 0.0056, 0.0356)。
+///
+/// **颜色是从实机截图上量得到的**:加益边界处有 1~2 个像素明显低于背景(0.50)与身体
+/// (0.74)的暗环,最低到 0.265 —— 「固有色 × 0.80」那条**永远画不出**这个凹陷。
+fn outline_ramp_color(id: f32) -> vec3<f32> {
+    let slot = i32(floor(min((1.0 - id) * 5.0 + 1.0, 5.0)));
+    return encode_linear_color(material.outline_ramp[clamp(slot, 1, 5) - 1].rgb);
 }
 
 /// 炫彩那一遍描边该不该换色。**`_Ol` 也有一条 `GlassySwitch` 排列** ——
 /// lua 的 `processAdditionalMaterial` 往本体材质的 `AdditionalMaterials`(就是那份 `_Ol`)
 /// 上写 `GlassySwitch=true` + 两个 Channel 色,所以描边跟着一起变。
 ///
-/// 门与本体那条**是同一张图同一个阈值**(`MatID` 就是 `_M`、`MinID` = 0.4):
+/// 门与本体那条**是同一个阈值、同一套刻度**(`MinID` = 0.4);图取 `_Ol` 自己的 `MatID`
+/// (见 `outline_mat_id` —— 它与本体的 `MaskTex` 大多数时候是同一张,但不总是):
 /// 汇编 `ge r0.w, r0.w, cb3[34].y` 之后 `mad r1.xyz, r0.w, (glass − 描边色), 描边色`
 /// —— 门外仍是 `OutLineOtherColor × Outline Intensity` 那条老路。
 ///
@@ -1821,8 +2039,8 @@ fn fs_outline(in: VsOut) -> @location(0) vec4<f32> {
 ///
 /// **门只当值用,不当分支用** —— 和 `glassy_layer` 里那条踩过的坑同一个道理:
 /// 采样带隐式导数,只能在一致控制流里调,提前 return 会让浏览器那边整份 shader 拒编。
-fn glassy_outline_zone(in: VsOut) -> f32 {
-    let id = textureSample(glassy_id_tex, base_sampler, in.uv).a;
+/// (贴图采样本身已经挪到 `outline_mat_id`,这里只收那个值。)
+fn glassy_outline_zone(id: f32) -> f32 {
     let on = material.glassy_red.w > 0.5 && material.glassy_red.w < 1.5;
     return select(0.0, 1.0, on && id >= GLASSY_MIN_ID);
 }

@@ -17,6 +17,8 @@ using CUE4Parse.UE4.Assets.Objects;
 using CUE4Parse.UE4.Assets.Objects.Properties;
 using CUE4Parse.UE4.Objects.Core.Math;
 
+using CUE4Parse.UE4.Objects.UObject;
+
 namespace RocomPets.Export;
 
 /// 一个特效父族的参数汇总(调查用)。
@@ -260,9 +262,21 @@ public static class MaterialProbe
             "OutlineWidthPC", "MaxWidthScale", "MinWidthScale", "OutlineOffset", "OutLine Offset",
             "Outline Intensity", "UseNormalVector", "IgnoreVertexColor", "DistanceUniform",
             "描边中心剔除范围", "MinID",
+            // 下面这批是**颜色**那条链(描边 PS 58499 第 32~41 行),见 SurveyOutlines 的注释
+            "OutlineIgnoreEnvColor", "Flat_EmissiveIntensity", "Flat_EmissiveRatio",
+        ];
+        // 颜色那条链要的向量:5 档描边色 + 两个混色口子
+        string[] watchVec =
+        [
+            "OutLineOtherColor", "OutLineOtherColor2", "OutLineOtherColor3",
+            "OutLineOtherColor4", "OutLineOtherColor5", "Flat_EmissiveColor", "SelectionColor",
         ];
         // 参数名 → 「有效值 → 命中数」。有效值 = 链上覆盖过且名字在根里存在,否则根默认。
         var effective = watch.ToDictionary(w => w, _ => new Dictionary<string, int>(), StringComparer.OrdinalIgnoreCase);
+        var effVec = watchVec.ToDictionary(w => w, _ => new Dictionary<string, int>(), StringComparer.OrdinalIgnoreCase);
+        // 「5 档是不是全一样」「MatID 指的是不是本体那张 _M」这两条是运行时要不要逐档的判据
+        var rampShape = new Dictionary<string, int>(StringComparer.Ordinal);
+        var matIdKind = new Dictionary<string, int>(StringComparer.Ordinal);
         var deadNames = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
         var parents = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
         var sample = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
@@ -283,10 +297,70 @@ public static class MaterialProbe
             for (var i = chain.Count - 1; i >= 0; i--)
                 foreach (var p in chain[i].GetOrDefault<FScalarParameterValue[]>("ScalarParameterValues", []))
                     if (!string.IsNullOrEmpty(p.Name)) scalars[p.Name] = p.ParameterValue;
+            var vectors = new Dictionary<string, float[]>(StringComparer.OrdinalIgnoreCase);
+            for (var i = chain.Count - 1; i >= 0; i--)
+                foreach (var p in chain[i].GetOrDefault<FVectorParameterValue[]>("VectorParameterValues", []))
+                    if (!string.IsNullOrEmpty(p.Name) && p.ParameterValue is { } c)
+                        vectors[p.Name] = [c.R, c.G, c.B, c.A];
+            var textures = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            for (var i = chain.Count - 1; i >= 0; i--)
+                foreach (var p in chain[i].GetOrDefault<FTextureParameterValue[]>("TextureParameterValues", []))
+                    if (!string.IsNullOrEmpty(p.Name) && p.ParameterValue?.ResolvedObject is { } t)
+                        textures[p.Name] = t.GetPathName();
 
             var root = RootMaterial.Of(mi);
             var rootName = chain[^1].Parent?.Name ?? "(无根)";
             parents[rootName] = parents.GetValueOrDefault(rootName) + 1;
+
+            // 5 档描边色:全同 / 只有第 5 档不同 / 真·多档
+            string Vec(string n) => vectors.TryGetValue(n, out var v)
+                ? $"({v[0]:0.####},{v[1]:0.####},{v[2]:0.####})"
+                : root.Vectors.TryGetValue(n, out var d) ? $"根({d[0]:0.####},{d[1]:0.####},{d[2]:0.####})"
+                : "(缺)";
+            var ramp = watchVec.Take(5).Select(Vec).ToArray();
+            var shape = ramp.Distinct().Count() switch
+            {
+                1 => "5 档全同",
+                2 when ramp[0] == ramp[1] && ramp[1] == ramp[2] && ramp[2] == ramp[3] => "1~4 同、第 5 档不同",
+                var k => $"{k} 种不同的值",
+            };
+            rampShape[shape] = rampShape.GetValueOrDefault(shape) + 1;
+            foreach (var n in watchVec)
+            {
+                var key = Vec(n);
+                effVec[n][key] = effVec[n].GetValueOrDefault(key) + 1;
+                sample.TryAdd($"{n}={key}", Path.GetFileNameWithoutExtension(path));
+            }
+
+            // MatID 指的是不是本体材质那张 `_M`(= 我们已经在导的 glassy_id_tex)?
+            var stem = Path.GetFileNameWithoutExtension(path);
+            var bodyName = stem[..^3];   // 去掉 "_Ol"
+            var matId = textures.GetValueOrDefault("MatID");
+            string kind;
+            if (matId is null) kind = "没有 MatID 覆盖(用根默认)";
+            else
+            {
+                string? bodyMask = null;
+                try
+                {
+                    var dir = path[..(path.LastIndexOf('/') + 1)];
+                    if (provider.LoadPackageObject($"{dir}{bodyName}") is UMaterialInstance body)
+                    {
+                        var bchain = new List<UMaterialInstance>();
+                        for (var cur = body; cur is not null && bchain.Count < 8; cur = cur.Parent as UMaterialInstance)
+                            bchain.Add(cur);
+                        for (var i = bchain.Count - 1; i >= 0; i--)
+                            foreach (var p in bchain[i].GetOrDefault<FTextureParameterValue[]>("TextureParameterValues", []))
+                                if (p.Name is "MaskTex" or "Mask" && p.ParameterValue?.ResolvedObject is { } t)
+                                    bodyMask = t.GetPathName();
+                    }
+                }
+                catch { /* 本体读不出来就只报 MatID 自己 */ }
+                kind = bodyMask is null ? "本体没有 MaskTex"
+                    : bodyMask == matId ? "= 本体 MaskTex" : "≠ 本体 MaskTex";
+                sample.TryAdd($"MatID:{kind}", stem);
+            }
+            matIdKind[kind] = matIdKind.GetValueOrDefault(kind) + 1;
 
             foreach (var name in watch)
             {
@@ -313,13 +387,195 @@ public static class MaterialProbe
                 effective[name].OrderByDescending(kv => kv.Value)
                     .Select(kv => $"{kv.Key} × {kv.Value}"
                                   + (kv.Value > 8 ? "" : $"({sample[$"{name}={kv.Key}"]})"))));
+        Console.WriteLine("\n--- 描边色(OutLineOtherColor1..5 按 MatID 分 5 档挑)");
+        foreach (var name in watchVec)
+            Console.WriteLine($"  {name,-22} " + string.Join("  ",
+                    effVec[name].OrderByDescending(kv => kv.Value).Take(6)
+                        .Select(kv => $"{kv.Key} × {kv.Value}"
+                                      + (kv.Value > 8 ? "" : $"({sample[$"{name}={kv.Key}"]})")))
+                + (effVec[name].Count > 6 ? $"  …另有 {effVec[name].Count - 6} 种" : ""));
+        Console.WriteLine("  5 档形状:" + string.Join("、", rampShape.OrderByDescending(kv => kv.Value)
+            .Select(kv => $"{kv.Key} × {kv.Value}")));
+        Console.WriteLine("  MatID 贴图:" + string.Join("、", matIdKind.OrderByDescending(kv => kv.Value)
+            .Select(kv => $"{kv.Key} × {kv.Value}"
+                          + (sample.ContainsKey($"MatID:{kv.Key}") && kv.Value <= 8 ? $"({sample[$"MatID:{kv.Key}"]})" : ""))));
         Console.WriteLine("\n--- 死设定(实例写了,但根材质里没有同名参数 ⇒ 运行时查不到,不生效)");
         foreach (var (name, n) in deadNames.OrderByDescending(kv => kv.Value))
             Console.WriteLine($"  {name,-22} × {n}   例:{sample[name]}");
     }
 
+    /// 全库普查**逐 `MatID` 的高光**(`--probe-material SPECULAR`)。
+    ///
+    /// 想回答的是一件事:`M_P_Object` 的 quality=Num 排列比 Low 多出来那一块
+    /// (`SpecColor` + 四组 `(SpecPow_n, SpecIntensity_n, SpecRadius_n)`,按 `MatID` 挑档)
+    /// **到底有几个材质真的开着**。判据取「`SpecIntensity2..5` 有没有被实例覆盖成非 0」——
+    /// 根默认全是 0,而强度为 0 这一层就不出场。顺带记这些材质有没有 `MaskTex`:
+    /// 没有的话「按 `MatID` 分档」根本无从谈起(整片是同一档)。
+    private static void SurveySpecular(AbstractVfsFileProvider provider)
+    {
+        const string petsRoot = "NRC/Content/ArtRes/AnimSequence/Pets";
+        var files = provider.Files.Values.Select(f => f.Path)
+            .Where(p => p.StartsWith(petsRoot + "/", StringComparison.OrdinalIgnoreCase)
+                        && p.EndsWith(".uasset", StringComparison.OrdinalIgnoreCase)
+                        && p.Contains("/Mat/", StringComparison.OrdinalIgnoreCase)
+                        && !p.EndsWith("_Ol.uasset", StringComparison.OrdinalIgnoreCase))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .OrderBy(p => p, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+        Console.WriteLine($"=== {files.Count} 份非描边材质");
+
+        string[] watch = ["SpecIntensity2", "SpecIntensity3", "SpecIntensity4", "SpecIntensity5"];
+        var hits = new List<string>();
+        var failed = 0;
+        foreach (var path in files)
+        {
+            UMaterialInstance? mi;
+            try { mi = provider.LoadPackageObject(path[..path.LastIndexOf('.')]) as UMaterialInstance; }
+            catch { failed++; continue; }
+            if (mi is null) { failed++; continue; }
+
+            var chain = new List<UMaterialInstance>();
+            for (var cur = mi; cur is not null && chain.Count < 8; cur = cur.Parent as UMaterialInstance)
+                chain.Add(cur);
+            var scalars = new Dictionary<string, float>(StringComparer.OrdinalIgnoreCase);
+            var textures = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            for (var i = chain.Count - 1; i >= 0; i--)
+            {
+                foreach (var p in chain[i].GetOrDefault<FScalarParameterValue[]>("ScalarParameterValues", []))
+                    if (!string.IsNullOrEmpty(p.Name)) scalars[p.Name] = p.ParameterValue;
+                foreach (var p in chain[i].GetOrDefault<FTextureParameterValue[]>("TextureParameterValues", []))
+                    if (!string.IsNullOrEmpty(p.Name) && p.ParameterValue?.ResolvedObject is { } t)
+                        textures[p.Name] = t.GetPathName();
+            }
+            var on = watch.Where(w => scalars.TryGetValue(w, out var v) && v != 0f).ToList();
+            if (on.Count == 0) continue;
+            var mask = textures.GetValueOrDefault("MaskTex");
+            hits.Add($"  {Path.GetFileNameWithoutExtension(path),-42} "
+                     + string.Join(" ", on.Select(w => $"{w}={scalars[w]:0.###}"
+                                                      + $"/Pow={scalars.GetValueOrDefault(w.Replace("Intensity", "Pow")):0.###}"
+                                                      + $"/R={scalars.GetValueOrDefault(w.Replace("Intensity", "Radius")):0.###}"))
+                     + $"   MaskTex={(mask is null ? "**没有**(整片同一档)" : Path.GetFileNameWithoutExtension(mask))}");
+        }
+        Console.WriteLine($"读取失败 {failed} 份;**强度非 0** 的有 {hits.Count} 份:");
+        foreach (var line in hits) Console.WriteLine(line);
+    }
+
+    /// 全库普查 `RampTex` 与 `RampID*`(`--probe-material RAMP`)。
+    ///
+    /// 想回答的是「按 `MatID` 挑 `RampID` 去查那张色带图」这一层值不值得做。
+    /// 共享的根默认 `T_AllDebugRamp` 每一行都是**近白的平色**(不随明暗变),
+    /// 所以只有「有材质换了别的图」时这一层才有内容。
+    private static void SurveyRamp(AbstractVfsFileProvider provider)
+    {
+        const string petsRoot = "NRC/Content/ArtRes/AnimSequence/Pets";
+        var files = provider.Files.Values.Select(f => f.Path)
+            .Where(p => p.StartsWith(petsRoot + "/", StringComparison.OrdinalIgnoreCase)
+                        && p.EndsWith(".uasset", StringComparison.OrdinalIgnoreCase)
+                        && p.Contains("/Mat/", StringComparison.OrdinalIgnoreCase))
+            .Distinct(StringComparer.OrdinalIgnoreCase).OrderBy(p => p, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+        var tex = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+        var ids = new Dictionary<string, int>(StringComparer.Ordinal);
+        var failed = 0;
+        foreach (var path in files)
+        {
+            UMaterialInstance? mi;
+            try { mi = provider.LoadPackageObject(path[..path.LastIndexOf('.')]) as UMaterialInstance; }
+            catch { failed++; continue; }
+            if (mi is null) { failed++; continue; }
+            var chain = new List<UMaterialInstance>();
+            for (var cur = mi; cur is not null && chain.Count < 8; cur = cur.Parent as UMaterialInstance)
+                chain.Add(cur);
+            string? rampTex = null;
+            var idv = new List<string>();
+            for (var i = chain.Count - 1; i >= 0; i--)
+            {
+                foreach (var p in chain[i].GetOrDefault<FTextureParameterValue[]>("TextureParameterValues", []))
+                    if (p.Name == "RampTex" && p.ParameterValue?.ResolvedObject is { } t)
+                        rampTex = Path.GetFileNameWithoutExtension(t.GetPathName());
+                foreach (var p in chain[i].GetOrDefault<FScalarParameterValue[]>("ScalarParameterValues", []))
+                    if (p.Name is not null && p.Name.StartsWith("RampID", StringComparison.OrdinalIgnoreCase))
+                        idv.Add($"{p.Name}={p.ParameterValue:0.##}");
+            }
+            tex[rampTex ?? "(没覆盖,用根默认 T_AllDebugRamp)"] =
+                tex.GetValueOrDefault(rampTex ?? "(没覆盖,用根默认 T_AllDebugRamp)") + 1;
+            var key = idv.Count == 0 ? "(一个 RampID 都没设)" : string.Join(" ", idv.OrderBy(x => x));
+            ids[key] = ids.GetValueOrDefault(key) + 1;
+        }
+        Console.WriteLine($"=== {files.Count} 份宠物材质,读取失败 {failed}");
+        Console.WriteLine("--- RampTex");
+        foreach (var (k, v) in tex.OrderByDescending(kv => kv.Value)) Console.WriteLine($"  {k} × {v}");
+        Console.WriteLine("--- RampID*(实例链上设过的)");
+        foreach (var (k, v) in ids.OrderByDescending(kv => kv.Value).Take(12))
+            Console.WriteLine($"  {k} × {v}");
+    }
+
+    /// 全库普查**某一个标量参数**的取值分布(`--probe-material PARAM:<名字>`)。
+    ///
+    /// 用来回答「这条链上的某个开关/系数,全库到底有没有人设过」——
+    /// 这套逆向里最常见的失误就是读出了公式却没查它实际吃到的数据(见 docs/design.md
+    /// 里那串「代码在字节码里 ≠ 这一层可见」)。只看**实例链上覆盖过的**,没覆盖单列一档。
+    private static void SurveyParam(AbstractVfsFileProvider provider, string name)
+    {
+        const string petsRoot = "NRC/Content/ArtRes/AnimSequence/Pets";
+        var files = provider.Files.Values.Select(f => f.Path)
+            .Where(p => p.StartsWith(petsRoot + "/", StringComparison.OrdinalIgnoreCase)
+                        && p.EndsWith(".uasset", StringComparison.OrdinalIgnoreCase)
+                        && p.Contains("/Mat/", StringComparison.OrdinalIgnoreCase))
+            .Distinct(StringComparer.OrdinalIgnoreCase).OrderBy(p => p, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+        var hits = new Dictionary<string, int>(StringComparer.Ordinal);
+        var sample = new Dictionary<string, string>(StringComparer.Ordinal);
+        var failed = 0;
+        foreach (var path in files)
+        {
+            UMaterialInstance? mi;
+            try { mi = provider.LoadPackageObject(path[..path.LastIndexOf('.')]) as UMaterialInstance; }
+            catch { failed++; continue; }
+            if (mi is null) { failed++; continue; }
+            var chain = new List<UMaterialInstance>();
+            for (var cur = mi; cur is not null && chain.Count < 8; cur = cur.Parent as UMaterialInstance)
+                chain.Add(cur);
+            string? val = null;
+            for (var i = chain.Count - 1; i >= 0; i--)
+            {
+                foreach (var p in chain[i].GetOrDefault<FScalarParameterValue[]>("ScalarParameterValues", []))
+                    if (name.Equals(p.Name, StringComparison.OrdinalIgnoreCase)) val = $"{p.ParameterValue:0.####}";
+                // 静态开关的形状见 `Materials.Resolve` 那段注释:存的是合并后的有效值
+                var staticSet = chain[i].GetOrDefault<FStructFallback>("StaticParameters");
+                foreach (var e in staticSet?.GetOrDefault<FStructFallback[]>("StaticSwitchParameters", []) ?? [])
+                {
+                    var pn = e.GetOrDefault<FStructFallback>("ParameterInfo")?.GetOrDefault<FName>("Name").Text;
+                    if (name.Equals(pn, StringComparison.OrdinalIgnoreCase))
+                        val = e.GetOrDefault<bool>("Value") ? "开" : "关";
+                }
+            }
+            var key = val ?? "(实例链上没设)";
+            hits[key] = hits.GetValueOrDefault(key) + 1;
+            sample.TryAdd(key, Path.GetFileNameWithoutExtension(path));
+        }
+        Console.WriteLine($"=== {files.Count} 份宠物材质,读取失败 {failed};`{name}` 的取值分布:");
+        foreach (var (k, v) in hits.OrderByDescending(kv => kv.Value))
+            Console.WriteLine($"  {k,-24} × {v}" + (v <= 8 ? $"   例:{sample[k]}" : ""));
+    }
+
     public static void Run(AbstractVfsFileProvider provider, string asset)
     {
+        if (asset.StartsWith("PARAM:", StringComparison.OrdinalIgnoreCase))
+        {
+            SurveyParam(provider, asset[6..]);
+            return;
+        }
+        if (asset.Equals("RAMP", StringComparison.OrdinalIgnoreCase))
+        {
+            SurveyRamp(provider);
+            return;
+        }
+        if (asset.Equals("SPECULAR", StringComparison.OrdinalIgnoreCase))
+        {
+            SurveySpecular(provider);
+            return;
+        }
         if (asset.StartsWith("FIND:", StringComparison.OrdinalIgnoreCase))
         {
             var needle = asset[5..];

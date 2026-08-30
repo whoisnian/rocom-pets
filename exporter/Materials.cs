@@ -74,8 +74,18 @@ public record MaterialInfo(
     /// 实测:小灵面 `_By`/`_By1` 有、幽火 `_Fx` **没有**;水灵只有 `_By`;
     /// 幽星光 `_By` 与**那两颗玻璃球 `_Fx1`** 都有;克莱因龙 `_By`/`_Fx` 有、液面 `_Fx1` 没有。
     ///
-    /// 宽度怎么来的见 `OutlineWidthOf`。
-    float? OutlineWidth = null)
+    /// 宽度怎么来的见 `OutlineOf`。
+    float? OutlineWidth = null,
+    /// 不为 null 时描边宽度改按「占这个形态包围盒高度的比例」算(乘 `height_cm` 得米)。
+    /// 全库 851/854 走这一支,见 `Materials.OutlineOf` 里「两个区间」那段。
+    float? OutlineHeightRatio = null,
+    /// 描边的**五档颜色**(线性 RGB,已乘过 `Outline Intensity`),按 `MatID` 遮罩挑。
+    /// 没有 `_Ol`、或那份 `_Ol` 挂在别的根材质上(`M_FairyBall_BallBack`,3 份)⇒ null,
+    /// 运行时退回「固有色压暗」那条老路。见 `OutlineOf`。
+    float[][]? OutlineColors = null,
+    /// 挑档用的那张遮罩(`MatID`,读 **alpha**)。854 份里 732 份就是本体的 `MaskTex`
+    /// (= 炫彩那张 `_M`),但**不能直接复用** —— 38 份指着另一张、81 份本体压根没有 `MaskTex`。
+    string? OutlineIdTexture = null)
 {
     /// 这个材质画不画描边。
     public bool HasOutline => OutlineWidth is > 0f;
@@ -547,8 +557,26 @@ public record MaterialInfo(
         Scalar("Star_RG_Int", 1f), Scalar("Star_RG_TwinkleSpeed", 0f),
     ];
 
+    /// `Star_RG_UV_Control` = **(平铺U, 速度U, 平铺V, 速度V)**。
+    /// 两个速度在 preshader 里**除以 100** 才进 cb(`scalar-slot[15]/[17]` 的字节码尾部
+    /// 是 `02 <100> 08`),运行时按同一条换算。
     public float[] XiaoYouStarUv =>
         FirstVector("Star_RG_UV_Control") ?? [1f, 0f, 1f, 0f];
+
+    /// 同上,第二层(`Star_BA_*`)。星点是**两层**:RG 那层用 `StarTex` 的 R(相位)与 G(遮罩)、
+    /// BA 那层用 B(相位)与 A(遮罩),各有自己的 UV 控制、强度、闪烁速度与阈值。
+    /// 见 pet.wgsl 的 `shade_xiaoyou`(PS 41540 第 91~117 行)。
+    public float[] XiaoYouStarUv2 =>
+        FirstVector("Star_BA_UV_Control") ?? [1f, 0f, 1f, 0f];
+
+    /// 两层星点各自的 **[阈值, 强度]**:`[Star_RG_DarkTime, Star_BA_DarkTime,
+    /// Star_BA_Int, Star_BA_TwinkleSpeed]`(RG 那层的强度与速度在 `XiaoYouShape` 的后两位)。
+    /// `DarkTime`(参数名里带着「数值越大, 黑的时间越长」)全库没人覆盖,根默认 0。
+    public float[] XiaoYouStar2 =>
+    [
+        Scalar("Star_RG_DarkTime", 0f), Scalar("Star_BA_DarkTime", 0f),
+        Scalar("Star_BA_Int", 1f), Scalar("Star_BA_TwinkleSpeed", 0f),
+    ];
 
     public string? NoiseTexture =>
         (IsYutuEar ? YutuDistortTexture : null)
@@ -871,6 +899,69 @@ public record MaterialInfo(
     /// 图里没有星贴层的材质(眼睛/嘴那族)返回 0 —— 那种材质不写这一条。
     public float GlassyStarTiling => GraphHasStickLayer ? StarTiling[0] : 0f;
 
+    /// **逐 `MatID` 的高光**:四档 `(SpecPow, SpecIntensity, SpecRadius)`,加上 `SpecColor`。
+    /// 四档强度**全是 0** ⇒ 返回空(这一层不出场,全库 2539 份里 2326 份如此)。
+    ///
+    /// ## 这一层只在 quality=Num 那条排列里
+    ///
+    /// 鸭吉吉 `_By` 的 Low 排列(PS 17314,220 行)与 Num 排列(PS 8409,333 行)**参数级
+    /// diff 只多一个 `SpecColor`**,多出来的 113 条指令就是这一块。实机跑 Num,所以要接。
+    ///
+    /// ## 公式(PS 8409 第 192~221 行)
+    ///
+    ///     挡位 = floor(min((1 − MaskTex.a) × 5 + 1, 5))          // 与描边同一张图同一套刻度
+    ///     (Pow, Int, R) = 挡位 1 ? (0.35, 0.001, 0.5)            // 第 1 档是**硬写的立即数**
+    ///                            : (SpecPow_n, SpecIntensity_n, SpecRadius_n)   // n = 2..5
+    ///     α    = Pow²
+    ///     D    = min((α / ((N·H)²(α² − 1) + 1))², 2048)          // 就是 GGX,少了 1/π
+    ///     k    = 0.25 × Pow + 0.25
+    ///     v    = lerp(saturate(k·D), k·D, R²)
+    ///     edge = saturate((saturate((k·D + 0.5) × 0.5) − (0.49 − R)) / (2R))
+    ///     out  = 基色 × 光照 × (1 + Int × SpecColor × v × edge)   ← **乘性加亮**,不是加一层白
+    ///
+    /// `R = 0` 时 `edge` 退化成 `k·D > 0.48` 的**硬阶跃** —— 那就是点点身上那种硬边高光块;
+    /// `R = 1` 时是一片宽而柔的加亮(蛋煲蛋)。四个槽位的顺序**是按用法定的、不是猜的**:
+    /// `.x` 进 `α = x²` 与 `k`、`.y` 是纯倍数、`.z` 进 `0.49 ± z` 的软边宽度、
+    /// `.w` 是 `RampID`(去查那张色带图,**我们没有那条链,所以不导**)。
+    ///
+    /// 第 1 档那个 `0.001` 让「没设过的部位」实际等于关闭(实测加亮量 0.006)。
+    public float[][] SpecSlots
+    {
+        get
+        {
+            float[] Slot(int n) =>
+            [
+                RootScalar($"SpecPow{n}", 1f),
+                RootScalar($"SpecIntensity{n}", 0f),
+                RootScalar($"SpecRadius{n}", 0.5f),
+            ];
+            var slots = new[] { Slot(2), Slot(3), Slot(4), Slot(5) };
+            return slots.Any(s => s[1] != 0f) ? slots : [];
+        }
+    }
+
+    /// 上面那一层的染色。根默认白;`SpecSlots` 为空时不写。
+    public float[] SpecColor =>
+        Vectors.TryGetValue("SpecColor", out var c) ? [c[0], c[1], c[2]]
+            : RootDefaults?.Vectors.GetValueOrDefault("SpecColor")?[..3] ?? [1f, 1f, 1f];
+
+    /// `MaskTex` —— 这一张同时装着三样东西,而我们原来只用了 alpha:
+    ///
+    /// | 通道 | 是什么 | 用在哪 |
+    /// | --- | --- | --- |
+    /// | **RG** | **切线空间法线**(`xy`,`z` 由 `sqrt(1 − x² − y²)` 补出) | PS 8409 第 44~52 行,喂主光照的 `N·L` |
+    /// | B | 明暗覆写(`> 0.95` 强制全亮、`< 0.05` 强制全暗;平时进 `0.5·N·L + b` 当偏置) | 全库实测恒为 **0.298**,当覆写用是死的 |
+    /// | A | `MatID`,炫彩区域门与描边/高光的五档都读它 | 见 `OutlineOf` 与 `SpecSlots` |
+    ///
+    /// 抽 14 张 `_By_M` 量过:**14 张全都带真实的法线扰动**(nx/ny 的 p2~p98 到 ±0.3~±0.7),
+    /// 不是一张平图。
+    ///
+    /// **只在有基色贴图的材质上写**:纯特效层(火焰/水壳/光晕)与几个专用族的 `MaskTex`
+    /// 装的不是法线(`M_P_MatCap_Masked` 那族的 `base_color` 槽绑的就是查找表),
+    /// 拿去当法线会把整块面翻掉。
+    public string? MatIdTexture =>
+        BaseColorTexture is null ? null : FirstTexture("MaskTex", "Mask");
+
     /// 星点层的强度。**根材质里叫 `Stick_Intensity`(默认 1.5)** —— 运行时原来写死 0.3,
     /// 那是手挑的。名字现在查实了(参数名哈希,见 RootDefaults.cs)。
     ///
@@ -1129,10 +1220,14 @@ public static class Materials
     public static MaterialInfo ResolveInstance(string key, UMaterialInstance material)
     {
         var roots = RootMaterial.Of(material);
+        var outline = OutlineOf(material);
         var info = Resolve(key, material) with
         {
             RootDefaults = roots,
-            OutlineWidth = OutlineWidthOf(material),
+            OutlineWidth = outline?.Width,
+            OutlineHeightRatio = outline?.HeightRatio,
+            OutlineColors = outline?.Colors,
+            OutlineIdTexture = outline?.IdTexture,
         };
         // **实例没覆盖混合模式时,用根材质自己的。** 实例侧的 `BLEND_Opaque` 是 0,
         // 与「没写」不可区分(见 `Resolve` 里那条注释),所以直接挂在根材质上的
@@ -1190,21 +1285,50 @@ public static class Materials
     ///                     × lerp(1, atan(ClipToView[0][0]) × 1.283426, DistanceUniform)
     ///                     × clamp(clip.w, MinWidthScale, MaxWidthScale) × (ViewProj·N).xy
     ///
-    /// 除以 w 之后等价于「沿法线在世界空间外扩 ε 厘米」,ε = 前面那一串(不含 `clip.w` 的除法)。
-    /// 于是:
+    /// 三项化简:
     ///
     /// - `max(|LocalToWorld|)` 是**物体缩放**,而我们的网格坐标就是局部坐标 ⇒ 这一项正好抵消,
     ///   宽度与 `model_scale` 无关;
-    /// - `clamp(clip.w, …)` 是相机距离(厘米)。我们是**正交相机**,没有这个量;实机看宠物的
-    ///   镜头在 `MaxWidthScale` 上下,所以取上限 —— 也正是那 3 份 `MinWidthScale =
-    ///   MaxWidthScale = 200` 的材质(火源)刻意做成的「与距离无关」;
-    /// - `DistanceUniform` 那一项是 FOV 补偿,`atan(tan(半水平FOV)) × 1.283426` 在
-    ///   **水平 FOV ≈ 89°** 时正好 = 1 —— 这是这套公式唯一钉不死的因子(实机各界面的镜头
-    ///   FOV 不同),取它自己的中性点 1。
+    /// - `lerp(1, 顶点色, IgnoreVertexColor)`:`IgnoreVertexColor` 全库 845 份是 0 ⇒ 这一项 = 1;
+    /// - `DistanceUniform` 那一项是 FOV 补偿。它**和投影自己的 `P00` 会抵掉**:
+    ///   `(ViewProj·N).xy` 里带一个 `P00 = 1/tan(半水平FOV)`,而补偿项是
+    ///   `atan(tan(半水平FOV)) × 1.283426`,两者相乘 = `1.283426 × atan(t)/t`,
+    ///   在 t ∈ (0, 1] 上只有 **1.00~1.28** —— 这条公式本来就设计成与 FOV 无关。
     ///
-    /// 代进全库的模态值 `0.13 × 300`:**ε = 0.39 厘米 = 0.0039 米**。原来运行时写的是
-    /// `包围盒对角线 × 0.004`(魔力猫 = 1.79 厘米),**粗了 4.6 倍** —— 这就是「实机几乎看不见
-    /// 描边、我们这儿一圈很明显」的原因。
+    /// ## 两个区间:`clamp(clip.w, …)` 决定这圈是屏幕空间常数还是世界空间常数
+    ///
+    /// 剩下的 `clamp(clip.w, Min, Max)` 除以透视除法的那个 `w`:
+    ///
+    /// - **`Min < Max`(851/854)**:相机落在区间内时 `clamp(w)/w = 1` ⇒ NDC 偏移与距离无关
+    ///   ⇒ **屏幕空间常数**。
+    /// - **`Max ≤ Min`(4 份)**:`clamp` 退化成常数,NDC 偏移 ∝ 1/w ⇒ **世界空间常数**。
+    ///   火源那 3 份 `Min = Max = 200` 就是刻意做成这样的;呜呜 `_Fx` 的 `Max = 0`
+    ///   ⇒ 常数 0 ⇒ 不画描边。**「Min=Max 是个特例」本身就是「默认那支不是世界空间常数」的旁证。**
+    ///
+    /// ⚠ **原来只推了后一支,把全库都当成世界空间常数的 0.0039 米,那是错的。**
+    /// 错法很隐蔽:大宠物上只差 1.3 倍,小宠物上差 5 倍 —— 莫比乌乌(体高 27.6cm)的面条身子
+    /// 会被一圈明显的黑边裹住,而实机那张几乎看不到描边。以前看不出来是因为描边取的是
+    /// 「固有色 × 0.80」,在浅色身体上本来就近乎隐形;**把颜色按汇编改对之后才露出来**。
+    ///
+    /// ## 屏幕空间常数怎么落到我们的正交相机上
+    ///
+    /// 我们的取景是「把包围盒最长边铺满画布」(见 `pet::gpu::framing_radius`),所以
+    /// **世界宽度 ÷ 宠物世界高度 = 描边像素 ÷ 宠物像素高**,与画布大小、取景余量都无关。
+    /// 于是屏幕空间常数在我们这儿的等价形式就是「占这个形态包围盒高度的固定比例」,
+    /// 由 `OutlineRatioPerPc × OutlineWidthPC` 给出,调用方乘上 `height_cm` 得米。
+    ///
+    /// 12 只有实机截图的宠物量下来(暗环面积反推宽度,4×SSAA + 同尺度),
+    /// 三条候选律「该是常数」的那一列的离散度:
+    ///
+    /// | 律 | 中位 | max/min | 变异系数 |
+    /// | --- | --- | --- | --- |
+    /// | 世界空间常数(原实现) | 0.227 厘米 | 7.06 | 0.46 |
+    /// | 屏幕空间常数(同一张 1440 画面里的像素) | 1.62 px | 4.05 | 0.37 |
+    /// | 占宠物自身高度(= 我们这儿的等价形式) | **0.255%** | **3.42** | 0.38 |
+    ///
+    /// 原实现那条明显最差。后两条在统计上分不开(我们的取景下它们本来就是同一件事),
+    /// 而汇编支持的是它们,所以照它改。估计量本身不干净(姿势、投影、特效层都会掺进来),
+    /// 别拿这三个数去推更细的结论。
     ///
     /// ## 有一条看着像宽度、其实是死设定的参数
     ///
@@ -1216,7 +1340,52 @@ public static class Materials
     /// 全库分布(`--probe-material OUTLINES`):`OutlineWidthPC` 0.13 × 848、
     /// `MaxWidthScale` 300 × 847;例外只有火源的两份(0.4/0.7 × 200)、呜呜 `_Fx`
     /// (`MaxWidthScale = 0` ⇒ 不画)、以及 3 份挂在 `M_FairyBall_BallBack` 上的(没有这套参数)。
-    private static float? OutlineWidthOf(UMaterialInstance material)
+    ///
+    /// ## 颜色是五档的,按 `MatID` 遮罩挑
+    ///
+    /// 描边 PS 58499(鸭吉吉 `_By_Ol` 的 quality=Num / LOD0 / DSId=0 排列,resource `984D6A92…`)
+    /// 第 32~41 行:
+    ///
+    ///     挡位  = floor(min((1 − MatID.a) × 5 + 1, 5))        // 1..5
+    ///     color = OutLineOtherColor[挡位] × `Outline Intensity`
+    ///     color = lerp(color, Flat_EmissiveColor × Flat_EmissiveIntensity, Flat_EmissiveRatio)
+    ///     color = lerp(color, SelectionColor.rgb, SelectionColor.a)
+    ///     out   = lerp(color, color × saturate(2 × 灯色亮度), OutlineIgnoreEnvColor)
+    ///
+    /// 后三行**全库都是恒等的**,所以只导第一行的结果:`Flat_EmissiveRatio` = 0 × 851、
+    /// `SelectionColor` 全库无值(引擎的编辑器选中色,打包后是 0)、`Outline Intensity` = 1 × 851。
+    /// 最后那个环境项 `OutlineIgnoreEnvColor` = 1 × 850(唯一例外呜呜 `_Fx` 是 0.35,而它
+    /// `MaxWidthScale = 0` 本来就不画)—— 名字有点反直觉,它的意思是「只吃环境光的**亮度**、
+    /// 不吃它的颜色」;白光下 `saturate(2 × 亮度)` = 1,我们没有等价量,取 1。
+    ///
+    /// **五档不是摆设**:854 份里 4 档不同的 334、5 档不同的 281、3 档不同的 198,
+    /// 真·全同只有 5 份。挡位与炫彩那道门是同一张图同一套刻度 —— `MinID` = 0.4 对应
+    /// 挡位 1~3(炫彩区),挡位 4/5 就是喙、脚这些非炫彩部位,所以第 5 档最常被美术改
+    /// (597 种不同的值)。颜色都很暗(线性 0.0x 量级),这与实机截图量到的一致:
+    /// 加益边界处有 1~2 像素明显低于背景与身体的暗环(见 docs/design.md)。
+    ///
+    /// `MatID` 那张图 732 份就是本体的 `MaskTex`,但**不能直接复用本体那张** ——
+    /// 38 份指着另一张、81 份本体压根没有 `MaskTex`。
+    /// 配套 `_Ol` 里读出来的那几件事。
+    ///
+    /// `Width` 是**世界空间**宽度(米);`HeightRatio` 不为 null 时改按它走 ——
+    /// 「占这个形态包围盒高度的比例」,由调用方乘上 `height_cm` 得出最终宽度。
+    /// 哪个生效见 `OutlineOf` 里「两个区间」那段。
+    private record OutlineRead(float Width, float? HeightRatio, float[][]? Colors, string? IdTexture);
+
+    /// 屏幕空间那一档:`OutlineWidthPC` = 1 时描边占宠物自身高度的比例。
+    ///
+    /// **这一个数是标定出来的,不是读出来的**,原因见 `OutlineOf`:汇编给的是
+    /// 「NDC 偏移 = 0.01 × OutlineWidthPC × F」,而 NDC 要换算成「占宠物多少」还差一项
+    /// **游戏那边的取景**(同一张 1440 画面里宠物占 264~1110 像素不等)—— 那是 UI 的事,
+    /// 不在 shader 里。所以拿 12 只有实机截图的宠物量:
+    /// 用暗环面积反推实机的描边像素宽,再除以宠物像素高,**中位 0.255%**(`OutlineWidthPC` = 0.13)。
+    /// ⇒ 每单位 PC = 0.0196。
+    ///
+    /// 这一档下 1024 画布上典型宠物的描边约 1.4 像素,和实机同一量级。
+    private const float OutlineRatioPerPc = 0.0196f;
+
+    private static OutlineRead? OutlineOf(UMaterialInstance material)
     {
         var provider = material.Owner?.Provider;
         var package = material.Owner?.Name;
@@ -1241,8 +1410,32 @@ public static class Materials
         float Value(string name, float fallback) =>
             roots.Scalars.ContainsKey(name) && chain.Scalars.TryGetValue(name, out var v) ? v
                 : roots.Scalars.GetValueOrDefault(name, fallback);
+        float[]? Color(string name) =>
+            roots.Vectors.ContainsKey(name) && chain.Vectors.TryGetValue(name, out var v) ? v
+                : roots.Vectors.GetValueOrDefault(name);
+
         // 兜底用全库模态值:`M_FairyBall_BallBack` 那 3 份没有这套参数。
-        return 0.0001f * Value("OutlineWidthPC", 0.13f) * Value("MaxWidthScale", 300f);
+        var pc = Value("OutlineWidthPC", 0.13f);
+        var minScale = Value("MinWidthScale", 20f);
+        var maxScale = Value("MaxWidthScale", 300f);
+        var width = 0.0001f * pc * maxScale;
+        // `clamp(clip.w, Min, Max)` = `min(max(w, Min), Max)`。**`Max <= Min` 时它是个常数**,
+        // 这一支才是世界空间常数;`Min < Max` 时相机在区间内 ⇒ `clamp(w)/w = 1` ⇒ 屏幕空间常数。
+        // 全库只有 4 份走前一支:火源那 3 份 `Min = Max = 200`(美术刻意做成与距离无关)、
+        // 呜呜 `_Fx` 的 `Max = 0`(⇒ 恒 0,不画描边)。
+        var ratio = maxScale > minScale ? OutlineRatioPerPc * pc : (float?)null;
+
+        // 五档颜色。第 1 档参数名**不带序号**(`OutLineOtherColor`),后四档才带 2..5。
+        var intensity = Value("Outline Intensity", 1f);
+        var ramp = new[] { "OutLineOtherColor", "OutLineOtherColor2", "OutLineOtherColor3",
+                           "OutLineOtherColor4", "OutLineOtherColor5" }
+            .Select(Color).ToArray();
+        // 有一档读不到就整份不给 —— 半份颜色比没有更糟(会把某个部位刷成黑)。
+        var colors = ramp.Any(c => c is null)
+            ? null
+            : ramp.Select(c => new[] { c![0] * intensity, c[1] * intensity, c[2] * intensity }).ToArray();
+
+        return new OutlineRead(width, ratio, colors, chain.Textures.GetValueOrDefault("MatID"));
     }
 
     /// 全零 GUID 是「没记」(材质层参数就是这样),不收。

@@ -123,6 +123,19 @@ struct RawMaterial {
     /// **旧包没有这个字段** ⇒ `None`,退回全库模态值(见 `MaterialSpec::outline_width`)。
     #[serde(default)]
     outline_width: Option<f32>,
+    /// 描边的**五档颜色**(线性 RGB)与挑档用的遮罩。见 `MaterialSpec::outline_colors`。
+    #[serde(default)]
+    outline_colors: Option<[[f32; 3]; 5]>,
+    #[serde(default)]
+    outline_id_tex: Option<String>,
+    /// 逐 `MatID` 的高光。见 `MaterialSpec::spec_slots`。
+    #[serde(default)]
+    spec_slots: Option<[[f32; 3]; 4]>,
+    #[serde(default)]
+    spec_color: Option<[f32; 3]>,
+    /// `MaskTex`:RG 是切线空间法线、A 是 `MatID`。见 `MaterialSpec::mat_id_mask`。
+    #[serde(default)]
+    mat_id_tex: Option<String>,
     /// 按画家序画:不写深度,后画的盖住先画的。见 `MaterialSpec::paint_order`。
     #[serde(default)]
     paint_order: bool,
@@ -272,6 +285,11 @@ struct RawMaterial {
     xiaoyou_shape: Option<[f32; 4]>,
     #[serde(default)]
     xiaoyou_star_uv: Option<[f32; 4]>,
+    /// 第二层星点(`Star_BA_*`)。见 `XiaoYou::star_uv2` / `star2`。
+    #[serde(default)]
+    xiaoyou_star_uv2: Option<[f32; 4]>,
+    #[serde(default)]
+    xiaoyou_star2: Option<[f32; 4]>,
     /// `M_Gra_Yutu_Ear_Lighting` 的目标 Low 专用分支。
     #[serde(default)]
     yutu_ear: bool,
@@ -451,10 +469,30 @@ pub struct Material {
     /// 这个材质画不画描边 —— 游戏是**逐材质**开的(`Mat/` 里有没有配套的 `_Ol` 资产)。
     /// `None` = 旧包没这个字段,退回「不透明画、半透不画」。
     pub outline: Option<bool>,
-    /// 沿法线外扩多少**米**。来自 `_Ol` 材质:`0.01 × OutlineWidthPC × MaxWidthScale` 厘米,
-    /// 全库 847/854 是 `0.13 × 300` ⇒ 0.0039 米。推导见 `Materials.cs` 的 `OutlineWidthOf`。
-    /// `None` = 旧包没这个字段,退回那个模态值(比旧包自己的「对角线 × 0.004」更接近实机)。
+    /// 沿法线外扩多少**米**,导出器逐材质算好。**它是随宠物大小走的**:全库 851/854 的描边
+    /// 在实机里是**屏幕空间常数**(见 `Materials.cs` 的 `OutlineOf`),换算到我们的正交取景
+    /// 就是「占这个形态包围盒高度 0.255% × OutlineWidthPC/0.13」;剩下 3 份(火源)才是
+    /// 世界空间常数。所以同一个数字在不同形态上并不相同,别再当成全库一份的常数用。
+    /// `None` = 旧包没这个字段,退回 [`DEFAULT_OUTLINE_WIDTH`](../pet/gpu.rs) 那个模态值。
     pub outline_width: Option<f32>,
+    /// **描边的五档颜色**(线性 RGB,已乘过 `Outline Intensity`),按 `outline_id_mask` 的
+    /// alpha 挑:`挡位 = floor(min((1 − MatID) × 5 + 1, 5))`。推导见 `Materials.cs` 的 `OutlineOf`。
+    /// `None` = 旧包没这个字段(或那份 `_Ol` 挂在别的根材质上)⇒ 退回「固有色 × 0.80」。
+    pub outline_colors: Option<[[f32; 3]; 5]>,
+    /// 挑档用的 `MatID` 遮罩(读 alpha)。**不能拿 `glassy_id_mask` 顶替** ——
+    /// 854 份 `_Ol` 里 38 份指着另一张图、81 份本体压根没有 `MaskTex`。
+    pub outline_id_mask: Option<PathBuf>,
+    /// **逐 `MatID` 的高光**:四档 `(SpecPow, SpecIntensity, SpecRadius)`(挡位 2~5;
+    /// 第 1 档在汇编里是硬写的立即数,见 pet.wgsl 的 `matid_specular`)。
+    /// `None` = 这个材质四档强度全 0(全库 2539 份里 2326 份如此),或者旧包没这个字段。
+    pub spec_slots: Option<[[f32; 3]; 4]>,
+    /// 上面那层的染色 `SpecColor`(线性 RGB,根默认白)。
+    pub spec_color: Option<[f32; 3]>,
+    /// **`MaskTex`** —— 一张图装三样:**RG 是切线空间法线**、B 是明暗覆写(全库恒 0.298,
+    /// 是死的)、**A 是 `MatID`**(炫彩区域门、描边五档、高光五档都读它)。
+    /// 只在有基色贴图的材质上导 —— 纯特效层与几个专用族的这个槽装的不是法线。
+    /// 和 `glassy_id_mask` 是**同一张图**,但那一份只给炫彩槽导,所以单开一条。
+    pub mat_id_mask: Option<PathBuf>,
     /// **按画家序画:进不写深度的那一遍,后画的三角盖住先画的。**
     /// 幽火那一族(`M_Gho_XiaoYou_GhostFire`)每团是「外壳套内壳」两层闭合几何,
     /// 索引缓冲里就是「外壳 → 内壳」的顺序;走不透明通道的话外壳会把内壳整个挡住
@@ -616,7 +654,13 @@ pub struct XiaoYou {
     pub star_color: [f32; 4],
     pub noise_flow: [f32; 4],
     pub shape: [f32; 4],
+    /// `Star_RG_UV_Control` = (平铺U, 速度U, 平铺V, 速度V);两个速度在 shader 里除以 100。
     pub star_uv: [f32; 4],
+    /// **星点是两层**:RG 那层用 `StarTex` 的 R(相位)/ G(遮罩),BA 那层用 B / A。
+    /// 这两格是 BA 那层的:`star_uv2` = `Star_BA_UV_Control`,
+    /// `star2` = [`Star_RG_DarkTime`, `Star_BA_DarkTime`, `Star_BA_Int`, `Star_BA_TwinkleSpeed`]。
+    pub star_uv2: [f32; 4],
+    pub star2: [f32; 4],
 }
 
 #[derive(Clone)]
@@ -828,6 +872,11 @@ fn material_table(root: &Path, raw: HashMap<String, RawMaterial>) -> HashMap<Str
                     translucent: mat.translucent,
                     outline: mat.outline,
                     outline_width: mat.outline_width,
+                    outline_colors: mat.outline_colors,
+                    outline_id_mask: mat.outline_id_tex.map(|rel| root.join(rel)),
+                    spec_slots: mat.spec_slots,
+                    spec_color: mat.spec_color,
+                    mat_id_mask: mat.mat_id_tex.map(|rel| root.join(rel)),
                     paint_order: mat.paint_order,
                     opacity: mat.opacity,
                     star: mat.star_tex.map(|rel| root.join(rel)),
@@ -903,6 +952,9 @@ fn material_table(root: &Path, raw: HashMap<String, RawMaterial>) -> HashMap<Str
                         noise_flow: mat.xiaoyou_noise_flow.unwrap_or([0.0; 4]),
                         shape: mat.xiaoyou_shape.unwrap_or([1.0, 1.0, 1.0, 0.0]),
                         star_uv: mat.xiaoyou_star_uv.unwrap_or([1.0, 0.0, 1.0, 0.0]),
+                        // 旧包没这两格 ⇒ 强度 0 ⇒ 第二层不出场,退回原来的单层近似
+                        star_uv2: mat.xiaoyou_star_uv2.unwrap_or([1.0, 0.0, 1.0, 0.0]),
+                        star2: mat.xiaoyou_star2.unwrap_or([0.0; 4]),
                     }),
                     yutu_ear: mat.yutu_ear.then(|| YutuEar {
                         bubble: mat.yutu_bubble_tex.map(|rel| root.join(rel)),

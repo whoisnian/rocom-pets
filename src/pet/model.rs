@@ -69,8 +69,21 @@ pub struct Material {
     pub translucent: bool,
     /// 见 `pack::MaterialSpec::outline`。
     pub outline: Option<bool>,
-    /// 见 `pack::MaterialSpec::outline_width`(米)。
+    /// 见 `pack::MaterialSpec::outline_width`(米;**随宠物大小走**,不是全库一份的常数)。
     pub outline_width: Option<f32>,
+    /// 见 `pack::MaterialSpec::outline_colors`(五档,线性 RGB)。
+    pub outline_colors: Option<[[f32; 3]; 5]>,
+    /// 挑档用的 `MatID` 遮罩(读 alpha)。见 `pack::MaterialSpec::outline_id_mask`。
+    pub outline_id_mask: Option<Image>,
+    /// 逐 `MatID` 的高光。见 `pack::MaterialSpec::spec_slots`。
+    pub spec_slots: Option<[[f32; 3]; 4]>,
+    pub spec_color: [f32; 3],
+    /// `MaskTex`:RG 是切线空间法线、A 是 `MatID`。见 `pack::MaterialSpec::mat_id_mask`。
+    pub mat_id_mask: Option<Image>,
+    /// **这个材质的不透明度是不是「画出来的」** —— 判据是它**自己那块 UV** 上基色 alpha
+    /// 的中位。只对半透件有意义,决定要不要给它补一层不透明的描边壳,见
+    /// `painted_opacity` 与 gpu.rs 的 `outline_draws`。
+    pub painted_opacity: bool,
     /// 见 `pack::MaterialSpec::paint_order`。
     pub paint_order: bool,
     pub opacity: f32,
@@ -201,6 +214,9 @@ pub struct XiaoYou {
     pub noise_flow: [f32; 4],
     pub shape: [f32; 4],
     pub star_uv: [f32; 4],
+    /// 第二层星点(`Star_BA_*`)。见 `pack::XiaoYou::star_uv2` / `star2`。
+    pub star_uv2: [f32; 4],
+    pub star2: [f32; 4],
 }
 
 pub struct YutuEar {
@@ -603,6 +619,20 @@ impl Model {
                     translucent: spec.translucent,
                     outline: spec.outline,
                     outline_width: spec.outline_width,
+                    // 两者缺一就整份不要:只有颜色没有遮罩会恒取一档,比老路更错
+                    outline_colors: spec.outline_colors,
+                    outline_id_mask: spec
+                        .outline_id_mask
+                        .as_deref()
+                        .and_then(|p| load_texture(p, true)),
+                    spec_slots: spec.spec_slots,
+                    spec_color: spec.spec_color.unwrap_or([1.0; 3]),
+                    mat_id_mask: spec
+                        .mat_id_mask
+                        .as_deref()
+                        .and_then(|p| load_texture(p, true)),
+                    // 这一项要等图元建完才算得出来(要按材质自己那块 UV 取样),先占位
+                    painted_opacity: false,
                     paint_order: spec.paint_order,
                     opacity: spec.opacity,
                     // 星点/matcap 的 alpha 原样保留:形状全在 alpha 里
@@ -709,6 +739,8 @@ impl Model {
                         noise_flow: x.noise_flow,
                         shape: x.shape,
                         star_uv: x.star_uv,
+                        star_uv2: x.star_uv2,
+                        star2: x.star2,
                     }),
                     yutu_ear: spec.yutu_ear.as_ref().map(|y| YutuEar {
                         bubble: y.bubble.as_deref().and_then(|p| load_texture(p, true)),
@@ -777,6 +809,17 @@ impl Model {
                 index_count,
                 material,
             });
+        }
+
+        // **半透件的不透明度是不是画出来的** —— 要等图元建完才算得出来,见 `painted_opacity`。
+        for prim in &primitives {
+            let range = prim.first_index as usize..(prim.first_index + prim.index_count) as usize;
+            let uvs = indices[range].iter().map(|&i| vertices[i as usize].uv);
+            let painted = materials[prim.material]
+                .base_color
+                .as_ref()
+                .is_some_and(|img| painted_opacity(img, uvs));
+            materials[prim.material].painted_opacity |= painted;
         }
 
         // ── 动画 ────────────────────────────────────────────────────
@@ -1055,6 +1098,40 @@ impl Model {
 /// 恒等于 1(100% 覆盖),那就没有任何线条可言;而水灵是 23% 覆盖,白线压在竖条纹上。
 /// alpha 恒定时若还照着它提亮,等于把**整只宠物均匀调亮**——雪影娃娃就是这么被冲淡的。
 /// 判据:alpha 要真的有高低之分,过高或过低的覆盖率都当「没信息」。
+/// 这个材质的不透明度是不是**画出来的**:在它**自己那块 UV** 上取样基色 alpha,看中位。
+///
+/// 判据来自「半透件要不要补一层不透明的描边壳」那条(见 gpu.rs 的 `outline_draws`):
+/// 幽星光/曜星光/暮星辰那几颗球那块 UV 的基色 alpha **中位与 p90 都是 0.000**
+/// —— 它们整条覆盖率链只剩 MatCap 那一路,实机看到的实心球只能来自背后的描边壳;
+/// 而暮星辰的裙子 / 春兔的耳膜 / 莫比乌乌的尾巴分别是 **0.537 / 0.378 / 0.400**,
+/// 是画出来的不透明度图,实机确实透得见背景,补壳会把里面糊掉。
+///
+/// **不能拿整张贴图统计**:基色是图集,球那块只占一小部分,全图会被别的部位污染 ——
+/// 实测幽星光整图「alpha > 0.1」占 27.6%,而球那块 UV 上是 0。**必须按材质自己的 UV 取样。**
+///
+/// 取样只走顶点 UV(不插值三角内部):够用,而且省掉一遍光栅化。
+fn painted_opacity(image: &Image, uvs: impl Iterator<Item = [f32; 2]>) -> bool {
+    if image.width == 0 || image.height == 0 {
+        return false;
+    }
+    let mut alphas: Vec<u8> = uvs
+        .map(|uv| {
+            let x = (uv[0].rem_euclid(1.0) * image.width as f32) as u32;
+            let y = (uv[1].rem_euclid(1.0) * image.height as f32) as u32;
+            let x = x.min(image.width - 1);
+            let y = y.min(image.height - 1);
+            image.rgba[((y * image.width + x) * 4 + 3) as usize]
+        })
+        .collect();
+    if alphas.is_empty() {
+        return false;
+    }
+    let mid = alphas.len() / 2;
+    let (_, median, _) = alphas.select_nth_unstable(mid);
+    // 门槛取 0.05:球那边是 0.000,画出来的那几个最低 0.378,中间空得很开。
+    *median as f32 / 255.0 > 0.05
+}
+
 fn alpha_has_detail(image: &Image) -> bool {
     let total = image.rgba.len() / 4;
     if total == 0 {
