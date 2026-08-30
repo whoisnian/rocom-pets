@@ -245,6 +245,64 @@ public static class MaterialProbe
     /// (`OutLine Offset`),而且几乎每份 `_Ol` 都写了 0 —— 照着它做会得出「全库都没有描边」
     /// 的错误结论。所以这里对每个标量同时打印:链上的覆盖值、根材质默认值,以及
     /// **名字在根材质里存不存在**。
+    /// 全库普查:**实机排列的编译期默认值** 与 `RootDefaults`(根材质的
+    /// `CachedExpressionData`)对不上的参数(`--probe-material DEFAULTDIFF`)。
+    ///
+    /// 为什么要它:两张表都自称「没人覆盖时的默认值」,而它们**可以不一致** ——
+    /// 根材质允许有两个同名参数,`CachedExpressionData` 只留一条,编译出来的排列
+    /// 绑的可能是另一条(`M_P_Object` 的 `FlowColor`:紫 (0.5,0,0.6) 对白 (1,1,1))。
+    /// 换默认值来源是会波及全库的改动,先量清楚有多少条会动、动的是哪些。
+    private static void SurveyDefaultDiff(AbstractVfsFileProvider provider)
+    {
+        const string petsRoot = "NRC/Content/ArtRes/AnimSequence/Pets";
+        var files = provider.Files.Values.Select(f => f.Path)
+            .Where(p => p.StartsWith(petsRoot + "/", StringComparison.OrdinalIgnoreCase)
+                        && p.EndsWith(".uasset", StringComparison.OrdinalIgnoreCase)
+                        && p.Contains("/Mat/", StringComparison.OrdinalIgnoreCase))
+            .Distinct(StringComparer.OrdinalIgnoreCase).OrderBy(p => p, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+        var diffs = new Dictionary<string, int>(StringComparer.Ordinal);
+        var sample = new Dictionary<string, string>(StringComparer.Ordinal);
+        int scanned = 0, noMap = 0, failed = 0;
+        foreach (var path in files)
+        {
+            UMaterialInstance? mi;
+            try { mi = provider.LoadPackageObject(path[..path.LastIndexOf('.')]) as UMaterialInstance; }
+            catch { failed++; continue; }
+            if (mi is null) { failed++; continue; }
+            var shader = ShaderMapDefaults.Of(mi);
+            if (shader.Vectors.Count == 0 && shader.Scalars.Count == 0) { noMap++; continue; }
+            scanned++;
+            var root = RootMaterial.Of(mi);
+            object cur = mi;
+            for (var d = 0; d < 8 && cur is UMaterialInstance step && step.Parent is not null; d++)
+                cur = step.Parent;
+            var rootName = (cur as UObject)?.Name ?? "?";
+            foreach (var (name, v) in shader.Vectors)
+            {
+                if (!root.Vectors.TryGetValue(name, out var r)) continue;
+                if (Enumerable.Range(0, 4).All(k => Math.Abs(r[k] - v[k]) < 1e-4f)) continue;
+                var key = $"{rootName}.{name}  根表=({r[0]:0.###},{r[1]:0.###},{r[2]:0.###},{r[3]:0.###})"
+                          + $"  排列=({v[0]:0.###},{v[1]:0.###},{v[2]:0.###},{v[3]:0.###})";
+                diffs[key] = diffs.GetValueOrDefault(key) + 1;
+                sample.TryAdd(key, mi.Name);
+            }
+            foreach (var (name, v) in shader.Scalars)
+            {
+                if (!root.Scalars.TryGetValue(name, out var r)) continue;
+                if (Math.Abs(r - v) < 1e-4f) continue;
+                var key = $"{rootName}.{name}  根表={r:0.####}  排列={v:0.####}";
+                diffs[key] = diffs.GetValueOrDefault(key) + 1;
+                sample.TryAdd(key, mi.Name);
+            }
+        }
+        Console.WriteLine($"=== {files.Count} 份宠物材质:{scanned} 份读到了实机排列、"
+                          + $"{noMap} 份没有(材质没内联 shader map 或没有 Num/lod0/dsid0 那条)、{failed} 份读失败");
+        Console.WriteLine($"=== 两张表对不上的参数 {diffs.Count} 种:");
+        foreach (var (k, v) in diffs.OrderByDescending(kv => kv.Value))
+            Console.WriteLine($"  × {v,4}  {k}   例:{sample[k]}");
+    }
+
     private static void SurveyOutlines(AbstractVfsFileProvider provider)
     {
         const string petsRoot = "NRC/Content/ArtRes/AnimSequence/Pets";
@@ -635,6 +693,11 @@ public static class MaterialProbe
         if (asset.Equals("OUTLINES", StringComparison.OrdinalIgnoreCase))
         {
             SurveyOutlines(provider);
+            return;
+        }
+        if (asset.Equals("DEFAULTDIFF", StringComparison.OrdinalIgnoreCase))
+        {
+            SurveyDefaultDiff(provider);
             return;
         }
         // `MESH:<资产名>`:打印骨骼网格每个 LOD 有几套 UV。

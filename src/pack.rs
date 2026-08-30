@@ -330,6 +330,15 @@ struct RawMaterial {
     water_flow: Option<[f32; 4]>,
     #[serde(default)]
     water_shape: Option<[f32; 4]>,
+    /// `MI_P_Object_Trans_XingGuang_Fresnel`(暮星辰那两颗球)。见 `MaterialSpec::xing_fresnel`。
+    #[serde(default)]
+    xing_fresnel: Option<[f32; 4]>,
+    #[serde(default)]
+    xing_fresnel2: Option<[f32; 4]>,
+    #[serde(default)]
+    xing_fresnel_shape: Option<[f32; 4]>,
+    #[serde(default)]
+    xing_fresnel_alpha: Option<[f32; 4]>,
     /// `M_P_BackRenderEmissive`:只画一侧的不透明背板(unlit)。见 `MaterialSpec::back_render`。
     #[serde(default)]
     back_render: bool,
@@ -707,6 +716,8 @@ pub struct Material {
     /// `MI_P_Object_Water_NoMetal` 的水体预设(caustics + 两色菲涅尔),`None` = 这个材质没有。
     /// 判据是导出器写没写 `water_color1`(那一项只有这一族有)。
     pub water: Option<Water>,
+    /// 幻星族那两颗球的菲涅尔换色层;判据是导出器写没写 `xing_fresnel`。
+    pub xing_fresnel: Option<XingFresnel>,
     /// `M_P_BackRenderEmissive` 的不透明背板。**只画一侧**,哪一侧看 `level[3]`
     /// (`UseBackFace`:0 = 只画正面,1 = 只画背面)。判据与汇编见导出器的
     /// `MaterialInfo.IsBackRender`。
@@ -768,6 +779,21 @@ pub struct Water {
     pub flow: [f32; 4],
     /// [CausticsInt, FlowDistort, FresnelInt, FresnelPower]
     pub shape: [f32; 4],
+}
+
+/// 幻星族那两颗球的菲涅尔换色层。字段含义见导出器的 `MaterialInfo.IsXingGuangFresnel`,
+/// 公式见 pet.wgsl 的 `xing_fresnel_layer`;来自 PS 53466(暮星辰 `_Fx2` 的
+/// `Num/lod=0/dsid=0`,resource `6CCB83FD…`)第 151~209 行。
+#[derive(Clone, Copy)]
+pub struct XingFresnel {
+    /// [Color.rgb, Int]
+    pub color: [f32; 4],
+    /// [Color02.rgb, OpenEmissiveBlend]
+    pub color2: [f32; 4],
+    /// [Range, Soft, UseVertexColorG, BottomLayer/TopLayer Opacity]
+    pub shape: [f32; 4],
+    /// [OpenOpacityAdd, UseOpacityMask, InversionMask, ForceUseDefOpacity]
+    pub alpha: [f32; 4],
 }
 
 /// `M_P_BackRenderEmissive` 的材质局部链。字段含义见导出器的 `MaterialInfo.IsBackRender`;
@@ -1105,6 +1131,14 @@ fn material_table(root: &Path, raw: HashMap<String, RawMaterial>) -> HashMap<Str
                         caustics: mat.water_caustics.unwrap_or([1.0, 0.8, 0.1, -0.5]),
                         flow: mat.water_flow.unwrap_or([1.0, 0.8, 0.1, -0.5]),
                         shape: mat.water_shape.unwrap_or([1.0, 0.2, 1.0, 1.771117]),
+                    }),
+                    xing_fresnel: mat.xing_fresnel.map(|c| XingFresnel {
+                        color: c,
+                        color2: mat.xing_fresnel2.unwrap_or([1.0; 4]),
+                        // 兜底 = 根材质默认:Range 15 / Soft 0.5 ⇒ 一条极窄的边;
+                        // `UseVertexColorG = 0` ⇒ 两颗球同色。
+                        shape: mat.xing_fresnel_shape.unwrap_or([15.0, 0.5, 0.0, 1.0]),
+                        alpha: mat.xing_fresnel_alpha.unwrap_or([0.0; 4]),
                     }),
                     back_render: mat.back_render.then(|| BackRender {
                         flow: mat.back_render_flow_tex.map(|rel| root.join(rel)),

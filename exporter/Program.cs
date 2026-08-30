@@ -204,9 +204,12 @@ else
     Console.Error.WriteLine($"--paks 路径不存在: {paksPath}");
     return 1;
 }
-// 材质探针需要读取 cooked material resource，才能把质量档/FeatureLevel 精确对到
-// shader archive 里的 map hash。正常导包不读这块（体积大，而且与素材导出无关）。
-provider.ReadShaderMaps = probeAsset is not null;
+// cooked material resource 有两个用处:① 材质探针要靠它把质量档/FeatureLevel 精确对到
+// shader archive 里的 map hash;② **导出也要读** —— 实机那条排列自带的 uniform 参数表
+// 是「没人覆盖时 GPU 拿到什么」的权威答案,与根材质的 `CachedExpressionData` 在全库
+// 10 处对不上(见 ShaderDefaults.cs 与 `--probe-material DEFAULTDIFF`)。
+// 代价实测:一条链的导出 15.6s → 16.1s(+3%)。
+provider.ReadShaderMaps = true;
 provider.Initialize();
 provider.SubmitKey(new FGuid(), new FAesKey(hex));
 if (provider.Files.Count == 0)
@@ -539,7 +542,22 @@ static List<MaterialEntry> BuildMaterials(
                 ExportEffectTexture(info.BackRenderFlowTexture),
                 info.BackRenderLevel, info.BackRenderSaturation, info.BackRenderFlowColor,
                 info.BackRenderFlow, WithSrgb(info.BackRenderRadial, info.BackRenderFlowTexture),
-                WithSrgb(info.BackRenderMain, info.BaseColorTexture))
+                // **这一族的基色贴图按线性读,不解 sRGB** —— 第四位固定 0。
+                //
+                // 贴图资产本身确实是 sRGB(`T_Ill_WuWu1_001_By_D`,探针打的是 `sRGB=1`),
+                // 同一张图在壳材质 `_By` 里也确实要解;但对着实机截图逐像素量,这一族**不解**:
+                // 莫比乌乌尾管中段那条蓝带,实机中位 (174, 210, 252),
+                //   解 sRGB ⇒ (96, 135, 203)   —— 逐通道差 (78, 75, 49)
+                //   不解    ⇒ (172, 197, 239)  —— 逐通道差 (2, 13, 13)
+                // 两边都近乎常色(我们 p5→p95 只有 (88,125,203)→(99,135,205)),不是取样点不同。
+                //
+                // **机制是推断的,不是读出来的**:UE 的 Texture Sample 节点有 SamplerType,
+                // 设成 `LinearColor` 时走非 sRGB 的 SRV —— 那是 editor-only 数据,cooked 包里没有,
+                // DXBC 里也看不见(硬件解码不体现在指令上)。所以这里只能按实测定。
+                // 旁证:`RGB强度(Light) = 2.278` 配这张图的 0.43 得 0.97 —— 一个「用眼睛调到刚好不过 1」
+                // 的值;若输入是线性的 0.15,同一个旋钮只能给到 0.33,那不像调出来的。
+                // **这一族只有莫比乌乌有实机参照**,其余 11 份材质没有独立验证。
+                [..info.BackRenderMain[..3], 0f])
             : null;
         var yutuEar = info.IsYutuEar
             ? new YutuEarMaterial(
@@ -595,6 +613,8 @@ static List<MaterialEntry> BuildMaterials(
             info.WaterColor1, info.WaterColor2,
             info.WaterMain is { } wm ? WithSrgb(wm, info.NoiseTexture) : null,
             info.WaterCaustics, info.WaterFlow, info.WaterShape,
+            info.IsXingGuangFresnel ? info.XingGuangColor : null,
+            info.XingGuangColor02, info.XingGuangShape, info.XingGuangAlpha,
             ExportEffectTexture(info.InteriorTexture), info.InteriorColor,
             info.Refraction, info.RefractDepth, info.FlickerSpeed, info.FlickerPower,
             info.NoiseUv,

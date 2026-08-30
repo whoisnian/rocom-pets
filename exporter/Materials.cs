@@ -63,6 +63,12 @@ public record MaterialInfo(
     /// 没有任何实例覆盖过的参数,只能从这儿拿(见 RootDefaults.cs)。
     /// **刻意与上面几张表分开**:现有判据看的是「美术显式设了没有」,混进根默认会整片翻转。
     RootDefaults? RootDefaults = null,
+    /// **实机那条 cooked 排列自带的参数默认表**(见 ShaderDefaults.cs)。与上面那张
+    /// `RootDefaults` 是两个来源、都自称「没人覆盖时的默认值」,而全库有 10 处对不上
+    /// (`--probe-material DEFAULTDIFF`:`FlowColor` / `StarColor` / `StarTiling` /
+    /// `FlickerSpeed` / `MainColor`)—— 对不上时**这一张才是 GPU 真拿到的**,
+    /// 因为根材质允许有两个同名参数而 `CachedExpressionData` 只留一条。
+    ShaderDefaults? ShaderDefaults = null,
     /// 材质资产是不是真的读到了。`false` = 网格引用的材质包在 pak 里根本不存在(悬空引用),
     /// 参数全空,导出器会退回按贴图命名约定给基色,见 Program.cs。
     bool Resolved = true,
@@ -354,6 +360,64 @@ public record MaterialInfo(
     public bool IsFakeFluid =>
         ParentChain.Any(p => p.Contains("FakeFulid", StringComparison.OrdinalIgnoreCase));
 
+    /// **幻星族那两颗球**:`MI_P_Object_Trans_XingGuang_Fresnel`。
+    /// 全库 3393 份材质里**只有暮星辰 `_Fx2` 一份**用它(`--probe-material FIND:` 查过)。
+    ///
+    /// 用户报的是「暮星辰两颗球颜色差距最大,实机一个偏紫黑、一个偏粉紫」,而我们两颗都是黑的。
+    /// 目标 PS **53466**(`Num/lod=0/dsid=0`,resource `6CCB83FD…`)第 151~209 行给出全部:
+    ///
+    /// ```text
+    /// fres = pow(max(1 − max(N顶点·V, 0), 1e-4), Range) × 0.96 − 0.46
+    /// t    = smoothstep(saturate(fres / (Soft × 0.1))) × Int
+    /// col  = UseVertexColorG ≥ 0.5 ? lerp(Color02, Color, 顶点色G) : Color
+    /// w    = lerp(max(基色a, 高光, MatCap, 边缘光), saturate(t), BottomLayer/TopLayer Opacity)
+    /// 发光 = lerp(发光, t × col, OpenEmissiveBlend × w)      ← **替换**,不是相加
+    /// 不透明度 += OpenOpacityAdd × w
+    /// ```
+    ///
+    /// **两颗球的差别全在顶点色 G**:它们绑在两根不同的骨骼上
+    /// (`Bone_Qhuan_M_00` 的那颗 G=0、`Bone_Qhuan_M_03` 的那颗 G=1),UV / 遮罩 / 基色**完全一样**。
+    /// 所以一颗取 `Color`(0.148, 0.059, 0.22 深紫)、另一颗取 `Color02`(0, 0.562, 1.5 青)。
+    ///
+    /// `cb6[12]`/`cb6[13]` ↔ `Color`/`Color02` 是按 `vector-slot` 字节码定的
+    /// (`vector-slot[12] = 04 06 00 …` ⇒ vector-param[6] = `Color`),不是猜的;
+    /// `v2 = COLOR0` 由 `dxbcsig.py` 的 ISGN 查实。
+    public bool IsXingGuangFresnel =>
+        ParentChain.Any(p => p.Contains("XingGuang_Fresnel", StringComparison.OrdinalIgnoreCase));
+
+    /// `[Color.rgb, Int]`
+    public float[] XingGuangColor =>
+    [
+        ..(FirstVector("Color") ?? RootVector("Color") ?? [1f, 1f, 1f, 1f])[..3],
+        RootScalar("Int", 1f),
+    ];
+
+    /// `[Color02.rgb, OpenEmissiveBlend]`
+    public float[] XingGuangColor02 =>
+    [
+        ..(FirstVector("Color02") ?? RootVector("Color02") ?? [1f, 1f, 1f, 1f])[..3],
+        RootScalar("OpenEmissiveBlend", 0f),
+    ];
+
+    /// `[OpenOpacityAdd, UseOpacityMask, InversionMask, ForceUseDefOpacity]` —— 这一层
+    /// 影响的是**不透明度**那一路(汇编第 197~207、304 行)。暮星辰只有第一格非零(0.15),
+    /// 其余三格是根默认 0;四格都导出来,将来有别的材质设了值时能在 manifest 里直接看见。
+    public float[] XingGuangAlpha =>
+    [
+        RootScalar("OpenOpacityAdd", 0f), RootScalar("UseOpacityMask", 0f),
+        RootScalar("InversionMask", 0f), RootScalar("ForceUseDefOpacity", 0f),
+    ];
+
+    /// `[Range, Soft, UseVertexColorG, BottomLayer/TopLayer Opacity]`。
+    /// **后两项别省**:`UseVertexColorG` = 0 时两颗球同色(那才是「差距最小」那一档),
+    /// 而最后那格 = 1 时不透明度整个由这条菲涅尔接管、`max` 链只剩加性的一份。
+    public float[] XingGuangShape =>
+    [
+        RootScalar("Range", 15f), RootScalar("Soft", 0.5f),
+        RootScalar("UseVertexColorG", 0f),
+        RootScalar("BottomLayer Opaciy or TopLayer Opacity", 1f),
+    ];
+
     /// **`M_P_BackRenderEmissive`:只画一侧的不透明背板。**
     ///
     /// 目标排列(莫比乌乌 `_Fx` 的 `quality=Num / lod=0 / dsid=0`,resource `C2685A88…`,
@@ -415,7 +479,7 @@ public record MaterialInfo(
     /// (莫比乌乌 (−0.12, 0, −0.292) ⇒ 反而加饱和)。
     public float[] BackRenderSaturation =>
     [
-        ..(FirstVector("饱和度变化") ?? RootDefaults?.Vectors.GetValueOrDefault("饱和度变化")
+        ..(FirstVector("饱和度变化") ?? RootVector("饱和度变化")
            ?? [0f, 0f, 0f, 0f])[..3],
         RootScalar("FlowPower", 1f),
     ];
@@ -423,7 +487,7 @@ public record MaterialInfo(
     /// `[UVFlowColor.rgb, FlowInt]` —— 流动层要**替换**成的颜色。
     public float[] BackRenderFlowColor =>
     [
-        ..(FirstVector("UVFlowColor") ?? RootDefaults?.Vectors.GetValueOrDefault("UVFlowColor")
+        ..(FirstVector("UVFlowColor") ?? RootVector("UVFlowColor")
            ?? [1f, 1f, 1f, 0f])[..3],
         RootScalar("FlowInt", 1f),
     ];
@@ -448,7 +512,7 @@ public record MaterialInfo(
     {
         get
         {
-            var c = FirstVector("MainColor") ?? RootDefaults?.Vectors.GetValueOrDefault("MainColor")
+            var c = FirstVector("MainColor") ?? RootVector("MainColor")
                     ?? [1f, 1f, 1f, 1f];
             var k = RootScalar("MainBright", 1f);
             return [c[0] * k, c[1] * k, c[2] * k, 0f];
@@ -469,27 +533,27 @@ public record MaterialInfo(
 
     public float[] MatcapMaskedBaseColor =>
         FirstVector("BaseColor")
-        ?? RootDefaults?.Vectors.GetValueOrDefault("BaseColor")
+        ?? RootVector("BaseColor")
         ?? [1f, 1f, 1f, 0f];
 
     public float[] MatcapMaskedLightRamp =>
         FirstVector("LightRampColor")
-        ?? RootDefaults?.Vectors.GetValueOrDefault("LightRampColor")
+        ?? RootVector("LightRampColor")
         ?? [1f, 1f, 1f, 0f];
 
     public float[] MatcapMaskedFlatEmissive =>
         FirstVector("Flat_EmissiveColor")
-        ?? RootDefaults?.Vectors.GetValueOrDefault("Flat_EmissiveColor")
+        ?? RootVector("Flat_EmissiveColor")
         ?? [1f, 1f, 1f, 1f];
 
     public float[] MatcapMaskedMainColor =>
         FirstVector("MainColor")
-        ?? RootDefaults?.Vectors.GetValueOrDefault("MainColor")
+        ?? RootVector("MainColor")
         ?? [1f, 1f, 1f, 1f];
 
     public float[] MatcapMaskedSelectionColor =>
         FirstVector("SelectionColor")
-        ?? RootDefaults?.Vectors.GetValueOrDefault("SelectionColor")
+        ?? RootVector("SelectionColor")
         ?? [0f, 0f, 0f, 0f];
 
     /// PS 19654 中 cb3[5].xy / cb3[13].z / cb3[14].w 的确切参数映射。
@@ -529,23 +593,23 @@ public record MaterialInfo(
     /// `MatCapColor.a` 是 MatCap 亮度换算成覆盖率的增益,`BaseColor.a` 与 `Opacity` 相加是底。
     public float[] FairyBallBaseColor =>
         FirstVector("BaseColor")
-        ?? RootDefaults?.Vectors.GetValueOrDefault("BaseColor")
+        ?? RootVector("BaseColor")
         ?? [1f, 1f, 1f, 0f];
 
     public float[] FairyBallMatcapColor =>
         FirstVector("MatCapColor")
-        ?? RootDefaults?.Vectors.GetValueOrDefault("MatCapColor")
+        ?? RootVector("MatCapColor")
         ?? [1f, 1f, 1f, 0.1f];
 
     /// 边缘光的暗/亮两色,第 83–84 行按 `N·L` 在两者之间取;alpha 是这一层自己的覆盖率。
     public float[] FairyBallRimDark =>
         FirstVector("RimDarkColor")
-        ?? RootDefaults?.Vectors.GetValueOrDefault("RimDarkColor")
+        ?? RootVector("RimDarkColor")
         ?? [1f, 1f, 1f, 1f];
 
     public float[] FairyBallRimLight =>
         FirstVector("RimLightColor")
-        ?? RootDefaults?.Vectors.GetValueOrDefault("RimLightColor")
+        ?? RootVector("RimLightColor")
         ?? [1f, 1f, 1f, 1f];
 
     /// 第 94 行的整体色,`MainColor.rgb`(xyz)+ `MainBright`(w)。五个实例都是白 × 1。
@@ -554,7 +618,7 @@ public record MaterialInfo(
         get
         {
             var main = FirstVector("MainColor")
-                       ?? RootDefaults?.Vectors.GetValueOrDefault("MainColor")
+                       ?? RootVector("MainColor")
                        ?? [1f, 1f, 1f, 1f];
             return [main[0], main[1], main[2], RootScalar("MainBright", 1f)];
         }
@@ -696,17 +760,17 @@ public record MaterialInfo(
 
     public float[] GlassyFlowColor01 =>
         FirstVector("GlassyFlowColor01")
-        ?? RootDefaults?.Vectors.GetValueOrDefault("GlassyFlowColor01")
+        ?? RootVector("GlassyFlowColor01")
         ?? [1f, 1f, 1f, 1f];
 
     public float[] GlassyFlowColor02 =>
         FirstVector("GlassyFlowColor02")
-        ?? RootDefaults?.Vectors.GetValueOrDefault("GlassyFlowColor02")
+        ?? RootVector("GlassyFlowColor02")
         ?? [1f, 1f, 1f, 1f];
 
     public float[] GlassyFresnelColor =>
         FirstVector("GlassyFresnelColor")
-        ?? RootDefaults?.Vectors.GetValueOrDefault("GlassyFresnelColor")
+        ?? RootVector("GlassyFresnelColor")
         ?? [1f, 1f, 1f, 1f];
 
     /// [速度, UV 尺度, GlassyNoiseRefract 原参数, 深度]。四个槽逐一对应 71636 的
@@ -800,7 +864,7 @@ public record MaterialInfo(
     /// **只查标量与静态开关**,向量参数一律落进「没设」那一档。普查器已经补上向量与贴图。
     public float[] UvFlowColor =>
     [
-        ..(FirstVector("FlowColor") ?? RootDefaults?.Vectors.GetValueOrDefault("FlowColor")
+        ..(FirstVector("FlowColor") ?? RootVector("FlowColor")
            ?? [1f, 1f, 1f, 0f])[..3],
         RootScalar("FlowInt", 1f),
     ];
@@ -843,7 +907,7 @@ public record MaterialInfo(
     public float[]? Fresnel =>
         !IsObjectRoot || Scalar("FresnelIntensity") <= 0f ? null
         : [..(FirstVector("FresnelColor")
-              ?? RootDefaults?.Vectors.GetValueOrDefault("FresnelColor") ?? [1f, 1f, 1f, 0f])[..3],
+              ?? RootVector("FresnelColor") ?? [1f, 1f, 1f, 0f])[..3],
            Scalar("FresnelIntensity")];
 
     /// `[FresnelExponent, FresnelBoost, FresnelBaseMin, FresnelSoftTohard]`。
@@ -857,7 +921,7 @@ public record MaterialInfo(
     public float[] FresnelHard =>
     [
         ..(FirstVector("HardLineCol")
-           ?? RootDefaults?.Vectors.GetValueOrDefault("HardLineCol") ?? [1f, 1f, 1f, 1f])[..3],
+           ?? RootVector("HardLineCol") ?? [1f, 1f, 1f, 1f])[..3],
         RootScalar("HardLineColMul", 1f),
     ];
 
@@ -886,7 +950,7 @@ public record MaterialInfo(
     /// `[Color1.rgb, FresnelPower]`。
     public float[] Fire1 =>
     [
-        ..(FirstVector("Color1") ?? RootDefaults?.Vectors.GetValueOrDefault("Color1")
+        ..(FirstVector("Color1") ?? RootVector("Color1")
            ?? [1f, 1f, 1f, 1f])[..3],
         RootScalar("FresnelPower", 1f),
     ];
@@ -894,7 +958,7 @@ public record MaterialInfo(
     /// `[Color2.rgb, FresnelInt]` —— `.w = 0` 就是层1 不画。
     public float[] Fire2 =>
     [
-        ..(FirstVector("Color2") ?? RootDefaults?.Vectors.GetValueOrDefault("Color2")
+        ..(FirstVector("Color2") ?? RootVector("Color2")
            ?? [1f, 1f, 1f, 1f])[..3],
         RootScalar("FresnelInt", 1f),
     ];
@@ -902,7 +966,7 @@ public record MaterialInfo(
     /// `[Color.rgb, Int]` —— `.w = 0` 就是层2 不画。
     public float[] Fire3 =>
     [
-        ..(FirstVector("Color") ?? RootDefaults?.Vectors.GetValueOrDefault("Color")
+        ..(FirstVector("Color") ?? RootVector("Color")
            ?? [1f, 1f, 1f, 1f])[..3],
         RootScalar("Int", 0f),
     ];
@@ -911,7 +975,7 @@ public record MaterialInfo(
     /// `lerp(Color02, Color, 顶点色.g)`,否则就是 `Color`。
     public float[] Fire4 =>
     [
-        ..(FirstVector("Color02") ?? RootDefaults?.Vectors.GetValueOrDefault("Color02")
+        ..(FirstVector("Color02") ?? RootVector("Color02")
            ?? [1f, 1f, 1f, 1f])[..3],
         RootScalar("UseVertexColorG", 0f),
     ];
@@ -1053,7 +1117,7 @@ public record MaterialInfo(
     public float[]? EmissiveColor =>
         EmissiveIntensity <= 0f ? null
         : Vectors.TryGetValue("Emitter Color", out var c) ? c
-        : RootDefaults?.Vectors.GetValueOrDefault("Emitter Color") ?? [1f, 1f, 1f, 1f];
+        : RootVector("Emitter Color") ?? [1f, 1f, 1f, 1f];
 
     /// 是不是半透材质。**有基色的材质也可能是半透**——暮星辰的裙子(`Fx1`)与那两个球(`Fx2`)
     /// 都是 `MI_P_Object_Trans_*` 家族、`BLEND_Translucent`,当成不透明画就是死板的实心块。
@@ -1182,7 +1246,7 @@ public record MaterialInfo(
     public float[] GlassyRim => !GraphHasStickLayer ? [] :
     [
         .. (Vectors.TryGetValue("RimColor", out var rc) ? rc[..3]
-            : RootDefaults?.Vectors.GetValueOrDefault("RimColor")?[..3] ?? [0.84375f, 0.961117f, 1f]),
+            : RootVector("RimColor")?[..3] ?? [0.84375f, 0.961117f, 1f]),
         RootScalar("RimIntensity", 1.5f),
     ];
 
@@ -1244,7 +1308,7 @@ public record MaterialInfo(
     /// 上面那一层的染色。根默认白;`SpecSlots` 为空时不写。
     public float[] SpecColor =>
         Vectors.TryGetValue("SpecColor", out var c) ? [c[0], c[1], c[2]]
-            : RootDefaults?.Vectors.GetValueOrDefault("SpecColor")?[..3] ?? [1f, 1f, 1f];
+            : RootVector("SpecColor")?[..3] ?? [1f, 1f, 1f];
 
     /// `MaskTex` —— 这一张同时装着三样东西,而我们原来只用了 alpha:
     ///
@@ -1345,8 +1409,8 @@ public record MaterialInfo(
     /// 那是解析 bug 造成的**槽位名整体错位一格**(见 rocom-capture 的 `uniexpr.param_pair`),
     /// 修完 `cb5[36]` 是 `BlackMagicRimColor`。全库没有实例覆盖过 `CrossStarColor`。
     public float[]? InteriorColor =>
-        FirstVector("CrossStarColor") ?? RootDefaults?.Vectors.GetValueOrDefault("CrossStarColor")
-        ?? FirstVector("StarColor") ?? RootDefaults?.Vectors.GetValueOrDefault("StarColor");
+        FirstVector("CrossStarColor") ?? RootVector("CrossStarColor")
+        ?? FirstVector("StarColor") ?? RootVector("StarColor");
 
     /// 折射率与 march 深度。这两个每个宠物材质都写着(1.3 / 100)。
     ///
@@ -1366,10 +1430,19 @@ public record MaterialInfo(
 
     public float FlickerPower => RootScalar("FlickerPower", 5f);
 
+    /// 查一个标量:**实例链 → 实机排列的编译期默认 → 根材质 `CachedExpressionData` → 兜底**。
+    /// 中间那一层是后加的,理由见 `ShaderDefaults` 那一格的注释。
     private float RootScalar(string name, float fallback) =>
         Scalars.TryGetValue(name, out var v) ? v
+        : ShaderDefaults?.Scalars.TryGetValue(name, out var s) == true ? s
         : RootDefaults?.Scalars.TryGetValue(name, out var r) == true ? r
         : fallback;
+
+    /// 查一个向量的**默认值**(不含实例链 —— 调用方那边先 `FirstVector` 再落到这儿)。
+    /// 层序与 `RootScalar` 同。
+    private float[]? RootVector(string name) =>
+        ShaderDefaults?.Vectors.GetValueOrDefault(name)
+        ?? RootDefaults?.Vectors.GetValueOrDefault(name);
 
     /// 半透族的颜色边缘参数。根材质默认是 0.4 / 0.3,实例会逐只覆盖
     /// (果冻 = 1.4 / 0.2)。目标实机选中的 Low alpha 链不读取这层；它只用于颜色。
@@ -1385,7 +1458,7 @@ public record MaterialInfo(
         get
         {
             var v = FirstVector("HighLight Offset")
-                    ?? RootDefaults?.Vectors.GetValueOrDefault("HighLight Offset")
+                    ?? RootVector("HighLight Offset")
                     ?? [0f, 0f, 0f, 1f];
             return [v[0], v[2], v[1]];
         }
@@ -1396,7 +1469,7 @@ public record MaterialInfo(
         get
         {
             var v = FirstVector("HighLight SpecCol")
-                    ?? RootDefaults?.Vectors.GetValueOrDefault("HighLight SpecCol")
+                    ?? RootVector("HighLight SpecCol")
                     ?? [1f, 1f, 1f, 0f];
             return [v[0], v[1], v[2]];
         }
@@ -1452,7 +1525,7 @@ public record MaterialInfo(
     /// 原 shader 尾部 `cb6[29].xyz = MainColor.rgb * MainBright`。
     public float[] ObjectTransMainColor =>
         FirstVector("MainColor")
-        ?? RootDefaults?.Vectors.GetValueOrDefault("MainColor")
+        ?? RootVector("MainColor")
         ?? [1f, 1f, 1f, 1f];
 
     public float ObjectTransMainBright => RootScalar("MainBright", 1f);
@@ -1525,6 +1598,9 @@ public static class Materials
         var info = Resolve(key, material) with
         {
             RootDefaults = roots,
+            // 只有 `--probe-material` 与导出主流程会打开 `ReadShaderMaps`,别处拿到的是
+            // `Empty` —— 那时整条链退回 `RootDefaults`,和加这一层之前一模一样。
+            ShaderDefaults = ShaderMapDefaults.Of(material),
             OutlineWidth = outline?.Width,
             OutlineHeightRatio = outline?.HeightRatio,
             OutlineColors = outline?.Colors,

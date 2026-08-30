@@ -339,6 +339,8 @@ pub struct PetGpu {
     paint_order_pipeline: wgpu::RenderPipeline,
     effect_pipeline: wgpu::RenderPipeline,
     glass_pipeline: wgpu::RenderPipeline,
+    /// 玻璃球的内胆(远半球实心,写深度)。见 pet.wgsl 的 `fs_glass_fill`。
+    glass_fill_pipeline: wgpu::RenderPipeline,
     glassy_inner_pipeline: wgpu::RenderPipeline,
     /// `M_P_BackRenderEmissive` 的不透明背板;两面都光栅化,剔面在片元里做。
     back_render_pipeline: wgpu::RenderPipeline,
@@ -347,6 +349,8 @@ pub struct PetGpu {
     draws: Vec<(u32, u32, usize)>,
     effect_draws: Vec<(u32, u32, usize)>,
     glass_draws: Vec<(u32, u32, usize)>,
+    /// 走 `glass_fill_pipeline` 的那一批(= `glass_draws` 里的球)。
+    glass_fill_draws: Vec<(u32, u32, usize)>,
     inner_draws: Vec<(u32, u32, usize)>,
     glassy_inner_draws: Vec<(u32, u32, usize)>,
     /// 背板族的片,见 `back_render_pipeline`。
@@ -986,6 +990,14 @@ impl PetGpu {
                 family[4] = w.flow;
                 family[5] = w.shape;
                 family[6] = [1.0, 0.0, 0.0, 0.0];
+            } else if let Some(x) = &material.xing_fresnel {
+                // 和水体一样是「加在玻璃族链路上的一层」,不占 `family_flags`;
+                // 判据借 `family[6].y`(`.x` 已经给了水体)。
+                family[0] = x.color;
+                family[1] = x.color2;
+                family[2] = x.shape;
+                family[3] = x.alpha;
+                family[6] = [0.0, 1.0, 0.0, 0.0];
             } else if let Some(b) = &material.back_render {
                 // **这一族不占 `family_flags`**:它有自己的片元入口与自己的通道
                 // (`back_render_pipeline`),`shade_main` 那条 dispatch 根本看不到它,
@@ -1538,6 +1550,16 @@ impl PetGpu {
             false,
             true,
         );
+        // 玻璃球的「内胆」:剔正面、只画远半球,**写深度**,当不透明件先画一遍。
+        // 见 pet.wgsl 的 `fs_glass_fill`(那里有完整的合成推导与两条被否决的做法)。
+        let glass_fill_pipeline = make_pipeline(
+            "pet-glass-fill",
+            "vs_main",
+            "fs_glass_fill",
+            Some(wgpu::Face::Front),
+            true,
+            false,
+        );
         // `M_ShuiMu_ByIn` 在原资产里是 BLEND_Opaque、alpha 恒 1。它必须写深度，且用自己
         // 的折射/三平面噪声片元函数；把它塞进通用半透 fs_effect 会同时改错颜色与遮挡。
         // **幽火那一族剔正面、留背面。** 每团幽火是「外壳套内壳」两层闭合几何,
@@ -1602,6 +1624,16 @@ impl PetGpu {
         let (glass_draws, effect_draws): (Vec<_>, Vec<_>) = blended
             .into_iter()
             .partition(|&(_, _, m)| model.materials[m].effect.is_none());
+        // 球那一批还要在不透明遍里先画一遍远半球(判据与描边壳那条同源:
+        // 玻璃族 + 不透明度不是画出来的)。
+        let glass_fill_draws: Vec<_> = glass_draws
+            .iter()
+            .copied()
+            .filter(|&(_, _, m)| {
+                let mat = &model.materials[m];
+                mat.alpha_opacity && !mat.painted_opacity
+            })
+            .collect();
         // **非加色的特效层要画在玻璃层前面。** 混合通道只测深度不写,顺序就是遮挡关系；
         // 这批几何是内层(如春兔耳膜里的液体),外层玻璃应在它之后混合。果冻的内胆已由
         // `glassy_inner_draws` 按原 BLEND_Opaque 单独写深度，不再依赖这条经验排序。
@@ -1664,11 +1696,13 @@ impl PetGpu {
             paint_order_pipeline,
             effect_pipeline,
             glass_pipeline,
+            glass_fill_pipeline,
             glassy_inner_pipeline,
             back_render_pipeline,
             draws,
             effect_draws,
             glass_draws,
+            glass_fill_draws,
             inner_draws,
             glassy_inner_draws,
             back_render_draws,
@@ -1762,6 +1796,13 @@ impl PetGpu {
         if !self.paint_order_draws.is_empty() {
             pass.set_pipeline(&self.paint_order_pipeline);
             for &(first, count, material) in &self.paint_order_draws {
+                pass.set_bind_group(1, &self.material_binds[material], &[]);
+                pass.draw_indexed(first..first + count, 0, 0..1);
+            }
+        }
+        if !self.glass_fill_draws.is_empty() {
+            pass.set_pipeline(&self.glass_fill_pipeline);
+            for &(first, count, material) in &self.glass_fill_draws {
                 pass.set_bind_group(1, &self.material_binds[material], &[]);
                 pass.draw_indexed(first..first + count, 0, 0..1);
             }

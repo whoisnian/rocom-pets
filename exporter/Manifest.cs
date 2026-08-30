@@ -196,6 +196,14 @@ public record MaterialEntry(
     float[] WaterCaustics,
     float[] WaterFlow,
     float[] WaterShape,
+    /// 幻星族那两颗球(`MI_P_Object_Trans_XingGuang_Fresnel`,全库只有暮星辰 `_Fx2`):
+    /// `[Color.rgb, Int]` / `[Color02.rgb, OpenEmissiveBlend]` /
+    /// `[Range, Soft, UseVertexColorG, BottomLayer/TopLayer Opacity]`。
+    /// 公式见 `MaterialInfo.IsXingGuangFresnel`。
+    float[]? XingFresnel,
+    float[] XingFresnel2,
+    float[] XingFresnelShape,
+    float[] XingFresnelAlpha,
     /// 玻璃内部那颗星:四角星场贴图 + 着色 + 折射率 + march 深度。
     string? InteriorTexture,
     float[]? InteriorColor,
@@ -417,6 +425,13 @@ public static class Manifest
                 // **这一行必须在这儿,不能靠下面「BaseColor is null」那支** —— 水体有基色。
                 if (mat.NoiseTexture is not null)
                     parts.Add($"noise_tex = {Quote(mat.NoiseTexture)}");
+            }
+            if (mat.XingFresnel is { } xf)
+            {
+                parts.Add($"xing_fresnel = [{string.Join(", ", xf.Select(Num))}]");
+                parts.Add($"xing_fresnel2 = [{string.Join(", ", mat.XingFresnel2.Select(Num))}]");
+                parts.Add($"xing_fresnel_shape = [{string.Join(", ", mat.XingFresnelShape.Select(Num))}]");
+                parts.Add($"xing_fresnel_alpha = [{string.Join(", ", mat.XingFresnelAlpha.Select(Num))}]");
             }
             if (mat.GlassyIdTexture is not null)
                 parts.Add($"glassy_id_tex = {Quote(mat.GlassyIdTexture)}");

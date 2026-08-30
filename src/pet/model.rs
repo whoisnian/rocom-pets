@@ -192,6 +192,8 @@ pub struct Material {
     pub xiaoyou: Option<XiaoYou>,
     /// `MI_P_Object_Water_NoMetal` 的水体预设(caustics + 两色菲涅尔)。见 `pack::Water`。
     pub water: Option<crate::pack::Water>,
+    /// 幻星族那两颗球的菲涅尔换色层。见 `pack::XingFresnel`。
+    pub xing_fresnel: Option<crate::pack::XingFresnel>,
     /// `M_P_BackRenderEmissive` 的不透明背板(unlit,只画一侧)。见 `pack::BackRender`。
     pub back_render: Option<BackRender>,
     /// `M_Gra_Yutu_Ear_Lighting` 的不透明内层液体。
@@ -847,6 +849,7 @@ impl Model {
                         star2: x.star2,
                     }),
                     water: spec.water,
+                    xing_fresnel: spec.xing_fresnel,
                     back_render: spec.back_render.as_ref().map(|b| BackRender {
                         flow: b.flow.as_deref().and_then(|p| load_texture(p, true)),
                         level: b.level,

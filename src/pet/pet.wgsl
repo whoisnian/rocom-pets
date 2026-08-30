@@ -866,6 +866,40 @@ fn fresnel_layer(vertex_normal: vec3<f32>, view_dir: vec3<f32>) -> vec3<f32> {
     return mix(hard, c * g, material.fresnel_shape.w);
 }
 
+/// **幻星族那两颗球的菲涅尔换色层**(`MI_P_Object_Trans_XingGuang_Fresnel`)。
+///
+/// 全库 3393 份材质里只有**暮星辰 `_Fx2`** 一份用它 —— 也正是用户说「两颗球颜色差距最大,
+/// 实机一个偏紫黑、一个偏粉紫」的那两颗。目标 PS **53466**(`Num/lod=0/dsid=0`,
+/// resource `6CCB83FD…`)第 151~209 行:
+///
+/// ```text
+/// fres = pow(max(1 − max(N顶点·V, 0), 1e-4), Range) × 0.96 − 0.46
+/// t    = smoothstep(saturate(fres / (Soft × 0.1))) × Int
+/// col  = UseVertexColorG ≥ 0.5 ? lerp(Color02, Color, 顶点色G) : Color
+/// w    = lerp(已有不透明度, saturate(t), BottomLayer/TopLayer Opacity)
+/// w    = lerp(w, saturate(t), UseOpacityMask)
+/// w    = w + InversionMask × (1 − 2w)
+/// 发光 = lerp(发光, t × col, OpenEmissiveBlend × w)     ← **替换**,不是相加
+/// 不透明度 += OpenOpacityAdd × w                        ← 汇编第 304 行
+/// ```
+///
+/// **两颗球的差别全在顶点色 G**:它们绑在两根不同的骨骼上(`Bone_Qhuan_M_00` 那颗 G=0、
+/// `Bone_Qhuan_M_03` 那颗 G=1),而 UV / 遮罩 / 基色三样**完全一样**(逐顶点量过)。
+/// 于是一颗取 `Color`(0.148, 0.059, 0.22 深紫)、另一颗取 `Color02`(0, 0.562, 1.5 青)。
+/// 我们原来两颗都是黑的,就是因为这一层根本没画。
+///
+/// 那两个字面量 `0.96 / −0.46` 是汇编里折叠好的常数(`mad r2.w, r2.w, 0.96, -0.46`),
+/// 不是参数;`cb6[12]/cb6[13] ↔ Color/Color02` 按 `vector-slot` 字节码定
+/// (`vector-slot[12] = 04 06 00 …` ⇒ vector-param[6] = `Color`),`v2 = COLOR0` 由 ISGN 查实。
+///
+/// **`N` 用的是顶点法线**(汇编点的是 `v1 = TEXCOORD11`),不是法线贴图扰动过的那个。
+fn xing_fresnel_coverage(vertex_normal: vec3<f32>) -> f32 {
+    let ndv = max(dot(vertex_normal, view_direction()), 0.0);
+    let shaped = pow(max(1.0 - ndv, 1.0e-4), max(material.family2.x, 1.0e-4)) * 0.96 - 0.46;
+    let c = saturate(shaped / max(material.family2.y * 0.1, 1.0e-4));
+    return c * c * (3.0 - 2.0 * c) * material.family0.w;
+}
+
 /// **火系族(`MI_P_Object_Fire*`)在同一个发光累加器上多的两层。**
 ///
 /// 读自火神 `_By` 的 quality=**Num** 排列(resource `041D1E47…`,PS 41058 第 68~122 行,
@@ -1079,7 +1113,16 @@ fn matcap_strength(n: vec3<f32>) -> f32 {
     if material.flags.w < 0.5 {
         return 0.0;
     }
-    return textureSample(matcap_tex, base_sampler, matcap_uv(n)).r;
+    // **MatCap 是 sRGB 资源,采样值要自己解码。** 探针对这一族每张图打的都是
+    // `MatCap → …/matcapNN sRGB=1`,游戏由硬件采样器解;我们统一按 `Rgba8Unorm` 上传,
+    // 没有那一步。`shade_fake_fluid` 里早就解了,玻璃族这条一直没解 —— 于是**暗部**强了
+    // 约 8 倍(matcap26 圆内 R 中位 0.122,解码后 0.014),而**亮斑几乎不动**
+    // (0.9 → 0.787)。也就是说漏掉这一步的代价不是「高光太亮」,是「整颗球糊了一层白雾」:
+    // 三对球的 G 通道因此系统性偏高(暮星辰 128 vs 实机 94、曜星光 182 vs 120),
+    // 看着就是用户说的「球颜色偏亮」。解码后暮星辰左球 G 128 → 80、两颗合计
+    // 逐通道 |误差| 159 → 136。`GLASS_MATCAP_GAIN` 不用改:它当年标的是**亮斑**的强度,
+    // 而亮斑在解码前后只差 13%。
+    return srgb_to_linear(vec3<f32>(textureSample(matcap_tex, base_sampler, matcap_uv(n)).r)).r;
 }
 
 /// 已逐指令还原材质的原始输出尾段。两份目标 PS 都是
@@ -1337,8 +1380,24 @@ fn shade_yutu_ear(in: VsOut) -> vec4<f32> {
 
 /// `M_P_FakeFulid` 的目标 Low PS 42877 局部链。原 shader 从 PrimitiveSceneData 读取
 /// 当前蒙皮盒中心/尺度，以 AbsoluteWorldPosition 对水平虚拟平面求交，再合成场景深度、
-/// FuildMask、MatCap、边缘/渐变色；最终覆盖率明确为
-/// `saturate(matcap_luma + fluid_coverage) * COLOR_0.g`。
+/// FuildMask、MatCap、边缘/渐变色；覆盖率是
+/// `saturate(菲涅尔 + matcap_luma + fluid) * COLOR_0.g`。
+///
+/// **这里原来写的是「明确为 `saturate(matcap_luma + fluid) * COLOR_0.g`」(没有菲涅尔),
+/// 那句是错的** —— PS 42877 第 235~246 行逐条是:
+///
+/// ```text
+/// 菲涅尔 = saturate((N·X − cb3[31].y) / 宽度)      ← 235~238,是 saturate 不是 smoothstep
+/// 玻璃色 = 菲涅尔 × FresnelColor + MatCap          ← 239
+/// 输出色 = fluid × 液体色 + 玻璃色                  ← 240
+/// r0.z   = 菲涅尔 + luminance(MatCap)              ← 243~244
+/// α      = saturate(saturate(r0.z + fluid) × 顶点色G) ← 245~246
+/// ```
+///
+/// 代码一直是对的,只有这段注释漏了菲涅尔那一项。**顺带一个排列上的例外**:
+/// `MI_Ill_WuWu3_001_Fx1` 的 16 条 resource 里**一条 `quality=Num` 都没有**
+/// (只有 Low/High/Medium/Epic),所以「实机默认 = Num ∧ lod=0 ∧ dsid=0」这条判据
+/// 对它落空 —— 这里读的是 `Low/lod=0/dsid=0`(resource `A6367A32…`)。
 fn shade_fake_fluid(in: VsOut, depth_coverage: f32) -> vec4<f32> {
     let n = normalize(in.normal);
     let view = view_direction();
@@ -1364,12 +1423,14 @@ fn shade_fake_fluid(in: VsOut, depth_coverage: f32) -> vec4<f32> {
     let fluid = below_plane * depth_coverage;
 
     let depth = saturate(-signed_height / max(material.family9.x, 1e-4));
-    let gradient_t = smoothstep(
-        material.family9.x - material.family9.y,
-        material.family9.x + material.family9.y,
-        depth
-    );
-    let gradient = mix(material.family4.rgb, material.family3.rgb, gradient_t);
+    // 汇编第 203~208 行是**线性斜坡 + 一次 lerp**,两处我们原来都反着写:
+    //   `t   = saturate((深度 − (GradientOffset − GradientSmooth)) / (2 × GradientSmooth))`
+    //   `col = lerp(GradientColor01, GradientColor02, t)`      ← 0 那头是 01
+    // 原来用的是 `smoothstep(o−s, o+s, 深度)`(形状不对,汇编是 `div_sat`,没有那条三次曲线)
+    // 外加 `mix(gradient2, gradient1, t)`(**两个颜色调过来了**)。
+    let gradient_t = saturate((depth - (material.family9.x - material.family9.y))
+                              / max(2.0 * material.family9.y, 1e-4));
+    let gradient = mix(material.family3.rgb, material.family4.rgb, gradient_t);
     let top_edge = depth_coverage * (1.0 - smoothstep(
         material.family10.x * 0.01,
         material.family10.x * 0.01 + plane_soft,
@@ -1379,9 +1440,21 @@ fn shade_fake_fluid(in: VsOut, depth_coverage: f32) -> vec4<f32> {
 
     let matcap = srgb_to_linear(textureSample(matcap_tex, base_sampler, matcap_uv(n)).rgb)
         * material.matcap_color.rgb;
-    let fresnel = smoothstep(material.family9.z,
-                             material.family9.z + max(material.family9.w, 1e-4),
-                             ndv);
+    // **这条菲涅尔是反的,我们原来写正了。** 汇编第 236~238 行:
+    //   `f = saturate((N·V − (FresnelOffset + FresnelSmooth)) / ((FresnelOffset − FresnelSmooth)
+    //                                                           − (FresnelOffset + FresnelSmooth)))`
+    // 分母是 **−2 × FresnelSmooth**(负数)⇒ `f` 随 `N·V` **递减**:正对镜头 f = 0、
+    // 掠射 f = 1 —— 一条正常的玻璃菲涅尔。cb 槽位不是猜的:vector=26 ⇒ 标量从 cb3[26] 起,
+    // `cb3[31].y = scalar-slot[21] = FresnelOffset + FresnelSmooth`、
+    // `cb3[31].z = scalar-slot[22] = FresnelOffset − FresnelSmooth`(字节码里 05=Add、06=Sub)。
+    //
+    // 代价很具体:克莱因龙的 `FresnelOffset/Smooth = 0.3/0.2`,正对镜头我们给 f = 1,
+    // 于是液面**以上**那半个球被涂成 `MatCap + FresnelColor` 的蓝黑 (85,85,110)、
+    // 而且 `α = saturate(f + matcap亮度 + 液体) × 顶点色G` 被顶成 1 ⇒ 整块不透明,
+    // 把后面那层白壳全挡住。实机那块是 (204,217,250) 的浅蓝白 —— 正是「玻璃在这儿几乎全透,
+    // 看到的是后面的身体」。用户报的「克莱因龙体内粉色液体上方是黑灰色内容」就是它。
+    let fresnel = saturate((material.family9.z + material.family9.w - ndv)
+                           / max(2.0 * material.family9.w, 1e-4));
     // 42877 第 178–185 行用“液面以下的世界距离 / BodyEdgeArea”构造边缘色，
     // 不是普通的视角 Fresnel。实例参数的 5/0.8/0.1 分别就是厘米范围与重映射阈值。
     let body_distance = max(-signed_height, 0.0);
@@ -1965,8 +2038,18 @@ fn shade_main(in: VsOut, depth_coverage: f32) -> vec4<f32> {
         // `max r2.yzw, matcap*MatCapColor, spec*SpecColor` 再 `max r2.xyz, 上一步, rim`。
         // 相加会让高光与边缘光在轮廓处叠成一圈白边;取 max 则是「哪层亮听哪层」。
         // `extra.x` = `Rim Power`、`extra.z` = `Rim Soft Edge`、`star.z` = `Rim Intensity`。
-        let rim_strength = trans_rim_coverage(n, material.extra.x, material.extra.z)
-            * material.star.z;
+        // **不透明度吃的是「没乘强度」的那份覆盖率。** 汇编里这两路是岔开的:
+        //   PS 53987:  220~223 得到覆盖率 r0.w → 259 `max r0.x, r0.w, r0.x`(进 α)
+        //              224~225 才 `× RimIntensity` → 只进颜色
+        //   PS 53466:  89~92 覆盖率 r0.x → 138 `max r0.x, r0.x, r1.x`(进 α)
+        //              93~94 才 `× RimIntensity` → 只进颜色
+        // **高光那一路正好相反**(53987 第 256 行先 `× HighLight SpecInt` 再进 α),
+        // 所以不能两条一起处理。
+        //
+        // 代价很具体:莫比乌乌的壳 `Rim Intensity = 0.2`,乘上去之后管子边缘的 α 只有 0.2,
+        // 实机那圈白边在我们这儿是一条 2px、α=110 的虚边,而实机是 5px 的实白。
+        let rim_coverage = trans_rim_coverage(n, material.extra.x, material.extra.z);
+        let rim_strength = rim_coverage * material.star.z;
         // 这组 SpecCol 属于 `M_P_Object_Trans` 的 alpha-opacity 排列；MatCap 族是另一张
         // 材质图，继续只走自己的查找表，不能被这一组根默认高光改色。
         let spec_light = select(vec3<f32>(0.0),
@@ -1989,7 +2072,22 @@ fn shade_main(in: VsOut, depth_coverage: f32) -> vec4<f32> {
         // 仍要在这儿取 max。**不接的代价**:幽星光那两颗球的基色 alpha 中位 0.000、p90 也是
         // 0.000(形状压根不在基色里),球会整个消失;暮星辰的裙子会薄掉一档
         // (量过:去掉这行 0.074 → 0.091,再叠上 Low 分支是 0.084)。
-        alpha = max(alpha, max(rim_strength, saturate(matcap_strength(n))));
+        alpha = max(alpha, max(rim_coverage, saturate(matcap_strength(n))));
+        // **幻星族那两颗球**多一层菲涅尔换色(见 `xing_fresnel_coverage`)。
+        // 位置照汇编:在 alpha 的 `max` 链之后、球内那颗星之前;它**替换**发光累加器,
+        // 顺带按 `OpenOpacityAdd` 给不透明度加一份。判据是 `family6.y`
+        // (`.x` 已经给了水体那一层)。
+        if material.family6.y > 0.5 {
+            let cov = xing_fresnel_coverage(normalize(in.normal));
+            let col = select(material.family0.rgb,
+                             mix(material.family1.rgb, material.family0.rgb, in.color.g),
+                             material.family2.z >= 0.5);
+            var w = mix(alpha, saturate(cov), material.family2.w);
+            w = mix(w, saturate(cov), material.family3.y);
+            w = w + material.family3.z * (1.0 - 2.0 * w);
+            glow = mix(glow, cov * col, saturate(material.family1.w * w));
+            alpha = saturate(alpha + material.family3.x * w);
+        }
         // **球内那颗星是「混进固有色」,不是加在上面。** 汇编最后一步是
         // `out = lerp(基色 × 明暗色, 发光层色, 混合系数)`(fx1/34529.asm ⑥,见 design.md §1),
         // 而发光层色 = `星点底色 + 星点强度 × 星点亮色`,再与「按物体空间高度 lerp 的那对颜色」混。
@@ -2131,6 +2229,43 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
 fn fs_glass(in: VsOut) -> @location(0) vec4<f32> {
     cull_face_card(in);
     return shade_main(in, trans_depth_coverage(in));
+}
+
+/// **玻璃球的「内胆」:把球的远半球当不透明件先画一遍(写深度)。**
+///
+/// 那三对球里各封着一块**不透明小饰件**(黄色四角星 / 圆点 / 立体四角星,画在 `_By` 上,
+/// 与球蒙在同一根或相邻骨骼、位置就在球心),实机三只球正中都看得见它;而球本身按颜色
+/// 必须是不透明的(曜星光两颗的实机色 (240,120,61) 橙与 (120,44,235) 蓝正是它们各自的
+/// 图集基色,而 `_Fx1_Ol` 的五档两颗挑的是同一档暗红,半透叠上去解不出一橙一蓝)。
+///
+/// 这一遍把两条都满足了,而且不动任何顺序:
+/// ```text
+/// 不透明遍:描边壳(暗) → 饰件 → **球的远半球(实心)**      ← 都写深度,重叠自然排序
+/// 混合遍  :球的近半球(α ≈ 0.2)
+/// 合成    :球身 = α·C + (1−α)·C = C        ← 和把球顶成不透明一样
+///           饰件 = α·C + (1−α)·饰件         ← 饰件比远半球近,深度测试让它留下
+///           轮廓 = 描边壳                    ← 那圈暗边保住了
+/// ```
+///
+/// **法线要沿视线镜像回来**:远半球的法线朝背面,`n' = n − 2(n·V)V` 把视线分量翻正,
+/// 得到的正是**同一屏幕位置上近半球的法线** —— MatCap 高光块与边缘光因此不动。
+/// (直接取 `-n` 是错的:那是球心对称的另一点,高光会整个翻到对面。)
+///
+/// **这是画法的选择,不是从汇编读出来的**:`M_P_Object_Trans` 与实例都没有 `TwoSided`。
+/// 实机究竟靠什么让不透明的球露出内部还没查到,最可能是那块饰件走 WPO 面向相机被推到球前
+/// (`_By` 的父链是 `..._UVFlow_Morph`,带整组 WPO 参数,而我们整条 WPO 没实现)。
+/// 试过的两条都被实测否决:只让 MatCap 那一支保持半透(曜星光偏暗)、
+/// 只画远半球不补近半球(两球重叠时排序坏掉)。见 docs/design.md。
+@fragment
+fn fs_glass_fill(in: VsOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f32> {
+    cull_face_card(in);
+    var v = in;
+    if !front {
+        let view = view_direction();
+        v.normal = in.normal - 2.0 * dot(in.normal, view) * view;
+    }
+    let shaded = shade_main(v, 0.0);
+    return vec4<f32>(shaded.rgb / max(shaded.a, 1.0e-4), 1.0);
 }
 
 @fragment
