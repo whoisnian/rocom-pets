@@ -807,6 +807,70 @@ public record MaterialInfo(
         : IsFakeTrans && Vectors.TryGetValue("NoiseTilingSpeed", out var n) && n[0] > 0 ? [n[0], n[1]]
         : [1f, 1f];
 
+    /// **炫彩玻璃层的逐材质标量。** 顺序与 `pack::MaterialSpec::glassy_params` 一致:
+    /// `GlobalRefraction / GlobalDepth / MainTexTiling / MainTexFlowSpeedX / MainTexFlowSpeedY /
+    /// NormalEffectAmount / BaseColorDetail / FlowColorIntensity / StarTiling / StarDensity /
+    /// StarIntensity`。
+    ///
+    /// **这几条不是全库一份根默认,是逐材质调过的。** lua 给常规炫彩只覆盖两个 Channel 色、
+    /// `StarIntensity` 与 `StarStickTex`(见 `processMaterial`),这几个标量一个都不碰 ——
+    /// 所以实机用的就是材质实例自己那份。实测差得很远:加油海葵 `_By` 的
+    /// `MainTexTiling = 0.2`(根默认 1.5,差 7.5 倍),而鸭吉吉/火神/白金独角兽都是根默认;
+    /// `GlobalRefraction = 1.3` / `GlobalDepth = 100` 则是四只全都覆盖过(根默认 2.0 / 30)。
+    ///
+    /// 运行时原来一律按根默认画,于是小宠物的花纹细得多 —— 实机加油海葵整只是一个颜色
+    /// 在绿↔蓝之间慢慢扫,我们那版身上横着一道绿蓝分界。
+    ///
+    /// 图里没有这一层的材质(眼睛/嘴那族)返回空数组,不写进 manifest。
+    public float[] GlassyScalars => !GraphHasStickLayer ? [] :
+    [
+        RootScalar("GlobalRefraction", 2f),
+        RootScalar("GlobalDepth", 30f),
+        RootScalar("MainTexTiling", 1.5f),
+        RootScalar("MainTexFlowSpeedX", 0f),
+        RootScalar("MainTexFlowSpeedY", 0.1f),
+        RootScalar("NormalEffectAmount", 0.1f),
+        RootScalar("BaseColorDetail", 0.35f),
+        RootScalar("FlowColorIntensity", 1.2f),
+        // 闪点层(高质量那条排列独有,见 pet.wgsl 的 `glassy_sparkle`):
+        // `StarTiling` 定格子大小、`StarDensity` 定密度、`StarIntensity` 定亮度。
+        // 全库暂时没见到覆盖过的(鸭吉吉/加油海葵都是根默认),照样逐材质导,免得又踩
+        // 「以为是全库一份」那个坑。
+        RootScalar("StarTiling", 0.4f),
+        RootScalar("StarDensity", 8f),
+        RootScalar("StarIntensity", 1f),
+    ];
+
+    /// **炫彩那圈边缘光**:`[RimColor.rgb, RimIntensity]`。
+    ///
+    /// 注意和上面那个 [`RimColor`](= `Rim LightColor`)/[`RimIntensity`](= 带空格的
+    /// `Rim Intensity`)**不是同一组参数** —— 玻璃层读的是不带空格的 `RimColor` 与
+    /// `RimIntensity`(鸭吉吉两个都没覆盖,用根默认 (0.844, 0.961, 1) 与 1.5)。
+    ///
+    /// **lua 写的那个 `MutationRimColor` 不在这条排列里**(向量参数表逐条查过),
+    /// 和当年的 `StarIntensity` 一个处境:设了,但这份编译产物根本不读。
+    /// 所以运行时原来那句「`MutationRimColor` 是 lua 里写死的 (0.6,0.6,0.6)」是错的。
+    public float[] GlassyRim => !GraphHasStickLayer ? [] :
+    [
+        .. (Vectors.TryGetValue("RimColor", out var rc) ? rc[..3]
+            : RootDefaults?.Vectors.GetValueOrDefault("RimColor")?[..3] ?? [0.84375f, 0.961117f, 1f]),
+        RootScalar("RimIntensity", 1.5f),
+    ];
+
+    /// **炫彩星贴层的平铺** —— 就是这个材质自己的标量 `StarStickTiling`([`StarTiling`] 的第一位)。
+    ///
+    /// 单开一条是因为 `StarTiling` 那份在 Program.cs 里会被**跨材质统一**(一只宠物只留一份
+    /// 星点层),而且只写给真开了星点层的材质;炫彩这一层是运行时另外打开的,要的是
+    /// **每个材质自己那份**,哪怕它平时不画星点。
+    ///
+    /// **不能拿 `PARTICLE_RANDOM_CONF.StarStickTiling`(2.2 / 1.0)去顶**:lua 里那句
+    /// `starStickTiling = particleConf.StarStickTiling` 包在 `IsGlassyRandomEgg` 里 ——
+    /// 只有随机蛋会写这个标量,宠物身上材质里那份原封不动。鸭吉吉 `_By` 写着 4.11,
+    /// 接成 2.2 的话粒子会大近一倍、密度只剩四分之一。
+    ///
+    /// 图里没有星贴层的材质(眼睛/嘴那族)返回 0 —— 那种材质不写这一条。
+    public float GlassyStarTiling => GraphHasStickLayer ? StarTiling[0] : 0f;
+
     /// 星点层的强度。**根材质里叫 `Stick_Intensity`(默认 1.5)** —— 运行时原来写死 0.3,
     /// 那是手挑的。名字现在查实了(参数名哈希,见 RootDefaults.cs)。
     ///

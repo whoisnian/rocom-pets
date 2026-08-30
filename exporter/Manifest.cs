@@ -203,7 +203,16 @@ public record MaterialEntry(
     /// 配套 `_Ol` 描边材质算出来的描边宽度(米);0 = 不画。见 `Materials.OutlineWidthOf`。
     float OutlineWidth = 0f,
     /// 按画家序画(不写深度),见 `MaterialInfo.IsPaintOrder`。
-    bool PaintOrder = false);
+    bool PaintOrder = false,
+    /// **炫彩星贴层的平铺** —— 这个材质自己的标量 `StarStickTiling`(没覆盖就是根默认 4)。
+    /// 与上面那个 `StarTiling` 是同一个参数,但那一份会被跨材质统一成「这只宠物的那份」,
+    /// 而且只在真开了星点层的材质上才有;炫彩要的是每个材质自己那份。见 `Materials.GlassyStarTiling`。
+    /// 0 = 这个材质的图里压根没有星贴层,不写进 manifest。
+    float GlassyStarTiling = 0f,
+    /// **炫彩玻璃层的逐材质标量**,顺序见 `Materials.GlassyScalars`;空 = 这个材质没有这一层。
+    float[]? GlassyScalars = null,
+    /// **炫彩那圈边缘光**:`[RimColor.rgb, RimIntensity]`,见 `Materials.GlassyRim`。
+    float[]? GlassyRim = null);
 
 public record FormReport(
     Form Form,
@@ -249,6 +258,15 @@ public static class Manifest
             parts.Add($"outline = {(mat.OutlineWidth > 0f ? "true" : "false")}");
             parts.Add($"outline_width = {Num(mat.OutlineWidth)}");
             if (mat.PaintOrder) parts.Add("paint_order = true");
+            // 炫彩那一层的平铺:**逐材质**、而且和星点层开没开无关(炫彩会把它打开)。
+            if (mat.GlassyStarTiling > 0f)
+                parts.Add($"glassy_star_tiling = {Num(mat.GlassyStarTiling)}");
+            // 玻璃层那几个标量也是**逐材质**的(加油海葵的 `MainTexTiling` 只有 0.2,
+            // 根默认是 1.5)。lua 对常规炫彩一个都不覆盖,所以这份就是实机用的那份。
+            if (mat.GlassyScalars is { Length: > 0 } gs)
+                parts.Add($"glassy_params = [{string.Join(", ", gs.Select(Num))}]");
+            if (mat.GlassyRim is { Length: 4 } gr)
+                parts.Add($"glassy_rim = [{string.Join(", ", gr.Select(Num))}]");
             // 星点/MatCap/边缘光对所有材质都可能有
             if (mat.StarTexture is not null)
             {

@@ -133,6 +133,15 @@ struct RawMaterial {
     star_fake_trans: bool,
     #[serde(default)]
     star_tiling: Option<[f32; 2]>,
+    /// 见 `MaterialSpec::glassy_star_tiling`。
+    #[serde(default)]
+    glassy_star_tiling: Option<f32>,
+    /// 见 `MaterialSpec::glassy_params`。
+    #[serde(default)]
+    glassy_params: Option<[f32; 11]>,
+    /// 见 `MaterialSpec::glassy_rim`。
+    #[serde(default)]
+    glassy_rim: Option<[f32; 4]>,
     #[serde(default)]
     star_color: Option<[f32; 3]>,
     #[serde(default = "one")]
@@ -461,6 +470,35 @@ pub struct Material {
     /// 星点层来自「假半透」族:着色用 `star_color`(= `Color02`),不是四段渐变
     pub star_fake_trans: bool,
     pub star_color: [f32; 3],
+    /// **炫彩星贴层的 uv 平铺**,也就是这个材质自己的标量 `StarStickTiling`。
+    ///
+    /// 和上面的 `star_tiling` 是同一个参数,但**不能共用**:`star_tiling` 会被导出器
+    /// 跨材质统一成「这只宠物的那一份」(见 Program.cs 里 `starLayer` 那段),而且只在
+    /// 真开了星点层的材质上才写;炫彩这条要的是**每个材质自己那一份**,而且哪怕这个
+    /// 材质平时不画星点也要有。
+    ///
+    /// `None` = 旧包没这个字段 ⇒ 退回根材质 `M_P_Object` 的默认 **4**。
+    /// 炫彩只刷在那一族的 `_by*` 槽上,所以这个兜底在能上炫彩的材质上总是对的口径;
+    /// 逐材质的微调(鸭吉吉 4.11)要重导一次包才拿得到。
+    pub glassy_star_tiling: Option<f32>,
+    /// **炫彩玻璃层的那几个标量,也是逐材质的**:
+    /// `[GlobalRefraction, GlobalDepth, MainTexTiling, FlowSpeedX, FlowSpeedY,
+    ///   NormalEffectAmount, BaseColorDetail, FlowColorIntensity,
+    ///   StarTiling, StarDensity, StarIntensity]` —— 后三个是闪点层的
+    /// (格子大小 / 密度 / 亮度,见 pet.wgsl 的 `glassy_sparkle`)。
+    ///
+    /// lua 给常规炫彩只覆盖两个 Channel 色与贴图,这几条一个都不碰 ⇒ 实机用的就是
+    /// 材质实例自己那份。差别不小:加油海葵 `MainTexTiling = 0.2`(根默认 1.5)、
+    /// 查过的宠物 `GlobalRefraction` 一律 1.3 / `GlobalDepth` 100(根默认 2.0 / 30)。
+    ///
+    /// `None` = 旧包没这个字段 ⇒ 退回 `glassy::ROOT_PARAMS`(根材质默认)。
+    pub glassy_params: Option<[f32; 11]>,
+    /// **炫彩那圈边缘光**:`[RimColor.rgb, RimIntensity]`。
+    ///
+    /// 和上面的 `rim_color`/`rim_intensity`(那是带空格的 `Rim LightColor`/`Rim Intensity`)
+    /// **不是同一组参数**;玻璃层读的是不带空格的这两个。`None` = 旧包 ⇒ 退回根默认
+    /// `(0.844, 0.961, 1) × 1.5`,见 `glassy::ROOT_RIM`。
+    pub glassy_rim: Option<[f32; 4]>,
     /// 星点层的强度(根材质 `Stick_Intensity` = 1.5)。
     pub stick_intensity: f32,
     /// 球面反射查找表:玻璃/金属高光。
@@ -795,6 +833,9 @@ fn material_table(root: &Path, raw: HashMap<String, RawMaterial>) -> HashMap<Str
                     star: mat.star_tex.map(|rel| root.join(rel)),
                     star_fake_trans: mat.star_fake_trans,
                     star_tiling: mat.star_tiling.unwrap_or([1.0, 1.0]),
+                    glassy_star_tiling: mat.glassy_star_tiling,
+                    glassy_params: mat.glassy_params,
+                    glassy_rim: mat.glassy_rim,
                     star_color: mat.star_color.unwrap_or([1.0; 3]),
                     stick_intensity: mat.stick_intensity,
                     matcap: mat.matcap_tex.map(|rel| root.join(rel)),

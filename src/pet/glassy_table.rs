@@ -3,7 +3,7 @@
 // 数据来自游戏配置表 COLOR_RANDOM_CONF / PARTICLE_RANDOM_CONF / HIDDEN_GLASS_CONF;
 // 字段含义与渲染公式见 src/pet/glassy.rs 与 docs/design.md「炫彩」那节。
 
-use super::glassy::{GlassyColor, GlassyParams, GlassyParticle, HiddenGlass};
+use super::glassy::{GlassyColor, GlassyOverrides, GlassyParticle, HiddenGlass};
 
 /// 常规炫彩的配色表:`mat_color_1` → `RedChannel`、`mat_color_2` → `GreenChannel`。
 /// 全表 39 条,`ratio` 全部相等 ⇒ 等概率;`shine_strength` 全表恒为 10。
@@ -406,15 +406,15 @@ pub static HIDDEN: [HiddenGlass; 4] = [
             [0.4, 0.42, 1.0, 1.0],
             [1.0, 0.95, 0.45, 1.0],
         ],
-        params: GlassyParams {
-            star_intensity: 1.0,
-            global_refraction: 2.0,
-            global_depth: 100.0,
-            main_tex_flow_x: 0.1,
-            main_tex_flow_y: 0.1,
-            main_tex_tiling: 1.5,
-            normal_effect_amount: 0.5,
-            base_color_detail: 0.35,
+        params: GlassyOverrides {
+            star_intensity: Some(1.0),
+            global_refraction: Some(2.0),
+            global_depth: Some(100.0),
+            main_tex_flow_x: Some(0.1),
+            main_tex_flow_y: Some(0.1),
+            main_tex_tiling: None,
+            normal_effect_amount: Some(0.5),
+            base_color_detail: None,
         },
         season_pets: &[3182],
     },
@@ -432,15 +432,15 @@ pub static HIDDEN: [HiddenGlass; 4] = [
             [0.24, 0.27, 0.3, 1.0],
             [0.5, 0.6, 0.8, 1.0],
         ],
-        params: GlassyParams {
-            star_intensity: 0.0,
-            global_refraction: 1.1,
-            global_depth: 100.0,
-            main_tex_flow_x: 0.0,
-            main_tex_flow_y: 0.0,
-            main_tex_tiling: 1.5,
-            normal_effect_amount: 0.1,
-            base_color_detail: 0.35,
+        params: GlassyOverrides {
+            star_intensity: Some(0.0),
+            global_refraction: Some(1.1),
+            global_depth: Some(100.0),
+            main_tex_flow_x: Some(0.0),
+            main_tex_flow_y: Some(0.0),
+            main_tex_tiling: None,
+            normal_effect_amount: None,
+            base_color_detail: None,
         },
         season_pets: &[3735],
     },
@@ -458,15 +458,15 @@ pub static HIDDEN: [HiddenGlass; 4] = [
             [1.0, 0.45, 0.91, 1.0],
             [0.55, 1.0, 0.19, 1.0],
         ],
-        params: GlassyParams {
-            star_intensity: 1.0,
-            global_refraction: 0.0001,
-            global_depth: 100.0,
-            main_tex_flow_x: 0.0,
-            main_tex_flow_y: 0.0,
-            main_tex_tiling: 3.0,
-            normal_effect_amount: 0.0,
-            base_color_detail: 0.3,
+        params: GlassyOverrides {
+            star_intensity: None,
+            global_refraction: Some(0.0001),
+            global_depth: Some(100.0),
+            main_tex_flow_x: None,
+            main_tex_flow_y: Some(0.0),
+            main_tex_tiling: Some(3.0),
+            normal_effect_amount: Some(0.0),
+            base_color_detail: Some(0.3),
         },
         season_pets: &[3230, 3231, 3232, 3233],
     },
@@ -484,15 +484,15 @@ pub static HIDDEN: [HiddenGlass; 4] = [
             [0.5, 0.5, 0.5, 1.0],
             [0.01, 0.01, 0.01, 1.0],
         ],
-        params: GlassyParams {
-            star_intensity: 0.0,
-            global_refraction: 1.1,
-            global_depth: 100.0,
-            main_tex_flow_x: 0.0,
-            main_tex_flow_y: 0.1,
-            main_tex_tiling: 1.5,
-            normal_effect_amount: 0.1,
-            base_color_detail: 0.35,
+        params: GlassyOverrides {
+            star_intensity: Some(0.0),
+            global_refraction: Some(1.1),
+            global_depth: Some(100.0),
+            main_tex_flow_x: Some(0.0),
+            main_tex_flow_y: Some(0.1),
+            main_tex_tiling: None,
+            normal_effect_amount: None,
+            base_color_detail: None,
         },
         season_pets: &[],
     },

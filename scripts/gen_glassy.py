@@ -41,7 +41,8 @@ SCALARS = [
 ]
 
 # 根材质 `M_P_Object` 的默认值(`exporter/RootDefaults.cs` 那条路读出来的,幽星光
-# `MI_..._By` 的冻结块逐条复核过)。隐藏款没写的标量落到这里。
+# `MI_..._By` 的冻结块逐条复核过)。**现在只留作参考**:隐藏款没列到的标量沿用
+# 材质实例自己那份(见下面 `GlassyOverrides` 那段),运行时的兜底在 `glassy::ROOT_PARAMS`。
 # 根材质 `M_P_Object` 的 `StickRandomColor01..04` —— 星贴层四段渐变的色标。
 # 与 pet.wgsl 的 `STICK_RAMP_0..3` 是同一组数(那边是既有星贴层用的,同一族同一条公式)。
 ROOT_STICK_COLORS = [
@@ -122,7 +123,7 @@ def build(parsed: Path) -> str:
     w("// 数据来自游戏配置表 COLOR_RANDOM_CONF / PARTICLE_RANDOM_CONF / HIDDEN_GLASS_CONF;")
     w("// 字段含义与渲染公式见 src/pet/glassy.rs 与 docs/design.md「炫彩」那节。")
     w("")
-    w("use super::glassy::{GlassyColor, GlassyParams, GlassyParticle, HiddenGlass};")
+    w("use super::glassy::{GlassyColor, GlassyOverrides, GlassyParticle, HiddenGlass};")
     w("")
 
     # ---- 配色
@@ -191,11 +192,14 @@ def build(parsed: Path) -> str:
         for s in sticks:
             w(f"            {vec4(s)},")
         w("        ],")
-        w("        params: GlassyParams {")
+        # **没列到的那几条 = 不覆盖**,沿用材质自己的值(不是回根默认)——
+        # lua 的 `num_param` 只写清单里那几个名字,别的参数在材质实例上原封不动。
+        # 狂欢怪谈就没列 `MainTexTiling`,而加油海葵那种材质自己写着 0.2,回根默认(1.5)
+        # 会把花纹凭空细 7.5 倍。
+        w("        params: GlassyOverrides {")
         for conf_name, field in SCALARS:
             val = num.get(conf_name)
-            val = ROOT_DEFAULTS[field] if val is None else float(val)
-            w(f"            {field}: {f(val)},")
+            w(f"            {field}: {'None' if val is None else f'Some({f(float(val))})'},")
         w("        },")
         pets = h.get("season_pet") or []
         w(f"        season_pets: &{list(pets)!r}".replace("[", "[").replace("]", "]") + ",")

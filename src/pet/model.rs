@@ -77,6 +77,15 @@ pub struct Material {
     /// 星点 / MatCap 两张附加贴图与它们的着色,以及边缘光。
     pub star: Option<Image>,
     pub star_tiling: [f32; 2],
+    /// 炫彩星贴层的 uv 平铺(材质自己的 `StarStickTiling`)。见 `pack::MaterialSpec`
+    /// 的同名字段:旧包没有这一条,退回根默认 4。
+    pub glassy_star_tiling: f32,
+    /// 炫彩玻璃层的逐材质标量。见 `pack::MaterialSpec::glassy_params`;
+    /// 旧包没有这一条,退回 `glassy::ROOT_PARAMS`。
+    pub glassy_params: super::glassy::GlassyParams,
+    /// 炫彩那圈边缘光:`[RimColor.rgb, RimIntensity]`。见 `pack::MaterialSpec::glassy_rim`;
+    /// 旧包没有这一条,退回 `glassy::ROOT_RIM`。
+    pub glassy_rim: [f32; 4],
     /// 星点层来自「假半透」族:着色用 `star_color`(= `Color02`),不是四段渐变
     pub star_fake_trans: bool,
     pub star_color: [f32; 3],
@@ -365,6 +374,10 @@ pub struct GlassySkin {
     pub render: GlassyRender,
     pub main_tex: Image,
     pub star_tex: Image,
+    /// 描边那一遍用的花纹图。**恒是共享的 `Tex_PetGlassy_007_D`** —— 描边材质自己的
+    /// `MainTex` 槽,lua 不覆盖它(见 `glassy` 模块「描边那一支」)。常规炫彩下和
+    /// `main_tex` 是同一张,隐藏/赛季款下不是。
+    pub outline_tex: Image,
 }
 
 /// `SeasonMutation` 那族的赛季外观(贴图已解码)。见 `pack::SeasonMutation`。
@@ -595,6 +608,13 @@ impl Model {
                     // 星点/matcap 的 alpha 原样保留:形状全在 alpha 里
                     star: spec.star.as_deref().and_then(|p| load_texture(p, true)),
                     star_tiling: spec.star_tiling,
+                    glassy_star_tiling: spec
+                        .glassy_star_tiling
+                        .unwrap_or(super::glassy::ROOT_STAR_STICK_TILING),
+                    glassy_params: spec
+                        .glassy_params
+                        .map_or(super::glassy::ROOT_PARAMS, super::glassy::GlassyParams::from_pack),
+                    glassy_rim: spec.glassy_rim.unwrap_or(super::glassy::ROOT_RIM),
                     star_fake_trans: spec.star_fake_trans,
                     star_color: spec.star_color,
                     stick_intensity: spec.stick_intensity,
@@ -1001,11 +1021,19 @@ impl Model {
             let load = |name: &str| {
                 super::glassy::shared(name).and_then(|bytes| decode_texture(&bytes, name))
             };
-            match (load(render.main_tex), load(render.star_tex)) {
-                (Some(main_tex), Some(star_tex)) => Some(GlassySkin {
+            let main_tex = load(render.main_tex);
+            // 描边那一遍用的恒是共享的那张;常规炫彩下它就是 `main_tex`,别再解一次码。
+            let outline_tex = if render.main_tex == super::glassy::DEFAULT_MAIN_TEX {
+                main_tex.clone()
+            } else {
+                load(super::glassy::DEFAULT_MAIN_TEX)
+            };
+            match (main_tex, load(render.star_tex), outline_tex) {
+                (Some(main_tex), Some(star_tex), Some(outline_tex)) => Some(GlassySkin {
                     render,
                     main_tex,
                     star_tex,
+                    outline_tex,
                 }),
                 _ => {
                     log::warn!(

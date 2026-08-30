@@ -122,6 +122,10 @@ struct MaterialParams {
     glassy_stick1: vec4<f32>,
     glassy_stick2: vec4<f32>,
     glassy_stick3: vec4<f32>,
+    // 闪点层:[StarTiling, StarDensity, StarIntensity, -]。见 `glassy_sparkle`。
+    glassy_sparkle: vec4<f32>,
+    // 玻璃层那圈边缘光:[RimColor.rgb, RimIntensity]。
+    glassy_rim: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> camera: Camera;
@@ -159,6 +163,11 @@ struct MaterialParams {
 // —— 那份排列里金属区就是平涂。只有 `MetalSpecInt > 0` 的材质导得到它,导不到就是白图
 // (乘 1 = 平涂):机幕方舟有(实机是带高光的银),龙息帕尔没有(实机是平白)。
 @group(1) @binding(15) var season_matcap_tex: texture_2d<f32>;
+// **描边那一遍的炫彩花纹图。** 描边材质有自己的 `MainTex` 槽,而 lua 只往它身上写
+// `GlassySwitch` + 两个 Channel 色(`processAdditionalMaterial`),贴图一概不动 ——
+// 所以隐藏款/赛季款在描边上用的**仍是共享的那张 `Tex_PetGlassy_007_D`**,
+// 不是本体那张。两张不能共用一个绑定,故单开一条;没选炫彩时是 1×1 白图。
+@group(1) @binding(16) var glassy_outline_tex: texture_2d<f32>;
 // 第一遍不透明材质留下的场景深度；半透明材质按原 shader 的
 // `OpacityDepthDistance` 计算与后方实体/背景的距离。
 @group(2) @binding(0) var scene_depth: texture_depth_2d;
@@ -348,14 +357,31 @@ const GLASSY_STICK_INTENSITY: f32 = 1.5;
 /// 星点覆盖率的偏置(汇编 `cb6[62].x`)。根默认 0 ⇒ 覆盖率就是那条平滑多项式本身。
 /// 见 `glassy::STICK_COVER_BIAS` 对「槽位没对上名字」那条的说明。
 const GLASSY_STICK_BIAS: f32 = 0.0;
-/// `MutationRimColor` —— lua 里写死的 `FLinearColor(0.6, 0.6, 0.6, 1)`。
-const GLASSY_RIM_COLOR: vec3<f32> = vec3<f32>(0.6, 0.6, 0.6);
-/// 边缘光的叠加量。原 PS 里这一项还乘着 `cb6[58].x`(槽位未定名),所以只能标定;
-/// 取值与玻璃族那条 `GLASS_RIM_GAIN` 同量级 —— 两者都是「线性空间里的一圈薄光」。
-const GLASSY_RIM_GAIN: f32 = 0.0532;
+/// ~~`MutationRimColor` / 标定的边缘光增益~~ **两条都撤了**(2026-08-29)。
+///
+/// 玻璃层那圈光读的是材质自己的 `RimColor` × `RimIntensity`(走 `material.glassy_rim`),
+/// 而 lua 写的 `MutationRimColor` 在这条排列里**根本没有这个参数**——
+/// 和当年的 `StarIntensity` 一个处境。见 `glassy_layer` 第 ⑦ 步与 `glassy::ROOT_RIM`。
 /// `BlendWeight`,材质里读出来是 1.0(不衰减)。留成常量是为了让「整层替换」这件事
 /// 在代码里看得见 —— 它一旦不是 1,炫彩就该回混原着色。
 const GLASSY_BLEND_WEIGHT: f32 = 1.0;
+/// 闪点层那条时间漂移(汇编里是硬写的 `time × 0.0056`)。极慢 —— 一整格要三分钟,
+/// 所以看着像「原地闪」而不是在飘。
+const GLASSY_SPARKLE_DRIFT: f32 = 0.0056;
+/// 闪点形状指数里那个**按相机距离**变的系数:实机是
+/// `min(|相机 − 物体| × 0.001, 1) × 0.15 + 0.25`,取值只在 **0.25~0.40** 之间。
+/// 我们是正交相机、没有真实距离,取中段的定值 —— 这是这一层唯一一个标定数,
+/// 而它只影响星芒的胖瘦,不影响位置与密度。
+const GLASSY_SPARKLE_DIST: f32 = 0.30;
+
+/// 描边材质 `MI_P_Outline` 的 `GlassyUV` = (平铺 u, 平铺 v, 流速 u, 流速 v)。
+/// **写死在共享的父材质上**(每份 `_Ol` 都继承它,鸭吉吉那份一个参数都没覆盖),
+/// 而 lua 往描边材质上只写两个 Channel 色 —— 所以这四个数对全库是同一份。
+const GLASSY_OUTLINE_UV: vec4<f32> = vec4<f32>(1.0, 1.0, 0.08, 0.08);
+/// 描边那条分支里的 `BlueChannel`。`MI_P_Outline` 写的是**白**(本体那份是 (1,1,1) 之外
+/// 的别的值,两者不是一个参数实例),而共享花纹图的 B 通道实测均值 0.0004、最大 0.004
+/// —— 这一项实际上不出场,照抄是为了让公式和汇编对得上。
+const GLASSY_OUTLINE_BLUE: vec3<f32> = vec3<f32>(1.0, 1.0, 1.0);
 /// 输出前软肩的白点(extended Reinhard);<= 0 关闭,退回硬削顶。见 `fs_main` 末尾。
 ///
 /// **它解开了一个卡了很久的死结。** 之前两次都撞到同一堵墙:想把亮度比从 0.83 拉到 1.0,
@@ -1152,6 +1178,67 @@ fn shade_fairy_ball(in: VsOut) -> vec4<f32> {
     return vec4<f32>(encode_linear_color(color) * alpha, alpha);
 }
 
+/// **闪点层** —— 实机淡色身体上那一片「极小的白色亮点」。
+///
+/// 这一层**只在高质量那条排列里**(鸭吉吉 `MI_Com_YaJiJi1_001_By` 的 resource `[15]`,
+/// quality=Num / LODUsed=0 / DSId=1,PS **5710**);我们一直读的 Low 那条(PS 50659)
+/// 整段都没有,所以过去怎么调相位、调分辨率都调不出来。同一条排列里还有
+/// **`StickRandomColor01..04` 四段渐变**(向量参数 14~17),与既有 `stick_layer` 那条
+/// 按实测颜色接出来的完全一致 —— 两件悬案一起结了。
+///
+/// 汇编是一段**三重循环的 Voronoi**(3×3×3 邻域),逐字如下:
+///
+/// ```text
+/// cell = vec3(UV0 × 20 × StarTiling, frac(time × 0.0056)) × StarDensity
+/// p    = saturate(2 × (MainTex.r − 法线投影 × NormalEffectAmount)) × 距离系数 + 0.1
+/// 对 27 个邻格:
+///     hash = frac(sin(vec3(dot(n,(1,57,113)), dot(n,(57,113,1)), dot(n,(113,1,57)))) × 43)
+///     d    = min((Σ |格内偏移 + hash|^p)^(1/p), 1)
+/// 闪点 = max((1 − min d) × StarIntensity, 0)
+/// ```
+///
+/// 两处值得记:
+///
+/// - **`p` 恒小于 1**(0.1~0.5),闵可夫斯基单位球因此是**凹的四角星** —— 实机截图里那些
+///   亮点确实是四芒星而不是圆点,形状就是这么来的,不是 bloom。
+/// - **`StarIntensity` 就是这一层的亮度**,而 lua 给常规炫彩把它设成 **10**
+///   (`COLOR_RANDOM_CONF.shine_strength` 全表 39 条都是 10)。这条参数一度被记成
+///   「实机空转」,因为 Low 那条排列里它根本不存在。
+///   配置表还能反过来验:狂欢怪谈与黑白把它写成 **0** ⇒ 那两款不该有亮点 ——
+///   实机奔波鼠(狂欢怪谈)与卡波(常规)同倍数放大一比,正是一个没有、一个满身。
+///
+/// 格子边长按根默认是 UV 的 1/64(`20 × 0.4 × 8`),而星贴层是 UV × 4 ——
+/// 密上十几倍,这就是「密度是方块的好几倍」。
+fn glassy_sparkle(uv: vec2<f32>, pattern_r: f32, normal_proj: f32) -> f32 {
+    let intensity = material.glassy_sparkle.z;
+    if intensity <= 0.0 {
+        return 0.0;
+    }
+    let p = saturate(2.0 * (pattern_r - normal_proj * material.glassy_p0.w))
+        * GLASSY_SPARKLE_DIST + 0.1;
+    let cell = vec3<f32>(uv * 20.0 * material.glassy_sparkle.x,
+                         fract(camera.time * GLASSY_SPARKLE_DRIFT)) * material.glassy_sparkle.y;
+    let inner = fract(cell);
+    let base_cell = floor(cell);
+    var best = 1e9;
+    for (var z = -1.0; z <= 1.0; z += 1.0) {
+        for (var y = -1.0; y <= 1.0; y += 1.0) {
+            for (var x = -1.0; x <= 1.0; x += 1.0) {
+                let offset = vec3<f32>(x, y, z);
+                let cell_id = base_cell + offset;
+                let hash = fract(sin(vec3<f32>(
+                    dot(cell_id, vec3<f32>(1.0, 57.0, 113.0)),
+                    dot(cell_id, vec3<f32>(57.0, 113.0, 1.0)),
+                    dot(cell_id, vec3<f32>(113.0, 1.0, 57.0)),
+                )) * 43.0);
+                let delta = pow(abs(offset - inner + hash), vec3<f32>(p));
+                best = min(best, min(pow(delta.x + delta.y + delta.z, 1.0 / p), 1.0));
+            }
+        }
+    }
+    return max((1.0 - best) * intensity, 0.0);
+}
+
 /// 炫彩(游戏里 `MDT_GLASS`)。**照 `GlassySwitch = true` 那条 shader 排列写的**,
 /// 不是观察出来的近似 —— 排列怎么找到的、每一步对应哪几行汇编,见 `src/pet/glassy.rs`
 /// 的模块注释与 docs/design.md「炫彩那条 shader 分支」。
@@ -1207,7 +1294,8 @@ fn glassy_layer(in: VsOut, base: vec3<f32>, shaded: vec3<f32>) -> vec3<f32> {
     uv += fract(camera.time * material.glassy_p1.xy);
     // ③ 法线扰动:偏移量是法线在投影矩阵 z 列上的分量 × `NormalEffectAmount`,
     //    u/v **同一个标量**(汇编 `mad r0.xy, -r0.x, cb6[60].x, r2.xyxx`)。
-    uv -= dot(n, camera_forward_direction()) * material.glassy_p0.w;
+    let normal_proj = dot(n, camera_forward_direction());
+    uv -= normal_proj * material.glassy_p0.w;
 
     // ④ 着色。这两行是整条链的核心,`RedChannel`/`GreenChannel` 就是玩家选的那两个颜色。
     //    乘的是 `cb6[61].x` = **(BaseColorDetail + 1) × FlowColorIntensity**(常规炫彩 = 1.62),
@@ -1238,11 +1326,15 @@ fn glassy_layer(in: VsOut, base: vec3<f32>, shaded: vec3<f32>) -> vec3<f32> {
     //    明暗结构,全靠这一步。
     let mean = (base.r + base.g + base.b) * 0.3333;
     let detail = select(min(pow(max(mean, 0.0), material.glassy_p1.w), 1.0), 0.0, mean <= 0.0);
-    glass *= detail;
+    // ⑤′ **闪点层**,加性、不吃这道亮度门(汇编 `mad r0.xyz, 玻璃色, 亮度门, 闪点`)。
+    glass = glass * detail + glassy_sparkle(in.uv, pattern.r, normal_proj);
 
     // ⑥ 星点层。相位公式与既有的 `stick_layer` 逐字相同(`1.1 × lerp(|sin θ|,|cos θ|, g)`,
     //    θ = `frac(time × 0.25) × 2π`)—— 两条排列共用同一段材质图。
     //    这里的 RGB **不是颜色**:g 给相位、r 给阈值、b 给幅度,颜色全来自参数。
+    //    **平铺(`glassy_p1.z`)来自材质自己的 `StarStickTiling`,不是粒子配置表里那个** ——
+    //    lua 只在**随机蛋**那条路上写 `StarStickTiling`(`PARTICLE_RANDOM_CONF` 的 2.2 / 1.0),
+    //    宠物身上一个字都不写,用的是材质(鸭吉吉 `_By` = 4.11)或根默认 4。见 glassy.rs。
     // 赛季那一族没有星贴层(它的 `StarStickTex` 不参与这条分支),绑的是白图,
     // 直接跳过免得在身上糊一层白方块。
     let star = select(
@@ -1275,8 +1367,27 @@ fn glassy_layer(in: VsOut, base: vec3<f32>, shaded: vec3<f32>) -> vec3<f32> {
         saturate(cover + GLASSY_STICK_BIAS),
     );
 
-    // ⑦ 边缘光。`MutationRimColor` 是 lua 里写死的 (0.6, 0.6, 0.6)。
-    glass += GLASSY_RIM_COLOR * pow(facing_ratio(n), 3.0) * GLASSY_RIM_GAIN;
+    // ⑦ 边缘光。**颜色与强度都是材质自己的 `RimColor` / `RimIntensity`** ——
+    //    lua 写的那个 `MutationRimColor` 在这条排列的向量参数表里根本不存在
+    //    (和当年的 `StarIntensity` 一个处境:设了没人读),所以原来那句
+    //    「写死的 (0.6,0.6,0.6) × 标定 0.0532」两处都是错的。
+    //
+    //    汇编(PS 5710 第 270~290、396 行)是三项相乘再乘强度:
+    //        菲涅尔 = max(1 − N·V, 0)^3            ← **不取绝对值**
+    //        A      = (2 × (MainTex.r − 0.5) × (L·N) + 1) × 0.5
+    //        B      = (h³ − 1) × 0.98 + 1,h = (L·N + 1) × 0.5;L·N ≤ −1 时取 0.02
+    //    A 把花纹图的红通道也拌进边缘光里,所以那圈光会跟着花纹一起流动。
+    let ndl = dot(normalize(camera.light_dir), n);
+    let rim_fresnel = pow(max(1.0 - dot(n, view_direction()), 0.0), 3.0);
+    let rim_pattern = (2.0 * (pattern.r - 0.5) * ndl + 1.0) * 0.5;
+    let half_lambert = (ndl + 1.0) * 0.5;
+    let rim_light = select(
+        (half_lambert * half_lambert * half_lambert - 1.0) * 0.98 + 1.0,
+        0.02,
+        ndl <= -1.0,
+    );
+    glass += material.glassy_rim.rgb * material.glassy_rim.w
+        * rim_fresnel * rim_pattern * rim_light;
 
     // ⑧ 换算到我们的线性空间再合成。**玻璃层是整帧里唯一一个不过光照的量** ——
     //    原式第 ⑧ 步是 `lerp(原着色, glass, BlendWeight)`,BlendWeight = 1 ⇒ 整层替换,
@@ -1694,7 +1805,49 @@ fn fs_outline(in: VsOut) -> @location(0) vec4<f32> {
                                          material.xiaoyou_base2.rgb,
                                          saturate(1.0 - in.color.g)));
     }
-    return vec4<f32>(albedo * 0.80, 1.0);
+    return vec4<f32>(mix(albedo * 0.80, glassy_outline(in), glassy_outline_zone(in)), 1.0);
+}
+
+/// 炫彩那一遍描边该不该换色。**`_Ol` 也有一条 `GlassySwitch` 排列** ——
+/// lua 的 `processAdditionalMaterial` 往本体材质的 `AdditionalMaterials`(就是那份 `_Ol`)
+/// 上写 `GlassySwitch=true` + 两个 Channel 色,所以描边跟着一起变。
+///
+/// 门与本体那条**是同一张图同一个阈值**(`MatID` 就是 `_M`、`MinID` = 0.4):
+/// 汇编 `ge r0.w, r0.w, cb3[34].y` 之后 `mad r1.xyz, r0.w, (glass − 描边色), 描边色`
+/// —— 门外仍是 `OutLineOtherColor × Outline Intensity` 那条老路。
+///
+/// **赛季那一族(`glassy_red.w = 2`)不走这里**:lua 对它先找描边材质上的
+/// `MutationSwitch`,找到了就只开那个、不写 Channel 色(`bFoundMutationSwitch`)。
+///
+/// **门只当值用,不当分支用** —— 和 `glassy_layer` 里那条踩过的坑同一个道理:
+/// 采样带隐式导数,只能在一致控制流里调,提前 return 会让浏览器那边整份 shader 拒编。
+fn glassy_outline_zone(in: VsOut) -> f32 {
+    let id = textureSample(glassy_id_tex, base_sampler, in.uv).a;
+    let on = material.glassy_red.w > 0.5 && material.glassy_red.w < 1.5;
+    return select(0.0, 1.0, on && id >= GLASSY_MIN_ID);
+}
+
+/// 描边那条 `GlassySwitch` 排列的颜色(PS 52499 第 40~52 行,鸭吉吉 `_By_Ol` 的
+/// LODUsed=0 / DSId=1 那份)。比本体那条短得多 —— **没有折射、没有屏幕空间 UV、
+/// 没有星贴层、也不按固有色亮度调制**,就是拿网格 UV0 采一次共享花纹图再混两个 Channel 色:
+///
+/// ```text
+/// uv    = UV0 × GlassyUV.xy + frac(time × GlassyUV.zw)
+/// glass = lerp(lerp(RedChannel × t.r, GreenChannel, t.g), BlueChannel, t.b)
+/// ```
+///
+/// **注意是 lerp 不是本体那条加法**(本体是 `Red × t.r + Green × t.g` 再乘 1.62 的增益):
+/// 汇编里 `mad r3.xyw, r3.y, (Green − Red×t.r), Red×t.r` 写得很清楚,而且这一支
+/// **一个增益都不乘**。所以描边环比本体略暗一点,实机也是这样。
+fn glassy_outline(in: VsOut) -> vec3<f32> {
+    let uv = in.uv * GLASSY_OUTLINE_UV.xy + fract(camera.time * GLASSY_OUTLINE_UV.zw);
+    let t = textureSample(glassy_outline_tex, base_sampler, uv).rgb;
+    var glass = mix(material.glassy_red.rgb * t.r, material.glassy_green.rgb, t.g);
+    glass = mix(glass, GLASSY_OUTLINE_BLUE, t.b);
+    // 和玻璃层同一条换算:游戏那边这个值直接进 `sqrt(x × 曝光)` 的尾段输出,
+    // 而这一遍我们是**直接写显示空间**的,所以先除掉 `EXPOSURE` 再走同一个编码
+    // —— 两处必须一致,否则描边环与本体差一整档,反倒比原来的原色描边更显眼。
+    return encode_linear_color(glass / EXPOSURE);
 }
 
 /// `M_ShuiMu_ByIn` 的原始材质局部链（pixel shader 71636）。这不是通用特效近似：

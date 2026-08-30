@@ -601,7 +601,7 @@ static List<MaterialEntry> BuildMaterials(
                     info.SeasonRed, info.SeasonGreen,
                     info.SeasonBlue, info.SeasonMetal, info.SeasonMetal02, info.SeasonFlow)
                 : null,
-            info.OutlineWidth ?? 0f, info.IsPaintOrder));
+            info.OutlineWidth ?? 0f, info.IsPaintOrder, info.GlassyStarTiling, info.GlassyScalars, info.GlassyRim));
 
         if (info.StarTexture is not null && ExportEffectTexture(info.StarTexture) is { } starTex
             && (starLayer is null || (info.IsFakeTrans && !starFromFakeTrans)))
