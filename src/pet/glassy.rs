@@ -654,15 +654,16 @@ impl Mutation {
 ///
 /// 炫彩要覆盖的两张贴图是全库共用的,既不进宠物包(塞进 201 个包要多背 120MB),
 /// 也不在运行时找目录:找目录意味着「装好了还得再摆一份素材」,而这一层的东西只有 3.5MB,
-/// 烘进来就没这一步了。导出器在正常导包时把它们写到 `<out>/glassy`,`build.rs` 构建时读那儿。
+/// 烘进来就没这一步了。
 ///
-/// 素材不在仓库里 —— 烘的是**构建那台机器上自己导出来的那一份**,没有就是空表
-/// (那时炫彩那几档在界面上是灰的)。见 build.rs 的模块头。
+/// 这 13 张**在仓库里**(`assets/glassy`),所以桌面版这张表永远是满的 —— 换台机器
+/// `cargo build` 就够,不必先备齐游戏数据导一次包。空表只会出现在 wasm 上
+/// (浏览器那份按需 fetch,见下面的 `runtime_store`)。见 build.rs 的模块头。
 mod embed {
     include!(concat!(env!("OUT_DIR"), "/glassy_embed.rs"));
 }
 
-/// 烘进来了几张。0 = 这个二进制没带素材,只能读目录。
+/// 烘进来了几张。桌面版恒等于 `assets/glassy` 里的张数;wasm 上是 0(那边按需 fetch)。
 pub fn embedded_count() -> usize {
     embed::EMBEDDED.len()
 }
@@ -748,11 +749,11 @@ fn common_assets() -> impl Iterator<Item = &'static str> {
     std::iter::once(DEFAULT_MAIN_TEX).chain(PARTICLES.iter().map(|p| p.tex))
 }
 
-/// 素材齐不齐。桌面版看烘进来的那份(运行时不再找任何目录,见 `embed` 的说明),
-/// 浏览器版看已经喂进来的那份。
+/// 素材齐不齐。桌面版看烘进来的那份(素材随仓库走,所以恒真),
+/// 浏览器版看已经喂进来的那份 —— 部署时没传 `glassy/` 就是不齐。
 ///
 /// 不齐就该把炫彩那几档在界面上禁掉并说清楚为什么:让用户看着一个点不出效果的选项,
-/// 比直接说「这个二进制没带炫彩素材」更糟。
+/// 比直接说「取不到炫彩素材」更糟。
 pub fn assets_ready() -> bool {
     common_assets().all(has_shared)
 }

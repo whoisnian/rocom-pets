@@ -184,9 +184,9 @@ npm run catalog -- --packs ~/Downloads/rocom/packs-all \
 rclone copy ~/Downloads/rocom/packs-all r2:rocom-pets/packs/ --include "*.rkpet" --progress
 rclone copy ~/Downloads/rocom/dist-bin  r2:rocom-pets/app/0.2.0/ --progress
 
-# 3b. 炫彩共享贴图(13 张 3.6MB,导出器写在 <out>/glassy)。**不传也能跑**,
+# 3b. 炫彩共享贴图(13 张 3.5MB,仓库里的 assets/glassy 就是那一份)。**不传也能跑**,
 #     只是预览里「炫彩」那个下拉会在第一次点的时候报「这个站点没上传炫彩素材」。
-rclone copy ~/Downloads/rocom/packs-all/glassy r2:rocom-pets/glassy/ --include "*.png" --progress
+rclone copy assets/glassy r2:rocom-pets/glassy/ --include "*.png" --progress
 
 # 4. 上线
 npm run deploy

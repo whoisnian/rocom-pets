@@ -187,15 +187,12 @@ fn run() -> anyhow::Result<()> {
         }
     }
     env_logger::Builder::new().parse_filters(&filter).init();
-    // 炫彩素材是**构建期**烘进来的(见 build.rs)。没烘上时说一句 —— 否则「炫彩那一档是灰的」
-    // 在运行时没有任何线索可查。
-    match rocom_pets::pet::glassy::embedded_count() {
-        0 => log::info!(
-            "这个二进制没带炫彩素材,外观里的「炫彩」不可用 —— \
-             先导一次包(素材会写到 <out>/glassy),再重新编译"
-        ),
-        n => log::debug!("炫彩素材 {n} 张(构建期烘进来的)"),
-    }
+    // 炫彩素材是**构建期**从 `assets/glassy` 烘进来的(见 build.rs),素材随仓库走,
+    // 所以这里只报个数;张数不对时这一行就是唯一的线索。
+    log::debug!(
+        "炫彩素材 {} 张(构建期烘进来的)",
+        rocom_pets::pet::glassy::embedded_count()
+    );
 
     let mut args = args.into_iter();
     let mut request: Option<offscreen::Request> = None;
