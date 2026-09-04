@@ -123,7 +123,7 @@ public partial record MaterialInfo(
     /// 基色贴图的对象路径;没有就是纯特效材质。
     public string? BaseColorTexture => BaseColorParam is { } p ? Textures[p] : null;
 
-    /// 是不是贴脸的小面片(眼/嘴)。它的贴图是**带透明背景的表情图集**,alpha 是真遮罩,
+    /// 是不是贴脸的小面片(眼/嘴)。它的贴图是**带透明背景的眼神图集**,alpha 是真遮罩,
     /// 渲的时候要按阈值剔;本体贴图的 alpha 是美术塞的遮罩通道,不能拿来剔(会把身体啃掉)。
     public bool IsFacePatch =>
         BaseColorParam?.Equals("EyeTex", StringComparison.OrdinalIgnoreCase) == true;

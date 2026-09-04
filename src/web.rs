@@ -1,6 +1,6 @@
 //! 下载站上的宠物预览:把桌宠那套渲染搬进浏览器。
 //!
-//! **这里只有胶水**。模型加载、蒙皮、toon 着色、动作降级、表情图集,全是
+//! **这里只有胶水**。模型加载、蒙皮、toon 着色、动作降级、眼神图集,全是
 //! `pet` / `pack` / `stage` / `persona` 里桌面版正在跑的那份代码 —— 网页和桌面
 //! 看到的是同一只宠物,不是照着做的第二套。差别只有三处:
 //!
@@ -151,7 +151,7 @@ pub fn glassy_missing(mutation: &str) -> Result<Vec<String>, JsValue> {
 /// 装一个形态的模型。**两个轴在这里分头落地**,和桌面版 `Assets::model` 同一条路:
 /// 异色换的是整套材质(包里已经是换好的那一份,挑一张表就够),炫彩往挑中的那套上刷一层。
 fn build_model(form: &crate::pack::Form, mutation: crate::pet::Mutation) -> Result<Arc<Model>, JsValue> {
-    let mut model = Model::load(&form.model, form.materials_for(mutation.shiny))
+    let mut model = Model::load(&form.model, form.materials_for(mutation.shiny), &form.clips)
         .map_err(|e| JsValue::from_str(&format!("{e:#}")))?;
     model.apply_mutation(mutation, form.id);
     Ok(Arc::new(model))
@@ -166,7 +166,9 @@ fn parse_mutation(text: &str) -> Result<crate::pet::Mutation, JsValue> {
         .ok_or_else(|| JsValue::from_str(&format!("认不得的外观「{text}」")))
 }
 
-/// 表情。`name` 就是界面上那个中文名,回头原样传给 `set_face`。
+/// 眼神(脸那张图集里的一格)。`name` 就是界面上那个中文名,回头原样传给 `set_face`。
+///
+/// **不是**「表情」那一套 —— 那是 Happy/Sad 那几段动作,见 `stage::EMOTES`。
 #[wasm_bindgen]
 pub fn expressions() -> Vec<String> {
     EXPRESSIONS.iter().map(|e| e.name.to_string()).collect()
@@ -346,7 +348,7 @@ impl Preview {
     /// 装一个形态,**默认站着待机**。返回它做得了的动作(界面据此出按钮)。
     ///
     /// 「做得了」用的是桌面版那张降级表:没有 `Shock` 而有 `Alert` 的形态,
-    /// 点「受惊」照样有反应 —— 两边同一套判断,不会出现「网页上能点、装上却没有」。
+    /// 点「震惊」照样有反应 —— 两边同一套判断,不会出现「网页上能点、装上却没有」。
     pub fn load_form(&mut self, asset: &str) -> Result<Vec<ClipInfo>, JsValue> {
         let gpu = self
             .gpu
@@ -454,7 +456,7 @@ impl Preview {
         Ok(())
     }
 
-    /// 播一段动作。**表情跟着换** —— 和桌宠一样,正在播的那段说了算
+    /// 播一段动作。**眼神跟着换** —— 和桌宠一样,正在播的那段说了算
     /// (`persona::face_for_clip`);那段没意见就保持人选的那张脸。
     pub fn play(&mut self, name: &str) -> bool {
         let Some(pet) = &mut self.pet else {
@@ -467,7 +469,8 @@ impl Preview {
         true
     }
 
-    /// 人手动挑的表情。传 [`expressions`] 里的名字;认不出来就当默认那张。
+    /// 人手动挑的眼神。传 [`expressions`] 里的名字(**不带「眼」字**:桌面版那句
+    /// 「急躁『生气眼』」的后缀是那一行自己加的);认不出来就当默认那张。
     pub fn set_face(&mut self, name: &str) {
         self.face = EXPRESSIONS
             .iter()
@@ -567,9 +570,20 @@ impl Preview {
         pet.player.advance(&pet.model, dt);
         pet.player.update(&pet.model);
 
-        // 正在播的那段动作说了算,它没意见才用人选的那张脸 —— 与 `PetActor::face` 同一条规矩
-        let face = crate::persona::face_for_clip(&pet.model.clips[pet.player.current()].name)
-            .unwrap_or(self.face);
+        // 正在播的那段动作说了算,它没意见才用人选的那张脸 —— 与 `PetActor::faces` 同一条规矩
+        let clip = &pet.model.clips[pet.player.current()];
+        let faces: [crate::persona::Expression; crate::pack::MAX_FACE_SLOTS] =
+            if clip.faces.iter().all(|t| t.is_empty()) {
+                let face = crate::persona::face_for_clip(&clip.name).unwrap_or(self.face);
+                [face; crate::pack::MAX_FACE_SLOTS]
+            } else {
+                let time = pet.player.time();
+                std::array::from_fn(|slot| {
+                    crate::pack::face_at(&clip.faces[slot], time)
+                        .and_then(crate::persona::Expression::from_card)
+                        .unwrap_or(self.face)
+                })
+            };
         let aspect = gpu.config.width as f32 / gpu.config.height.max(1) as f32;
         pet.gpu.update(
             &gpu.queue,
@@ -586,8 +600,9 @@ impl Preview {
                 outline_scale: 1.0,
                 time: self.time,
                 high_material_quality: false,
-                face_uv: face.uv_offset(),
-                face_card: face.card(),
+                face_uv: faces.map(|f| f.uv_offset()),
+                face_card: faces[0].card(),
+                morph_weights: pet.player.morph_weights,
             },
             &pet.player.matrices,
         );

@@ -6,6 +6,11 @@
 
 use super::*;
 
+/// 脸槽的编号(见 `pack::face_slot`)。测里直接写数字看不出是哪个槽。
+const EYE: usize = 0;
+const MOUTH: usize = 2;
+const DYNAMIC1: usize = 4;
+
 /// 测试宠物的本体高度。画布是 200×200,本体比画布小(取景余量),取 120 与真实比例相当;
 /// 于是一个身位 = 120px,`NOTICE_DISTANCE` 折合 240px。
 const TEST_BODY_PX: f32 = 120.0;
@@ -112,7 +117,7 @@ mod home_tests {
                 name.to_string(),
                 crate::pack::Clip {
                     seconds: 1.0,
-                    speed_cm_s: 0.0,
+                    ..Default::default()
                 },
             );
         }
@@ -154,8 +159,9 @@ mod home_tests {
             persona: timid,
             ..test_build(model, 5)
         })));
+        // `Model::for_test` 不带眼神曲线 ⇒ 走 `face_for_clip` 那条兜底路
         let face = |stage: &Stage| match stage.entity(id).map(|e| e.actor()) {
-            Some(Actor::Pet(pet)) => pet.face().uv_offset(),
+            Some(Actor::Pet(pet)) => pet.faces()[EYE].uv_offset(),
             _ => panic!("不是宠物"),
         };
         assert_eq!(face(&stage), timid.face.uv_offset(), "待机时是性格那张脸");
@@ -164,6 +170,77 @@ mod home_tests {
         // 睡的那段只有 SleepStand,降级过去之后眼睛也得跟着变困
         assert!(stage.play_clip(id, "SleepLoop"));
         assert_eq!(face(&stage), crate::persona::SLEEPY.uv_offset());
+    }
+
+    /// 有曲线时**逐帧**查表,而且各个脸槽各查各的。
+    ///
+    /// 钉住四件事:① 曲线第 1 格 =「默认」= 性格那张脸(待机眨眼就靠这条);
+    /// ② 眼和嘴可以同时是两格(游戏里就是两条独立曲线);
+    /// ③ 有曲线的段里,嘴那条空着时嘴停在性格那张脸上,**不跟着眼睛跑**;
+    /// ④ Dynamic 槽同理各走各的(幽影树的两条藤就是这样)。
+    #[test]
+    fn the_face_curve_is_sampled_per_frame_for_each_slot_separately() {
+        let mut model = Model::for_test(&["Idle", "Shock"]);
+        // 待机:0.3 秒起闭眼(第 5 格),0.4 秒回默认 —— 这就是一次眨眼
+        model.clips[0].faces[EYE] = vec![(0.0, 1), (0.3, 5), (0.4, 1)];
+        // 受惊:眼第 3 格、嘴第 7 格(幽星光的 Shock 就是这样),藤第 4 格
+        model.clips[1].faces[EYE] = vec![(0.0, 3)];
+        model.clips[1].faces[MOUTH] = vec![(0.0, 7)];
+        model.clips[1].faces[DYNAMIC1] = vec![(0.0, 4)];
+        let mut stage = Stage::new((1000, 600));
+        let timid = crate::persona::Persona::by_id("timid");
+        let id = stage.spawn(Actor::Pet(PetActor::new(PetBuild {
+            persona: timid,
+            ..test_build(Arc::new(model), 5)
+        })));
+        let face = |stage: &Stage| match stage.entity(id).map(|e| e.actor()) {
+            Some(Actor::Pet(pet)) => pet.faces(),
+            _ => panic!("不是宠物"),
+        };
+        // 只推进播放头,不跑行为逻辑 —— 这条测的是「按时刻查曲线」,不是状态机
+        let advance = |stage: &mut Stage, dt: f32| {
+            let Some(Actor::Pet(pet)) = stage.entity_mut(id).map(|e| &mut e.actor) else {
+                panic!("不是宠物");
+            };
+            pet.player.advance(&pet.model, dt);
+        };
+        assert_eq!(face(&stage)[EYE], timid.face, "第 1 格 = 性格那张脸");
+        advance(&mut stage, 0.35);
+        assert_eq!(face(&stage)[EYE], crate::persona::SLEEPY, "0.35 秒该闭着眼");
+        advance(&mut stage, 0.1);
+        assert_eq!(face(&stage)[EYE], timid.face, "0.45 秒睁回来");
+
+        assert!(stage.play_clip(id, "Shock"));
+        let faces = face(&stage);
+        assert_eq!(faces[EYE], crate::persona::SURPRISED);
+        assert_eq!(faces[MOUTH], crate::persona::CLENCHED, "嘴不跟着眼睛走");
+        assert_eq!(
+            faces[DYNAMIC1],
+            crate::persona::ANGRY,
+            "Dynamic 槽也是自己一条"
+        );
+
+        // 待机段有眼曲线、没有别的槽 ⇒ 那几个槽停在性格那张脸上
+        assert!(stage.play_clip(id, "Idle"));
+        assert_eq!(face(&stage)[MOUTH], timid.face);
+        assert_eq!(face(&stage)[DYNAMIC1], timid.face);
+    }
+
+    /// 槽号是**定死的**:manifest 里写的是名字,而材质那份 uniform 里存的是编号,
+    /// 两边靠这张表对上。改一个编号 = 所有已导出的包整体串位。
+    #[test]
+    fn face_slot_numbers_are_frozen() {
+        use crate::pack::face_slot;
+        assert_eq!(face_slot("eye"), Some(EYE));
+        assert_eq!(face_slot("eye_1"), Some(1));
+        assert_eq!(face_slot("mouth"), Some(MOUTH));
+        assert_eq!(face_slot("mouth_1"), Some(3));
+        assert_eq!(face_slot("dynamic1"), Some(DYNAMIC1));
+        assert_eq!(face_slot("dynamic2"), Some(5));
+        assert_eq!(face_slot("dynamic3"), Some(6));
+        // 不认得的名字按「不是脸」处理,别让新包把旧运行时带崩
+        assert_eq!(face_slot("dynamic9"), None);
+        assert_eq!(face_slot("eye_9"), None);
     }
 }
 

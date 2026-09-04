@@ -2,15 +2,21 @@
 //!
 //! 以前这里是自己编的五个(乖巧/活泼/慵懒/黏人/高冷)。解包数据里其实有现成的:
 //!
-//! - `NATURE_CONF` —— 31 条性格,每条一个 `emotion_desc`,那就是这只宠物的**默认表情**。
+//! - `NATURE_CONF` —— 31 条性格,每条一个 `emotion_desc`,那就是这只宠物的**默认眼神**。
 //!   31 条里只有 6 条不是「默认」:天真/开朗 → 微笑,懒散/悠闲 → 困倦,胆小 → 哭哭,
-//!   急躁 → 生气。**表情落在眼睛(和嘴)上** —— 是脸那张图集里换一格,
+//!   急躁 → 生气。**眼神落在眼睛(和嘴)上** —— 是脸那张图集里换一格,
 //!   不是播一段动作,见 [`Expression`]。
 //! - `LLM_PET_BEHAVIOR_CONF` —— 84 条宠物行为,每条标着 `nature_id`(哪几种性格会做它)。
 //!   反过来读就是「这个性格爱做哪些动作」:调皮 → happy/happy_1/jump/run_to_player,
 //!   冷静 → relax/nap/deep_sleep,悠闲 → fear/fear_1/sad/run_away …
 //!
-//! 两张表合起来正好是要的东西:**性格决定表情**,不用再让人手工勾表情池。
+//! 两张表合起来正好是要的东西:**性格决定眼神**,顺带定了它爱做哪几个表情,
+//! 不用再让人手工勾表情池。
+//!
+//! **「眼神」与「表情」是两套词,别混**(这条口径贯穿两端的界面与文档):
+//! *眼神* = 脸那张图集里的一格(默认/微笑/惊讶/生气/困倦/哭哭/闭紧/晕眩),跟着性格
+//! 与动画曲线走,人只在下载站的下拉框里直接挑;*表情* = Happy/Sad 那几段**动作**
+//! (开心/放松/炫耀/生气/伤心/惊恐),配置窗口里那个「表情池」说的是这一套。
 //!
 //! 名字与 `nature_id` 都照抄游戏,便于回表核对。**倍率那五个数字是编的** ——
 //! 游戏那两张表没有「多久睡一次」这种量,只能按每种性格爱做的行为往这五个旋钮上折:
@@ -19,22 +25,40 @@
 
 use crate::stage::EMOTES;
 
-/// 表情 = 脸那张贴图里的**一格**。
+/// 眼神 = 脸那张贴图里的**一格**。**不是**「表情」那一套 —— 那是 Happy/Sad
+/// 那几段动作(见 [`crate::stage::EMOTES`]),这里说的是眼睛与嘴上换的那张图。
 ///
-/// 眼睛和嘴各是一张 **2 列 × 4 行的图集**(`M_P_Eyes` 那一族材质),网格的 UV 落在
-/// 左上那一格,换表情就是整格地偏一下 UV。八格的内容(逐格渲出来看的,以幽星光为例;
-/// 抽查喵喵/火花/菊花梨,图集结构一致):
+/// 眼睛和嘴**各是一张** 2 列 × 4 行的图集(`M_P_Eyes` 那一族材质,材质名后缀 `_Es`/`_Mh`),
+/// 网格的 UV 落在左上那一格,换眼神就是整格地偏一下 UV。八格的内容(逐格渲出来看的,
+/// 以幽星光为例;抽查喵喵/火花/菊花梨/加尔/里奥,图集结构一致):
 ///
 /// ```text
 ///   (0,0) 竖眼 + 弯月嘴     = 默认     (1,0) 眯眼笑 + 腮红 + 张嘴 = 微笑
-///   (0,1) 圆睁眼 + 腮红     (惊讶)     (1,1) 尖角怒眼            = 生气
+///   (0,1) 圆睁眼 + 腮红     = 惊讶     (1,1) 尖角怒眼            = 生气
 ///   (0,2) 闭眼 + 水滴       = 困倦     (1,2) 八字垂眼 + 倒弯嘴    = 哭哭
-///   (0,3) 眯眼 + 大张嘴     (大笑)     (1,3) 螺旋眼              (晕)
+///   (0,3) 「><」紧闭眼+大张嘴 = 闭紧     (1,3) 螺旋眼              = 晕眩
 /// ```
+///
+/// **格号就是游戏的编号**:`col + 2·row + 1` ∈ 1..8,见 [`Expression::card`]。原来这条
+/// 只是从网格脸族的顶点色推出来的,现在被动画里的 `EC_Eye` 曲线独立坐实了 ——
+/// 那条曲线的值就是 `格号 × 100`,而 Happy=200、Anger=400、Sad=600、Shock=300、
+/// Sleep=500 与这里的 (1,0)/(1,1)/(1,2)/(0,1)/(0,2) 逐个对上。
 ///
 /// 哪个性格用哪一格由游戏的 `NATURE_CONF.emotion_desc` 定;格子的**位置**是把八格
 /// 逐个渲出来、和三方攻略里那张「幽星光不同性格的眼睛」逐张比对出来的 ——
-/// 配置表里只有「微笑」这种名字,没有下标。五种表情与攻略图一一对上。
+/// 配置表里只有「微笑」这种名字,没有下标。五种眼神与攻略图一一对上。
+///
+/// 另外三格(惊讶/闭紧/晕眩)配置表里没有名字,但**美术自己给形变目标起的名**能当第二证人:
+/// 那套 blendshape 叫 `Zheng/Xi/Jing/Nu/Shui/Ai/Shou/Yun`(正/喜/惊/怒/睡/哀/收/晕),
+/// 正好八个。把全库「只有一个非默认 `EC_Eye` 值」的动画拿来投票、看那段同时驱动了哪条
+/// 同名曲线,第一名逐格对上自己的格:2→xi 62 次、3→jing 10、4→nu 96、6→ai 15、
+/// 7→shou 22、8→yun 15(5 号那格 shui 21 次,`Shui` 按用法是「睡」不是「水」)。
+///
+/// **(0,3) 原来叫「大笑」,是误读**:全库 `EC_Eye` 里这一格 76% 出现在 Fear 段上
+/// (加尔的 `Common_Fear` 是 `0=100 0.167=700 1.267=100`),其余落在落地与入睡起手。
+/// 三只对照(幽星光/加尔/里奥)画的都是「><」那种用力闭紧的眼,配的嘴是大张。
+/// 美术给这一格的形变目标起的名是 `Shou`(收),所以这里就叫**闭紧** ——
+/// 描述的是眼睛的样子,不猜它在表达什么情绪。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Expression {
     /// `NATURE_CONF.emotion_desc` 里的名字。
@@ -53,8 +77,9 @@ pub const DEFAULT_FACE: Expression = Expression {
     cell: (0, 0),
 };
 
-/// 图集里另外那几格。名字取自 `NATURE_CONF.emotion_desc` 的用词;
-/// 括号里那两个(惊讶/大笑)配置表里没有名字,是照着格子里画的东西起的。
+/// 图集里另外那几格。名字取自 `NATURE_CONF.emotion_desc` 的用词;配置表里没名字的那三格
+/// 里,「晕眩」用游戏行为表 `dizzy` 的官方词,「惊讶」「闭紧」照着格子里画的东西 +
+/// 美术给形变目标起的名(`Jing` 惊 / `Shou` 收)起。
 pub const SMILE: Expression = Expression {
     name: "微笑",
     cell: (1, 0),
@@ -75,15 +100,24 @@ pub const CRYING: Expression = Expression {
     name: "哭哭",
     cell: (1, 2),
 };
-pub const LAUGHING: Expression = Expression {
-    name: "大笑",
+/// 「><」紧闭眼 + 大张嘴。**原来叫「大笑」是误读**,见 [`Expression`] 的说明:
+/// 游戏的 `EC_Eye` 曲线把这一格用在 Fear 上,美术给它起的名是 `Shou`(收)。
+pub const CLENCHED: Expression = Expression {
+    name: "闭紧",
     cell: (0, 3),
 };
+/// 螺旋眼。战斗里的那一格,`emotion_desc` 里没有它,也不在给人挑的那七格里 ——
+/// 但技能循环段与 `Common_Stun` 的 `EC_Eye` 会用到(幽星光 `Skill3Loop` 的嘴就是 800),
+/// 所以 [`Expression::from_card`] 要认得它。名字用游戏行为表 `dizzy` 的官方词「晕眩」。
+pub const DIZZY: Expression = Expression {
+    name: "晕眩",
+    cell: (1, 3),
+};
 
-/// 有名字的那七格,给「让人自己挑一张脸」的界面用(下载站的预览)。
+/// 有名字的那七格,给「让人自己挑一双眼神」的界面用(下载站的预览)。
 ///
-/// **第八格 (1,3) 螺旋眼不在里面**:那是战斗里的「晕」,游戏的 `emotion_desc` 里没有它,
-/// 桌宠也没有哪段动作会用到 —— 列出来只会让人点一个不属于这只宠物的表情。
+/// **第八格 (1,3) 螺旋眼不在里面**:那是战斗里的「晕眩」,游戏的 `emotion_desc` 里没有它,
+/// 桌宠也没有哪段动作会用到 —— 列出来只会让人点一个不属于这只宠物的眼神。
 pub const EXPRESSIONS: &[Expression] = &[
     DEFAULT_FACE,
     SMILE,
@@ -91,30 +125,36 @@ pub const EXPRESSIONS: &[Expression] = &[
     ANGRY,
     SLEEPY,
     CRYING,
-    LAUGHING,
+    CLENCHED,
 ];
 
-/// 这段动作自带的表情。**换动作眼睛也跟着换** —— 游戏里一只「哭哭眼」的幽星光
-/// 生气时是生气眼、睡着时是困倦眼,性格给的那张脸只是它**平时**的样子。
-/// 返回 None = 这段动作不改脸,还用性格那张。
+/// 这段动作自带的眼神 —— **只在包里没有 `[forms.face]` 时用的兜底**。
 ///
-/// 这张对照表**是按语义挑的,不是从配置表里查的**:游戏那边换脸是行为逻辑直接设
-/// 材质参数(31 条性格的 `emotion_desc` 之外,没有第二张「动作 → 表情」的表),
-/// 而动作名本身已经把意思写清楚了。挑的时候优先用 `emotion_desc` 里出现过的名字,
-/// 剩下两格(惊讶/大笑)只给意思实在对得上的那两段。
+/// 正经的来源是**动画自带的 `EC_Eye`/`EC_Mouth` 曲线**(见导出器的 `FaceCurves.cs`
+/// 与 `pack::FaceTrack`):它逐帧、分眼与嘴、而且**每个形态自己一份**。
+/// 这张表是全库投票压扁出来的一个平均值,只够给旧包兜底:
+///
+/// - 压扁掉了眨眼(待机段里 `EC_Eye` 100↔500 来回跳的那一路);
+/// - 压扁掉了眼嘴不一致(全库 8636 段两条曲线都有的动画里约三成对不上);
+/// - 压扁掉了形态差异(加灵一阶 Fear 用第 6 格,二/三阶用第 7 格 —— 同一条进化链都不同)。
+///
+/// 表里每一档都换成了全库投票的结果(每段动画各取自己的非默认主值,再跨全库投票),
+/// 原来那版是按动作名的意思猜的,其中三档是错的:
+/// Fear 猜「哭哭」实际是第 7 格「闭紧」(76%)、CallOut 猜第 7 格实际是「微笑」(48%)、
+/// Alert 猜「不改脸」实际是「生气」(40%)。
 pub fn face_for_clip(clip: &str) -> Option<Expression> {
     Some(match clip {
         "Anger" => ANGRY,
-        // 难过与害怕都是这张八字垂眼:游戏的 emotion_desc 里也只有「哭哭」这一档
-        "Sad" | "Fear" => CRYING,
-        // 受惊是圆睁眼那格 —— 吓一跳,不是难过
+        "Sad" => CRYING,
+        // 惊恐是「><」那格,不是八字垂眼 —— 全库 Fear 段 76% 落在第 7 格
+        "Fear" => CLENCHED,
         "Shock" => SURPRISED,
-        "Happy" | "Relax" | "Show" => SMILE,
-        // 张着大嘴喊,正好是「大张嘴」那格
-        "CallOut" => LAUGHING,
-        // 睡的四段(含只有 SleepStand 的那批)全是困倦眼
+        // CallOut 也是微笑那格(48%),不是张大嘴那格
+        "Happy" | "Relax" | "Show" | "CallOut" => SMILE,
+        // 警觉(Alert):全库 40% 是尖角怒眼(31% 是闭眼,那是段里的眨眼)
+        "Alert" => ANGRY,
         "SleepStart" | "SleepLoop" | "SleepStand" | "SleepEnd" => SLEEPY,
-        // 待机/走/跑/落地/警觉不改脸:平时什么样就什么样
+        // 待机/走/跑/落地不改脸:平时什么样就什么样
         _ => return None,
     })
 }
@@ -130,7 +170,7 @@ impl Expression {
 
     /// **网格脸**要画第几张卡(1–8),见 `pack.rs` 的 `Material::face_cards`。
     ///
-    /// 那一族(`M_P_Eyes_Mesh`,全库 20 个形态、21 片网格)把整套表情做成**八张重叠的几何**,
+    /// 那一族(`M_P_Eyes_Mesh`,全库 20 个形态、21 片网格)把整套眼神做成**八张重叠的几何**,
     /// 每张的 UV 早就钉在图集的某一格上,顶点色的 **G 通道**写着它是第几张
     /// (`floor(G × 10)`,实测取值 0.149/0.247/…/0.847,正好落在 1..8 每一档的中间)。
     /// 所以这一族不偏 UV,改成**只画一张**。
@@ -140,11 +180,35 @@ impl Expression {
     /// 证据:① 觅觅蝠一/三阶压根没有 1 号卡,碎晶蝎与觅觅蝠二阶的 1 号卡只有十几个顶点
     /// (占位);② 翠顶夫人/黑羽夫人的 1 号卡与 5 号卡(困倦)是同一份美术;
     /// ③ 实机图鉴里这两只的待机脸是 **2 号卡**那张(尖睫毛 + 腮红)。
-    /// 图鉴用的就是默认表情 —— 拿单卡族的点点对照过:图鉴里是圆睁的绿眼,
+    /// 图鉴用的就是默认那张脸 —— 拿单卡族的点点对照过:图鉴里是圆睁的绿眼,
     /// 正是 (0,0) 那格,不是微笑那格。所以 1 号是眨眼/占位一类,默认落在 2 号。
     /// 于是「默认」与「微笑」在这一族里是同一张脸(它们只有七张)。
     pub fn card(&self) -> u32 {
         (self.cell.0 + self.cell.1 * 2 + 1).max(2)
+    }
+
+    /// 格号(1..8)→ 眼神。`card` 的逆,给 `EC_Eye`/`EC_Mouth` 曲线用
+    /// (曲线的值就是 `格号 × 100`,见 `pack::FaceTrack`)。
+    ///
+    /// **1 号返回 None**:那是「默认」,而「默认」是哪张脸由性格说了算
+    /// (`NATURE_CONF.emotion_desc`)—— 一只「哭哭眼」的幽星光在待机段里
+    /// 该是哭哭眼,不是 (0,0) 那格。**这一条是推的**:游戏那边是把性格那张脸设成材质的
+    /// 基础 `Number`、再让曲线在段内覆盖,数据里没有第二处能直接对照的地方;
+    /// 但按「1 = 用性格那张」解释,待机眨眼(1↔5)与性格脸两件事同时成立,
+    /// 换任何别的解释都会丢掉其中一件。
+    ///
+    /// 越界(0 或 >8)也当默认:曲线是浮点的,四舍五入之外不该再信它。
+    pub fn from_card(card: u32) -> Option<Expression> {
+        Some(match card {
+            2 => SMILE,
+            3 => SURPRISED,
+            4 => ANGRY,
+            5 => SLEEPY,
+            6 => CRYING,
+            7 => CLENCHED,
+            8 => DIZZY,
+            _ => return None,
+        })
     }
 }
 
@@ -169,7 +233,7 @@ pub struct Persona {
     pub run: f32,
     /// 注意到旁边那只的距离倍率。大 = 更爱搭理别人。
     pub social: f32,
-    /// 这个性格的脸(`NATURE_CONF.emotion_desc`)—— **就是眼睛/嘴那张图集里的一格**。
+    /// 这个性格的眼神(`NATURE_CONF.emotion_desc`)—— **就是眼睛/嘴那张图集里的一格**。
     pub face: Expression,
     /// 待机时随手做的那个表情动作;None = 没有偏好。
     /// **和 `face` 不是一回事**:那是眼睛,这是动作。
@@ -395,13 +459,13 @@ mod tests {
         }
     }
 
-    /// 游戏里那五种脸(默认/微笑/困倦/哭哭/生气)在这份名单里都要有代表,
+    /// 游戏里那五种眼神(默认/微笑/困倦/哭哭/生气)在这份名单里都要有代表,
     /// 否则「性格换眼睛」这件事在界面上看不出来。
     #[test]
     fn the_five_game_faces_are_all_represented() {
         let faces: Vec<&str> = ALL.iter().map(|p| p.face.name).collect();
         for want in ["默认", "微笑", "困倦", "哭哭", "生气"] {
-            assert!(faces.contains(&want), "没有性格用「{want}」那张脸");
+            assert!(faces.contains(&want), "没有性格用「{want}」那双眼神");
         }
     }
 
@@ -447,7 +511,7 @@ mod tests {
         // 默认那张脸必须是左上角那一格 —— 网格 UV 本来就落在那儿,偏移 0 就是原样
         assert_eq!(DEFAULT_FACE.uv_offset(), [0.0, 0.0]);
         // 动作带来的那几张也一样(它们和性格用的是同一批常量)
-        for face in [SMILE, SURPRISED, ANGRY, SLEEPY, CRYING, LAUGHING] {
+        for face in [SMILE, SURPRISED, ANGRY, SLEEPY, CRYING, CLENCHED, DIZZY] {
             let (col, row) = face.cell;
             assert!(
                 (col as f32) < FACE_COLS && (row as f32) < FACE_ROWS,
@@ -469,7 +533,8 @@ mod tests {
             ANGRY,
             SLEEPY,
             CRYING,
-            LAUGHING,
+            CLENCHED,
+            DIZZY,
         ];
         for face in faces {
             let card = face.card();
@@ -482,7 +547,7 @@ mod tests {
         // 网格脸只有七张:「默认」与「微笑」共用 2 号
         assert_eq!(DEFAULT_FACE.card(), SMILE.card());
         // 除那一对外,别的格子不许撞号 —— 撞了就是有张脸永远轮不到
-        let others = [SURPRISED, ANGRY, SLEEPY, CRYING, LAUGHING];
+        let others = [SURPRISED, ANGRY, SLEEPY, CRYING, CLENCHED, DIZZY];
         let mut seen = vec![DEFAULT_FACE.card()];
         for face in others {
             assert!(
@@ -495,22 +560,52 @@ mod tests {
         }
         // 卡号是**按行读**图集:(列, 行) → 列 + 行×2 + 1。抽两格钉住这个换算。
         assert_eq!(ANGRY.card(), 4, "生气在 (1,1)");
-        assert_eq!(LAUGHING.card(), 7, "大笑在 (0,3)");
+        assert_eq!(CLENCHED.card(), 7, "闭紧在 (0,3)");
     }
 
-    /// 会换脸的动作与不换脸的动作,两边都点名核一遍 —— 这张表是手挑的,
-    /// 加动作时很容易漏掉一半(比如加了 Sad 忘了 Fear)。
+    /// 格号 ↔ 眼神的来回。**`EC_Eye`/`EC_Mouth` 曲线就是靠这一对认格子的**,
+    /// 反过来错一格就是全库眼神整体串位。
+    #[test]
+    fn cards_round_trip_through_from_card() {
+        for face in [SMILE, SURPRISED, ANGRY, SLEEPY, CRYING, CLENCHED, DIZZY] {
+            assert_eq!(
+                Expression::from_card(face.card()),
+                Some(face),
+                "第 {} 格该是「{}」",
+                face.card(),
+                face.name
+            );
+        }
+        // 1 号是「默认」——那是性格那张脸,不是图集左上角那一格,所以不给具体眼神
+        assert_eq!(Expression::from_card(1), None);
+        // 越界一律当默认:曲线是浮点的,四舍五入之外不该再信它
+        assert_eq!(Expression::from_card(0), None);
+        assert_eq!(Expression::from_card(9), None);
+        // 游戏曲线的值就是格号 ×100,这几档是全库实测最常见的
+        assert_eq!(Expression::from_card(200 / 100), Some(SMILE), "Happy=200");
+        assert_eq!(Expression::from_card(400 / 100), Some(ANGRY), "Anger=400");
+        assert_eq!(Expression::from_card(600 / 100), Some(CRYING), "Sad=600");
+        assert_eq!(Expression::from_card(700 / 100), Some(CLENCHED), "Fear=700");
+    }
+
+    /// 兜底表:会换脸的动作与不换脸的动作,两边都点名核一遍。
+    /// **这张表只给没有 `[forms.face]` 的旧包用**,值来自全库 `EC_Eye` 投票
+    /// (见 `face_for_clip` 的说明),不是猜的 —— 改动前先回那份统计。
     #[test]
     fn actions_map_to_the_faces_they_say_they_do() {
         for (clip, want) in [
             ("Anger", ANGRY),
             ("Sad", CRYING),
-            ("Fear", CRYING),
+            // Fear 是第 7 格「闭紧」,不是哭哭 —— 全库 EC_Eye 投票 76%
+            ("Fear", CLENCHED),
             ("Shock", SURPRISED),
             ("Happy", SMILE),
             ("Relax", SMILE),
             ("Show", SMILE),
-            ("CallOut", LAUGHING),
+            // CallOut 也是微笑那格(48%),不是第 7 格那张大张嘴的
+            ("CallOut", SMILE),
+            // 警觉(Alert)是尖角怒眼(40%)
+            ("Alert", ANGRY),
             ("SleepStart", SLEEPY),
             ("SleepLoop", SLEEPY),
             ("SleepEnd", SLEEPY),
@@ -521,7 +616,7 @@ mod tests {
             assert_eq!(got, Some(want), "{clip} 该是「{}」", want.name);
         }
         // 日常那几段不改脸,否则性格给的那张脸基本没机会露面
-        for clip in ["Idle", "Walk", "Run", "JumpFall", "Alert"] {
+        for clip in ["Idle", "Walk", "Run", "JumpFall"] {
             assert_eq!(face_for_clip(clip), None, "{clip} 不该改脸");
         }
     }

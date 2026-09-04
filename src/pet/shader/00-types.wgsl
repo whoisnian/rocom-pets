@@ -27,14 +27,24 @@ struct Camera {
     // 是否选择高材质质量排列。目标实机为 Low；它实际绑定了 MobileDirectionalLight，
     // 但所选 `M_P_Object_Trans` shader map 仍没有 StarStick 采样块。
     high_material_quality: f32,
-    // ⚠ `vec2<f32>` 按 8 字节对齐:这里落在 88。
-    // 表情:脸那两个材质的 UV 偏移(整格)。**每只一份**,所以放在这儿而不是材质里 ——
-    // 材质是按形态共享的,同一个形态的两只可以是两种表情。
-    face_uv: vec2<f32>,
-    // 当前蒙皮姿势的 PrimitiveSceneData bounds：[中心.xyz,最长边]。
-    object_bounds: vec4<f32>,
     // 网格脸要画第几张卡(1–8);已在 CPU 侧退过档,这只一定有这张。
     face_card: f32,
+    // 这只有几个形变目标(0 = 没有,顶点着色器整段跳过),以及一块占多少个顶点。
+    morph_count: f32,
+    morph_stride: f32,
+    // 当前蒙皮姿势的 PrimitiveSceneData bounds：[中心.xyz,最长边]。
+    object_bounds: vec4<f32>,
+    // 眼神:**每个脸槽**的 UV 偏移(整格),两个槽挤一个 vec4(xy 是偶数槽、zw 是奇数槽)。
+    // 槽号定死在 `pack::face_slot`:0 眼、1 眼#1、2 嘴、3 嘴#1、4..7 Dynamic1..4;
+    // 材质那份 uniform 里的 `flags.x` 存的就是「10 + 槽号」。
+    //
+    // **每只一份**,所以放在这儿而不是材质里 —— 材质是按形态共享的,同一个形态的两只
+    // 可以是两种眼神。**逐槽分开**是因为游戏里它们各是一条独立的动画曲线
+    // (`EC_Eye` / `EC_Mouth` / `EC_Dynamic1`…),同一段动作里可以指向不同的格子。
+    face_uv: array<vec4<f32>, 4>,
+    // 形变目标(脸的 blendshape)的权重,顺序同 `morph_deltas` 里的分块。
+    // 一部分宠物的**嘴是几何不是贴图**(里奥一/二阶就没有嘴的图集槽),那张嘴靠它变形。
+    morph_weights: array<vec4<f32>, 2>,
 };
 
 /// 每材质一份。普通材质也有(tint 全 1、params.z=0),两条通道共用布局。
@@ -163,6 +173,9 @@ struct MaterialParams {
 @group(0) @binding(0) var<uniform> camera: Camera;
 // 蒙皮矩阵:关节世界变换 × 逆绑定矩阵,每帧由 CPU 采样动画后上传
 @group(0) @binding(1) var<storage, read> joints: array<mat4x4<f32>>;
+// 形变目标的逐顶点位移,**target 主序**:`morph_deltas[t * morph_stride + 顶点号]`。
+// 没有形变目标的宠物绑的是一个 16 字节的空壳(见 gpu/mod.rs),靠 `morph_count == 0` 跳过。
+@group(0) @binding(2) var<storage, read> morph_deltas: array<vec4<f32>>;
 @group(1) @binding(0) var base_color: texture_2d<f32>;
 @group(1) @binding(1) var base_sampler: sampler;
 // 第二张贴图,两种用途共用(一个材质只会是其中一种):
@@ -209,6 +222,8 @@ struct MaterialParams {
 @group(2) @binding(0) var scene_depth: texture_depth_2d;
 
 struct VsIn {
+    // 形变目标要按顶点号去 `morph_deltas` 里取自己那一份
+    @builtin(vertex_index) index: u32,
     @location(0) pos: vec3<f32>,
     @location(1) normal: vec3<f32>,
     @location(2) uv: vec2<f32>,

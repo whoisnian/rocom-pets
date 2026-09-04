@@ -54,6 +54,14 @@ struct RawForm {
     locomotion: String,
     #[serde(default)]
     clips: HashMap<String, RawClip>,
+    /// `[forms.face]`:眼神曲线,键与 `[forms.clips]` 同一套。**旧包没有这一节**
+    /// ⇒ 空表,运行时退回 `persona::face_for_clip` 那张兜底表。
+    #[serde(default)]
+    face: HashMap<String, RawFace>,
+    /// `[forms.morph]`:形变目标(脸的 blendshape)。位移与权重曲线都在 glb 里
+    /// (标准的 glTF morph target + `weights` 通道),这儿只留名字用来回表核对。
+    #[serde(default)]
+    morph: Option<RawMorph>,
     #[serde(default)]
     materials: HashMap<String, RawMaterial>,
     /// `[forms.shiny_materials]`:异色那一套。**旧包没有这一节** ⇒ 空表 = 这只没有异色。
@@ -95,13 +103,91 @@ struct RawClip {
     speed_cm_s: f32,
 }
 
+/// `[forms.morph]`:形变目标的名字,顺序即 glb 里 morph target 的顺序。
+#[derive(Deserialize)]
+struct RawMorph {
+    #[serde(default)]
+    targets: Vec<String>,
+}
+
+/// `[forms.face]` 里的一段:**一个脸槽一条**曲线,键是槽名(`eye` / `eye_1` /
+/// `mouth` / `dynamic1`…),值是 `[[毫秒, 格号], …]`。
+type RawFace = HashMap<String, Vec<[i64; 2]>>;
+
+/// 一条眼神曲线:**阶梯**的 (秒, 图集格号 1..8),按时间升序。
+///
+/// 来源是动画自带的 `EC_*` 曲线(见导出器的 `FaceCurves.cs`)。空 = 这段动作没给这个槽
+/// 值,那时用性格那张脸。**一个脸槽一条**,同一段里可以完全不同 —— 幽星光的 `Shock`
+/// 就是眼第 3 格、嘴第 7 格。
+pub type FaceTrack = Vec<(f32, u32)>;
+
+/// 一个形态最多认几个脸槽。编号是**定死的**(见 [`face_slot`]),
+/// 不是按包里出现的顺序分配 —— 这样材质与曲线两边各自查表就能对上,不用再传一张映射。
+///
+/// 全库实测的上限:`_Es` 最多 2 个(一窝蜂二/三阶、加油海葵异形、里奥三阶异形)、
+/// `_Mh` 最多 2 个(加油海葵异形)、`_Dynamic*` 最多 3 个(卡波二阶)。
+pub const MAX_FACE_SLOTS: usize = 8;
+
+/// 槽名 → 编号。`None` = 不认得的名字(新导出器加了槽而运行时还没跟上),按「不是脸」处理。
+///
+/// 顺序就是 [`crate::pet::gpu::FrameParams::face_uv`] 那个数组的下标,也是着色器里
+/// `camera.face_uv[]` 的下标。**加新槽只能往后加**:旧包里写的是名字、不是编号,
+/// 但材质那份 uniform 里存的是编号,前面插一个会把已经导好的包整体串位。
+pub fn face_slot(key: &str) -> Option<usize> {
+    Some(match key {
+        "eye" => 0,
+        "eye_1" => 1,
+        "mouth" => 2,
+        "mouth_1" => 3,
+        "dynamic1" => 4,
+        "dynamic2" => 5,
+        "dynamic3" => 6,
+        "dynamic4" => 7,
+        _ => return None,
+    })
+}
+
+/// 阶梯查值:返回 `time` 时刻生效的那一格。空曲线或时刻在第一帧之前都返回 None
+/// (= 用性格那张脸)。
+pub fn face_at(track: &FaceTrack, time: f32) -> Option<u32> {
+    let mut card = None;
+    for &(t, c) in track {
+        if t > time {
+            break;
+        }
+        card = Some(c);
+    }
+    card
+}
+
+fn face_track(raw: Vec<[i64; 2]>) -> FaceTrack {
+    raw.into_iter()
+        .map(|[ms, card]| (ms as f32 / 1000.0, card.clamp(1, 8) as u32))
+        .collect()
+}
+
+/// `[forms.face]` 的一段 → 按槽号排好的曲线表。不认得的键直接丢
+/// (往前兼容:新导出器多写一个槽,旧运行时照常跑,只是那个槽不动)。
+fn face_tracks(raw: RawFace) -> [FaceTrack; MAX_FACE_SLOTS] {
+    let mut tracks: [FaceTrack; MAX_FACE_SLOTS] = Default::default();
+    for (key, steps) in raw {
+        if let Some(slot) = face_slot(&key) {
+            tracks[slot] = face_track(steps);
+        }
+    }
+    tracks
+}
+
 // manifest 是契约的一部分:这些字段现在还没人读(形态切换/行为要用),但照着 schema
 // 解出来放着,比等到要用时再补解析更省事
 #[allow(dead_code)]
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct Clip {
     pub seconds: f32,
     pub speed_cm_s: f32,
+    /// 各脸槽的眼神曲线,下标见 [`face_slot`]。空 = 这段动作没给这个槽值,
+    /// 那时那个槽用性格那张脸 —— 和游戏一致:动画上那个通知只覆盖它配置过的槽。
+    pub faces: [FaceTrack; MAX_FACE_SLOTS],
 }
 
 #[allow(dead_code)]
@@ -125,6 +211,10 @@ pub struct Form {
     /// 异色那一套材质,**键与 `materials` 完全相同**(glb 里的材质名是默认那套)。
     /// 空 = 这个形态没有异色 —— 全库只有一小部分有(游戏里也是),见 `Form::has_shiny`。
     pub shiny_materials: HashMap<String, Material>,
+    /// 形变目标(脸的 blendshape)的名字,顺序即 glb 里 morph target 的顺序。
+    /// **渲染不读它** —— 位移与权重曲线都在 glb 里;留着是为了报告与排查
+    /// (「这只的嘴是几何还是贴图」一眼能看出来)。全库 1000 个资产里只有 37 个非空。
+    pub morph_targets: Vec<String>,
 }
 
 impl Form {
@@ -231,6 +321,7 @@ impl Form {
             voice: None,
             materials: HashMap::new(),
             shiny_materials: HashMap::new(),
+            morph_targets: Vec::new(),
         }
     }
 }
@@ -502,21 +593,26 @@ impl Pack {
                         sfx: sound_files(root, form.sfx),
                     }
                 }),
-                clips: form
-                    .clips
-                    .into_iter()
-                    .map(|(name, clip)| {
-                        (
-                            name,
-                            Clip {
-                                seconds: clip.ms as f32 / 1000.0,
-                                speed_cm_s: clip.speed_cm_s,
-                            },
-                        )
-                    })
-                    .collect(),
+                clips: {
+                    let mut face = form.face;
+                    form.clips
+                        .into_iter()
+                        .map(|(name, clip)| {
+                            let f = face.remove(&name).unwrap_or_default();
+                            (
+                                name,
+                                Clip {
+                                    seconds: clip.ms as f32 / 1000.0,
+                                    speed_cm_s: clip.speed_cm_s,
+                                    faces: face_tracks(f),
+                                },
+                            )
+                        })
+                        .collect()
+                },
                 materials: material_table(root, form.materials),
                 shiny_materials: material_table(root, form.shiny_materials),
+                morph_targets: form.morph.map(|m| m.targets).unwrap_or_default(),
             })
             .collect::<Vec<_>>();
         if forms.is_empty() {

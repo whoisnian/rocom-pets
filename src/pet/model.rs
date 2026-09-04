@@ -15,6 +15,10 @@ use super::anim::Pose;
 use super::glassy::GlassyRender;
 use crate::pack::Material as PackMaterial;
 
+/// 形变目标最多认几个。这套脸的 blendshape 最多 8 个(七情 + 正),导出器也按 8 个截。
+/// 权重整组装进相机那份 uniform,所以这个数直接决定 uniform 的大小。
+pub const MAX_MORPH_TARGETS: usize = 8;
+
 /// 顶点布局:位置/法线/UV/关节索引/权重/顶点色。与 pet/shader/*.wgsl 的 `@location` 一一对应。
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -68,16 +72,18 @@ pub struct Primitive {
 
 pub struct Material {
     pub name: String,
-    /// 脸(眼/嘴)那两个槽 —— 表情图集就贴在它们身上,见 pack.rs 的 `Material::face`。
+    /// 脸那几个槽(眼/嘴/Dynamic)—— 眼神图集就贴在它们身上,见 pack.rs 的 `Material::face`。
     pub face: bool,
-    /// 这张脸是**八张重叠的表情卡**(`M_P_Eyes_Mesh`),不是偏 UV 的图集。
+    /// 这个脸槽跟哪条曲线走(`pack::face_slot` 的编号),见 pack.rs 的 `Material::face_slot`。
+    pub face_slot: u8,
+    /// 这张脸是**八张重叠的眼神卡**(`M_P_Eyes_Mesh`),不是偏 UV 的图集。
     /// 见 pack.rs 的 `Material::face_cards` 与 `Model::face_cards`。
     pub face_cards: bool,
     /// 炫彩刷在这个槽上,见 pack.rs 的 `Material::glassy_target`。
     pub glassy_target: bool,
     /// 基色贴图(RGBA8),路径来自 manifest 的材质表;读失败才是 None,渲染时用白色兜底。
     pub base_color: Option<Image>,
-    /// 贴图 alpha 是**镂空遮罩**(眼/嘴的表情图集)还是**线条遮罩**(本体的纹路)。
+    /// 贴图 alpha 是**镂空遮罩**(眼/嘴的眼神图集)还是**线条遮罩**(本体的纹路)。
     pub cutout: bool,
     /// alpha 里是否真的有线条信息(见 `alpha_has_detail`);否则提亮要关掉。
     pub line_detail: bool,
@@ -398,6 +404,67 @@ pub struct Clip {
     pub name: String,
     pub duration: f32,
     pub channels: Vec<Channel>,
+    /// 各脸槽的眼神曲线,来自 manifest 的 `[forms.face]`(= 动画自带的 `EC_*`),
+    /// 下标见 `pack::face_slot`。**整段都空** = 这段没有曲线(旧包或者裸 glb),
+    /// 那时退回 `persona::face_for_clip` 那张兜底表。
+    pub faces: [crate::pack::FaceTrack; crate::pack::MAX_FACE_SLOTS],
+    /// 形变目标的权重曲线(glTF 的 `weights` 通道)。None = 这段不驱动形变。
+    pub weights: Option<WeightTrack>,
+}
+
+/// 形变目标的权重随时间变化。**整组一起给**:`values` 每 `count` 个是一帧。
+///
+/// 来源是动画里与形变目标同名的浮点曲线(`Xi/Jing/Nu/Shui/Ai/Shou/Yun`),
+/// 导出器把它们转成了标准的 glTF `weights` 通道,见 exporter/MorphTargets.cs。
+pub struct WeightTrack {
+    pub times: Vec<f32>,
+    /// 长度 = `times.len() × count`。
+    pub values: Vec<f32>,
+    pub count: usize,
+    pub interpolation: Interpolation,
+}
+
+impl WeightTrack {
+    /// 采样到 `out` 里(长度 `MAX_MORPH_TARGETS`,多出来的位置清零)。
+    pub fn sample(&self, time: f32, out: &mut [f32; MAX_MORPH_TARGETS]) {
+        out.fill(0.0);
+        if self.times.is_empty() || self.count == 0 {
+            return;
+        }
+        let (i, f) = locate_time(&self.times, time);
+        let take = self.count.min(MAX_MORPH_TARGETS);
+        let at = |k: usize, t: usize| self.values.get(k * self.count + t).copied().unwrap_or(0.0);
+        let step =
+            f == 0.0 || self.interpolation == Interpolation::Step || i + 1 >= self.times.len();
+        for (t, slot) in out.iter_mut().enumerate().take(take) {
+            let a = at(i, t);
+            *slot = if step { a } else { a + (at(i + 1, t) - a) * f };
+        }
+    }
+}
+
+/// 找到 `time` 落在哪两个关键帧之间,返回(前一帧下标, 插值系数)。
+/// 和 anim.rs 的 `locate` 是同一套,只是那边吃的是 `Channel`。
+fn locate_time(times: &[f32], time: f32) -> (usize, f32) {
+    if times.len() == 1 || time <= times[0] {
+        return (0, 0.0);
+    }
+    if time >= times[times.len() - 1] {
+        return (times.len() - 1, 0.0);
+    }
+    let mut i = 0;
+    while i + 1 < times.len() && times[i + 1] <= time {
+        i += 1;
+    }
+    let span = times[i + 1] - times[i];
+    (
+        i,
+        if span <= 0.0 {
+            0.0
+        } else {
+            (time - times[i]) / span
+        },
+    )
 }
 
 pub struct Model {
@@ -418,7 +485,16 @@ pub struct Model {
     /// 实测(120 个抽样形态 × Idle/Happy/Show/Walk 各查一次):按绑定盒取景 11 个被裁
     /// (阿米亚特/波波拉肉眼可见)→ 按这个盒子取景剩 1 个;代价是画布面积平均 1.64 倍。
     pub motion_bounds: (Vec3, Vec3),
-    /// 网格脸这只**真的有**哪几张表情卡(升序,取值 1..8;不是网格脸就是空)。
+    /// 形变目标(脸的 blendshape)的逐顶点位移,**target 主序**:
+    /// `morph_deltas[t * vertices.len() + v]` 是第 t 个目标在第 v 个顶点上的位移(米)。
+    /// 空 = 这只没有形变目标(全库 1000 个资产里只有 37 个有)。
+    ///
+    /// 为什么摊成稠密表:顶点着色器要按 `vertex_index` 随机取,稀疏表在 GPU 上要么排序
+    /// 查找、要么另做一层索引;而这里最大也就 8 × 3464 × 16B ≈ 0.4MB,一只一份。
+    pub morph_deltas: Vec<[f32; 4]>,
+    /// 形变目标的个数(≤ [`MAX_MORPH_TARGETS`])。
+    pub morph_count: usize,
+    /// 网格脸这只**真的有**哪几张眼神卡(升序,取值 1..8;不是网格脸就是空)。
     /// 卡是按需做的,缺号不少见 —— 觅觅蝠一/三阶没有 1 号、蝴蝶陶陶三阶没有 5 号。
     /// 想要的那号不在这儿就得退档,否则整张脸一个像素都不画(眼睛直接消失)。
     pub face_cards: Vec<u32>,
@@ -472,7 +548,13 @@ impl Model {
     /// `materials_spec` 是 manifest 的 `[forms.materials]`:glb 材质名 → 该画什么
     /// (基色贴图、alpha 语义)。**这是唯一的贴图来源**,导出器从游戏材质实例里解出来,
     /// 不再按贴图命名约定猜(猜法错 258 处,见 docs/findings.md §1)。
-    pub fn load(glb_path: &Path, materials_spec: &HashMap<String, PackMaterial>) -> Result<Self> {
+    /// `clips_spec` 是 manifest 的 `[forms.clips]`(**含眼神曲线**),按动作逻辑名配对;
+    /// 给空表就是「没有眼神曲线」,旧包与裸 glb 走这条。
+    pub fn load(
+        glb_path: &Path,
+        materials_spec: &HashMap<String, PackMaterial>,
+        clips_spec: &HashMap<String, crate::pack::Clip>,
+    ) -> Result<Self> {
         if materials_spec.is_empty() {
             bail!("{glb_path:?} 所属的包没有 [forms.materials](旧版导出的包),重导一次");
         }
@@ -547,6 +629,8 @@ impl Model {
         let mut primitives = Vec::new();
         let mut materials: Vec<Material> = Vec::new();
         let mut material_index = HashMap::new();
+        // [target][顶点] 的位移,拼完整份网格再摊平成 GPU 要的那一维
+        let mut morph_deltas: Vec<Vec<[f32; 3]>> = Vec::new();
 
         for primitive in mesh.primitives() {
             let material_name = primitive
@@ -663,6 +747,27 @@ impl Model {
                     uv2: uv2s.get(i).copied().unwrap_or([0.0, 0.0]),
                 });
             }
+            // 形变目标:每个 target 摊成一份「整份模型顶点数」长的位移表。
+            // 图元的顺序就是 `vertices` 的拼接顺序,所以直接往后接;这个图元没有的 target
+            // (导出器保证不会,但手工做的包可能)补零,免得后面的顶点整体错位。
+            let target_count = primitive.morph_targets().count().min(MAX_MORPH_TARGETS);
+            while morph_deltas.len() < target_count {
+                morph_deltas.push(vec![[0.0f32; 3]; base as usize]);
+            }
+            for (t, (displacements, _, _)) in reader
+                .read_morph_targets()
+                .take(MAX_MORPH_TARGETS)
+                .enumerate()
+            {
+                let mut deltas: Vec<[f32; 3]> =
+                    displacements.map(|it| it.collect()).unwrap_or_default();
+                deltas.resize(positions.len(), [0.0; 3]);
+                morph_deltas[t].extend(deltas);
+            }
+            for track in morph_deltas.iter_mut().skip(target_count) {
+                track.resize(track.len() + positions.len(), [0.0; 3]);
+            }
+
             let first_index = indices.len() as u32;
             let prim_indices: Vec<u32> = match reader.read_indices() {
                 Some(it) => it.into_u32().map(|i| i + base).collect(),
@@ -707,6 +812,7 @@ impl Model {
                     name: name.clone(),
                     base_color,
                     face: spec.face,
+                    face_slot: spec.face_slot,
                     face_cards: spec.face_cards,
                     glassy_target: spec.glassy_target,
                     cutout: spec.mask_alpha,
@@ -946,6 +1052,7 @@ impl Model {
         let mut clamped = 0usize;
         for animation in doc.animations() {
             let mut channels = Vec::new();
+            let mut weights: Option<WeightTrack> = None;
             let mut duration = 0.0f32;
             for channel in animation.channels() {
                 let reader = channel.reader(get);
@@ -977,7 +1084,25 @@ impl Model {
                         })
                         .collect::<Vec<_>>(),
                     ),
-                    ReadOutputs::MorphTargetWeights(_) => continue, // 形变目标先不做
+                    // 形变目标的权重:**不进 `channels`** —— 它不是某个节点的 TRS,
+                    // 而是整份网格一组标量,单独挂在 clip 上(见 `WeightTrack`)。
+                    ReadOutputs::MorphTargetWeights(it) => {
+                        let values: Vec<f32> = it.into_f32().collect();
+                        let count = if times.is_empty() {
+                            0
+                        } else {
+                            values.len() / times.len()
+                        };
+                        if count > 0 {
+                            weights = Some(WeightTrack {
+                                times,
+                                values,
+                                count,
+                                interpolation,
+                            });
+                        }
+                        continue;
+                    }
                 };
                 channels.push(Channel {
                     node: channel.target().node().index(),
@@ -987,10 +1112,16 @@ impl Model {
                     values,
                 });
             }
+            let name = animation.name().unwrap_or("(未命名)").to_string();
+            // 眼神曲线按**动作逻辑名**配对 —— manifest 的 `[forms.clips]` 保证
+            // glb 里的 animation 名与逻辑名同名。
+            let face = clips_spec.get(&name);
             clips.push(Clip {
-                name: animation.name().unwrap_or("(未命名)").to_string(),
+                faces: face.map(|c| c.faces.clone()).unwrap_or_default(),
+                name,
                 duration,
                 channels,
+                weights,
             });
         }
 
@@ -1026,7 +1157,19 @@ impl Model {
         let bounds = bind_pose_bounds(&vertices, &skeleton);
         let motion_bounds = animated_bounds(&vertices, &skeleton, &clips, bounds);
         let face_cards = face_cards(&vertices, &indices, &primitives, &materials);
+        // 摊平成 GPU 要的一维:target 主序,每个 target 一整份顶点表。
+        // vec3 在 WGSL 的 storage array 里按 16 字节跨步,所以直接存成 vec4。
+        let morph_count = morph_deltas.len();
+        let morph_deltas: Vec<[f32; 4]> = morph_deltas
+            .into_iter()
+            .flat_map(|mut track| {
+                track.resize(vertices.len(), [0.0; 3]);
+                track.into_iter().map(|d| [d[0], d[1], d[2], 0.0])
+            })
+            .collect();
         Ok(Self {
+            morph_deltas,
+            morph_count,
             vertices,
             indices,
             primitives,
@@ -1080,7 +1223,7 @@ fn clamp_scale(v: [f32; 3]) -> ([f32; 4], bool) {
 
 /// 按材质表给的路径读基色贴图。/// 按材质表给的路径读基色贴图。**alpha 原样保留**,怎么解释交给 shader:
 ///
-/// - 眼/嘴的表情图集:alpha 是真遮罩,按阈值剔(`mask_alpha = true`);
+/// - 眼/嘴的眼神图集:alpha 是真遮罩,按阈值剔(`mask_alpha = true`);
 /// - 本体:alpha 是**线条/细节遮罩**——RGB 是完整的固有色图集,alpha 里画着身上的纹路
 ///   (水灵身上那一道道竖向浅色条纹就在 alpha 里,白线正好压在纹路上)。
 ///   曾经把它刷成 255「省事」,结果纹路全丢;拿它当不透明度剔像素更糟,身体会被啃掉。
@@ -1614,7 +1757,7 @@ fn animated_bounds(
     (min, max)
 }
 
-/// 网格脸(`M_P_Eyes_Mesh`)这只有哪几张表情卡:顶点色 G 通道 `floor(G × 10)`,升序去重。
+/// 网格脸(`M_P_Eyes_Mesh`)这只有哪几张眼神卡:顶点色 G 通道 `floor(G × 10)`,升序去重。
 ///
 /// 只认 1..8。同族的**单卡**脸把 G 写成 1.0(`floor` 得 10),那不是卡号、是「没有卡系统」;
 /// 月牙雪熊那种 `M_P_Eyes` 里也混着 G=1.0 的顶点,不能一起算进来 —— 所以先按材质筛。
@@ -1671,6 +1814,8 @@ impl Model {
                 name: (*name).to_string(),
                 duration: 1.0,
                 channels: Vec::new(),
+                faces: Default::default(),
+                weights: None,
             })
             .collect();
         Self {
@@ -1686,6 +1831,9 @@ impl Model {
             motion_bounds: (Vec3::new(-0.5, 0.0, -0.5), Vec3::new(0.5, 1.0, 0.5)),
             // 也没有网格脸
             face_cards: Vec::new(),
+            // 也没有形变目标
+            morph_deltas: Vec::new(),
+            morph_count: 0,
             glassy: None,
             mutation: super::glassy::Mutation::default(),
             season_art: false,

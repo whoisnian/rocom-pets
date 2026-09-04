@@ -13,7 +13,8 @@ use anyhow::Result;
 use glam::{Mat4, Vec3};
 use wgpu::util::DeviceExt;
 
-use super::model::{GlassySkin, Model, Vertex};
+use super::model::{GlassySkin, MAX_MORPH_TARGETS, Model, Vertex};
+use crate::pack::MAX_FACE_SLOTS;
 
 /// 着色器源码:`src/pet/shader/*.wgsl` 按文件名顺序拼成一个模块。
 ///
@@ -54,19 +55,31 @@ struct CameraUniform {
     /// 是否选择原游戏的高材质质量排列。目标实机配置为 Low；对应的
     /// `M_P_Object_Trans` shader map 不含 StarStick 采样块。
     high_material_quality: f32,
-    /// 表情:脸那两个材质的 UV 偏移(整格,见 persona.rs 的 `Expression`)。
-    /// **放在相机这份 uniform 里**是因为它是**每只**的(同一个形态的两只可以不同表情),
-    /// 而材质那份是按形态共享的 —— 那边只存「这是不是脸」。
-    face_uv: [f32; 2],
+    /// 网格脸要画第几张卡(1–8),已经退过档、保证这只身上有。
+    /// 和 `face_uv` 一样是**每只**的,所以放这份 uniform 里。
+    face_card: f32,
+    /// 这只有几个形变目标(0 = 没有,顶点着色器整段跳过)。
+    morph_count: f32,
+    /// 一个形变目标在 `morph_deltas` 里占多长(= 顶点数),用来算下标。
+    morph_stride: f32,
+    /// ⚠ WGSL 里 `vec4` 与 `array<vec4, N>` 都按 **16 字节**对齐,而 Rust 的 `[f32; 4]`
+    /// 只按 4 字节 —— 不补这 12 字节,下面 `object_bounds` 起就整体错位,
+    /// 表现是「包围盒/眼神偏移读到一堆别人的数」。补到 112(= 7 × 16)。
+    _pad: [f32; 3],
     /// 当前蒙皮姿势的物体包围盒中心(xyz)与最长边(w)。FakeFulid 的目标 PS 从
     /// PrimitiveSceneData 读取的正是 ObjectWorldPositionAndRadius / ObjectBounds；
     /// 不能拿未蒙皮 POSITION 或绑定姿势盒替代，否则液面会跟着身体弯曲。
     object_bounds: [f32; 4],
-    /// 网格脸要画第几张卡(1–8),已经退过档、保证这只身上有。
-    /// 和 `face_uv` 一样是**每只**的,所以放这份 uniform 里。
-    face_card: f32,
-    /// vec4 要 16 字节对齐,`object_bounds` 之后只能整块地补。
-    _pad: [f32; 3],
+    /// 眼神:**每个脸槽**的 UV 偏移(整格,见 persona.rs 的 `Expression`),
+    /// 槽号见 `pack::face_slot`。两个槽挤一个 vec4,所以这里是 4 个 vec4 而不是 8 个 vec2
+    /// —— WGSL 的 uniform 数组元素按 16 字节对齐,写成 `array<vec2, 8>` 会被撑成 128 字节。
+    ///
+    /// **放在相机这份 uniform 里**是因为它是**每只**的(同一个形态的两只可以不同眼神),
+    /// 而材质那份是按形态共享的 —— 那边只存「这个槽是第几号」。
+    face_uv: [[f32; 4]; MAX_FACE_SLOTS / 2],
+    /// 形变目标(脸的 blendshape)的权重,顺序同 `Model::morph_deltas`。
+    /// **每只一份**,所以和眼神一样放在相机这份 uniform 里。
+    morph_weights: [f32; MAX_MORPH_TARGETS],
 }
 
 /// 桌宠这一侧的描边宽度倍率 —— 把「按宠物身高走」拉回「按屏幕走」。
@@ -125,11 +138,16 @@ pub struct FrameParams {
     pub time: f32,
     /// 是否选择原游戏的高材质质量排列；桌面与离屏默认复现实机的 Low。
     pub high_material_quality: bool,
-    /// 表情:脸那两个材质的 UV 偏移(见 persona.rs 的 `Expression`)。
-    pub face_uv: [f32; 2],
-    /// 表情:网格脸要画第几张卡(见 persona.rs 的 `Expression::card`)。
+    /// 眼神:**每个脸槽**的 UV 偏移(见 persona.rs 的 `Expression`),下标见 `pack::face_slot`。
+    /// 各槽各走各的曲线,见 `pack::FaceTrack`。
+    pub face_uv: [[f32; 2]; MAX_FACE_SLOTS],
+    /// 眼神:网格脸要画第几张卡(见 persona.rs 的 `Expression::card`)。
+    /// 网格脸是**眼睛**那一族,所以跟着眼睛那条曲线走。
     /// 这只没有这张卡时会自动退档,调用方不必管。
     pub face_card: u32,
+    /// 形变目标(脸的 blendshape)的权重,取自 `Player::morph_weights`。
+    /// 这只没有形变目标就全 0(也可以直接给 `[0.0; MAX_MORPH_TARGETS]`)。
+    pub morph_weights: [f32; MAX_MORPH_TARGETS],
 }
 
 /// 每个材质一份的特效参数。**普通材质也占一份**(tint 全 1、flags=0),
@@ -353,11 +371,15 @@ pub struct PetGpu {
     indices: wgpu::Buffer,
     joints: wgpu::Buffer,
     joint_capacity: usize,
+    /// 这只有几个形变目标(脸的 blendshape),以及一个目标在 `morph_deltas` 里占多长。
+    /// 0 = 没有,顶点着色器整段跳过。
+    morph_count: usize,
+    morph_stride: usize,
     camera: wgpu::Buffer,
     /// 只在模型含 FakeFulid 时保留一份 CPU 顶点，用当前关节矩阵复原 UE 每帧更新的
     /// PrimitiveSceneData bounds。其他宠物不承担逐帧蒙皮包围盒的开销。
     bounds_vertices: Option<Vec<Vertex>>,
-    /// 这只网格脸真有哪几张表情卡(见 `Model::face_cards`);不是网格脸就是空。
+    /// 这只网格脸真有哪几张眼神卡(见 `Model::face_cards`);不是网格脸就是空。
     face_cards: Vec<u32>,
     bind_bounds: [f32; 4],
     frame_bind: wgpu::BindGroup,
@@ -423,6 +445,23 @@ impl PetGpu {
             contents: bytemuck::cast_slice(&model.indices),
             usage: wgpu::BufferUsages::INDEX,
         });
+        // 形变目标的逐顶点位移。没有形变目标的宠物(全库绝大多数)也要绑一份 ——
+        // 绑定组布局是固定的,给一个 16 字节的空壳就行,着色器按 `morph_count == 0` 跳过。
+        let morph_count = model.morph_count.min(MAX_MORPH_TARGETS);
+        let morph_stride = if morph_count == 0 {
+            0
+        } else {
+            model.vertices.len()
+        };
+        let morphs = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("pet-morphs"),
+            contents: if model.morph_deltas.is_empty() {
+                bytemuck::cast_slice(&[[0.0f32; 4]])
+            } else {
+                bytemuck::cast_slice(&model.morph_deltas)
+            },
+            usage: wgpu::BufferUsages::STORAGE,
+        });
         let joint_capacity = model.skeleton.joints.len().max(1);
         let joints = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("pet-joints"),
@@ -453,6 +492,17 @@ impl PetGpu {
                 },
                 wgpu::BindGroupLayoutEntry {
                     binding: 1,
+                    visibility: wgpu::ShaderStages::VERTEX,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                // 形变目标的逐顶点位移(见 `Model::morph_deltas`)
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
                     visibility: wgpu::ShaderStages::VERTEX,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Storage { read_only: true },
@@ -683,6 +733,10 @@ impl PetGpu {
                 wgpu::BindGroupEntry {
                     binding: 1,
                     resource: joints.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: morphs.as_entire_binding(),
                 },
             ],
         });
@@ -1240,12 +1294,16 @@ impl PetGpu {
                     // flags.y = 1 表示「玻璃/纱」:fs_main 据此加 MatCap 高光与材质边缘光,
                     // 普通不透明宠物无条件叠这两样会整只发白。
                     // flags.x 在这条路上原来是空的,拿来放「这是哪种脸」:
-                    // 0 = 不是脸、1 = 图集脸(偏 UV)、2 = 网格脸(八张卡里只画一张)
+                    // 0 = 不是脸、2 = 网格脸(八张卡里只画一张)、
+                    // **10 + 槽号** = 图集脸(偏 `camera.face_uv[槽号]`,槽号见 `pack::face_slot`)。
+                    // 10 这个起点是为了和上面两档隔开,着色器一个比较就能分路。
                     flags: [
                         if material.face_cards {
                             2.0
+                        } else if material.face {
+                            10.0 + material.face_slot as f32
                         } else {
-                            has(material.face)
+                            0.0
                         },
                         has(material.translucent),
                         has(material.star.is_some()),
@@ -1723,6 +1781,8 @@ impl PetGpu {
             vertices,
             indices,
             joints,
+            morph_count,
+            morph_stride,
             joint_capacity,
             camera,
             bounds_vertices,
@@ -1772,10 +1832,17 @@ impl PetGpu {
                 } else {
                     0.0
                 },
-                face_uv: frame.face_uv,
-                object_bounds,
                 face_card: resolve_face_card(&self.face_cards, frame.face_card) as f32,
+                morph_count: self.morph_count as f32,
+                morph_stride: self.morph_stride as f32,
                 _pad: [0.0; 3],
+                object_bounds,
+                // 两个槽挤一个 vec4:偶数槽在 xy、奇数槽在 zw(着色器那边照这个取)
+                face_uv: std::array::from_fn(|i| {
+                    let (a, b) = (frame.face_uv[i * 2], frame.face_uv[i * 2 + 1]);
+                    [a[0], a[1], b[0], b[1]]
+                }),
+                morph_weights: frame.morph_weights,
             }),
         );
         let count = matrices.len().min(self.joint_capacity);
@@ -1879,3 +1946,28 @@ impl PetGpu {
     }
 }
 
+
+#[cfg(test)]
+mod uniform_tests {
+    use super::*;
+
+    /// 相机那份 uniform 的内存布局必须和 WGSL 里 `Camera` 的对齐规则逐字节对上。
+    ///
+    /// **这是最容易悄悄错的一处**:WGSL 里 `vec4` 与 `array<vec4, N>` 按 16 字节对齐,
+    /// 而 Rust 的 `[f32; 4]` 只按 4 字节 —— 少补一次填充,着色器读到的就是后面那些字段
+    /// 错位后的值,画面上表现为「眼神偏移莫名其妙」或「包围盒抖」,没有任何报错。
+    #[test]
+    fn the_camera_uniform_matches_the_wgsl_layout() {
+        use std::mem::{offset_of, size_of};
+        assert_eq!(offset_of!(CameraUniform, view_proj), 0);
+        assert_eq!(offset_of!(CameraUniform, light_dir), 64);
+        assert_eq!(offset_of!(CameraUniform, face_card), 88);
+        // vec4:16 的倍数
+        assert_eq!(offset_of!(CameraUniform, object_bounds), 112);
+        // array<vec4, 4>:同样 16 的倍数
+        assert_eq!(offset_of!(CameraUniform, face_uv), 128);
+        assert_eq!(offset_of!(CameraUniform, morph_weights), 192);
+        // 整份也要是 16 的倍数
+        assert_eq!(size_of::<CameraUniform>(), 224);
+    }
+}

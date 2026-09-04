@@ -99,16 +99,39 @@ const SELF_SPEAK_COOLDOWN: f32 = 60.0;
 ///
 /// **这就是「表情池」的全集**。每只可以只开其中几个(见 `PetBuild::emotes`);
 /// 一个都不开或者包里一个都没有,那只就只会站桩,行为上是允许的。
+///
+/// **中文名照抄游戏的 `LLM_PET_BEHAVIOR_CONF`**(84 条宠物行为,每条一个
+/// `pet_behavior_id` + 官方中文 `pet_behavior_name`):`happy` 开心、`relax` 放松、
+/// `show_1` 炫耀、`anger` 生气、`sad` 伤心、`fear` 惊恐。原来这几个是照英文段名
+/// 自己翻的(展示/难过/害怕),现在能对上游戏就用游戏的词。
+///
+/// 「表情」在这份代码里**专指这一套动作**;眼睛那张图集上的一格叫「眼神」,
+/// 见 [`crate::persona::Expression`]。
 pub const EMOTES: &[(&str, &str)] = &[
     ("Happy", "开心"),
     ("Relax", "放松"),
-    ("Show", "展示"),
+    ("Show", "炫耀"),
     ("Anger", "生气"),
-    ("Sad", "难过"),
-    ("Fear", "害怕"),
+    ("Sad", "伤心"),
+    ("Fear", "惊恐"),
 ];
 
 /// 运行时会去找的**全部**动作:动作名 → 中文名。配置窗口按它算「动作覆盖率」。
+///
+/// 中文名能对上游戏 `LLM_PET_BEHAVIOR_CONF` 的就用官方词:`shock` 震惊、`fear` 惊恐、
+/// `sad` 伤心、`show_1` 炫耀。待机/行走/奔跑/落地与三段睡眠游戏那张表里没有对得上的一条
+/// (它只有 `nap` 小睡 / `deep_sleep` 沉睡),沿用原来的词。
+///
+/// **`Alert` 与 `CallOut` 是两个例外,官方有词也不用**(2026-09-05 定):
+///
+/// - `Alert` 的官方词是 `confused` **疑惑**,但那条指的是 `alert` 那一类里**歪头冒问号**
+///   的一个变体;我们这一段是通用的 `Common_Alert`,全库看下来是「竖起耳朵四下张望」,
+///   **警觉**更贴它。
+/// - `CallOut` 的官方词是 **交流**,说明写「朝着小洛克的方向大声呼唤,试图引起注意」。
+///   照字面是宠物在喊人没错,但桌宠这边它是**用户点出来让宠物喊一嗓子**的那颗按钮,
+///   站在用户视角「召唤」读着更顺 —— 而且「交流」听着像双向对话,这一段并不是。
+///
+/// 也就是说:**官方词是默认,不是铁律**;哪条更说得清这段动作在桌面上是什么样,就用哪条。
 ///
 /// **不是照 manifest 的 `[report]` 算的** —— 全库没有一个包写了那一节。
 /// 这张表问的是另一个更有用的问题:*这只宠物在桌面上有哪些事做不了*。
@@ -119,12 +142,12 @@ pub const RUNTIME_CLIPS: &[(&str, &str)] = &[
     ("Walk", "行走"),
     ("Run", "奔跑"),
     ("JumpFall", "落地"),
-    ("Shock", "受惊"),
+    ("Shock", "震惊"),
     ("Happy", "开心"),
-    ("Fear", "害怕"),
-    ("Sad", "难过"),
+    ("Fear", "惊恐"),
+    ("Sad", "伤心"),
     ("Anger", "生气"),
-    ("Show", "展示"),
+    ("Show", "炫耀"),
     ("Relax", "放松"),
     ("Alert", "警觉"),
     ("SleepStart", "入睡"),
@@ -554,15 +577,35 @@ struct Clips {
 }
 
 impl PetActor {
-    /// 这只此刻该是哪张脸(见 persona.rs 的 `Expression`)。
+    /// 这只此刻各个脸槽该是哪张脸,下标见 `pack::face_slot`(0 眼、2 嘴、4..6 Dynamic1..3)。
+    /// 见 persona.rs 的 `Expression`。
     ///
     /// **正在播的那段动作说了算**,它没意见才用性格那张脸 —— 游戏里也是这样:
     /// 一只「哭哭眼」的幽星光生气时是生气眼、睡着时是困倦眼,性格给的只是它平时的样子。
-    /// 按当前动作现算,不另存一份状态:换脸和换动作本来就是同一件事,
+    /// 按当前动作**与当前时刻**现算,不另存一份状态:换脸和换动作本来就是同一件事,
     /// 存两份就会有对不上的时候。
-    pub fn face(&self) -> crate::persona::Expression {
-        let clip = &self.model.clips[self.player.current()].name;
-        crate::persona::face_for_clip(clip).unwrap_or(self.persona.face)
+    ///
+    /// 三条路,按包里有什么决定:
+    ///
+    /// 1. 包里有 `[forms.face]`(动画自带的 `EC_*` 曲线)—— 逐槽逐帧查那条阶梯。
+    ///    **待机段里的眨眼就是这么来的**:曲线在第 1 格与第 5 格(闭眼)之间来回跳。
+    /// 2. 曲线说第 1 格(「默认」)、或者这段没给这个槽值 —— 那个槽用性格那张脸。
+    ///    嘴那条空得多(只有做了 `_Mh` 槽的宠物才有),那时嘴就停在性格那张上,
+    ///    **不跟着眼睛跑** —— 游戏里没驱动它,它就不动。
+    /// 3. 整段所有槽都空 = 旧包没有这一节,退回 `face_for_clip` 那张全库投票压出来的兜底表,
+    ///    所有槽同一张(旧行为)。
+    pub fn faces(&self) -> [crate::persona::Expression; crate::pack::MAX_FACE_SLOTS] {
+        let clip = &self.model.clips[self.player.current()];
+        if clip.faces.iter().all(|t| t.is_empty()) {
+            let face = crate::persona::face_for_clip(&clip.name).unwrap_or(self.persona.face);
+            return [face; crate::pack::MAX_FACE_SLOTS];
+        }
+        let time = self.player.time();
+        std::array::from_fn(|slot| {
+            crate::pack::face_at(&clip.faces[slot], time)
+                .and_then(crate::persona::Expression::from_card)
+                .unwrap_or(self.persona.face)
+        })
     }
 
     /// 播一次性反应动作,播完回待机。缺对应动作就只改状态(至少行为语义还在)。
@@ -637,7 +680,7 @@ impl PetActor {
             if let Some(&clip) = self.pick_emote() {
                 self.player.play(clip);
                 // 待机时随手做的表情**也出声**。原来只有受惊/摸头/醒来会响,于是一只
-                // 自己在桌上生气、难过、展示的宠物是全程哑的 —— 而这几段在游戏里都有配音,
+                // 自己在桌上生气、伤心、炫耀的宠物是全程哑的 —— 而这几段在游戏里都有配音,
                 // 只是当初导出器只导了四段(见 exporter/Audio.cs 那张表)
                 let name = self.model.clips[clip].name.clone();
                 self.speak_self(&name);
@@ -871,7 +914,7 @@ impl PetActor {
         let run = model.clip("Run");
         let jump_fall = model.clip("JumpFall");
         // 反应动作:游戏里「摸头」在 INTERACTIONTREE_CONF 有对应动作键,但键→动作表的映射
-        // 还没核实(见 design.md §5),所以先按语义挑:受惊 Shock、开心 Happy、害怕 Fear,
+        // 还没核实(见 design.md §5),所以先按语义挑:震惊 Shock、开心 Happy、惊恐 Fear,
         // 缺哪个就退到 Alert / Show / Shock
         let startled = find_clip(&model, "Shock");
         let happy = find_clip(&model, "Happy");
@@ -1300,7 +1343,7 @@ impl Stage {
         pet.acting = false;
         pet.player.play(clip);
         // **按点的那个名字出声,不是按降级后播的那段**:两边共用同一张降级表,
-        // 点「受惊」而形态只有 Alert 时,动作与声音会一起退到 Alert
+        // 点「震惊」而形态只有 Alert 时,动作与声音会一起退到 Alert
         pet.speak(name);
         // 走/跑与技能循环段按住几秒再收(见 `manual_hold`):它们一个周期不到一秒,
         // 播一遍就回待机的话点下去只看得见抽一下

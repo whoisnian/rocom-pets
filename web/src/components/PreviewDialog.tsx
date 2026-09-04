@@ -114,7 +114,7 @@ function midOf(pointers: Map<number, { x: number; y: number }>): { x: number; y:
  * 才开始下的 —— 首屏与只想下载的人一个字节都不多付。
  *
  * 画的是桌宠那份渲染器编成的 wasm(src/web.rs),不是另做的一套预览:
- * 动作清单、降级规则、表情图集都来自同一份代码。
+ * 动作清单、降级规则、眼神图集都来自同一份代码。
  */
 export function PreviewDialog({ pack, initial, onState, onOpenChange }: Props) {
   // **画布用回调 ref 存进 state,不是 useRef**:Radix 的 Portal 是在 layout effect 里
@@ -164,7 +164,7 @@ export function PreviewDialog({ pack, initial, onState, onOpenChange }: Props) {
         setGlassy(glassy);
 
         // 分享链接带来的现场。**认不出来的就用默认**:形态可能已经改名、
-        // 表情可能是手打的 —— 那种情况下打开一只默认样子的宠物,好过报错不给看
+        // 眼神可能是手打的 —— 那种情况下打开一只默认样子的宠物,好过报错不给看
         const wanted = forms.find((f) => f.asset === initial?.form)?.asset;
         const first = wanted ?? forms[0]?.asset ?? "";
         const wantFace = faces.includes(initial?.face ?? "") ? initial!.face! : (faces[0] ?? "");
@@ -266,7 +266,7 @@ export function PreviewDialog({ pack, initial, onState, onOpenChange }: Props) {
 
   // 现场变了就往上报一次,由外面写进地址栏(见 lib/share.ts)。
   //
-  // **默认值一律不写**:链首形态、默认表情、原样外观都省掉,于是随手点开一只得到的是
+  // **默认值一律不写**:链首形态、默认眼神、原样外观都省掉,于是随手点开一只得到的是
   // 干净的 `?pet=011-鸭吉吉`,而不是一串等于没说的参数。和 `roster.toml` 那条
   // 「默认值不落盘」是同一条规矩。
   const look = mutationText(shiny, kind, particle, color);
@@ -432,8 +432,8 @@ export function PreviewDialog({ pack, initial, onState, onOpenChange }: Props) {
                   sessionRef.current?.setFace(v);
                 }}
               >
-                <SelectTrigger className="w-32" aria-label="表情">
-                  <SelectValue placeholder="表情" />
+                <SelectTrigger className="w-32" aria-label="眼神">
+                  <SelectValue placeholder="眼神" />
                 </SelectTrigger>
                 <SelectContent>
                   {faces.map((name) => (

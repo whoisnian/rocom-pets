@@ -5,7 +5,9 @@
 
 use glam::{Mat4, Quat, Vec3};
 
-use super::model::{Channel, Clip, Interpolation, Model, Property, Skeleton, Trs};
+use super::model::{
+    Channel, Clip, Interpolation, MAX_MORPH_TARGETS, Model, Property, Skeleton, Trs,
+};
 
 /// 一帧的姿势:每个节点的局部变换。
 #[derive(Clone)]
@@ -61,6 +63,15 @@ impl Pose {
             out.push(world[node] * skeleton.inverse_bind[joint]);
         }
     }
+}
+
+/// 这段动作在 `time` 时刻的形变权重;没有权重曲线就是全 0(= 不变形)。
+fn sample_weights(clip: &Clip, time: f32) -> [f32; MAX_MORPH_TARGETS] {
+    let mut out = [0.0; MAX_MORPH_TARGETS];
+    if let Some(track) = &clip.weights {
+        track.sample(time, &mut out);
+    }
+    out
 }
 
 /// 找到 `time` 落在哪两个关键帧之间,返回(前一帧下标, 插值系数)。
@@ -128,6 +139,9 @@ pub struct Player {
     pose: Pose,
     scratch: Pose,
     pub matrices: Vec<Mat4>,
+    /// 形变目标(脸的 blendshape)的当前权重,顺序同 `Model::morph_deltas`。
+    /// 这只没有形变目标时恒为全 0(着色器那边按 `morph_count == 0` 整段跳过)。
+    pub morph_weights: [f32; MAX_MORPH_TARGETS],
 }
 
 impl Player {
@@ -142,6 +156,7 @@ impl Player {
             pose: pose.clone(),
             scratch: pose,
             matrices: Vec::new(),
+            morph_weights: [0.0; MAX_MORPH_TARGETS],
         }
     }
 
@@ -195,6 +210,15 @@ impl Player {
             // 以旧姿势为底,按权重混向新姿势
             std::mem::swap(&mut self.pose, &mut self.scratch);
             self.pose.blend_from(&self.scratch, weight);
+        }
+        // 形变权重和姿势一样要跟着淡化 —— 硬切会让嘴瞬间变形
+        self.morph_weights = sample_weights(&model.clips[self.current], self.time);
+        if let Some((prev, prev_time, remaining)) = self.previous {
+            let weight = 1.0 - (remaining / self.fade_duration).clamp(0.0, 1.0);
+            let old = sample_weights(&model.clips[prev], prev_time);
+            for (now, was) in self.morph_weights.iter_mut().zip(old) {
+                *now = was + (*now - was) * weight;
+            }
         }
         if self.strip_root_motion {
             let root = skeleton.root_joint;

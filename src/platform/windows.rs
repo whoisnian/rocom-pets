@@ -578,8 +578,9 @@ impl App {
                 shared::canvas_size((aw, ah), scale, gpu.device.limits().max_texture_dimension_2d);
             let view = view_proj(pet.model.motion_bounds, pet.yaw, CANVAS_PADDING);
             let matrices = pet.player.matrices.clone();
-            // 表情:性格决定脸上是哪张脸(见 persona.rs)
-            let face = pet.face();
+            // 眼神:动作自带的曲线说了算,它没意见才用性格那张(见 stage.rs 的 `faces`)。
+            // **逐槽一格** —— 游戏里眼/嘴/Dynamic 各是一条独立曲线。
+            let faces = pet.faces();
             let Some(surfaces) = stage.pets.iter_mut().find(|s| s.id == *id) else {
                 continue;
             };
@@ -599,8 +600,11 @@ impl App {
                     time: effect_time(),
                     // 复现目标实机的 MaterialQualityLevel=Low shader map。
                     high_material_quality: false,
-                    face_uv: face.uv_offset(),
-                    face_card: face.card(),
+                    face_uv: faces.map(|f| f.uv_offset()),
+                    // 网格脸是眼睛那一族,跟着眼睛那条走
+                    face_card: faces[0].card(),
+                    // 形变目标(部分宠物的嘴是几何不是贴图,见 exporter/MorphTargets.cs)
+                    morph_weights: pet.player.morph_weights,
                 },
                 &matrices,
             );

@@ -38,6 +38,10 @@ const string usage = """
       --probe-anim <资产>
                         只打印动画的调查信息:骨架的平移重定向模式、各段动画里整只跑偏的
                         骨骼;给 ALL 则全库普查「剥掉类别前缀之后哪些逻辑名撞了」
+      --probe-face <资产>
+                        只打印眼神曲线与材质槽的配对:网格的材质槽(按槽序)、每段动画里的
+                        `EC_*` 曲线与取值、盖在整段上的 `ANS_SetFacialExpressionIntegrated`
+                        通知带的配置(类型 + 下标)。给 ALL 则全库列「哪些资产有哪些曲线」
       --index           只列出归并后的包名与形态构成(不碰 pak,不导东西)
       --glassy          **只**导炫彩要用的共享贴图到 <--out>/glassy(不导宠物)。
                         炫彩不换材质,它覆盖的 MainTex/StarStickTex 是全库共用的,
@@ -97,6 +101,7 @@ var skipExisting = false;
 var jobs = Environment.ProcessorCount;
 var probeAsset = (string?)null;
 var probeAnimAsset = (string?)null;
+var probeFaceAsset = (string?)null;
 var indexOnly = false;
 var glassyOnly = false;
 var noGlassy = false;
@@ -124,6 +129,7 @@ for (var i = 0; i < args.Length; i++)
         case "--zip-only": zip = zipOnly = true; break;
         case "--probe-material": probeAsset = Next(ref i); break;
         case "--probe-anim": probeAnimAsset = Next(ref i); break;
+        case "--probe-face": probeFaceAsset = Next(ref i); break;
         case "--index": indexOnly = true; break;
         case "--glassy": glassyOnly = true; break;
         case "--no-glassy": noGlassy = true; break;
@@ -133,7 +139,8 @@ for (var i = 0; i < args.Length; i++)
             return 1;
     }
 }
-if (species.Count == 0 && !all && probeAsset is null && probeAnimAsset is null && !indexOnly
+if (species.Count == 0 && !all && probeAsset is null && probeAnimAsset is null
+    && probeFaceAsset is null && !indexOnly
     && !glassyOnly)
 {
     Console.Error.WriteLine($"缺 --species(或 --all)\n{usage}");
@@ -227,6 +234,12 @@ if (probeAsset is not null)
 if (probeAnimAsset is not null)
 {
     AnimProbe.Run(provider, probeAnimAsset);
+    return 0;
+}
+
+if (probeFaceAsset is not null)
+{
+    FaceProbe.Run(provider, probeFaceAsset);
     return 0;
 }
 
@@ -491,6 +504,9 @@ ChainResult ExportChain(Chain chain)
 static List<MaterialEntry> BuildMaterials(
     AbstractVfsFileProvider fileProvider,
     Dictionary<string, MaterialInfo> resolved,
+    // 脸槽 → 跟哪条眼神曲线(材质名 → `eye`/`eye_1`/`mouth`/`dynamic1`…),
+    // 由 `FaceCurves.SlotTracks` 按**网格的槽序**算出来 —— 材质表是按名字查的,自己数不出序号。
+    IReadOnlyDictionary<string, string> faceTracks,
     string assetName,
     string texDir,
     // 描边宽度要用它:全库 851/854 的描边是**屏幕空间常数**,换算到我们的正交取景就是
@@ -640,7 +656,8 @@ static List<MaterialEntry> BuildMaterials(
             info.IsPaintOrder, info.GlassyStarTiling, info.GlassyScalars, info.GlassyRim,
             info.OutlineColors, ExportEffectTexture(info.OutlineIdTexture),
             info.SpecSlots is { Length: 4 } ? info.SpecSlots : null, info.SpecColor,
-            ExportEffectTexture(info.MatIdTexture)));
+            ExportEffectTexture(info.MatIdTexture),
+            faceTracks.GetValueOrDefault(name)));
 
         if (info.StarTexture is not null && ExportEffectTexture(info.StarTexture) is { } starTex
             && (starLayer is null || (info.IsFakeTrans && !starFromFakeTrans)))
@@ -847,7 +864,7 @@ FormReport ExportForm(
         }
     }
 
-    var (glb, written, buildWarnings) = GlbBuilder.Build(mesh, clips, lod);
+    var (glb, written, buildWarnings, morph) = GlbBuilder.Build(mesh, clips, lod);
     warnings.AddRange(buildWarnings);
 
     var formDir = Path.Combine(packDir, "forms", form.Asset);
@@ -867,8 +884,9 @@ FormReport ExportForm(
             $"{form.Asset} 的材质资产在 pak 里全部缺失(疑似未实装的宠物)");
 
     var heightCm = mesh.ImportedBounds.BoxExtent.Z * 2f;
+    var faceTracks = FaceCurves.SlotTracks(mesh);
     var materials = BuildMaterials(
-        fileProvider, resolved, form.Asset, texDir, heightCm, textures, warnings);
+        fileProvider, resolved, faceTracks, form.Asset, texDir, heightCm, textures, warnings);
 
     // 异色(`MDT_SHINING`):清单挂在宠物蓝图的 `DiffMaterials` 上,内容是
     // `<资产>/Yise/Mat/` 那一套。**多数宠物没有**,拿不到就是空表,不是错误。
@@ -879,7 +897,7 @@ FormReport ExportForm(
     {
         var shinyResolved = Shiny.Resolve(shinySources, warnings);
         shinyMaterials = BuildMaterials(
-            fileProvider, shinyResolved, form.Asset, texDir, heightCm, textures, warnings);
+            fileProvider, shinyResolved, faceTracks, form.Asset, texDir, heightCm, textures, warnings);
     }
 
     // 音频:拿不到就是 null(39 个 bnk 查无此宠,还有形态压根没有 Pet_Vo_* 库),不算失败
@@ -888,7 +906,7 @@ FormReport ExportForm(
         : Audio.Export(fileProvider, pinyin, formDir, $"forms/{form.Asset}", warnings);
 
     return new FormReport(form, written, textures, materials, glb.Length, heightCm,
-        warnings, audio, shinyMaterials);
+        warnings, audio, shinyMaterials, morph);
 }
 
 /// 上游的 `FPackedNormal(FVector)` 是否能把向量原样存取回来。**上游 9893d83b 起已修**,

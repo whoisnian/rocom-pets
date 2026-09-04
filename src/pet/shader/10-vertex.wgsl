@@ -11,9 +11,30 @@ fn skin_matrix(ids: vec4<u32>, weights: vec4<f32>) -> mat4x4<f32> {
     return joints[ids.x] * w.x + joints[ids.y] * w.y + joints[ids.z] * w.z + joints[ids.w] * w.w;
 }
 
+/// 形变目标(脸的 blendshape):把各目标按权重叠到顶点位置上,**在蒙皮之前**。
+///
+/// 一部分宠物的脸是几何不是贴图 —— 里奥一/二阶没有嘴的图集槽,那张嘴就是本体网格上的
+/// 七个形变目标(喜/惊/怒/睡/哀/收/晕),权重由动画里的同名曲线逐帧驱动。
+/// 全库 1000 个资产里只有 37 个有,所以 `morph_count == 0` 这条早退是常态。
+///
+/// **只叠位置,不叠法线**:UE 那边的 `TangentZDelta` 我们没导 —— 位移最大也就几厘米,
+/// 光照差别看不出来,而多一份法线表要再翻一倍显存。
+fn morphed_position(input: VsIn) -> vec3<f32> {
+    var pos = input.pos;
+    let count = u32(camera.morph_count);
+    let stride = u32(camera.morph_stride);
+    for (var i = 0u; i < count; i = i + 1u) {
+        let w = camera.morph_weights[i / 4u][i % 4u];
+        if (w != 0.0) {
+            pos = pos + w * morph_deltas[i * stride + input.index].xyz;
+        }
+    }
+    return pos;
+}
+
 fn skin(input: VsIn) -> VsOut {
     let m = skin_matrix(input.joint_ids, input.weights);
-    let world = m * vec4<f32>(input.pos, 1.0);
+    let world = m * vec4<f32>(morphed_position(input), 1.0);
     // 均匀缩放假设下法线可以直接用左上 3x3 变换;宠物骨骼没有非均匀缩放动画
     let normal = normalize((m * vec4<f32>(input.normal, 0.0)).xyz);
 
@@ -52,7 +73,8 @@ fn vs_main(input: VsIn) -> VsOut {
 fn vs_outline(input: VsIn) -> VsOut {
     let m = skin_matrix(input.joint_ids, input.weights);
     let normal = normalize((m * vec4<f32>(input.normal, 0.0)).xyz);
-    let world = m * vec4<f32>(input.pos, 1.0);
+    // 描边是同一份网格外扩一点,形变也得跟着 —— 不跟的话嘴一变形就从描边里露出来
+    let world = m * vec4<f32>(morphed_position(input), 1.0);
     var out: VsOut;
     // 宽度逐材质,来自那份 `_Ol` 描边材质(`0.01 × OutlineWidthPC × MaxWidthScale` 厘米);
     // 推导与「有一条看着像宽度、其实是死设定的参数」见 exporter/Materials.cs 的 `OutlineWidthOf`。

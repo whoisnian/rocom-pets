@@ -21,14 +21,19 @@ pub(super) struct RawMaterial {
     /// 将来做特效通道时改成按 blend 走半透/加色,见 design.md 横向待办。
     #[serde(default)]
     base_color: Option<String>,
-    /// 贴图 alpha 是不是真遮罩。眼/嘴的表情图集是(不剔就是一块方糊),
+    /// 贴图 alpha 是不是真遮罩。眼/嘴的眼神图集是(不剔就是一块方糊),
     /// 本体贴图不是(它的 alpha 是美术塞的遮罩通道,拿来剔会把身体啃掉)。
     #[serde(default)]
     mask_alpha: bool,
-    /// 材质的父链(游戏里的材质实例继承)。**眼/嘴那两个槽认它**:
-    /// 表情是贴在 `M_P_Eyes` 这一族上的图集(见 `Material::face`)。
+    /// 材质的父链(游戏里的材质实例继承)。**脸那几个槽认它**:
+    /// 眼神是贴在 `M_P_Eyes` 这一族上的图集(见 `Material::face`)。
     #[serde(default)]
     parents: Vec<String>,
+    /// 这个脸槽跟哪条眼神曲线走(`eye` / `eye_1` / `mouth` / `dynamic1`…,
+    /// 键与 `[forms.face]` 那几个同一套)。**旧包没有这个字段** ⇒ 按材质名后缀猜
+    /// (见 `face_slot_of`),那时数不出「同后缀里的第几个」,多槽的形态只有第一个能动。
+    #[serde(default)]
+    face_track: Option<String>,
     /// 以下都只对特效层有意义(`base_color` 缺失时)。
     #[serde(default)]
     tint: Option<[f32; 4]>,
@@ -419,6 +424,35 @@ fn is_glassy_target(name: &str, parents: &[String]) -> bool {
 }
 
 
+/// 这个脸槽跟哪条曲线走(`pack::face_slot` 的编号)。
+///
+/// **优先用导出器写的 `face_track`** —— 「同后缀里的第几个」是按网格的槽序数的,
+/// 而这张表是按名字查的哈希表,自己数不出来。旧包没有那个字段时按名字后缀退一档:
+/// `_Es*` → 眼、`_Mh*` → 嘴、`_Dynamic<n>` → 对应那条,序号一律当 0
+/// (多槽的形态因此只有第一个会动 —— 全库 8 个形态如此,重导即可)。
+///
+/// 大小写不较真,理由同 `is_glassy_target`:材质名在资产文件名与对象名之间会漂。
+fn face_slot_of(name: &str, track: Option<&str>) -> usize {
+    if let Some(slot) = track.and_then(crate::pack::face_slot) {
+        return slot;
+    }
+    let lower = name.to_ascii_lowercase();
+    let suffix = lower.rsplit('_').next().unwrap_or_default();
+    let digits_only = |s: &str| s.chars().all(|c| c.is_ascii_digit());
+    if let Some(tail) = suffix.strip_prefix("mh")
+        && digits_only(tail)
+    {
+        return crate::pack::face_slot("mouth").unwrap_or(0);
+    }
+    if let Some(tail) = suffix.strip_prefix("dynamic")
+        && digits_only(tail)
+    {
+        let n = if tail.is_empty() { "1" } else { tail };
+        return crate::pack::face_slot(&format!("dynamic{n}")).unwrap_or(0);
+    }
+    0
+}
+
 /// 一个材质槽该怎么画。由导出器解析游戏材质实例得出,取代原来按贴图命名约定的猜法。
 #[derive(Clone)]
 pub struct Material {
@@ -427,12 +461,22 @@ pub struct Material {
     pub mask_alpha: bool,
     /// 这是脸(眼睛/嘴)吗 —— 父链里有 `M_P_Eyes` 就是。
     ///
-    /// **表情就画在这两个槽上**:贴图是 2×4 的表情图集,网格 UV 落在左上那一格,
-    /// 换表情 = 给 UV 加一个整格的偏移(见 persona.rs 的 `Expression`)。
+    /// **眼神就画在这两个槽上**:贴图是 2×4 的眼神图集,网格 UV 落在左上那一格,
+    /// 换眼神 = 给 UV 加一个整格的偏移(见 persona.rs 的 `Expression`)。
     pub face: bool,
+    /// 这个脸槽跟哪条眼神曲线走(`pack::face_slot` 的编号:0 眼、2 嘴、4..6 Dynamic1..3)。
+    /// 只在 `face` 为真时有意义。
+    ///
+    /// 一个形态可以有好几个脸槽,各有各的图集与曲线:全库 1084 个挂 `P_Eyes` 的材质里
+    /// `_Es` 762 个、`_Mh` 290 个、`_Dynamic1..3` 40 个。同一段动作里它们可以指向不同的格
+    /// (幽影树的 `Relax` 是眼第 6/7 格、两条藤第 4 格),所以运行时逐槽偏。
+    ///
+    /// 判据是导出器写的 `face_track`(它按网格槽序数了「同后缀里的第几个」),
+    /// 旧包退回按名字后缀猜,见 `face_slot_of`。
+    pub face_slot: u8,
     /// 脸的另一种做法:父链里是 `M_P_Eyes_Mesh`(全库 859 片脸网格里有 21 片)。
     ///
-    /// 这一族**不偏 UV**:八种表情各是一份独立几何,叠在同一处,UV 各自钉死在图集的一格上,
+    /// 这一族**不偏 UV**:八种眼神各是一份独立几何,叠在同一处,UV 各自钉死在图集的一格上,
     /// 顶点色 G 通道写着自己是第几张(`floor(G × 10)` ∈ 1..8)。游戏靠材质参数只画其中一张
     /// (根材质 `M_P_Eyes_Mesh` 上那个默认值为 1 的 `Number`)。
     /// **我们原来把它当普通图集脸画,于是八张一起画** —— 乖乖鹄一家的
@@ -834,6 +878,7 @@ pub(super) fn material_table(root: &Path, raw: HashMap<String, RawMaterial>) -> 
                     base_color: mat.base_color.map(|rel| root.join(rel)),
                     mask_alpha: mat.mask_alpha,
                     face: mat.parents.iter().any(|p| p.contains("P_Eyes")),
+                    face_slot: face_slot_of(&name, mat.face_track.as_deref()) as u8,
                     face_cards: mat.parents.iter().any(|p| p.contains("P_Eyes_Mesh")),
                     glassy_target: is_glassy_target(&name, &mat.parents),
                     effect: Effect {

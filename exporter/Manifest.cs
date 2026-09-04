@@ -105,7 +105,7 @@ public record MaterialEntry(
     string Name,
     /// 基色贴图在包内的相对路径;null = 这个材质不画固有色(纯 VFX),运行时目前整片跳过。
     string? BaseColor,
-    /// 贴图 alpha 是不是真遮罩(眼/嘴的表情图集是,本体贴图不是)。
+    /// 贴图 alpha 是不是真遮罩(眼/嘴的眼神图集是,本体贴图不是)。
     bool MaskAlpha,
     float MaskClip,
     string Blend,
@@ -271,7 +271,10 @@ public record MaterialEntry(
     /// 上面那层的染色 `SpecColor`(线性 RGB)。
     float[]? SpecColor = null,
     /// `MaskTex`:**RG 是切线空间法线、A 是 `MatID`**。见 `MaterialInfo.MatIdTexture`。
-    string? MatIdTexture = null);
+    string? MatIdTexture = null,
+    /// 这个槽跟哪条眼神曲线走(`eye` / `eye_1` / `mouth` / `dynamic1`…,见 FaceCurves.SlotTracks);
+    /// null = 不是脸槽。键与 `[forms.face]` 里那几个是同一套。
+    string? FaceTrack = null);
 
 public record FormReport(
     Form Form,
@@ -284,7 +287,9 @@ public record FormReport(
     /// 叫声与动作音效;null = 这个形态两族库都没有(或者外部工具不在)。
     AudioInfo? Audio = null,
     /// 异色材质表(键是**默认**槽的材质名,glb 里用的就是它)。空 = 这个形态没有异色。
-    List<MaterialEntry>? ShinyMaterialsOrNull = null)
+    List<MaterialEntry>? ShinyMaterialsOrNull = null,
+    /// 形变目标(脸的 blendshape)的名字,顺序即 glb 里 morph target 的顺序。
+    MorphInfo? Morph = null)
 {
     /// 异色材质表,永远不为 null。
     public List<MaterialEntry> ShinyMaterials => ShinyMaterialsOrNull ?? [];
@@ -326,6 +331,9 @@ public static class Manifest
                 parts.Add($"outline_id_tex = {Quote(mat.OutlineIdTexture)}");
             }
             if (mat.PaintOrder) parts.Add("paint_order = true");
+            // 脸槽跟哪条曲线走。**逐槽写**:同一族里第几个是按网格的槽序数的,
+            // 运行时的材质表是按名字查的哈希表、没有槽序,只能由导出器算好写下来。
+            if (mat.FaceTrack is { } track) parts.Add($"face_track = {Quote(track)}");
             // 炫彩那一层的平铺:**逐材质**、而且和星点层开没开无关(炫彩会把它打开)。
             if (mat.GlassyStarTiling > 0f)
                 parts.Add($"glassy_star_tiling = {Num(mat.GlassyStarTiling)}");
@@ -683,6 +691,32 @@ public static class Manifest
                     $"ms = {(int)MathF.Round(clip.Seconds * 1000f)}, frames = {clip.Frames}{extra} }}");
             }
 
+            // 眼神:动画自带的 EC_* 曲线(见 FaceCurves.cs)。**一个脸槽一条**,
+            // 键是槽名(`eye` / `eye_1` / `mouth` / `dynamic1`…,与材质表里的 `face_track`
+            // 同一套);同一段里各槽可以完全不一样。只写有内容的那些段。
+            var faced = report.Clips.Where(c => c.Faces is { Count: > 0 }).ToList();
+            if (faced.Count > 0)
+            {
+                sb.AppendLine();
+                sb.AppendLine("  [forms.face]   # 眼神:动画自带的 EC_* 曲线,一个脸槽一条,"
+                              + "[毫秒, 图集第几格(1..8)] 的阶梯;缺的槽/段用性格那张脸");
+                foreach (var clip in faced)
+                {
+                    var parts = clip.Faces!.Select(f => $"{f.Key} = {Track(f.Track)}");
+                    sb.AppendLine($"  {ClipKey(clip.Logical)} = {{ {string.Join(", ", parts)} }}");
+                }
+            }
+
+            // 形变目标:一部分宠物(全库 37 个资产)的脸是几何不是贴图 —— 里奥就没有嘴的
+            // 图集槽,嘴是本体网格上的形变。名字列在这儿只为**能回表核对**:权重曲线与
+            // 顶点位移都在 glb 里(标准的 glTF morph target + `weights` 通道),运行时按下标读。
+            if (report.Morph is { Names.Length: > 0 } morph)
+            {
+                sb.AppendLine();
+                sb.AppendLine("  [forms.morph]   # 形变目标(脸的 blendshape),顺序即 glb 里的 morph target 顺序");
+                sb.AppendLine($"  targets = [{string.Join(", ", morph.Names.Select(Quote))}]");
+            }
+
             if (report.Audio is { } audio)
             {
                 // 两节都用 `[forms.clips]` 那把键(动作逻辑名):谁在播这段动作,就出这个声
@@ -740,6 +774,10 @@ public static class Manifest
 
         return sb.ToString();
     }
+
+    /// 一条眼神曲线写成 `[[毫秒, 格号], …]`。
+    private static string Track(FaceTrack track) =>
+        "[" + string.Join(", ", track.Keys.Select(k => $"[{k.Ms}, {k.Card}]")) + "]";
 
     /// PETBASE_CONF.move_type 是中文(步行/浮游/…),转成运行时用的枚举。
     private static string Locomotion(string moveType) => moveType switch

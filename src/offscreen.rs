@@ -11,9 +11,22 @@ use glam::Vec3;
 
 use crate::pet::{Model, PetGpu, Player, gpu::DEPTH_FORMAT, orthographic_view};
 
-/// 这段动作自带的表情;它没意见就用默认那张脸(离屏渲染不带性格)。
-fn clip_face(clip: &str) -> crate::persona::Expression {
-    crate::persona::face_for_clip(clip).unwrap_or(crate::persona::DEFAULT_FACE)
+/// 这段动作在 `time` 时刻各脸槽的眼神(下标见 `pack::face_slot`)。走和运行时同一条路
+/// (见 stage.rs 的 `PetActor::faces`),只是离屏渲染不带性格,所以「默认」就是默认那张脸。
+fn clip_faces(
+    clip: &crate::pet::model::Clip,
+    time: f32,
+) -> [crate::persona::Expression; crate::pack::MAX_FACE_SLOTS] {
+    if clip.faces.iter().all(|t| t.is_empty()) {
+        let face =
+            crate::persona::face_for_clip(&clip.name).unwrap_or(crate::persona::DEFAULT_FACE);
+        return [face; crate::pack::MAX_FACE_SLOTS];
+    }
+    std::array::from_fn(|slot| {
+        crate::pack::face_at(&clip.faces[slot], time)
+            .and_then(crate::persona::Expression::from_card)
+            .unwrap_or(crate::persona::DEFAULT_FACE)
+    })
 }
 
 /// 输出纹理格式:和 stage 表面一致(非 sRGB,预乘 alpha)。
@@ -54,9 +67,9 @@ pub fn render(request: &Request) -> Result<()> {
         None => crate::pet::Mutation::default(),
     };
     // 异色挑的是另一张材质表,炫彩是往挑中的那套上刷一层 —— 两个轴分头落地,和运行时同一条路。
-    let spec = load_materials(&request.pack, &glb, mutation.shiny)
+    let (spec, clips_spec) = load_form_spec(&request.pack, &glb, mutation.shiny)
         .with_context(|| format!("{:?} 里找不到这个形态的材质表,重导一次包", request.pack))?;
-    let mut model = Model::load(&glb, &spec)?;
+    let mut model = Model::load(&glb, &spec, &clips_spec)?;
     // 赛季专属贴图要按 petbase_id 认人,裸 glb 认不出来(没有 manifest),按 0 处理。
     let petbase = petbase_id(&request.pack, &glb).unwrap_or(0);
     model.apply_mutation(mutation, petbase);
@@ -206,8 +219,9 @@ pub fn render(request: &Request) -> Result<()> {
                 time: request.time,
                 // 目标实机配置是 MaterialQualityLevel=Low。
                 high_material_quality: false,
-                face_uv: face.uv_offset(),
+                face_uv: [face.uv_offset(); crate::pack::MAX_FACE_SLOTS],
                 face_card: face.card(),
+                morph_weights: [0.0; crate::pet::model::MAX_MORPH_TARGETS],
             },
             &identity,
         );
@@ -234,9 +248,9 @@ pub fn render(request: &Request) -> Result<()> {
         let mut player = Player::new(&model, index);
         player.seek(duration * request.at);
         player.update(&model);
-        // 这段动作自带的表情。离屏渲染不带性格,所以「没意见」就是默认那张脸 ——
-        // 于是这张图也顺带成了「换动作换眼睛」的验收图
-        let face = clip_face(name);
+        // 这段动作在采样时刻的眼神。离屏渲染不带性格,所以「没意见」就是默认那张脸 ——
+        // 于是这张图也顺带成了「换动作换眼睛/换嘴」的验收图
+        let faces = clip_faces(&model.clips[index], duration * request.at);
         pet.update(
             &queue,
             &crate::pet::FrameParams {
@@ -245,8 +259,9 @@ pub fn render(request: &Request) -> Result<()> {
                 outline_scale: 1.0,
                 time: request.time,
                 high_material_quality: false,
-                face_uv: face.uv_offset(),
-                face_card: face.card(),
+                face_uv: faces.map(|f| f.uv_offset()),
+                face_card: faces[0].card(),
+                morph_weights: player.morph_weights,
             },
             &player.matrices,
         );
@@ -287,8 +302,9 @@ pub fn render(request: &Request) -> Result<()> {
                 outline_scale: 1.0,
                 time: request.time,
                 high_material_quality: false,
-                face_uv: crate::persona::DEFAULT_FACE.uv_offset(),
+                face_uv: [crate::persona::DEFAULT_FACE.uv_offset(); crate::pack::MAX_FACE_SLOTS],
                 face_card: crate::persona::DEFAULT_FACE.card(),
+                morph_weights: player.morph_weights,
             },
             &player.matrices,
         );
@@ -370,8 +386,9 @@ fn benchmark(
                 outline_scale: 1.0,
                 time: frame_time,
                 high_material_quality: false,
-                face_uv: crate::persona::DEFAULT_FACE.uv_offset(),
+                face_uv: [crate::persona::DEFAULT_FACE.uv_offset(); crate::pack::MAX_FACE_SLOTS],
                 face_card: crate::persona::DEFAULT_FACE.card(),
+                morph_weights: player.morph_weights,
             },
             &player.matrices,
         );
@@ -602,11 +619,17 @@ fn petbase_id(pack: &Path, glb: &Path) -> Option<i64> {
 
 /// 从包目录里定位形态的 glb(也接受直接给 .glb)。
 /// 从包的 manifest 里取这个形态的材质表。给的是裸 glb、或包没有材质表时返回 None。
-fn load_materials(
+/// 这个形态的材质表与动作表(**含眼神曲线**)。渲图必须走和运行时同一条路径,
+/// 否则「渲出来对不对」验的不是运行时的行为 —— 眼神也是。
+#[allow(clippy::type_complexity)]
+fn load_form_spec(
     pack: &Path,
     glb: &Path,
     shiny: bool,
-) -> Option<std::collections::HashMap<String, crate::pack::Material>> {
+) -> Option<(
+    std::collections::HashMap<String, crate::pack::Material>,
+    std::collections::HashMap<String, crate::pack::Clip>,
+)> {
     let dir = if pack.extension().is_some_and(|e| e == "glb") {
         // 裸 glb:往上两级找包目录(forms/<资产>/model.glb)
         pack.parent()?.parent()?.parent()?
@@ -617,7 +640,7 @@ fn load_materials(
     let asset = glb.parent()?.file_name()?.to_str()?;
     let form = loaded.forms.iter().find(|f| f.asset == asset)?;
     let table = form.materials_for(shiny);
-    (!table.is_empty()).then(|| table.clone())
+    (!table.is_empty()).then(|| (table.clone(), form.clips.clone()))
 }
 
 fn locate_glb(pack: &Path, form: Option<&str>) -> Result<PathBuf> {

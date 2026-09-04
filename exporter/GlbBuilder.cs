@@ -35,7 +35,17 @@ using SharpGLTF.Transforms;
 namespace RocomPets.Export;
 
 /// 一段已写进 glb 的动画。
-public record ClipResult(string Logical, string Clip, float Seconds, int Frames, float RootMotionCm);
+///
+/// `Faces` 是动画自带的眼神曲线(见 FaceCurves.cs),一个脸槽一条:
+/// 键是槽名(`eye` / `eye_1` / `mouth` / `dynamic1`…),与材质表里的 `face_track` 同一套。
+/// 没出现在里面的槽 = 这段动画没给它值,运行时那时退回性格给的那张脸。
+public record ClipResult(
+    string Logical,
+    string Clip,
+    float Seconds,
+    int Frames,
+    float RootMotionCm,
+    IReadOnlyList<(string Key, FaceTrack Track)>? Faces = null);
 
 public static class GlbBuilder
 {
@@ -51,7 +61,9 @@ public static class GlbBuilder
     public static Quaternion SwapYz(FQuat q) => new(-q.X, -q.Z, -q.Y, q.W);
 
     /// 导出网格 glb,再把 `clips`(逻辑名 → AnimSequence)加成动画通道。
-    public static (byte[] Glb, List<ClipResult> Written, List<string> Warnings) Build(
+    /// `Morph` 是这个形态导出的形变目标名(顺序即 glb 里 morph target 的顺序);
+    /// 空 = 这只没有,见 MorphTargets.cs。
+    public static (byte[] Glb, List<ClipResult> Written, List<string> Warnings, MorphInfo Morph) Build(
         USkeletalMesh mesh,
         IReadOnlyList<(string Logical, string Clip, UAnimSequence Sequence)> clips,
         int lodIndex)
@@ -70,13 +82,9 @@ public static class GlbBuilder
             meshFormat: EMeshFormat.Gltf2,
             meshQuality: quality,
             exportMaterials: false, // 贴图另走命名约定,见 Textures.cs
-            // 不导 morph target(表情 blend shape)。我们只播骨骼动画,从不驱动它们
-            // (glb 里既没有 morph 通道也没有 mesh.weights),纯属死重;
-            // 更要命的是 CUE4Parse 会把空的 morph 写成**没有 bufferView 的 accessor**——
-            // 按 glTF 规范那等价于「全零」是合法的,但 Rust 的 gltf crate 判定
-            // 「accessors[N].bufferView: Missing data」直接拒绝加载。
-            // 实测全量 826 个形态里 32 个带 morph target,这 32 个**全部**加载失败。
-            // 将来若真要做表情,除了打开这个开关还得把 AnimSequence 的曲线转成 morph 通道。
+            // **不走上游那条 morph 导出**(它会写出没有 bufferView 的 accessor,Rust 的
+            // gltf crate 直接拒绝加载;顶点匹配也是 O(n²) 且只取第一个命中)。
+            // 形变目标由 `MorphTargets.Inject` 在解析好的 glb 上自己写,理由见那个文件。
             exportMorphTargets: false);
 
         using var dto = new SkeletalMeshDto(mesh, quality);
@@ -89,6 +97,16 @@ public static class GlbBuilder
 
         var model = ModelRoot.ParseGLB(lod.Data);
         FixBindPose(model, mesh, warnings);
+        // 形变目标(脸的 blendshape)。**要在写动画之前**:每段动画的权重通道按
+        // `morph.Names` 的顺序整组给,顺序由这一步定下来。
+        var morph = MorphTargets.Inject(model, dto, mesh, lodIndex, warnings);
+        // 这个形态有哪几个脸槽(材质名后缀 + 槽序),动画只取这几条曲线 ——
+        // 动画是**整条进化链共用**的,一窝蜂一阶(只有一个 `_Es`)照样带着
+        // `EC_Eye_1`/`EC_Eye_2`,那是给二/三阶那两只小蜜蜂的,写进来只是白占体积。
+        var faceSlots = FaceCurves.SlotTracks(mesh).Values.Distinct().ToList();
+        var morphNode = morph.Names.Length == 0
+            ? null
+            : model.LogicalNodes.FirstOrDefault(n => n.Mesh is not null);
         var nodes = new Dictionary<string, Node>(StringComparer.Ordinal);
         foreach (var node in model.LogicalNodes)
             if (!string.IsNullOrEmpty(node.Name))
@@ -135,7 +153,7 @@ public static class GlbBuilder
                 }
                 var result = AddAnimation(
                     model, nodes, logical, clipName, sequence, foreign, skinned,
-                    suspects, shifted, trackMaps, borrowed, warnings);
+                    suspects, shifted, trackMaps, borrowed, warnings, morph, morphNode, faceSlots);
                 if (result is not null) written.Add(result);
             }
             catch (Exception e)
@@ -183,7 +201,7 @@ public static class GlbBuilder
 
         using var stream = new MemoryStream();
         model.WriteGLB(stream);
-        return (stream.ToArray(), written, warnings);
+        return (stream.ToArray(), written, warnings, morph);
     }
 
     /// 用正确的四元数映射改写骨骼节点旋转,并重算 inverseBindMatrices(见文件头的上游 bug 说明)。
@@ -232,7 +250,10 @@ public static class GlbBuilder
         List<(string Logical, TrackShift Shift)> shifted,
         IReadOnlyDictionary<int, int[]> trackMaps,
         List<string> borrowed,
-        List<string> warnings)
+        List<string> warnings,
+        MorphInfo morph,
+        Node? morphNode,
+        IReadOnlyList<string> faceSlots)
     {
         if (sequence.AdditiveAnimType != EAdditiveAnimationType.AAT_None)
         {
@@ -386,7 +407,12 @@ public static class GlbBuilder
         }
 
         var rootMotion = (rootEnd - rootStart).Size();
-        return new ClipResult(logical, clipName, frames / fps, frames, rootMotion);
+        var seconds = frames / fps;
+        // 形变目标的权重曲线(脸的 blendshape)。名字与形变目标同名,见 MorphTargets.cs。
+        if (morphNode is not null)
+            MorphTargets.WriteWeights(animation, morphNode, sequence, morph, seconds);
+        return new ClipResult(logical, clipName, seconds, frames, rootMotion,
+            FaceCurves.Extract(sequence, seconds, faceSlots));
     }
 
     public static bool IsInPlace(float rootMotionCm) => rootMotionCm < InPlaceThresholdCm;

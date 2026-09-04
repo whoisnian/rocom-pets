@@ -20,13 +20,12 @@ fn shade_main(in: VsOut, depth_coverage: f32) -> vec4<f32> {
     if material.family11.w > 0.5 {
         return shade_fairy_ball(in);
     }
-    // 表情:脸那两个槽的贴图是 2×4 的图集,网格 UV 落在左上那一格,
-    // 换表情就是整格地偏一下(flags.x = 1 表示图集脸)。其余材质偏移量恒为 0 ——
-    // **网格脸(flags.x = 2)也不能偏**:它八张卡的 UV 早各自钉在一格上了,再偏就串格。
-    let uv = in.uv + camera.face_uv * select(0.0, 1.0, is_atlas_face());
+    // 眼神:脸那两个槽的贴图各是一张 2×4 的图集,网格 UV 落在左上那一格,
+    // 换眼神就是整格地偏一下 —— 眼和嘴各偏各的,见 `face_uv_offset`。
+    let uv = in.uv + face_uv_offset();
     let tex = textureSample(base_color, base_sampler, uv);
     // **alpha 有三种含义,由材质决定**(params.x / params.z):
-    // - 镂空遮罩(眼/嘴的表情图集,params.x):按阈值剔,不剔就是一块方糊;
+    // - 镂空遮罩(眼/嘴的眼神图集,params.x):按阈值剔,不剔就是一块方糊;
     // - **不透明度**(params.z,静态开关 `Opacity or OpacityMask` 点名的 11 个材质);
     // - 线条遮罩(其余本体):RGB 是完整固有色,alpha 里画着身上的纹路(水灵的竖条纹就在这儿)。
     //   这种**绝对不能拿来剔像素**——本体贴图的 alpha 覆盖率普遍很低(813 张里 60 张 <5%),
@@ -362,17 +361,33 @@ fn shade_main(in: VsOut, depth_coverage: f32) -> vec4<f32> {
     return vec4<f32>(encoded * alpha, alpha);
 }
 
-// 脸有两种做法,由 `material.flags.x` 区分:1 = 图集脸(偏 UV)、2 = 网格脸(挑一张卡)。
-fn is_atlas_face() -> bool {
-    return material.flags.x > 0.5 && material.flags.x < 1.5;
+// 脸的种类由 `material.flags.x` 区分:
+//   0 = 不是脸、2 = 网格脸(挑一张卡)、**10 + 槽号** = 图集脸(偏 UV)。
+//
+// 图集脸要偏的那一格在 `camera.face_uv[]` 里,槽号定死在 `pack::face_slot`
+// (0 眼、1 眼#1、2 嘴、3 嘴#1、4..7 Dynamic1..4)。**逐槽分开**是因为游戏把它们写成
+// 一条条独立的动画曲线(`EC_Eye` / `EC_Mouth` / `EC_Dynamic1`…),同一段动作里可以指向
+// 不同的格子(幽星光的 `Shock` 是眼第 3 格、嘴第 7 格;幽影树的 `Relax` 是眼第 6 格、
+// 两条藤第 4 格)。
+// **网格脸(2)一格都不能偏**:它八张卡的 UV 早各自钉在一格上了,再偏就串格。
+fn face_uv_offset() -> vec2<f32> {
+    if material.flags.x < 9.5 {
+        return vec2<f32>(0.0, 0.0);
+    }
+    let slot = u32(material.flags.x - 10.0);
+    let pair = camera.face_uv[slot / 2u];
+    return select(pair.zw, pair.xy, (slot & 1u) == 0u);
 }
 
-/// 网格脸(`M_P_Eyes_Mesh`)只画当前表情那一张卡,其余七张整片剔掉。
+/// 网格脸(`M_P_Eyes_Mesh`)只画当前眼神那一张卡,其余七张整片剔掉。
 ///
 /// 卡号写在顶点色 G 里(`floor(G × 10)` ∈ 1..8);八张卡是**叠在同一处的独立几何**,
 /// 不剔就是「眉毛、眼睛、腮红搅在一起」。整张卡的顶点同色,所以插值出来的值也稳。
 fn cull_face_card(in: VsOut) {
-    if material.flags.x > 1.5 && abs(floor(in.color.g * 10.0) - camera.face_card) > 0.5 {
+    // ⚠ 只认 2(网格脸)。10 以上是图集脸(眼/嘴/Dynamic),它们的顶点色 G 里没有卡号,
+    // 拿这条剔等于把那一片整个剔掉。
+    if material.flags.x > 1.5 && material.flags.x < 2.5
+        && abs(floor(in.color.g * 10.0) - camera.face_card) > 0.5 {
         discard;
     }
 }

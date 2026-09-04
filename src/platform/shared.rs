@@ -214,7 +214,7 @@ impl Assets {
         }
         // 两个轴在这里分头落地:**异色**换的是整套材质,包里已经是换好的那一份,挑一张表就够了;
         // **炫彩**是往挑中的那套上刷一层。所以异色炫彩不必另写一条路 —— 挑异色那张表,再刷。
-        let mut model = Model::load(&form.model, form.materials_for(mutation.shiny))?;
+        let mut model = Model::load(&form.model, form.materials_for(mutation.shiny), &form.clips)?;
         model.apply_mutation(mutation, form.id);
         let model = Arc::new(model);
         self.models.insert(key, Arc::clone(&model));
