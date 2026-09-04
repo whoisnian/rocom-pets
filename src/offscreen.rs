@@ -55,6 +55,10 @@ pub struct Request {
     /// 外观变异,写法同 `roster.toml` 的 `mutation`(`异色` / `炫彩:3/33` / `炫彩:黑白`,
     /// 两者可用 `+` 同时带)。炫彩要这个二进制烘进了共享素材(构建时由 build.rs 决定)。
     pub mutation: Option<String>,
+    /// 描边宽度的倍率。**1 = 包里那份宽度**(离屏这一侧不按身高缩,见
+    /// `pet::gpu::desktop_outline_scale`)。给别的值是为了**标定**:拿实机高清截图
+    /// 反推宽度时要能试着把描边调窄/调宽再量一遍(见 `tools/edge_profile.py`)。
+    pub outline_scale: f32,
 }
 
 pub fn render(request: &Request) -> Result<()> {
@@ -215,7 +219,7 @@ pub fn render(request: &Request) -> Result<()> {
             &crate::pet::FrameParams {
                 view_proj,
                 light_dir,
-                outline_scale: 1.0,
+                outline_scale: request.outline_scale,
                 time: request.time,
                 // 目标实机配置是 MaterialQualityLevel=Low。
                 high_material_quality: false,
@@ -256,7 +260,7 @@ pub fn render(request: &Request) -> Result<()> {
             &crate::pet::FrameParams {
                 view_proj,
                 light_dir,
-                outline_scale: 1.0,
+                outline_scale: request.outline_scale,
                 time: request.time,
                 high_material_quality: false,
                 face_uv: faces.map(|f| f.uv_offset()),
@@ -299,7 +303,7 @@ pub fn render(request: &Request) -> Result<()> {
             &crate::pet::FrameParams {
                 view_proj,
                 light_dir,
-                outline_scale: 1.0,
+                outline_scale: request.outline_scale,
                 time: request.time,
                 high_material_quality: false,
                 face_uv: [crate::persona::DEFAULT_FACE.uv_offset(); crate::pack::MAX_FACE_SLOTS],
@@ -383,6 +387,7 @@ fn benchmark(
             &crate::pet::FrameParams {
                 view_proj,
                 light_dir: light,
+                // 基准这一路固定 1:出帧耗时不该随标定用的那个旋钮变
                 outline_scale: 1.0,
                 time: frame_time,
                 high_material_quality: false,

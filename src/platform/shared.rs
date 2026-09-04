@@ -176,6 +176,25 @@ pub fn canvas_size(logical: (u32, u32), scale: f32, max: u32) -> (u32, u32) {
     (side(logical.0), side(logical.1))
 }
 
+/// 合成那块四边形落在 stage 表面上的位置与大小(物理像素)。**两样都吸到像素网格上。**
+///
+/// 合成用的是线性采样器(`render.rs` 的 `quad`),所以只要目标矩形没和纹素对齐,
+/// 整只宠物就会被重采样一遍:
+///
+/// - **位置取整**。`逻辑坐标 × 缩放` 一般是小数,而走路时它每帧都换一个小数相位 ⇒
+///   每帧的糊法都不一样 —— 看着就是「边缘发糊,而且跟着动」。
+///   走一步是好几个像素,吸到整数像素上不会看出卡顿。
+/// - **大小取画布纹理的尺寸**,而不是再算一遍 `逻辑尺寸 × 缩放`。后者是小数,
+///   与纹理(那是取整过的)差着零点几个像素,于是**站着不动也一直在轻微缩放**。
+///   对齐之后 1:1;画布开了超采样时(见 `pet::target::SUPERSAMPLE`)正好是整数倍缩小,
+///   双线性退化成精确的盒式降采样。
+pub fn quad_rect(pos: (f32, f32), scale: f32, canvas: (u32, u32)) -> ((f32, f32), (f32, f32)) {
+    (
+        ((pos.0 * scale).round(), (pos.1 * scale).round()),
+        (canvas.0 as f32, canvas.1 as f32),
+    )
+}
+
 /// 解一层声音(叫声或动作音效)。
 ///
 /// **加载时就解码**:每次出声都重解是白费,而且直接把解码器丢进 mixer 出不了声
@@ -558,6 +577,23 @@ pub fn save_roster(roster: &[Member], packs_dir: Option<&Path>, path: Option<&Pa
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 落点吸到整数像素上,大小直接用纹理尺寸 —— 否则线性采样器每帧换一个相位重采样,
+    /// 边缘就会「发糊 + 跟着动」。
+    #[test]
+    fn the_composited_quad_lands_on_whole_pixels() {
+        let canvas = canvas_size((235, 235), 1.5, 8192);
+        let (pos, size) = quad_rect((100.3, 40.7), 1.5, canvas);
+        assert_eq!(pos, (150.0, 61.0), "落点该取整");
+        assert_eq!(
+            size,
+            (canvas.0 as f32, canvas.1 as f32),
+            "大小该等于纹理尺寸,而不是再算一遍 逻辑×缩放"
+        );
+        // 再算一遍是 352.5,而纹理只有 352 像素 —— 正是要避免的那半个像素的缩放
+        assert_eq!(canvas.0, 352);
+        assert_ne!(size.0, 235.0 * 1.5);
+    }
 
     #[test]
     fn caches_start_empty_and_prune_is_safe_on_empty() {

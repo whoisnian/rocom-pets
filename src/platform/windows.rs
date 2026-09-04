@@ -547,7 +547,8 @@ impl App {
             let gpu = self.gpu.as_ref().expect("上面判过");
             let canvas = PetTarget::new(&gpu.device, gpu.format(), canvas_size, &pet_gpu);
             let quad = gpu.create_quad(canvas.view());
-            let readback = MaskReadback::new(&gpu.device, canvas_size);
+            let readback =
+                MaskReadback::new(&gpu.device, canvas.render_size(), canvas.supersample());
             self.stages[index].pets.push(PetSurfaces {
                 id,
                 gpu: pet_gpu,
@@ -611,9 +612,11 @@ impl App {
             surfaces
                 .canvas
                 .render(&gpu.device, &gpu.queue, &surfaces.gpu);
-            surfaces
-                .readback
-                .resize(&gpu.device, surfaces.canvas.size());
+            surfaces.readback.resize(
+                &gpu.device,
+                surfaces.canvas.render_size(),
+                surfaces.canvas.supersample(),
+            );
         }
 
         let count = stage.pets.len();
@@ -638,17 +641,27 @@ impl App {
             };
             let (px, py) = entity.pos();
             let (aw, ah) = entity.actor().size();
-            let quad = match stage.pets.iter().find(|s| s.id == *id) {
-                Some(surfaces) => &surfaces.quad,
+            // 宠物走 `quad_rect`(吸到像素网格上);精灵那条调试路照旧
+            let (quad, (pos, size)) = match stage.pets.iter().find(|s| s.id == *id) {
+                Some(surfaces) => (
+                    &surfaces.quad,
+                    shared::quad_rect((px, py), scale, surfaces.canvas.size()),
+                ),
                 None => match stage.sprite_quad.as_ref() {
-                    Some(quad) => quad,
+                    Some(quad) => (
+                        quad,
+                        (
+                            (px * scale, py * scale),
+                            (aw as f32 * scale, ah as f32 * scale),
+                        ),
+                    ),
                     None => continue,
                 },
             };
             draws.push(QuadDraw {
                 quad,
-                pos: (px * scale, py * scale),
-                size: (aw as f32 * scale, ah as f32 * scale),
+                pos,
+                size,
                 highlight: entity.is_dragging(),
             });
         }
@@ -781,7 +794,11 @@ impl App {
                 if surfaces.canvas.resize(&gpu.device, canvas, &surfaces.gpu) {
                     surfaces.quad = gpu.create_quad(surfaces.canvas.view());
                 }
-                surfaces.readback.resize(&gpu.device, canvas);
+                surfaces.readback.resize(
+                    &gpu.device,
+                    surfaces.canvas.render_size(),
+                    surfaces.canvas.supersample(),
+                );
             }
         }
         // 窗口大小变了,区域是按旧尺寸算的

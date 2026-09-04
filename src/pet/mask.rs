@@ -11,6 +11,9 @@ use crate::sprite::Rect;
 
 /// 掩码格子边长(物理像素)。8 与精灵那套输入区粒度一致:
 /// 太小则矩形数量爆炸(wl_region 每个矩形都是一次调用),太大则腿/尾之间的空隙点不穿。
+///
+/// **画布是超采样的**(见 `pet::target::SUPERSAMPLE`),所以实际用的格子是
+/// `CELL × 超采样倍率` 个画布像素 —— 折算回物理像素仍是 8,格子数与矩形数不受影响。
 const CELL: u32 = 8;
 
 /// 判定「这一格算宠物」的 alpha 阈值。
@@ -26,6 +29,8 @@ const MIN_INTERVAL: std::time::Duration = std::time::Duration::from_millis(140);
 pub struct Mask {
     cols: u32,
     rows: u32,
+    /// 一格多少**画布**像素(= `CELL × 超采样倍率`)。`rects` 换算要用。
+    cell: u32,
     covered: Vec<bool>,
 }
 
@@ -43,8 +48,8 @@ impl Mask {
     /// 输出覆盖区域的矩形并集,坐标按 `logical_size` 缩放到角色局部逻辑像素。
     /// 只做行内合并:cell=8 时矩形是几十个量级,够用。
     pub fn rects(&self, logical_size: (u32, u32)) -> Vec<Rect> {
-        let sx = logical_size.0 as f32 / (self.cols * CELL) as f32;
-        let sy = logical_size.1 as f32 / (self.rows * CELL) as f32;
+        let sx = logical_size.0 as f32 / (self.cols * self.cell) as f32;
+        let sy = logical_size.1 as f32 / (self.rows * self.cell) as f32;
         let mut out = Vec::new();
         for row in 0..self.rows {
             let mut run: Option<u32> = None;
@@ -53,10 +58,10 @@ impl Mask {
                 match (covered, run) {
                     (true, None) => run = Some(col),
                     (false, Some(start)) => {
-                        let x0 = (start * CELL) as f32 * sx;
-                        let x1 = (col * CELL) as f32 * sx;
-                        let y0 = (row * CELL) as f32 * sy;
-                        let y1 = ((row + 1) * CELL) as f32 * sy;
+                        let x0 = (start * self.cell) as f32 * sx;
+                        let x1 = (col * self.cell) as f32 * sx;
+                        let y0 = (row * self.cell) as f32 * sy;
+                        let y1 = ((row + 1) * self.cell) as f32 * sy;
                         out.push(Rect {
                             x: x0.floor() as i32,
                             y: y0.floor() as i32,
@@ -80,16 +85,23 @@ impl Mask {
 /// 画布 → 掩码的异步回读。一次只在飞行中放一个请求。
 pub struct MaskReadback {
     buffer: wgpu::Buffer,
-    /// 缓冲对应的画布尺寸(物理像素)与行距。
+    /// 缓冲对应的画布尺寸(**画布像素**,已含超采样)与行距。
     canvas: (u32, u32),
     padded_row: u32,
+    /// 一格多少画布像素、扫描步长多少画布像素 —— 都按超采样倍率放大,
+    /// 于是格子粒度与 CPU 扫描量都与没有超采样时一样。
+    cell: u32,
+    step: u32,
     pending: bool,
     receiver: Option<std::sync::mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>>,
     last_request: Option<std::time::Instant>,
 }
 
 impl MaskReadback {
-    pub fn new(device: &wgpu::Device, canvas: (u32, u32)) -> Self {
+    /// `canvas` 是**纹理**尺寸(`PetTarget::render_size`),`supersample` 是它相对
+    /// 屏幕尺寸的倍率(`PetTarget::supersample`)。
+    pub fn new(device: &wgpu::Device, canvas: (u32, u32), supersample: u32) -> Self {
+        let n = supersample.max(1);
         let padded_row = (canvas.0 * 4).next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
         let buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("pet-mask-readback"),
@@ -101,6 +113,8 @@ impl MaskReadback {
             buffer,
             canvas,
             padded_row,
+            cell: CELL * n,
+            step: SAMPLE_STEP * n,
             pending: false,
             receiver: None,
             last_request: None,
@@ -108,11 +122,11 @@ impl MaskReadback {
     }
 
     /// 画布尺寸变了要重建(缓冲大小与行距都变了)。
-    pub fn resize(&mut self, device: &wgpu::Device, canvas: (u32, u32)) {
-        if canvas == self.canvas {
+    pub fn resize(&mut self, device: &wgpu::Device, canvas: (u32, u32), supersample: u32) {
+        if canvas == self.canvas && supersample.max(1) * CELL == self.cell {
             return;
         }
-        *self = Self::new(device, canvas);
+        *self = Self::new(device, canvas, supersample);
     }
 
     /// 提交一次「画布 → 缓冲」的拷贝并开始映射。
@@ -199,7 +213,13 @@ impl MaskReadback {
                     return None;
                 }
             };
-            Some(build(&view, self.canvas, self.padded_row))
+            Some(build(
+                &view,
+                self.canvas,
+                self.padded_row,
+                self.cell,
+                self.step,
+            ))
         };
         self.buffer.unmap();
         self.pending = false;
@@ -209,23 +229,26 @@ impl MaskReadback {
 }
 
 /// 把 RGBA 字节按格子 OR 归约成掩码(只看 alpha)。
-fn build(bytes: &[u8], canvas: (u32, u32), padded_row: u32) -> Mask {
-    let cols = canvas.0.div_ceil(CELL).max(1);
-    let rows = canvas.1.div_ceil(CELL).max(1);
+/// `cell`/`step` 的单位是**画布像素**(已含超采样倍率)。
+fn build(bytes: &[u8], canvas: (u32, u32), padded_row: u32, cell: u32, step: u32) -> Mask {
+    let cell = cell.max(1);
+    let cols = canvas.0.div_ceil(cell).max(1);
+    let rows = canvas.1.div_ceil(cell).max(1);
     let mut covered = vec![false; (cols * rows) as usize];
-    for y in (0..canvas.1).step_by(SAMPLE_STEP as usize) {
+    for y in (0..canvas.1).step_by(step.max(1) as usize) {
         let row_start = (y * padded_row) as usize;
-        let cell_row = y / CELL;
-        for x in (0..canvas.0).step_by(SAMPLE_STEP as usize) {
+        let cell_row = y / cell;
+        for x in (0..canvas.0).step_by(step.max(1) as usize) {
             let alpha = bytes[row_start + (x * 4) as usize + 3];
             if alpha >= ALPHA_THRESHOLD {
-                covered[(cell_row * cols + x / CELL) as usize] = true;
+                covered[(cell_row * cols + x / cell) as usize] = true;
             }
         }
     }
     Mask {
         cols,
         rows,
+        cell,
         covered,
     }
 }
@@ -250,7 +273,7 @@ mod tests {
     #[test]
     fn hit_only_inside_opaque_area() {
         let (bytes, padded) = canvas(64, 64, (16, 16, 48, 48));
-        let mask = build(&bytes, (64, 64), padded);
+        let mask = build(&bytes, (64, 64), padded, CELL, SAMPLE_STEP);
         assert!(mask.hit(0.5, 0.5), "正中应命中");
         assert!(!mask.hit(0.05, 0.05), "左上角透明处不该命中");
         assert!(!mask.hit(1.5, 0.5), "越界不该命中");
@@ -260,7 +283,7 @@ mod tests {
     #[test]
     fn rects_cover_opaque_and_scale_to_logical() {
         let (bytes, padded) = canvas(64, 64, (16, 16, 48, 48));
-        let mask = build(&bytes, (64, 64), padded);
+        let mask = build(&bytes, (64, 64), padded, CELL, SAMPLE_STEP);
         // 画布 64 物理像素 → 32 逻辑像素:矩形坐标应当整体减半
         let rects = mask.rects((32, 32));
         assert!(!rects.is_empty());
@@ -280,7 +303,7 @@ mod tests {
     #[test]
     fn empty_canvas_yields_empty_mask() {
         let (bytes, padded) = canvas(32, 32, (0, 0, 0, 0));
-        let mask = build(&bytes, (32, 32), padded);
+        let mask = build(&bytes, (32, 32), padded, CELL, SAMPLE_STEP);
         assert!(mask.is_empty());
         assert!(mask.rects((32, 32)).is_empty());
     }
