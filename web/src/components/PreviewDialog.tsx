@@ -1,5 +1,14 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { Loader2, RotateCcw, Sparkles, TriangleAlert, ZoomIn, ZoomOut } from "lucide-react";
+import {
+  Download,
+  Loader2,
+  RotateCcw,
+  Sparkles,
+  TriangleAlert,
+  ZoomIn,
+  ZoomOut,
+} from "lucide-react";
+import { toast } from "sonner";
 import type { Pack } from "../../shared/types.ts";
 import { Button } from "@/components/ui/button.tsx";
 import {
@@ -23,6 +32,14 @@ import {
   type Progress,
 } from "@/lib/preview.ts";
 import { previewUrl } from "@/lib/api.ts";
+import {
+  STICKER_FPS,
+  STICKER_RATES,
+  STICKER_SIZES,
+  download,
+  encodeGif,
+  plan,
+} from "@/lib/sticker.ts";
 import { cn, formatBytes } from "@/lib/utils.ts";
 
 interface Props {
@@ -110,6 +127,14 @@ function midOf(pointers: Map<number, { x: number; y: number }>): { x: number; y:
 }
 
 /**
+ * 装完形态之后界面上该显示哪一段在播。**跟着 wasm 走**:那边默认播 Idle,
+ * 没有 Idle 的形态退到第一段(见 `Preview::load_form`)。
+ */
+function pickClip(list: ClipEntry[]): string {
+  return list.find((c) => c.name === "Idle")?.name ?? list[0]?.name ?? "";
+}
+
+/**
  * 宠物预览。**点开才加载**:wasm 渲染器、包里的模型与贴图,都是这个组件挂上之后
  * 才开始下的 —— 首屏与只想下载的人一个字节都不多付。
  *
@@ -138,6 +163,15 @@ export function PreviewDialog({ pack, initial, onState, onOpenChange }: Props) {
   const [particle, setParticle] = useState(1);
   /** 炫彩取不到素材(部署时没传 `glassy/`)。出现过一次就把那几档一直禁着。 */
   const [glassyError, setGlassyError] = useState<string | null>(null);
+  // 表情包:正在播的那段动作 + 导出选项。wasm 那边装完形态默认播 Idle,这里跟着它
+  const [clip, setClip] = useState("Idle");
+  const [stickerSize, setStickerSize] = useState<number>(STICKER_SIZES[0]);
+  const [stickerFps, setStickerFps] = useState<number>(STICKER_FPS);
+  const [transparent, setTransparent] = useState(true);
+  /** 展开表情包那几个设置,同时在画布上画出取景框。 */
+  const [sticker, setSticker] = useState(false);
+  /** 正在存表情包时显示这一句(抓帧 / 编码进度);闲着是 null。 */
+  const [saving, setSaving] = useState<string | null>(null);
   const supported = canPreview();
   const hasShiny = forms.find((f) => f.asset === asset)?.shiny ?? false;
 
@@ -170,7 +204,9 @@ export function PreviewDialog({ pack, initial, onState, onOpenChange }: Props) {
         const wantFace = faces.includes(initial?.face ?? "") ? initial!.face! : (faces[0] ?? "");
         setFace(wantFace);
         setAsset(first);
-        setClips(await session.showForm(first, setProgress));
+        const list = await session.showForm(first, setProgress);
+        setClips(list);
+        setClip(pickClip(list));
         if (wantFace) session.setFace(wantFace);
 
         // 外观放在**装完形态之后**:`setMutation` 改的是「当前这只」,没有当前这只就没处改。
@@ -206,6 +242,45 @@ export function PreviewDialog({ pack, initial, onState, onOpenChange }: Props) {
     // —— 进了依赖就成了「改一下选项 → 重开一次会话」的死循环
   }, [pack, supported, canvas]);
 
+  /**
+   * 把**眼前这一身**存成 GIF:形态、眼神、异色/炫彩、朝向缩放、正在播的这段动作,
+   * 一样不落 —— 抓的就是同一个渲染器同一份状态(见 `Preview::capture`)。
+   *
+   * 帧数按动作时长算,不是固定值:接得上循环靠的是「一个周期均匀取 N 帧」。
+   */
+  const saveSticker = useCallback(async () => {
+    const session = sessionRef.current;
+    const current = clips.find((c) => c.name === clip);
+    if (!session || !current || !pack) return;
+    const { total, delayMs } = plan(current.seconds, stickerFps);
+    const name = forms.find((f) => f.asset === asset)?.name ?? pack.name;
+    setSaving("0%");
+    try {
+      const blob = await encodeGif(
+        // 分批要:512 那档 400 帧的原始 RGBA 有 420MB,不能一口气全拿在手里
+        (first) => session.capture(stickerSize, total, first, transparent, session.background),
+        {
+          size: stickerSize,
+          total,
+          delayMs,
+          transparent,
+          background: session.background,
+          onProgress: (ratio) => setSaving(`${Math.round(ratio * 100)}%`),
+        },
+      );
+      download(blob, `${name}-${current.label}.gif`);
+      toast.success("表情包已保存", {
+        description: `${stickerSize}×${stickerSize} · ${total} 帧 · ${Math.round(1000 / delayMs)}fps · ${formatBytes(blob.size)}`,
+      });
+    } catch (e) {
+      toast.error("存不下来", {
+        description: e instanceof Error ? e.message : String(e),
+      });
+    } finally {
+      setSaving(null);
+    }
+  }, [asset, clip, clips, forms, pack, stickerFps, stickerSize, transparent]);
+
   const switchForm = useCallback(
     async (next: string) => {
       const session = sessionRef.current;
@@ -216,7 +291,10 @@ export function PreviewDialog({ pack, initial, onState, onOpenChange }: Props) {
       const drop = shiny && !forms.find((f) => f.asset === next)?.shiny;
       if (drop) setShiny(false);
       try {
-        setClips(await session.showForm(next, setProgress));
+        const list = await session.showForm(next, setProgress);
+        setClips(list);
+        // 换形态时 wasm 那边会重新从 Idle 起播,界面上跟着回到同一段
+        setClip(pickClip(list));
         // 界面上放下了,wasm 那边也要跟着放下 —— 不然两边记的不是同一身,
         // 下次改配色时才「顺手」纠正过来,中间这段时间是对不上的
         if (drop) await session.setMutation(mutationText(false, kind, particle, color));
@@ -363,12 +441,21 @@ export function PreviewDialog({ pack, initial, onState, onOpenChange }: Props) {
 
         <div className="min-h-0 flex-1 overflow-y-auto px-5 py-4">
           {/* 画布不透明(见 preview.ts 的 watchTheme),底色由它照这块的背景现算 */}
-          <div className="relative overflow-hidden rounded-lg border bg-muted">
+          {/*
+            `[container-type:size]` 是给取景框用的:它要「父元素的短边」,而 CSS 里只有
+            容器查询单位能表达 `min(父宽, 父高)`。
+
+            **高度必须写在这一层**:`container-type: size` 连带的是**两个轴**的尺寸限制 ——
+            这块的高度不再由里面的 canvas 撑出来。原来高度挂在 canvas 上,加了这一句之后
+            整块塌成 0(实机反馈的「画布不见了」就是它)。所以高度提到这儿、canvas 改成
+            `h-full`,画出来一模一样,而尺寸限制拿到的是一个确定的高。
+          */}
+          <div className="relative h-[min(46svh,22rem)] overflow-hidden rounded-lg border bg-muted [container-type:size]">
             <canvas
               ref={setCanvas}
               className={cn(
                 // select-none:Shift+拖动本来是「扩选」,别让它把弹窗里的文字一路刷蓝
-                "block h-[min(46svh,22rem)] w-full touch-none select-none",
+                "block size-full touch-none select-none",
                 supported ? "cursor-grab active:cursor-grabbing" : "opacity-40",
               )}
               onPointerDown={onPointerDown}
@@ -380,6 +467,18 @@ export function PreviewDialog({ pack, initial, onState, onOpenChange }: Props) {
               onContextMenu={(e) => e.preventDefault()}
               onMouseDown={(e) => e.button === 1 && e.preventDefault()}
             />
+            {/*
+              表情包的取景框。**画布的世界高度是 `2 × 取景半径`**(`orbit_view` 只按 aspect
+              放宽横向),而贴纸是方的 ⇒ 抓的正是「画布正中、边长 = 画布短边」的那块。
+              `min(100cqw, 100cqh)` 就是这个短边 —— 父元素开了 `container-type: size`,
+              于是横屏按高、竖屏(手机上弹窗会变窄)按宽,和 `Preview::capture` 里那个
+              `fit` 是同一条。框本身不吃指针,拖动照旧。
+            */}
+            {sticker && !progress && !error && supported && (
+              <div className="pointer-events-none absolute inset-0 grid place-items-center">
+                <div className="aspect-square w-[min(100cqw,100cqh)] rounded-sm border-2 border-dashed border-primary/70" />
+              </div>
+            )}
             {(progress || error || !supported) && (
               <div className="absolute inset-0 grid place-items-center bg-card/80 px-6 text-center backdrop-blur-[1px]">
                 {error || !supported ? (
@@ -578,16 +677,103 @@ export function PreviewDialog({ pack, initial, onState, onOpenChange }: Props) {
 
           {clips.length > 0 && (
             <div className="mt-3 flex flex-wrap gap-1.5">
-              {clips.map((clip) => (
+              {clips.map((c) => (
                 <Button
-                  key={clip.name}
-                  variant="outline"
+                  key={c.name}
+                  variant={c.name === clip ? "default" : "outline"}
                   size="sm"
-                  onClick={() => sessionRef.current?.play(clip.name)}
+                  aria-pressed={c.name === clip}
+                  onClick={() => {
+                    setClip(c.name);
+                    sessionRef.current?.play(c.name);
+                  }}
                 >
-                  {clip.label}
+                  {c.label}
                 </Button>
               ))}
+            </div>
+          )}
+
+          {/*
+            存表情包。抓的是**眼前这一身**(形态/眼神/异色/炫彩/朝向/这段动作),
+            按动作时长取一整个循环 —— 所以放在动作那一行的下面,选完再存。
+
+            **默认只有一个按钮**:多数人是来看宠物或下包的,那几个设置对他们是噪声。
+            按下去才展开,同时画布上出现取景框 —— 那三个设置里「尺寸」影响的正是框里那块,
+            没有框的话调了也看不出变化。
+          */}
+          {clips.length > 0 && (
+            /*
+              `min-h-10`:展开的那两个下拉是 `h-10`,而按钮是 `h-8` —— 不占住这 8px 的话
+              一按下去整行长高、弹窗跟着跳一下。收起时那点空白看不出来,跳动看得出来。
+            */
+            <div className="mt-2 flex min-h-10 flex-wrap items-center gap-2">
+              <Button
+                variant={sticker ? "default" : "outline"}
+                size="sm"
+                aria-pressed={sticker}
+                onClick={() => setSticker((on) => !on)}
+              >
+                <Download />
+                下载当前动作为表情
+              </Button>
+              {sticker && (
+                <>
+                  <Select
+                    value={String(stickerSize)}
+                    onValueChange={(v) => setStickerSize(Number(v))}
+                  >
+                    <SelectTrigger className="w-28" aria-label="尺寸">
+                      <SelectValue placeholder="尺寸" />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {STICKER_SIZES.map((px) => (
+                        <SelectItem key={px} value={String(px)}>
+                          {px}×{px}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                  <Select
+                    value={String(stickerFps)}
+                    onValueChange={(v) => setStickerFps(Number(v))}
+                  >
+                    {/* 和「尺寸」同宽:w-24 装不下「20 fps」,会截成「20 f…」 */}
+                    <SelectTrigger className="w-28" aria-label="帧率">
+                      <SelectValue placeholder="帧率" />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {STICKER_RATES.map((fps) => (
+                        <SelectItem key={fps} value={String(fps)}>
+                          {fps} fps
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                  {/* 深色主题下「实心 = 开」不够显眼,再给个星标 —— 一眼看出选没选中 */}
+                  <Button
+                    variant={transparent ? "default" : "outline"}
+                    size="sm"
+                    aria-pressed={transparent}
+                    onClick={() => setTransparent((on) => !on)}
+                  >
+                    {transparent ? "★" : "☆"} 透明背景
+                  </Button>
+                  {/*
+                    定宽:进度是就地打在这颗按钮上的(「0%」…「100%」),不定宽的话每跳一次
+                    都在改行的排布 —— 那正是上面 `min-h-10` 要躲的那种抖动的横向版本。
+                  */}
+                  <Button
+                    size="sm"
+                    className="min-w-24 justify-center"
+                    disabled={saving !== null}
+                    onClick={() => void saveSticker()}
+                  >
+                    {saving ? <Loader2 className="animate-spin" /> : <Download />}
+                    {saving ?? "确定下载"}
+                  </Button>
+                </>
+              )}
             </div>
           )}
 

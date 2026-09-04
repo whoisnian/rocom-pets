@@ -50,6 +50,8 @@ export interface GlassyCatalog {
 export interface ClipEntry {
   name: string;
   label: string;
+  /** 一个循环多少秒。存表情包时按它算要抓多少帧。 */
+  seconds: number;
 }
 
 interface Wasm {
@@ -67,7 +69,7 @@ interface WasmPreview {
   put(path: string, bytes: Uint8Array): void;
   reset(): void;
   load_pack(): { asset: string; name: string; shiny: boolean }[];
-  load_form(asset: string): { name: string; label: string }[];
+  load_form(asset: string): { name: string; label: string; seconds: number }[];
   play(name: string): boolean;
   set_face(name: string): void;
   put_glassy(name: string, bytes: Uint8Array): void;
@@ -77,6 +79,17 @@ interface WasmPreview {
   zoom_by(factor: number): void;
   recenter(): void;
   set_background(r: number, g: number, b: number): void;
+  /** 抓第 `first` 帧起的一批,返回这批**实际**抓了几帧(0 = 没抓成)。见 `Preview::capture`。 */
+  capture(
+    size: number,
+    total: number,
+    first: number,
+    transparent: boolean,
+    r: number,
+    g: number,
+    b: number,
+  ): number;
+  capture_take(): Uint8Array | undefined;
   resize(width: number, height: number): void;
   frame(dt: number): void;
   free(): void;
@@ -117,6 +130,8 @@ export class PreviewSession {
   private theme: MutationObserver | null = null;
   /** 拖动要按它的 CSS 高度折算,见 `drag`。 */
   private canvas: HTMLCanvasElement | null = null;
+  /** 最近一次告诉 wasm 的画布底色(0~255)。存表情包挑「纯色背景」时用同一个。 */
+  private bg: [number, number, number] = [255, 255, 255];
   /** 已经喂进 wasm 的形态,别重复下载。 */
   private loaded = new Set<string>();
 
@@ -195,7 +210,9 @@ export class PreviewSession {
       });
       this.loaded.add(asset);
     }
-    const clips = pv.load_form(asset).map((c) => ({ name: c.name, label: c.label }));
+    const clips = pv
+      .load_form(asset)
+      .map((c) => ({ name: c.name, label: c.label, seconds: c.seconds }));
     this.start();
     return clips;
   }
@@ -267,6 +284,52 @@ export class PreviewSession {
     this.pv?.recenter();
   }
 
+  /** 画布当前的底色(0~255),跟着主题走。 */
+  get background(): [number, number, number] {
+    return this.bg;
+  }
+
+  /**
+   * 抓**一批**帧,给「存成表情包」用:一个循环切成 `total` 帧,这次要第 `first` 帧起的那批。
+   *
+   * 一批多少帧由 wasm 那边按显存预算定(512² 一帧就是 1MB),所以返回值里带回**实际**帧数,
+   * 调用方照着往下要(见 `Preview::capture` 与 `sticker.ts` 的 `encodeGif`)。
+   * `data` 是紧排的**预乘** RGBA(`frames × size × size × 4`),怎么还原成直通见 `sticker.ts`。
+   *
+   * 回读是异步的,所以这里隔帧问一次 —— 推进 GPU 的那个 rAF 循环本来就在转
+   * (见 `start`),不必再自己 poll 设备。
+   */
+  capture(
+    size: number,
+    total: number,
+    first: number,
+    transparent: boolean,
+    bg: [number, number, number],
+  ): Promise<{ data: Uint8Array; frames: number }> {
+    const pv = this.pv;
+    if (!pv) return Promise.reject(new Error("预览还没起来"));
+    const got = pv.capture(size, total, first, transparent, bg[0] / 255, bg[1] / 255, bg[2] / 255);
+    if (!got) return Promise.reject(new Error("抓帧没能开始"));
+    return new Promise((resolve, reject) => {
+      const poll = () => {
+        if (this.abort.signal.aborted || !this.pv) {
+          reject(new Error("预览已关闭"));
+          return;
+        }
+        let data: Uint8Array | undefined;
+        try {
+          data = this.pv.capture_take();
+        } catch (e) {
+          reject(e instanceof Error ? e : new Error(String(e)));
+          return;
+        }
+        if (data) resolve({ data, frames: got });
+        else requestAnimationFrame(poll);
+      };
+      requestAnimationFrame(poll);
+    });
+  }
+
   close() {
     this.abort.abort();
     cancelAnimationFrame(this.raf);
@@ -323,7 +386,9 @@ export class PreviewSession {
     const apply = () => {
       const host = canvas.parentElement ?? canvas;
       const rgb = toRgb(getComputedStyle(host).backgroundColor);
-      if (rgb) this.pv?.set_background(rgb[0] / 255, rgb[1] / 255, rgb[2] / 255);
+      if (!rgb) return;
+      this.bg = rgb;
+      this.pv?.set_background(rgb[0] / 255, rgb[1] / 255, rgb[2] / 255);
     };
     apply();
     this.theme = new MutationObserver(apply);

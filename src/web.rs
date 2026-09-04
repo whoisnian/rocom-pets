@@ -49,6 +49,55 @@ const PAN_LIMIT: f32 = 1.5;
 const ZOOM_MIN: f32 = 0.5;
 const ZOOM_MAX: f32 = 5.0;
 
+/// 表情包一帧的边长上下限(像素)。上限 512 是 Telegram 那档;微信表情是 240。
+const MIN_STICKER: u32 = 64;
+const MAX_STICKER: u32 = 512;
+/// 一个循环最多抓这么多帧。**帧率是前端挑的**,这条只是不让它离谱。
+///
+/// 全库 11513 段运行时动作里最长的是 12.27 秒(放松),400 帧摊在它上面是 32fps,
+/// 也就是前端那三档(20/25/50)里只有 50fps 撞得到这条,而撞到了也只是降帧率、
+/// 不截断(采样点仍铺满一个周期)。原来这里是 60 —— 那 9% 的长动作会掉到 5~15fps,
+/// 实机反馈的「掉帧严重」就是它。
+///
+/// 一次抓不下这么多没关系:回读缓冲按 [`MAX_STICKER_BYTES`] 分批,
+/// 前端按 `first` 逐批要(见 [`Preview::capture`])。
+const MAX_STICKER_FRAMES: u32 = 400;
+/// 表情包那一路的超采样倍率。和桌宠画布同一条理由(见 `pet::target::SUPERSAMPLE`):
+/// 管线一个采样点都没有,不超采样的话 240px 的贴纸边缘全是硬锯齿、描边还是一圈虚线。
+/// 先渲 2 倍再由 GPU 缩回去 —— **缩完再回读**,回读量与贴纸尺寸一致而不是它的四倍。
+const STICKER_SS: u32 = 2;
+
+/// 把 2 倍的那张缩回贴纸尺寸。一个全屏三角形 + 线性采样:目标像素中心正好落在
+/// 2×2 个源纹素正中,双线性 = 精确的盒式降采样(和 `platform::shared::quad_rect` 同一条)。
+/// 不开混合,预乘 alpha 原样写出去。
+const DOWNSAMPLE_WGSL: &str = r#"
+@group(0) @binding(0) var src: texture_2d<f32>;
+@group(0) @binding(1) var samp: sampler;
+
+struct VsOut {
+    @builtin(position) clip: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+};
+
+@vertex
+fn vs(@builtin(vertex_index) idx: u32) -> VsOut {
+    // 覆盖整个视口的大三角形
+    let uv = vec2<f32>(f32((idx << 1u) & 2u), f32(idx & 2u));
+    var out: VsOut;
+    out.clip = vec4<f32>(uv * 2.0 - 1.0, 0.0, 1.0);
+    out.uv = vec2<f32>(uv.x, 1.0 - uv.y);
+    return out;
+}
+
+@fragment
+fn fs(in: VsOut) -> @location(0) vec4<f32> {
+    return textureSample(src, samp, in.uv);
+}
+"#;
+/// **一批**回读缓冲的上限。512² 一帧就是 1MB,200 帧要 210MB —— 浏览器里一口气要这么大
+/// 不合适,所以分批:这条定的是一批多少字节([`Preview::capture`] 返回这一批抓了几帧)。
+const MAX_STICKER_BYTES: u64 = 48 << 20;
+
 #[wasm_bindgen(start)]
 pub fn start() {
     console_error_panic_hook::set_once();
@@ -59,6 +108,8 @@ pub fn start() {
 pub struct ClipInfo {
     pub name: String,
     pub label: String,
+    /// 这段动作一个循环多少秒。前端按它算表情包要抓多少帧。
+    pub seconds: f32,
 }
 
 /// 包里的一个形态。
@@ -212,6 +263,24 @@ pub struct Preview {
     time: f32,
     /// 清屏色。见 `attach` 里那段:网页画布只能是不透明的。
     background: wgpu::Color,
+    /// 正在飞的那次表情包抓帧。见 [`Preview::capture`]。
+    capture: Option<Capture>,
+}
+
+/// 一次抓帧:命令已经提交、缓冲正在映射。**回读是异步的**,和桌面版那份
+/// `pet::mask::MaskReadback` 同一套路数 —— 前端提交后隔帧来问 `capture_take`。
+struct Capture {
+    buffer: wgpu::Buffer,
+    /// 每帧的边长(像素)与帧数。
+    size: u32,
+    frames: u32,
+    /// 缓冲里每行多少字节(256 对齐后的)。
+    padded_row: u32,
+    /// 纹理格式是 BGRA 还是 RGBA —— 浏览器给的表面格式两种都见过,
+    /// 回读出来要按它决定换不换 R/B。
+    bgra: bool,
+    /// 映射完成了没有:`None` = 还在飞,`Some(ok)` = 好了(或者失败了)。
+    done: std::rc::Rc<std::cell::Cell<Option<bool>>>,
 }
 
 impl Default for Preview {
@@ -243,6 +312,7 @@ impl Preview {
                 b: 0.14,
                 a: 1.0,
             },
+            capture: None,
         }
     }
 
@@ -370,10 +440,13 @@ impl Preview {
 
         let clips = RUNTIME_CLIPS
             .iter()
-            .filter(|(name, _)| find_clip(&model, name).is_some())
-            .map(|(name, label)| ClipInfo {
-                name: (*name).to_string(),
-                label: (*label).to_string(),
+            .filter_map(|(name, label)| {
+                let index = find_clip(&model, name)?;
+                Some(ClipInfo {
+                    name: (*name).to_string(),
+                    label: (*label).to_string(),
+                    seconds: model.clips[index].duration,
+                })
             })
             .collect();
 
@@ -570,20 +643,7 @@ impl Preview {
         pet.player.advance(&pet.model, dt);
         pet.player.update(&pet.model);
 
-        // 正在播的那段动作说了算,它没意见才用人选的那张脸 —— 与 `PetActor::faces` 同一条规矩
-        let clip = &pet.model.clips[pet.player.current()];
-        let faces: [crate::persona::Expression; crate::pack::MAX_FACE_SLOTS] =
-            if clip.faces.iter().all(|t| t.is_empty()) {
-                let face = crate::persona::face_for_clip(&clip.name).unwrap_or(self.face);
-                [face; crate::pack::MAX_FACE_SLOTS]
-            } else {
-                let time = pet.player.time();
-                std::array::from_fn(|slot| {
-                    crate::pack::face_at(&clip.faces[slot], time)
-                        .and_then(crate::persona::Expression::from_card)
-                        .unwrap_or(self.face)
-                })
-            };
+        let faces = faces_of(pet, self.face);
         let aspect = gpu.config.width as f32 / gpu.config.height.max(1) as f32;
         pet.gpu.update(
             &gpu.queue,
@@ -621,61 +681,450 @@ impl Preview {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("preview"),
             });
-        // 两遍:先画写深度的,再拿那份场景深度画半透明外壳(与桌面/离屏同一套)
-        {
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("preview-opaque"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(self.background),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                    view: &gpu.depth,
-                    depth_ops: Some(wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(1.0),
-                        store: wgpu::StoreOp::Store,
-                    }),
-                    stencil_ops: None,
-                }),
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-            pet.gpu.draw_opaque(&mut pass, true);
-        }
-        {
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("preview-translucent"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Load,
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                // depth_ops = None ⇒ 只读:同一张深度既当附件又被采样,
-                // WebGPU 只在只读时允许
-                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                    view: &gpu.depth,
-                    depth_ops: None,
-                    stencil_ops: None,
-                }),
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-            pet.gpu.draw_translucent(&mut pass, depth_bind);
-        }
+        draw_pet(
+            &mut encoder,
+            &pet.gpu,
+            &view,
+            &gpu.depth,
+            depth_bind,
+            self.background,
+        );
         gpu.queue.submit(Some(encoder.finish()));
         gpu.queue.present(frame);
     }
+
+    /// 抓一整个循环的帧,给「存成表情包」用。用的是**当前的一切**:形态、眼神、
+    /// 异色/炫彩、朝向与缩放、正在播的那段动作。
+    ///
+    /// **不是把画布录下来**,三条理由:
+    ///
+    /// 1. 画布只能不透明(见 `attach`),录下来抠不出干净的透明背景;
+    /// 2. rAF 的采样点和动作时长没关系,录出来首尾接不上;
+    /// 3. 画布是长方的,而表情包要方的。
+    ///
+    /// 所以另开一张方的 RGBA 离屏纹理,时间轴按 `t = i × 时长 / total` 均匀取
+    /// (首尾不重复 ⇒ 循环接得上),清成全透明 ⇒ 拿到的是**带真 alpha** 的帧。
+    ///
+    /// **取的正是预览里那个方框**(前端画的虚线框):画布的世界高度是 `2 × 取景半径`,
+    /// 而贴纸是方的 ⇒ 取「画布正中、边长 = 画布短边」的那块。横屏时就是画布高度那么大的
+    /// 中央方块;竖屏(手机上弹窗会变窄)时按宽度来,不然会把画布外的东西也抓进去。
+    ///
+    /// **着色器那个 `time` 是冻住的**(取当前值)。火焰流动、星点闪烁的周期和动作时长
+    /// 没有公倍数,跟着推进的话每绕一圈就跳一下 —— 表情包是要无限循环的,宁可让那几层
+    /// 停在一个好看的相位上。
+    ///
+    /// 回读是异步的,和桌面版 `pet::mask::MaskReadback` 同一套路数:这里只提交,
+    /// 前端隔帧问 [`Preview::capture_take`]。同时只许一次在飞。
+    ///
+    /// `transparent = false` 时清成 `(r, g, b)` 那个不透明纯色。
+    ///
+    /// ## 分批
+    ///
+    /// 一整个循环最多 [`MAX_STICKER_FRAMES`] 帧,而 512² 一帧就是 1MB —— 全塞一个回读缓冲
+    /// 要 210MB。所以**按 [`MAX_STICKER_BYTES`] 分批**:调用方给这一批从哪一帧 `first` 起,
+    /// 拿回**这一批抓了几帧**(0 = 没抓成:没有模型、上一次还在飞、或者 `first` 已经到头)。
+    /// `total` 只影响时间轴怎么切,所以分不分批、怎么分,出来的帧都是同一批。
+    // 参数是多,但这是给 JS 的接口:包成结构体那边就得先造个对象再传,
+    // 而 `wasm_bindgen` 对结构体入参要额外的胶水。八个标量直接传更省事。
+    #[allow(clippy::too_many_arguments)]
+    pub fn capture(
+        &mut self,
+        size: u32,
+        total: u32,
+        first: u32,
+        transparent: bool,
+        r: f32,
+        g: f32,
+        b: f32,
+    ) -> u32 {
+        if self.capture.is_some() {
+            return 0;
+        }
+        let (Some(gpu), Some(pet)) = (self.gpu.as_mut(), self.pet.as_mut()) else {
+            return 0;
+        };
+        let size = size.clamp(MIN_STICKER, MAX_STICKER);
+        let total = total.clamp(1, MAX_STICKER_FRAMES);
+        let Some(left) = total.checked_sub(first).filter(|n| *n > 0) else {
+            return 0;
+        };
+        let padded_row = (size * 4).next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
+        let per_frame = padded_row as u64 * size as u64;
+        let budget = (MAX_STICKER_BYTES / per_frame.max(1)).max(1) as u32;
+        let frames = left.min(budget);
+        let bytes = per_frame * frames as u64;
+
+        // 渲 2 倍那张,再由 GPU 缩回贴纸尺寸(见 `STICKER_SS`)
+        let hi = size * STICKER_SS;
+        let extent = wgpu::Extent3d {
+            width: size,
+            height: size,
+            depth_or_array_layers: 1,
+        };
+        // 管线是按表面格式建的(`load_form` 里那句 `PetGpu::new`),这两张也得跟它一样,
+        // 否则整套管线都不认。浏览器给的常是 BGRA,回读之后再换 R/B。
+        let format = gpu.config.format;
+        let hi_color = gpu.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("sticker-hi"),
+            size: wgpu::Extent3d {
+                width: hi,
+                height: hi,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let hi_view = hi_color.create_view(&wgpu::TextureViewDescriptor::default());
+        let color = gpu.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("sticker-color"),
+            size: extent,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let color_view = color.create_view(&wgpu::TextureViewDescriptor::default());
+        let depth_view = make_depth(&gpu.device, hi, hi);
+        let depth_bind = pet.gpu.bind_scene_depth(&gpu.device, &depth_view);
+        let (shrink, shrink_bind) = downsampler(&gpu.device, format, &hi_view);
+        let buffer = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("sticker-readback"),
+            size: bytes,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+
+        let clear = if transparent {
+            wgpu::Color::TRANSPARENT
+        } else {
+            wgpu::Color {
+                r: r as f64,
+                g: g as f64,
+                b: b as f64,
+                a: 1.0,
+            }
+        };
+        let duration = pet.model.clips[pet.player.current()].duration.max(1e-4);
+        let resume = pet.player.time();
+        // 「画布正中、边长 = 画布短边」那块。画布的世界**高度**是 `2 × 取景半径`
+        // (`orbit_view` 只按 aspect 放宽横向),而取景半径正比于 padding ——
+        // 所以把 padding 乘上「短边 ÷ 高」就正好是那个方框。前端画的虚线框同此。
+        let (cw, ch) = (gpu.config.width.max(1), gpu.config.height.max(1));
+        let fit = cw.min(ch) as f32 / ch as f32;
+        let view_proj = orbit_view(
+            pet.model.motion_bounds,
+            self.yaw,
+            self.pitch,
+            PADDING / self.zoom * fit,
+            // 方的:表情包是方的,而画布不是
+            1.0,
+            self.target,
+        );
+        for i in 0..frames {
+            pet.player
+                .seek(duration * (first + i) as f32 / total as f32);
+            pet.player.update(&pet.model);
+            let faces = faces_of(pet, self.face);
+            pet.gpu.update(
+                &gpu.queue,
+                &FrameParams {
+                    view_proj,
+                    light_dir: Vec3::new(-0.4, 0.8, 0.6),
+                    outline_scale: 1.0,
+                    time: self.time,
+                    high_material_quality: false,
+                    face_uv: faces.map(|f| f.uv_offset()),
+                    face_card: faces[0].card(),
+                    morph_weights: pet.player.morph_weights,
+                },
+                &pet.player.matrices,
+            );
+            // **一帧一次 submit**:`update` 是 `queue.write_buffer`,它相对 submit 有序 ——
+            // 攒着一次提交的话每一遍读到的都是最后那次写进去的姿势。
+            let mut encoder = gpu
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("sticker"),
+                });
+            draw_pet(
+                &mut encoder,
+                &pet.gpu,
+                &hi_view,
+                &depth_view,
+                &depth_bind,
+                clear,
+            );
+            {
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("sticker-shrink"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &color_view,
+                        depth_slice: None,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            // 整张都会被那个全屏三角形盖住,清不清都一样
+                            load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                });
+                pass.set_pipeline(&shrink);
+                pass.set_bind_group(0, &shrink_bind, &[]);
+                pass.draw(0..3, 0..1);
+            }
+            encoder.copy_texture_to_buffer(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &color,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::TexelCopyBufferInfo {
+                    buffer: &buffer,
+                    layout: wgpu::TexelCopyBufferLayout {
+                        offset: padded_row as u64 * size as u64 * i as u64,
+                        bytes_per_row: Some(padded_row),
+                        rows_per_image: Some(size),
+                    },
+                },
+                extent,
+            );
+            gpu.queue.submit(Some(encoder.finish()));
+        }
+        // 抓完把播放游标放回去,预览那边不该因为存了张图就跳一下
+        pet.player.seek(resume);
+        pet.player.update(&pet.model);
+
+        let done = std::rc::Rc::new(std::cell::Cell::new(None));
+        let flag = done.clone();
+        buffer
+            .slice(..)
+            .map_async(wgpu::MapMode::Read, move |res| flag.set(Some(res.is_ok())));
+        self.capture = Some(Capture {
+            buffer,
+            size,
+            frames,
+            padded_row,
+            bgra: matches!(
+                gpu.config.format,
+                wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Bgra8UnormSrgb
+            ),
+            done,
+        });
+        frames
+    }
+
+    /// 取走 [`Preview::capture`] 的结果。**非阻塞**:还没好就返回 `undefined`,
+    /// 前端隔帧再问。好了就给一整块紧排的 RGBA(`frames × size × size × 4` 字节,
+    /// **预乘 alpha** —— 和管线里那条约定一致,前端合成/去预乘见 `sticker.ts`)。
+    pub fn capture_take(&mut self) -> Result<Option<Vec<u8>>, JsValue> {
+        let Some(cap) = self.capture.as_ref() else {
+            return Ok(None);
+        };
+        let Some(ok) = cap.done.get() else {
+            return Ok(None);
+        };
+        let cap = self.capture.take().expect("上一句刚看过");
+        if !ok {
+            return Err(JsValue::from_str("抓帧回读失败"));
+        }
+        let row = (cap.size * 4) as usize;
+        let mut out = vec![0u8; row * cap.size as usize * cap.frames as usize];
+        {
+            let view = cap
+                .buffer
+                .slice(..)
+                .get_mapped_range()
+                .map_err(|e| JsValue::from_str(&format!("抓帧映射失败: {e}")))?;
+            for i in 0..(cap.frames * cap.size) as usize {
+                let src = i * cap.padded_row as usize;
+                out[i * row..(i + 1) * row].copy_from_slice(&view[src..src + row]);
+            }
+        }
+        cap.buffer.unmap();
+        if cap.bgra {
+            for px in out.chunks_exact_mut(4) {
+                px.swap(0, 2);
+            }
+        }
+        Ok(Some(out))
+    }
+}
+
+/// 正在播的那段动作说了算,它没意见才用人选的那张脸 —— 与 `PetActor::faces` 同一条规矩。
+fn faces_of(
+    pet: &Pet,
+    fallback: Expression,
+) -> [crate::persona::Expression; crate::pack::MAX_FACE_SLOTS] {
+    let clip = &pet.model.clips[pet.player.current()];
+    if clip.faces.iter().all(|t| t.is_empty()) {
+        let face = crate::persona::face_for_clip(&clip.name).unwrap_or(fallback);
+        return [face; crate::pack::MAX_FACE_SLOTS];
+    }
+    let time = pet.player.time();
+    std::array::from_fn(|slot| {
+        crate::pack::face_at(&clip.faces[slot], time)
+            .and_then(crate::persona::Expression::from_card)
+            .unwrap_or(fallback)
+    })
+}
+
+/// 两遍:先画写深度的,再拿那份场景深度画半透明外壳(与桌面/离屏同一套)。
+///
+/// `clear` 的 alpha 是有意义的:画布那条路只能不透明(见 `attach`),
+/// 而表情包那条路清成全透明,拿到的就是**带真 alpha** 的一帧。
+fn draw_pet(
+    encoder: &mut wgpu::CommandEncoder,
+    pet: &PetGpu,
+    color: &wgpu::TextureView,
+    depth: &wgpu::TextureView,
+    depth_bind: &wgpu::BindGroup,
+    clear: wgpu::Color,
+) {
+    {
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("preview-opaque"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: color,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(clear),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                view: depth,
+                depth_ops: Some(wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(1.0),
+                    store: wgpu::StoreOp::Store,
+                }),
+                stencil_ops: None,
+            }),
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        pet.draw_opaque(&mut pass, true);
+    }
+    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+        label: Some("preview-translucent"),
+        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+            view: color,
+            depth_slice: None,
+            resolve_target: None,
+            ops: wgpu::Operations {
+                load: wgpu::LoadOp::Load,
+                store: wgpu::StoreOp::Store,
+            },
+        })],
+        // depth_ops = None ⇒ 只读:同一张深度既当附件又被采样,
+        // WebGPU 只在只读时允许
+        depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+            view: depth,
+            depth_ops: None,
+            stencil_ops: None,
+        }),
+        timestamp_writes: None,
+        occlusion_query_set: None,
+        multiview_mask: None,
+    });
+    pet.draw_translucent(&mut pass, depth_bind);
+}
+
+/// 「把 `src` 缩到目标附件那么大」的管线与绑定。见 [`DOWNSAMPLE_WGSL`]。
+fn downsampler(
+    device: &wgpu::Device,
+    format: wgpu::TextureFormat,
+    src: &wgpu::TextureView,
+) -> (wgpu::RenderPipeline, wgpu::BindGroup) {
+    let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("sticker-shrink"),
+        source: wgpu::ShaderSource::Wgsl(DOWNSAMPLE_WGSL.into()),
+    });
+    let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("sticker-shrink"),
+        entries: &[
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 1,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                count: None,
+            },
+        ],
+    });
+    let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+        label: Some("sticker-shrink"),
+        mag_filter: wgpu::FilterMode::Linear,
+        min_filter: wgpu::FilterMode::Linear,
+        ..Default::default()
+    });
+    let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("sticker-shrink"),
+        layout: &layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(src),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::Sampler(&sampler),
+            },
+        ],
+    });
+    let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("sticker-shrink"),
+        bind_group_layouts: &[Some(&layout)],
+        immediate_size: 0,
+    });
+    let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("sticker-shrink"),
+        layout: Some(&pipeline_layout),
+        vertex: wgpu::VertexState {
+            module: &module,
+            entry_point: Some("vs"),
+            compilation_options: Default::default(),
+            buffers: &[],
+        },
+        primitive: wgpu::PrimitiveState::default(),
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState::default(),
+        fragment: Some(wgpu::FragmentState {
+            module: &module,
+            entry_point: Some("fs"),
+            compilation_options: Default::default(),
+            // **不开混合**:预乘 alpha 原样写出去
+            targets: &[Some(wgpu::ColorTargetState {
+                format,
+                blend: None,
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        multiview_mask: None,
+        cache: None,
+    });
+    (pipeline, bind)
 }
 
 fn make_depth(device: &wgpu::Device, width: u32, height: u32) -> wgpu::TextureView {
