@@ -177,12 +177,12 @@ cp target/x86_64-pc-windows-msvc/release/rocom-pets.exe \
 
 # 2. 扫包目录,算 sha256,读 manifest 里的形态构成,顺便从解包数据拼头像精灵图
 npm run catalog -- --packs ~/Downloads/rocom/packs-all \
-                   --apps  ~/Downloads/rocom/dist-bin --version 0.2.0
+                   --apps  ~/Downloads/rocom/dist-bin --version 0.4.0
 
 # 3. 传 R2。--include 是必要的:导出器会在包目录里留下 report.txt,没加 --zip-only 的那几次
 #    还会留下一堆同名目录 —— catalog 只 glob *.rkpet 所以不受影响,但 rclone 会照单全收。
 rclone copy ~/Downloads/rocom/packs-all r2:rocom-pets/packs/ --include "*.rkpet" --progress
-rclone copy ~/Downloads/rocom/dist-bin  r2:rocom-pets/app/0.2.0/ --progress
+rclone copy ~/Downloads/rocom/dist-bin  r2:rocom-pets/app/0.4.0/ --progress
 
 # 3b. 炫彩共享贴图(13 张 3.5MB,仓库里的 assets/glassy 就是那一份)。**不传也能跑**,
 #     只是预览里「炫彩」那个下拉会在第一次点的时候报「这个站点没上传炫彩素材」。
@@ -192,7 +192,7 @@ rclone copy assets/glassy r2:rocom-pets/glassy/ --include "*.png" --progress
 npm run deploy
 ```
 
-`--version` 决定 R2 key 的前缀 `app/<版本>/` 与页面上显示的 `v0.2.0`。它和 `Cargo.toml` 里的
+`--version` 决定 R2 key 的前缀 `app/<版本>/` 与页面上显示的 `v0.4.0`。它和 `Cargo.toml` 里的
 `version` **没有任何代码上的联动**,发布时自己对齐:git tag、`Cargo.toml`、这个参数三处
 填同一个数。
 
@@ -282,7 +282,7 @@ npm run dev                                      # Vite + workerd,/api/* 是真�
 `404 R2 里没有 packs/….rkpet`。所以要真在浏览器里转一圈,得有真目录 + 本地对象:
 
 ```sh
-npm run catalog -- --packs ~/Downloads/rocom/packs-all --version 0.2.0   # 带 size/sha256
+npm run catalog -- --packs ~/Downloads/rocom/packs-all --version 0.4.0   # 带 size/sha256
 
 # dev 开着,往它那份本地 R2 里灌。键里的 / 必须写成 %2F(不然按路径分段,404),
 # 中文原样即可
