@@ -381,9 +381,13 @@ missing_clips = ["hide"]
 5. 叫声转码，生成 manifest 与覆盖率报告，打包 zip。
 
 依赖与坑：
-- **CUE4Parse 克隆必须先打补丁**,否则法线会被静默写成切线(§1「法线」那条):
-  `git -C "$CUE4PARSE_DIR" apply <本仓库>/exporter/patches/0001-fix-FPackedNormal-quantize.patch`。
-  导出器启动时会自检并拦住,不打补丁跑不起来。
+- **CUE4Parse 克隆必须先打补丁**:`git -C "$CUE4PARSE_DIR" apply <本仓库>/exporter/patches/*.patch`。
+  三条上游没修的(`0003`/`0004` 是本作特有的格式,`0002` 是通用的):`0002` 网格没有顶点色缓冲时 `COLOR_0` 该是白的(三个族拿它当遮罩,
+  给 0 等于整层关掉)、`0003` 标量参数表的步长(不改则探针只有第一个参数有名字,见 findings.md
+  「步长差 4 字节」那节)、`0004` luac 前面那 7 字节头(只影响手工读 lua,导出不用)。
+  `0002` 导出器启动时会自检并拦住,不打跑不起来。
+  **法线那条(`FPackedNormal` 少括号)上游 9893d83b 自己修了**,补丁已撤;
+  自检仍在,克隆太旧会被拦下。
 - CUE4Parse-Natives **必须带 ACL 编译**，否则动画解压报 `nAllocate` 找不到：
   `git submodule update --init --recursive CUE4Parse-Natives/ACL/external/acl`，
   再 `cmake -B builddir -DCMAKE_BUILD_TYPE=RelWithDebInfo . && cmake --build builddir`。

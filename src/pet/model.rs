@@ -580,7 +580,8 @@ impl Model {
                 // UE 顶点工厂在网格没有颜色缓冲时提供白色常量；这也是目标 PS 实际读到的值。
                 .unwrap_or_else(|| vec![[1.0; 4]; positions.len()]);
             if has_source_colors {
-                // 当前 CUE4Parse glTF 导出器把 FColor 的隐式 [0,1] 转换又除了一次 255。
+                // 旧版 CUE4Parse glTF 导出器(`f081f32e` 之前)把 FColor 的隐式 [0,1] 转换又除了一次 255;
+                // 上游已修,这段是**读老包**的兼容。
                 // 因而本应为 1 的通道在 GLB 中只有 1/255；这些通道正是原材质用来控制
                 // XiaoYou/FakeFluid 等效果的顶点遮罩。只识别这种明确的特征，兼容早期
                 // 已正确导出的包（其最大值会显著大于 1/255）。

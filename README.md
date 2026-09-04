@@ -281,7 +281,7 @@ cargo run                                                  # 同上但用调试�
 # `--profile fast` = release 的优化 + 能并行的 LTO:改一行重编 23 秒 vs release 的 1 分 38 秒
 # (代价是二进制大 3.4MB)。**出包仍然用 `--release`**,体积那一档在发布里要算。
 cargo run --profile fast -- --render packs/喵喵 --bench 600  # 离屏渲宠物 + 测出帧耗时
-git -C "$CUE4PARSE_DIR" apply exporter/patches/*.patch      # 导出前必做:修上游法线与顶点色导出 bug
+git -C "$CUE4PARSE_DIR" apply exporter/patches/*.patch      # 导出前必做:修上游顶点色 / 标量参数名 / lua 头三处
 dotnet run --project exporter -- --species 3001 --out packs # 导一条进化链
 dotnet run --project exporter -- --all --zip-only --skip-existing --out packs  # 全量导(可分批续跑)
 dotnet run --project exporter -- --glassy --out packs       # 只导炫彩共享贴图(正常导包时本来就会写)

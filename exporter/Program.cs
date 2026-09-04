@@ -150,15 +150,14 @@ if (indexOnly)
     return 0;
 }
 
-// **上游必须先打补丁**,见 patches/0001-fix-FPackedNormal-quantize.patch。
-// 未打补丁时法线会被静默写成切线(整只宠物的光照/matcap/边缘光全错,而模型看着仍然正常),
-// 所以在这儿硬拦一道:导出坏包比导出失败更糟。
+// 这一条**上游自己修了**(9893d83b 的 `Pack()`),所以本仓库不再带对应补丁 ——
+// 但坏掉的版本会把法线静默写成切线(整只宠物的光照/matcap/边缘光全错,而模型看着仍然正常),
+// 克隆太旧就是这个下场,所以在这儿仍然硬拦一道:导出坏包比导出失败更糟。
 if (!PackedNormalRoundTrips())
 {
     Console.Error.WriteLine("""
-        CUE4Parse 的 FPackedNormal(FVector) 构造函数是坏的(上游 bug),法线会被写成切线。
-        先给 CUE4Parse 克隆打补丁:
-          git -C "$CUE4PARSE_DIR" apply <本仓库>/exporter/patches/0001-fix-FPackedNormal-quantize.patch
+        CUE4Parse 的 FPackedNormal(FVector) 构造函数是坏的,法线会被写成切线。
+        这是上游 9893d83b 之前的 bug,把 CUE4Parse 克隆更新到该提交之后即可。
         细节见 docs/findings.md §1「法线」那几行。
         """);
     return 1;
@@ -892,7 +891,8 @@ FormReport ExportForm(
         warnings, audio, shinyMaterials);
 }
 
-/// 上游的 `FPackedNormal(FVector)` 是否能把向量原样存取回来。
+/// 上游的 `FPackedNormal(FVector)` 是否能把向量原样存取回来。**上游 9893d83b 起已修**,
+/// 这道自检只拦「克隆太旧」。
 ///
 /// 坏掉的版本少了括号、又踩了 C# 里 `+` 比 `<<` 紧的优先级,三个分量会被搅成一个数;
 /// 高精度切线基(`FPackedRGBA16N`)正是经它降到 8 位的,于是**法线与切线变成同一个向量**。

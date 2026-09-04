@@ -26,7 +26,7 @@
 | 捕尘长绒的资产家族是 `Wor_MaoTouXiaoZhu2_001`(毛头小蛛)，AI 表里正有「【毛头小蛛】主动清扫」 | §6 的第一个互动样例(珀尔鼬 × 捕尘长绒)有据可依 |
 | 叫声在 `WwiseAudio` 的 `Pet_Vo_*.bnk` + 流式 wem，`PetData.voice` 选组；粗嗓门/婉转声是运行时 Wwise pitch RTPC，wem 本身中性 | 复用 rocom-petvo 的提取管线；变调用播放速率复刻 |
 | CUE4Parse 的 BC7 解码有 R/B 通道对调的上游 bug | 导出贴图时必须换回，参照 rocom-capture 的 `FixBc7ChannelOrder` |
-| **法线一直是错的:上游把切线写进了 NORMAL。** `FPackedNormal(FVector)` 少了两层括号(`vector.X + 1 * 127.5` 是 `X+127.5`,要的是 `(X+1)*127.5`),又踩了 C# 里 `+` 比 `<<` 紧的优先级 —— `a + b << 8 + c << 16` 实际被解析成 `((a+b) << (8+c)) << 16`,三个分量搅成一个数。本作的切线基是**高精度**的(`FPackedRGBA16N`),而它降到 8 位**只经这个构造函数**,于是 TangentX 与 TangentZ 出来是同一个值。实测:glb 里 `NORMAL · TANGENT` 中位 **+1.000**(本该正交)、面法线·顶点法线 中位 **−0.12 ~ −0.71**(平面四边形的眼/嘴 100% 的面都反);修好后分别是 **≈0** 与 **+0.996~+0.999** | 打补丁:`exporter/patches/0001-fix-FPackedNormal-quantize.patch`(降到 8 位有 ≤0.45° 量化误差,可接受)。**导出器启动时硬拦一道**(`PackedNormalRoundTrips`):未打补丁直接退出,因为模型看着仍然正常、只有光照错,静默产出坏包比失败更糟。这条是**一大类观感问题的共同根因**——matcap 闪烁、两段明暗、边缘光、以及我为了压住「整只发白」加的那些底与增益,全是在错法线上调出来的 |
+| **法线一直是错的:上游把切线写进了 NORMAL。** `FPackedNormal(FVector)` 少了两层括号(`vector.X + 1 * 127.5` 是 `X+127.5`,要的是 `(X+1)*127.5`),又踩了 C# 里 `+` 比 `<<` 紧的优先级 —— `a + b << 8 + c << 16` 实际被解析成 `((a+b) << (8+c)) << 16`,三个分量搅成一个数。本作的切线基是**高精度**的(`FPackedRGBA16N`),而它降到 8 位**只经这个构造函数**,于是 TangentX 与 TangentZ 出来是同一个值。实测:glb 里 `NORMAL · TANGENT` 中位 **+1.000**(本该正交)、面法线·顶点法线 中位 **−0.12 ~ −0.71**(平面四边形的眼/嘴 100% 的面都反);修好后分别是 **≈0** 与 **+0.996~+0.999** | 打补丁:`exporter/patches/0001-fix-FPackedNormal-quantize.patch`(降到 8 位有 ≤0.45° 量化误差,可接受)。**补丁 2026-09-04 已撤** —— 上游 9893d83b 自己修好了(`Pack()`),见文末「跟上游同步到 52d7de4a」。**导出器启动时硬拦一道**(`PackedNormalRoundTrips`):未打补丁直接退出,因为模型看着仍然正常、只有光照错,静默产出坏包比失败更糟。这条是**一大类观感问题的共同根因**——matcap 闪烁、两段明暗、边缘光、以及我为了压住「整只发白」加的那些底与增益,全是在错法线上调出来的 |
 | **材质实例是能正常读的**——「`UMaterialInstance.Deserialize` 抛 OverflowException」这条旧结论**是错的**。实测本作 2792 个宠物材质全部强类型加载成功、参数一条不少。当初大概是把 CUE4Parse 为**别的**资产刷的 OverflowException 日志当成了材质的 | 贴图**不按命名约定猜**,直接读材质的 `TextureParameterValues`:`BaseTex`=本体基色、`EyeTex`=眼/嘴基色,`MaskTex/MainTex/StarStickTex/MatCap/Noise` 是别的通道。参数是继承的,要顺 `Parent` 链合并(子覆盖父) |
 | **alpha 的含义分两种,由基色参数名决定**:`EyeTex`(眼/嘴)的贴图是**带透明背景的表情图集**,alpha 是真遮罩;`BaseTex`(本体)的 alpha 是美术塞的遮罩通道(813 张 `_By_D` 里 160 张通过率 <95%、60 张 <5%) | 导出器把这个区分写进 manifest 的 `mask_alpha`:载入时本体贴图的 alpha 刷成 255、表情图集原样保留,shader 里一个统一的 alpha 测试就够。阈值用材质给的 `OpacityMaskClipValue`,全量实测都是 0.3333 |
 | **材质名在「资产文件名」与「对象名」之间大小写会漂,方向还不一致**:喵呜的文件是 `MI_Gra_MiaoMiao2_001_By`、对象名是 `…Miaomiao2…`,魔力猫正好反过来 | glb 里的材质名取的是**对象名**,所以 manifest 的键也要用对象名,运行时查表再统一小写。两头对不上的表现是**整只宠物一片都画不出来**,而且报错是 wgpu 深处一句 `buffer slice can not be empty`——现在载入时加了空网格守卫,直接说清楚 |
@@ -4336,3 +4336,36 @@ f = saturate((N·V − (FresnelOffset + FresnelSmooth))
 **这三只的「对比 / 亮度」仍旧不可全信** —— 那两颗球在实机侧是独立连通块、被 `game_mask`
 的「取最大连通块」剔掉了,在我们这侧却进了选区。
 
+### 跟上游同步到 52d7de4a:补丁集重排,导出产物一个字节没变(2026-09-04)
+
+上游从 `9893d83b` 走到 `52d7de4a`,**7 个提交**。逐条看过,**没有一条碰到本作要走的路**:
+Gangstar Mirage City / Aion2 / Zeus / PUBG 各自的支持;`Aes.cs` 是纯换行与字段改名;
+`FScriptStruct` 多认一个 `Uint32Vector4`;`FPakInfo`、`FText` 都是别的游戏的分支。
+唯一落在洛克王国那条分支上的是 `USkeletalMesh.Deserialize` 从 `if` 改成 `switch`
+(为了并进 Gangstar 的顶点解码),**顺带加了 `VertsFloat == null` 的保护,语义没变**。
+
+**实测核对**:同一份 paks、打完补丁,重导喵喵整条链(5 个形态)与 `packs-all/002-喵喵.rkpet`
+逐文件比 —— **glb / 贴图 / 全部形态目录逐字节相同**,只有 `manifest.toml` 的
+`generated_at` 与 `source_version` 两行不同。`.ogg` 也全都不同,但那**与换版无关**:
+同一份代码连导两遍,ogg 照样每次不一样(已连跑两次确认),编码器本身不确定。
+
+**补丁集从「0001+0002」变成「0002+0003+0004」**:
+
+| 补丁 | 状态 | 说明 |
+| --- | --- | --- |
+| `0001` FPackedNormal 量化 | **撤掉** | 上游 9893d83b 自己修了(私有 `Pack()`,还比我们那版多做一次 `MathF.Round`)。`Program.cs` 的 `PackedNormalRoundTrips` 自检**留着** —— 它现在拦的是「克隆太旧」,报错文案改成叫人更新而不是叫人打补丁 |
+| `0002` 顶点色缺省该是白 | 不变 | 仍能干净应用 |
+| `0003` 标量参数表步长 | **新入库** | 就是上面「步长差 4 字节」那节的改法,`Ar.Position.Align(Ar.Game is GAME_RocoKingdomWorld ? 4 : 8)` |
+| `0004` luac 前面那 7 字节头 | **新入库** | `NRCLua.DecryptLuaBytecode`:`FA E5 C0` + uint32-LE 密文长度,有就剥掉。手工读 lua 用,导出器根本不读 lua |
+
+**教训:`0003` / `0004` 当时只改在本机的 CUE4Parse 检出里、没进仓库,这次 `git pull` 之后
+`0003` 就没了**(`MaterialResourceTypes.cs` 上游动过,本地那行被冲掉;`0004` 因为文件上游没动
+才侥幸留着)。8-29 那节写的「补丁在本机的 CUE4Parse 检出里」= 下次换版必丢。
+**以后凡是要长期存在的上游改动,一律落成 `exporter/patches/` 里的文件。**
+
+`0003` 这次是**做了对照**才入库的:同一个 `--probe-material Wat_ShuiLanLan2_001`,
+`Align(8)` 时 `scalar-param[0] MaskID Max` 之后**全是 `None=0`**,换成 `Align(4)` 后
+`MaskID Min` / `Emitter Intensity` / `Flow_U_Speed` … **逐条都有名字**。
+
+三条补丁都对干净的 `52d7de4a` 试过(`patch -p1 --dry-run`),全部干净应用;
+`dotnet build exporter` 0 错误,导出器**没有一处 API 要跟着改**。
