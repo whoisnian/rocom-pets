@@ -119,32 +119,158 @@ async function underReportQuota(env: Env, ip: string): Promise<{ ok: boolean; ta
 
 // ---------------------------------------------------------------- 计数
 
-function bump(env: Env, id: string, kind: Kind, column: "downloads" | "reports") {
-  // UPSERT 里的 `列 = 列 + 1` 是单语句原子的。读出来加一再写回会在并发下丢计数。
-  return env.DB.prepare(
-    `INSERT INTO asset_stats (id, kind, downloads, reports, updated_at)
-     VALUES (?1, ?2, ?3, ?4, ?5)
-     ON CONFLICT(id) DO UPDATE SET ${column} = ${column} + 1, updated_at = excluded.updated_at`,
-  )
-    .bind(id, kind, column === "downloads" ? 1 : 0, column === "reports" ? 1 : 0, Date.now())
-    .run();
+/**
+ * 摘要里那个 id 的 JSON 路径,`$."002-喵喵"`。**只有一层** —— 父节点永远是 `$`,
+ * 于是新 id 首次出现时 `json_set` 能直接把它建出来(SQLite 不会替你补中间层)。
+ *
+ * SQLite 的路径解析在双引号键里不认反斜杠转义,所以 id 里带 `"` 就没法安全表达。
+ * 那种 id 不会从 `catalog.json` 里来,真碰上了回 null,让调用方**只写明细不写摘要** ——
+ * 宁可摘要少这一条(`db:init` 重算能补回来),也不能拼出一条歪路径去改别的键。
+ */
+function summaryPath(id: string): string | null {
+  return id.includes('"') ? null : `$."${id}"`;
+}
+
+/**
+ * 一次计数要写的语句:**明细一条 + 摘要一条**,永远一起 batch。
+ *
+ * - 明细(`asset_stats`)是真相。UPSERT 里的 `列 = 列 + 1` 单语句原子,读出来加一
+ *   再写回会在并发下丢计数。
+ * - 摘要(`stats_summary`)是给 `/api/stats` 单行读的派生物。这里也是**单语句原子**:
+ *   `json_set(payload, 路径, json_object(旧值 + 增量))`,增量在 SQL 里算完,不经过
+ *   Worker 的读-改-写,所以并发下不会互相盖掉。
+ *
+ * 两条放一个 `batch()` 里是**一个事务**:要么都成、要么都不成。宁可这次不计数,
+ * 也不要出现「明细加了、摘要没加」那种谁也说不清的漂移。
+ */
+function bumpWrites(
+  env: Env,
+  id: string,
+  kind: Kind,
+  column: "downloads" | "reports",
+): D1PreparedStatement[] {
+  const at = Date.now();
+  const dl = column === "downloads" ? 1 : 0;
+  const rp = column === "reports" ? 1 : 0;
+
+  const writes = [
+    env.DB.prepare(
+      `INSERT INTO asset_stats (id, kind, downloads, reports, updated_at)
+       VALUES (?1, ?2, ?3, ?4, ?5)
+       ON CONFLICT(id) DO UPDATE SET ${column} = ${column} + 1, updated_at = excluded.updated_at`,
+    ).bind(id, kind, dl, rp, at),
+  ];
+
+  const path = summaryPath(id);
+  if (path === null) {
+    console.error("id 里有双引号,摘要跳过这一条,等 db:init 重算", id);
+    return writes;
+  }
+
+  writes.push(
+    env.DB.prepare(
+      `UPDATE stats_summary
+       SET payload = json_set(payload, ?1, json_object(
+             -- CAST 不能省:D1 把 JS 的数字当 REAL 绑进来,不铸回整数的话摘要里会
+             -- 一路攒出 "downloads":1.0 这种值 —— 前端 JSON.parse 出来虽然还是 1,
+             -- 但数字白白变长,而且看一眼库就觉得哪里不对
+             'downloads', CAST(COALESCE(json_extract(payload, ?1 || '.downloads'), 0) + ?2 AS INTEGER),
+             'reports',   CAST(COALESCE(json_extract(payload, ?1 || '.reports'),   0) + ?3 AS INTEGER)
+           )),
+           updated_at = ?4
+       WHERE id = 1`,
+    ).bind(path, dl, rp, at),
+  );
+  return writes;
 }
 
 // ---------------------------------------------------------------- 路由
 
+/**
+ * `/api/stats` 读的是 `stats_summary` 那**一行**。以前它是全站唯一一个全表扫,而 D1
+ * 按「读了多少行」计费 —— 200 多个包,每回源一次就吃掉 200 多行,免费额度(500 万行/天)
+ * 两万多次首屏就见底。改成摘要之后每次回源只读 1 行,并且从此与包的数量脱钩。
+ *
+ * 摘要由计数那条路顺手维护(见 `bumpWrites`),真相仍在 `asset_stats`,`db:init` 会
+ * 从明细重算一遍摘要。
+ *
+ * 缓存还是要的:1 行也是行,而且省掉的是一整个 D1 往返(十几毫秒)。
+ * **只在响应头上写 `s-maxage` 没有用**:Cloudflare 的边缘缓存在 Worker 的*下游*
+ * (它缓存的是 Worker 里 `fetch()` 发出去的子请求),Worker 自己 `return` 的响应不会
+ * 被自动收进去 —— 那个头只管到浏览器。要让它进边缘缓存,得自己 `caches.default.put()`。
+ *
+ * 于是这里摞两层,都是 60 秒:
+ *
+ * - **isolate 内存** —— 同一个 isolate 连着来的请求连 Cache API 那次 await 都省了;
+ *   也是本地 `wrangler dev` 唯一生效的一层(miniflare 那边的 Cache API 是个永远 miss 的空壳)。
+ * - **Cache API** —— 跨 isolate、同一节点共享,isolate 被回收了也还在。
+ *
+ * 两层**都只由「真查了 D1」那条路填**,谁也不回填谁:所以最坏就是差 60 秒,不会两层
+ * 叠成 120 秒。计数本来也不是实时数据(点了下载是前端本地乐观 +1,见 `App.tsx` 里
+ * `stats` 与 `orderStats` 的分工),晚一分钟没人看得出来。
+ */
+const STATS_TTL_MS = 60 * 1000;
+let statsCache: { at: number; body: string } | null = null;
+
+/** 摘要行缺席时的回落。类型标注顺带把「payload 就是 StatsResponse」这件事钉在编译期。 */
+const EMPTY_STATS: StatsResponse = {};
+const EMPTY_STATS_BODY = JSON.stringify(EMPTY_STATS);
+
+const STATS_HEADERS: Record<string, string> = {
+  "content-type": "application/json",
+  // max-age 给浏览器;s-maxage 是下面 cache.put() 存多久的依据 —— Cache API 认这一条
+  "cache-control": "public, max-age=30, s-maxage=60",
+};
+
+/**
+ * 缓存键**把 query 丢掉**。`/api/stats?t=1` 和 `/api/stats` 是同一份数据,不归一的话
+ * 随手带个随机参数就能一路穿透到 D1,这层缓存等于没加。
+ */
+function statsCacheKey(url: string): Request {
+  const key = new URL(url);
+  key.search = "";
+  return new Request(key.toString(), { method: "GET" });
+}
+
+/**
+ * `caches.default` 就是边缘缓存本身,Workers 独有。tsconfig 的 lib 里同时开着 DOM,
+ * 而 DOM 那个 `CacheStorage` 没有 `default` 成员又正好压过 workers-types 的声明 ——
+ * 运行时是有的,所以这里断言一次,别把它扩散成到处 any。
+ */
+function edgeCache(): Cache {
+  return (caches as unknown as { default: Cache }).default;
+}
+
 app.get("/api/stats", async (c) => {
-  const { results } = await c.env.DB.prepare(
-    `SELECT id, downloads, reports FROM asset_stats`,
-  ).all<{ id: string; downloads: number; reports: number }>();
+  const now = Date.now();
+  if (statsCache && now - statsCache.at < STATS_TTL_MS) {
+    return new Response(statsCache.body, { headers: STATS_HEADERS });
+  }
 
-  const stats: StatsResponse = {};
-  for (const row of results) stats[row.id] = { downloads: row.downloads, reports: row.reports };
+  const cache = edgeCache();
+  const cacheKey = statsCacheKey(c.req.url);
+  const hit = await cache.match(cacheKey);
+  if (hit) return hit;
 
-  // 边缘缓存 60 秒。计数不是实时数据,而这个接口首屏必打 —— 缓存住之后
-  // 同一节点一分钟内只回源一次,D1 的读配额基本不动。
-  return c.json(stats, 200, {
-    "Cache-Control": "public, max-age=30, s-maxage=60",
-  });
+  // payload 本身就是一份 StatsResponse 的 JSON —— 原样当响应体发出去,不解析也不重新序列化
+  const row = await c.env.DB.prepare(
+    `SELECT payload FROM stats_summary WHERE id = 1`,
+  ).first<{ payload: string }>();
+
+  // 摘要行不见了(库还没跑过 db:init)只回空表:前端拿到空对象就是「都还没有数字」,
+  // 页面照常出。**别在这儿回落去扫 asset_stats** —— 那正是要躲开的那次全表扫,
+  // 真回落了反而是「越缺越贵」。
+  const body = row?.payload ?? EMPTY_STATS_BODY;
+  statsCache = { at: now, body };
+
+  const res = new Response(body, { headers: STATS_HEADERS });
+  // 写缓存别挡在响应前面;本地 dev 那个空壳 Cache 也可能直接抛,别让它冒到请求上
+  c.executionCtx.waitUntil(
+    cache
+      .put(cacheKey, res.clone())
+      .catch((err: unknown) => console.error("stats 缓存写入失败", err)),
+  );
+  return res;
 });
 
 app.get("/api/config", (c) => {
@@ -180,7 +306,7 @@ app.get("/api/dl/:id", async (c) => {
       (async () => {
         try {
           if (await claim(c.env, "dl", id, clientIp(c.req.raw))) {
-            await bump(c.env, id, target.kind, "downloads");
+            await c.env.DB.batch(bumpWrites(c.env, id, target.kind, "downloads"));
           }
         } catch (err) {
           console.error("下载计数失败", id, err);
@@ -447,15 +573,8 @@ app.post("/api/report", async (c) => {
        VALUES (?1, ?2, ?3, ?4, ?5)`,
     ).bind(body.id, body.reason, note, quota.tag.slice(0, 12), Date.now()),
   ];
-  if (counted) {
-    writes.push(
-      c.env.DB.prepare(
-        `INSERT INTO asset_stats (id, kind, downloads, reports, updated_at)
-         VALUES (?1, ?2, 0, 1, ?3)
-         ON CONFLICT(id) DO UPDATE SET reports = reports + 1, updated_at = excluded.updated_at`,
-      ).bind(body.id, target.kind, Date.now()),
-    );
-  }
+  // 明细 + 摘要跟着一起进这个 batch:和下载那条走同一套写法,别在这儿手抄第二份 UPSERT
+  if (counted) writes.push(...bumpWrites(c.env, body.id, target.kind, "reports"));
   await c.env.DB.batch(writes);
 
   return c.json({ ok: true, counted });

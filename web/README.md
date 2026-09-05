@@ -31,7 +31,11 @@ wrangler secret put DEDUPE_SALT         # 随便一串随机字符
 
 `wrangler.jsonc` 里的 D1 uuid 与 KV id 是账户内的资源标识、不是凭据(拿它读写仍要账户的
 API token),可以进公开仓库;真机密只有 `DEDUPE_SALT` 与 `TURNSTILE_SECRET`,走
-`wrangler secret put`,不落文件。`schema.sql` 全是 `IF NOT EXISTS`,`db:init` 重复跑无副作用。
+`wrangler secret put`,不落文件。`db:init` **重复跑无副作用,而且顺带修统计摘要** ——
+建表建索引全是 `IF NOT EXISTS`、删索引是 `IF EXISTS`,末尾那条 `stats_summary` 的
+UPSERT 每次都从 `asset_stats` 重算一遍。**已经部署过的库要再跑一次**:摘要表和
+`DROP INDEX idx_stats_downloads` 都靠它落到远端,现有计数会原样搬进摘要、不会清零
+(为什么这么设计见「`/api/stats` 为什么读的是一行」)。
 
 `DEDUPE_SALT` 不设也能跑 —— `worker/index.ts` 的 `claim()` 会回落到硬编码的 `"rocom-pets"`。
 但那个回落值就写在公开源码里,盐一旦已知,拿 `report_log.ip_tag` 那 12 位十六进制穷举
@@ -322,7 +326,7 @@ curl -s -X DELETE -H 'Content-Type: application/json' \
 
 | 路由 | 说明 |
 | --- | --- |
-| `GET /api/stats` | `{ id: { downloads, reports } }`,边缘缓存 60 秒 |
+| `GET /api/stats` | `{ id: { downloads, reports } }`,D1 里单行读 + 缓存 60 秒,见下 |
 | `GET /api/config` | 前端要的 Turnstile sitekey 与「是否直连」 |
 | `GET /api/dl/:id` | 计数后 302 到 R2(或代理字节);id 就是 `002-喵喵` / `app-windows-x64` |
 | `GET /api/link` | **开放接口**:拿游戏侧编号换一条预览链接,见下 |
@@ -330,6 +334,47 @@ curl -s -X DELETE -H 'Content-Type: application/json' \
 
 `/api/dl/:id` **不接受客户端传对象键** —— Worker 自己读 `catalog.json` 把 id 解析成 R2 key
 并缓存 5 分钟。让客户端传键等于把整个桶开放给任意路径。
+
+### `/api/stats` 为什么读的是一行
+
+D1 按「**读了多少行**」计费。这个接口首屏必打,而它原本是全站唯一一个全表扫 —— 201 个包
++ 2 个应用,回源一次就吃掉 203 行。免费额度 500 万行/天,合下来两万多次首屏就见底;相比
+之下 Worker 请求有 10 万/天、一次计数只写几行。**它烧额度比别的快得多,不是它被打得多,
+是它单次就贵两个数量级。**
+
+所以库里多了一张 `stats_summary`:**整张 `asset_stats` 压成一行 JSON**,形状就是
+`shared/types.ts` 的 `StatsResponse`。
+
+- **读**:`SELECT payload FROM stats_summary WHERE id = 1` —— 走主键,正好 1 行,而且
+  从此**与包的数量脱钩**(以后出到 500 个包也还是 1 行)。`payload` 本身就是响应体,
+  Worker 不解析也不重新序列化,原样发出去。
+- **写**:计数那条路顺手把摘要也更新掉,`json_set(payload, '$."<id>"', json_object(旧值 +
+  增量))`。增量在 SQL 里算完,**单语句原子**,不经过 Worker 的读-改-写,并发下不会互相盖。
+  明细与摘要两条语句放同一个 `batch()`(一个事务):要么都成、要么都不成,不会漂。
+
+代价是每次计数从写 1 行变成写 2 行。**这笔钱由删掉的 `idx_stats_downloads` 出** ——
+D1 的「写入行数」是把索引行算进去的,那条索引本来每次就要写一行,一换一,写入成本持平。
+顺带一提,**`asset_stats` 上别再加索引**:这张表上的读只剩按主键的 UPSERT,任何索引都排不
+上用场(排序是前端 `src/lib/search.ts` 的 `sortHits` 做的),加一条纯粹是给写入加钱。
+
+**摘要不是真相,`asset_stats` 才是。** 摘要漂了就从明细重算,`schema.sql` 末尾那条
+`INSERT … ON CONFLICT DO UPDATE` 干的就是这件事 —— 于是 `npm run db:init` 既是初始化也是
+修复工具,对**已经有数据的老库**会把现有计数原样搬进摘要,不会清零。
+
+#### 上面还压了一层 60 秒缓存
+
+1 行也是行,而且省下的是一整个 D1 往返(十几毫秒)。**只在响应头上写 `s-maxage` 不管用**:
+Cloudflare 的边缘缓存在 Worker 的*下游*(它缓存的是 Worker 里 `fetch()` 发出去的子请求),
+Worker 自己 `return` 的响应不会被自动收进去,那个头只管到浏览器。所以缓存是在 Worker 里
+手摞的两层:
+
+- **isolate 内存** —— 同一个 isolate 连着来的请求连 Cache API 那次 await 都省了;也是本地
+  `wrangler dev` 唯一生效的一层(miniflare 那边的 Cache API 是个永远 miss 的空壳)。
+- **Cache API**(`caches.default`)—— 跨 isolate、同一节点共享,isolate 被回收了也还在。
+
+缓存键**把 query 抹掉**,不然随手带个随机参数就能一路穿透到 D1。两层都只由「真查了 D1」
+那条路填、谁也不回填谁,所以最坏差 60 秒,不会叠成 120。数字晚一分钟没人看得出来 ——
+点了下载本来就是前端本地乐观 +1(见下面「计数在前端是两份」)。
 
 ### `GET /api/link` —— 给外部工具的入口
 
@@ -369,7 +414,9 @@ curl -s -X DELETE -H 'Content-Type: application/json' \
 
 D1 的自增走 `INSERT … ON CONFLICT DO UPDATE SET downloads = downloads + 1`,**单语句原子**。
 读出来加一再写回会在并发下丢计数 —— 这也是计数没用 KV 的原因,KV 没有原子自增,
-而且同一个键有每秒 1 次写的软限制,热门包正好撞上。
+而且同一个键有每秒 1 次写的软限制,热门包正好撞上。`stats_summary` 那条 `json_set` 也是
+同一个规矩:增量在 SQL 里算,和明细同一个 `batch()`、同一个事务(见
+「`/api/stats` 为什么读的是一行」)。
 
 **没有做的事**:Cloudflare 自带的无限量 DDoS 缓解拦的是流量形态异常,拦不住「有人写个循环
 一直点下载」。真被盯上了,在 `/api/*` 上加一条速率限制规则;**别在下载域上开 Bot Fight Mode**,
