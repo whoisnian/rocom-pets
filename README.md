@@ -23,6 +23,8 @@
 - **异色**与**炫彩**两种稀有外观：异色是美术另做的一整套材质；炫彩有无炫彩 / 黑白隐藏 / 常规炫彩 /
   暗夜拾光 / 狂欢怪谈 / 铅字幻梦 / 月涌狂想，常规炫彩再挑配色与粒子（39 组 × 4 种，编号与游戏一致），
   每个赛季的传说精灵有自家赛季炫彩；两者互不影响，异色炫彩也行；
+- 多块屏当成一整个桌面：拖动、走动、互相打招呼都能跨屏（上下摞着放的屏只能拖过去）；
+  记得每只站在哪块屏，下次启动站回原处；从配置窗口添加的宠物出现在配置窗口所在的那块屏上；
 - 点击穿透开关：开着的时候宠物只是看着，鼠标直接落到底下的窗口上。
 
 **托盘菜单**：点击穿透、静音叫声、召回宠物；帧率（20 / 30 / 60）、大小倍率（50% / 100% / 150% / 自定义）、
@@ -51,7 +53,7 @@
 
 | 平台 | 状态 |
 | --- | --- |
-| **Windows 10+** | 实机验过：上桌、置顶、点击穿透、拖放、托盘 |
+| **Windows 10+** | 实机验过：上桌、置顶、点击穿透、拖放、托盘；多屏（分辨率 / 缩放不同）跨屏拖动与行走 |
 | **KDE Plasma Wayland** | 开发环境（Plasma 6.x / kwin_wayland），日常在跑；要 Vulkan 驱动与 `xdg-desktop-portal-kde` |
 
 GNOME 等不实现 wlr-layer-shell 的合成器不在支持范围，也不做 X11 回退。
@@ -74,14 +76,14 @@ GNOME 等不实现 wlr-layer-shell 的合成器不在支持范围，也不做 X1
 
 宠物包在 `%LOCALAPPDATA%\rocom-pets\packs\`（Windows）/ `~/.local/share/rocom-pets/packs/`（Linux），
 一个图鉴号一个 `.rkpet2`；配置与在场阵容在 `%APPDATA%\rocom-pets\` / `~/.config/rocom-pets/`
-（`config.toml` + `roster.toml`），下次启动自动恢复阵容。
+（`config.toml` + `roster.toml`），下次启动自动恢复阵容与各自的位置。
 
 **没有内置的全局热键**：要快捷键就在系统里把自定义快捷键绑到下面这几条，键位归系统管，
 桌宠一个组合键都不抢：
 
 ```sh
 rocom-pets --toggle-passthrough   # 切换点击穿透
-rocom-pets --recall               # 把宠物召回屏幕中间
+rocom-pets --recall               # 把宠物召回主屏中间
 rocom-pets --reload               # 手改完 config / roster 后让它重读
 rocom-pets --quit                 # 退出
 rocom-pets --settings             # 打开配置窗口
