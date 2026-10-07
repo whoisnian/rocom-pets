@@ -2,6 +2,13 @@
 
 各版本的分发件(Linux / Windows 各一个可执行文件)见 [GitHub Releases](https://github.com/whoisnian/rocom-pets/releases)。
 
+## [1.7.0](https://github.com/whoisnian/rocom-pets/releases/tag/1.7.0) - 2026-10-07
+
+- 修复燃了鸭尾部火焰效果，小灵菇蓝色光环波动，晶石蜗矿石材质，守夜烛火焰颜色
+- 修复通用流动光/闪烁/星光/拖尾/火焰描边等材质效果
+- 修复诅咒狼灵中轴位置偏移问题
+- 桌宠点击回正逻辑回滚，自选炫彩排列异常
+
 ## [1.6.1](https://github.com/whoisnian/rocom-pets/releases/tag/1.6.1) - 2026-10-07
 
 - 修复移动端网页宽度导致的横向滚动条问题
