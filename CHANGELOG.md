@@ -2,6 +2,11 @@
 
 各版本的分发件(Linux / Windows 各一个可执行文件)见 [GitHub Releases](https://github.com/whoisnian/rocom-pets/releases)。
 
+## [1.8.0](https://github.com/whoisnian/rocom-pets/releases/tag/1.8.0) - 2026-10-09
+
+- 宠物叫声补充，预览时粗嗓门/婉转声逻辑调整
+- 个别宠物骨骼缩放问题修复
+
 ## [1.7.1](https://github.com/whoisnian/rocom-pets/releases/tag/1.7.1) - 2026-10-08
 
 - 尝试修复桌宠偶尔出现的音画不同步问题
