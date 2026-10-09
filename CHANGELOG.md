@@ -2,6 +2,13 @@
 
 各版本的分发件(Linux / Windows 各一个可执行文件)见 [GitHub Releases](https://github.com/whoisnian/rocom-pets/releases)。
 
+## [1.9.0](https://github.com/whoisnian/rocom-pets/releases/tag/1.9.0) - 2026-10-10
+
+- 修复项目地址与下载页点击跳转
+- 网页端打包下载音频避免读条
+- 设置新增不限制帧率，宠物预览遵循设置
+- 个别宠物翅膀星空效果修复
+
 ## [1.8.0](https://github.com/whoisnian/rocom-pets/releases/tag/1.8.0) - 2026-10-09
 
 - 宠物叫声补充，预览时粗嗓门/婉转声逻辑调整
