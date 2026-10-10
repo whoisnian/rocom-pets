@@ -2,6 +2,12 @@
 
 各版本的分发件(Linux / Windows 各一个可执行文件)见 [GitHub Releases](https://github.com/whoisnian/rocom-pets/releases)。
 
+## [1.9.1](https://github.com/whoisnian/rocom-pets/releases/tag/1.9.1) - 2026-10-11
+
+- 优化动作展示期间的表情跳变
+- 尝试修复 windows 桌宠丢帧及音频设备切换问题
+- 桌面端及网页端打包依赖更新
+
 ## [1.9.0](https://github.com/whoisnian/rocom-pets/releases/tag/1.9.0) - 2026-10-10
 
 - 修复项目地址与下载页点击跳转
