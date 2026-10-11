@@ -2,6 +2,12 @@
 
 各版本的分发件(Linux / Windows 各一个可执行文件)见 [GitHub Releases](https://github.com/whoisnian/rocom-pets/releases)。
 
+## [1.10.0](https://github.com/whoisnian/rocom-pets/releases/tag/1.10.0) - 2026-10-12
+
+- 移除桌面为空时的圆形占位图案
+- 新增神奇的蛋，支持已导出宠物随机上桌
+- 导出逻辑调整，补充被错误跳过的女王蜂
+
 ## [1.9.1](https://github.com/whoisnian/rocom-pets/releases/tag/1.9.1) - 2026-10-11
 
 - 优化动作展示期间的表情跳变
