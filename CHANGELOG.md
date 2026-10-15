@@ -2,6 +2,10 @@
 
 各版本的分发件(Linux / Windows 各一个可执行文件)见 [GitHub Releases](https://github.com/whoisnian/rocom-pets/releases)。
 
+## [1.12.0](https://github.com/whoisnian/rocom-pets/releases/tag/1.12.0) - 2026-10-15
+
+- 描边及眨眼动作优化
+
 ## [1.11.0](https://github.com/whoisnian/rocom-pets/releases/tag/1.11.0) - 2026-10-14
 
 - 新增聚能动作
