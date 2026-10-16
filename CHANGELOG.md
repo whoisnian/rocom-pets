@@ -2,6 +2,11 @@
 
 各版本的分发件(Linux / Windows 各一个可执行文件)见 [GitHub Releases](https://github.com/whoisnian/rocom-pets/releases)。
 
+## [1.13.1](https://github.com/whoisnian/rocom-pets/releases/tag/1.13.1) - 2026-10-17
+
+- 宠物描边及抗锯齿优化
+- 网页端宠物加载速度优化
+
 ## [1.13.0](https://github.com/whoisnian/rocom-pets/releases/tag/1.13.0) - 2026-10-15
 
 - 同步游戏版本更新，补充 奔波鼠/花怨鳗/稻草人/云梦豚
