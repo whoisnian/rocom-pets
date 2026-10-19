@@ -2,6 +2,11 @@
 
 各版本的分发件(Linux / Windows 各一个可执行文件)见 [GitHub Releases](https://github.com/whoisnian/rocom-pets/releases)。
 
+## [1.14.0](https://github.com/whoisnian/rocom-pets/releases/tag/1.14.0) - 2026-10-20
+
+- 修复宠物叫声与动作音效的音量比例
+- 网页端新增 WebGL2 兼容模式，优化宠物切换
+
 ## [1.13.2](https://github.com/whoisnian/rocom-pets/releases/tag/1.13.2) - 2026-10-18
 
 - 补充宠物受击动作叫声
