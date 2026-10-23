@@ -2,6 +2,11 @@
 
 各版本的分发件(Linux / Windows 各一个可执行文件)见 [GitHub Releases](https://github.com/whoisnian/rocom-pets/releases)。
 
+## [1.14.3](https://github.com/whoisnian/rocom-pets/releases/tag/1.14.3) - 2026-10-24
+
+- 桌宠摸头判定修复，增加抛出及连戳反应
+- 修复炫彩效果与部分特效的异常叠加问题
+
 ## [1.14.2](https://github.com/whoisnian/rocom-pets/releases/tag/1.14.2) - 2026-10-22
 
 - 多显卡新增 GPU偏好 首选项，修复双显卡笔记本桌宠无法使用独显、首选项打不开的问题
