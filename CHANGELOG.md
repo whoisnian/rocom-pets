@@ -2,6 +2,12 @@
 
 各版本的分发件(Linux / Windows 各一个可执行文件)见 [GitHub Releases](https://github.com/whoisnian/rocom-pets/releases)。
 
+## [1.15.0](https://github.com/whoisnian/rocom-pets/releases/tag/1.15.0) - 2026-11-06
+
+- 补充 S5 新宠物，新增 S5 赛季炫彩
+- 新增头顶表情与动作特效，提高表情包可读性
+- 飞行宠物抛出后支持飘落，点击触发动作优化
+
 ## [1.14.3](https://github.com/whoisnian/rocom-pets/releases/tag/1.14.3) - 2026-10-24
 
 - 桌宠摸头判定修复，增加抛出及连戳反应
