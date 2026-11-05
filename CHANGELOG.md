@@ -2,6 +2,11 @@
 
 各版本的分发件(Linux / Windows 各一个可执行文件)见 [GitHub Releases](https://github.com/whoisnian/rocom-pets/releases)。
 
+## [1.15.1](https://github.com/whoisnian/rocom-pets/releases/tag/1.15.1) - 2026-11-06
+
+- 修复透明 GIF 中表情背景柔光变成大片不透明色块的问题
+- 导出宠物时检查赛季炫彩配置、贴图与色卡，缺失时自动重新导出共享素材，并提示重启客户端
+
 ## [1.15.0](https://github.com/whoisnian/rocom-pets/releases/tag/1.15.0) - 2026-11-06
 
 - 补充 S5 新宠物，新增 S5 赛季炫彩
