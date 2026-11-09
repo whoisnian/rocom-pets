@@ -2,6 +2,11 @@
 
 各版本的分发件(Linux / Windows 各一个可执行文件)见 [GitHub Releases](https://github.com/whoisnian/rocom-pets/releases)。
 
+## [1.15.2](https://github.com/whoisnian/rocom-pets/releases/tag/1.15.2) - 2026-11-10
+
+- 参考 www.rocopedia.org 补充宠物名称中英切换，列表补充宠物头像
+- 预览功能支持全屏画布，仅保留动作播放悬浮按钮
+
 ## [1.15.1](https://github.com/whoisnian/rocom-pets/releases/tag/1.15.1) - 2026-11-06
 
 - 修复透明 GIF 中表情背景柔光变成大片不透明色块的问题
