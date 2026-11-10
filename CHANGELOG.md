@@ -2,6 +2,10 @@
 
 各版本的分发件(Linux / Windows 各一个可执行文件)见 [GitHub Releases](https://github.com/whoisnian/rocom-pets/releases)。
 
+## [1.15.3](https://github.com/whoisnian/rocom-pets/releases/tag/1.15.3) - 2026-11-11
+
+- 鲸羽行走额外圆环问题修复
+
 ## [1.15.2](https://github.com/whoisnian/rocom-pets/releases/tag/1.15.2) - 2026-11-10
 
 - 参考 www.rocopedia.org 补充宠物名称中英切换，列表补充宠物头像
