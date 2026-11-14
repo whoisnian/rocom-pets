@@ -50,6 +50,20 @@
 （64～512px、20 / 25 / 50fps、透明或纯色底、GIF 或无损 WebP），定格某一帧存 PNG 静态贴纸，
 或排成角色设定图。看的那条链还没导出就在窗口里直接导。表情包导出教程见 [GUIDE.md](GUIDE.md)。
 
+**本地接口**（REST + MCP，「常用配置 › 本地接口」里填监听地址开启，默认不监听）：本机别的程序与 AI agent
+能查在场宠物、让它说话 / 播动作 / 冒表情 / 走动、增删改宠物、改全局设置、开预览窗口。REST 在 `/v1`，MCP 在 `/mcp`，
+每个请求都要带 `Authorization: Bearer <鉴权令牌>`（填了监听地址会自动生成）；带 `Origin` 的请求还要在「允许跨域」的单子上。
+接入 agent：
+
+```sh
+claude mcp add --transport http rocom-pets http://127.0.0.1:47831/mcp --header "Authorization: Bearer <令牌>"
+```
+
+全部接口、参数与错误码见 [docs/api.md](docs/api.md)。其中 `POST /v1/preview` 带上抓包里的 `base_conf_id` 与
+`glass_info` 原样字段就开一个不带列表的预览窗口，[rocom-capture](https://github.com/whoisnian/rocom-capture)
+的炫彩色卡唤起预览走的就是它：启动时给 `-pets-url http://<这里填的地址> -pets-token <鉴权令牌>`，
+「允许跨域」里填它的页面地址。
+
 **网页版**：[rkpet.whoisnian.com](https://rkpet.whoisnian.com) —— 与预览窗口同一份渲染编成 wasm
 在浏览器里跑，不用装东西、不用游戏目录，看模型、换炫彩、听叫声、存表情包。优先 WebGPU，不支持时可用
 WebGL2 兼容模式；电脑与手机浏览器都能开。
