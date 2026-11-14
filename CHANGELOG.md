@@ -2,6 +2,13 @@
 
 各版本的分发件(Linux / Windows 各一个可执行文件)见 [GitHub Releases](https://github.com/whoisnian/rocom-pets/releases)。
 
+## [1.16.0](https://github.com/whoisnian/rocom-pets/releases/tag/1.16.0) - 2026-11-14
+
+- 新增本地接口，支持 REST + MCP 触发桌宠行为
+- 修复学院呱呱动作中的道具位置偏移问题
+- 修复桌宠被点醒后马上坐回去又站起的问题
+- 神奇的蛋破壳特效优化
+
 ## [1.15.3](https://github.com/whoisnian/rocom-pets/releases/tag/1.15.3) - 2026-11-11
 
 - 鲸羽行走额外圆环问题修复
