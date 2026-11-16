@@ -2,6 +2,11 @@
 
 各版本的分发件(Linux / Windows 各一个可执行文件)见 [GitHub Releases](https://github.com/whoisnian/rocom-pets/releases)。
 
+## [1.16.1](https://github.com/whoisnian/rocom-pets/releases/tag/1.16.1) - 2026-11-17
+
+- 补充滴廿豚身上的流动光带
+- 修复黄蜂后、女王蜂等宠物部分动作眼神错误
+
 ## [1.16.0](https://github.com/whoisnian/rocom-pets/releases/tag/1.16.0) - 2026-11-14
 
 - 新增本地接口，支持 REST + MCP 触发桌宠行为
