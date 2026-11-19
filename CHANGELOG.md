@@ -2,6 +2,11 @@
 
 各版本的分发件(Linux / Windows 各一个可执行文件)见 [GitHub Releases](https://github.com/whoisnian/rocom-pets/releases)。
 
+## [1.16.2](https://github.com/whoisnian/rocom-pets/releases/tag/1.16.2) - 2026-11-20
+
+- 同步游戏更新，补充 陪伴阿布的样子
+- 修复部分首领形态动作缺失的问题
+
 ## [1.16.1](https://github.com/whoisnian/rocom-pets/releases/tag/1.16.1) - 2026-11-17
 
 - 补充滴廿豚身上的流动光带
